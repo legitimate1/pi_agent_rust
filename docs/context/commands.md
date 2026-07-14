@@ -15,10 +15,7 @@ cargo build --release    # 发布构建（LTO + size opt）
 - **Dev profile**：`debug = "line-tables-only"`，减少 debug 信息量以加速编译
 - **Defender 排除**：项目 `target/` 已加入 Windows Defender 排除列表
 
-安装 sccache：
-```bash
-cargo install sccache
-```
+
 
 ## 测试
 
