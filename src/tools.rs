@@ -3935,12 +3935,17 @@ pub(crate) async fn run_pwsh_command(
         ));
     }
 
+    // Wrap command to ensure UTF-8 output encoding for proper Chinese character support
+    let pwsh_command = format!(
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); $PSDefaultParameterOutputEncoding = [System.Text.UTF8Encoding]::new(); {command}"
+    );
+
     let mut cmd = std::process::Command::new("pwsh");
     cmd.arg("-NoProfile")
         .arg("-ExecutionPolicy")
         .arg("Bypass")
         .arg("-Command")
-        .arg(&command)
+        .arg(&pwsh_command)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -373,7 +373,7 @@ strip = true
 
 [profile.dev]
 opt-level = 0
-debug = true
+debug = "line-tables-only"
 
 [profile.test]
 # Full-suite RCH workers have limited artifact storage; keep test binaries

@@ -4,8 +4,20 @@
 
 ```bash
 cargo check              # 快速检查编译错误
-cargo build              # Debug 构建
+cargo build              # Debug 构建（LLD 链接器 + sccache 缓存）
 cargo build --release    # 发布构建（LTO + size opt）
+```
+
+### 构建优化配置（`.cargo/config.toml`）
+
+- **LLD 链接器**：`lld-link.exe` 替代 MSVC `link.exe`，链接速度快 3-5x
+- **sccache**：编译器缓存，`cargo clean` / 切换分支后大幅加速冷启动
+- **Dev profile**：`debug = "line-tables-only"`，减少 debug 信息量以加速编译
+- **Defender 排除**：项目 `target/` 已加入 Windows Defender 排除列表
+
+安装 sccache：
+```bash
+cargo install sccache
 ```
 
 ## 测试

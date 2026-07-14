@@ -10,3 +10,10 @@ rustflags = ["-L", "/usr/local/lib"]
 
 [env]
 PKG_CONFIG_PATH = { value = "/usr/local/libdata/pkgconfig", force = false }
+
+# Use LLD for faster linking on Windows (MSVC target)
+[target.x86_64-pc-windows-msvc]
+linker = "C:\\Program Files\\LLVM\\bin\\lld-link.exe"
+
+[build]
+rustc-wrapper = "sccache"
