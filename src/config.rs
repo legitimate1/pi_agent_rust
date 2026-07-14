@@ -138,6 +138,10 @@ pub struct Config {
     #[serde(alias = "failClosedHooks")]
     pub fail_closed_hooks: Option<bool>,
 
+    // Disabled built-in tools
+    #[serde(alias = "disabledTools")]
+    pub disabled_tools: Option<Vec<String>>,
+
     // Extension Policy
     #[serde(alias = "extensionPolicy")]
     pub extension_policy: Option<ExtensionPolicyConfig>,
@@ -563,6 +567,7 @@ impl Config {
             themes: other.themes.or(base.themes),
             enable_skill_commands: other.enable_skill_commands.or(base.enable_skill_commands),
             fail_closed_hooks: other.fail_closed_hooks.or(base.fail_closed_hooks),
+            disabled_tools: other.disabled_tools.or(base.disabled_tools),
 
             // Extension Policy
             extension_policy: merge_extension_policy(base.extension_policy, other.extension_policy),

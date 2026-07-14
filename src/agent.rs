@@ -1206,11 +1206,16 @@ impl Agent {
     }
 
     /// Extend the tool registry with additional tools (e.g. extension-registered tools).
+    /// Extension tools with the same name as existing tools override them.
     pub fn extend_tools<I>(&mut self, tools: I)
     where
         I: IntoIterator<Item = Box<dyn Tool>>,
     {
-        self.tools.extend(tools);
+        let new_tools: Vec<Box<dyn Tool>> = tools.into_iter().collect();
+        let override_names: std::collections::HashSet<&str> =
+            new_tools.iter().map(|t| t.name()).collect();
+        self.tools.retain(|t| !override_names.contains(t.name()));
+        self.tools.extend(new_tools);
         self.cached_tool_defs = None; // Invalidate cache when tools change
     }
 

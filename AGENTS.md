@@ -1,5 +1,7 @@
 # AGENTS.md — pi_agent_rust (Pi CLI Coding Agent)
 
+> 当需要探索代码库时，先阅读 docs/context/index.md 及相关知识库文件
+
 > Guidelines for AI coding agents working in this Rust codebase.
 
 ---

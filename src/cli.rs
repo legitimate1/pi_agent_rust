@@ -413,10 +413,10 @@ pub struct Cli {
     #[arg(long)]
     pub no_tools: bool,
 
-    /// Specific tools to enable (comma-separated: read,write,edit,bash,grep,find,ls,hashline_edit)
+    /// Specific tools to enable (comma-separated: read,write,edit,bash,grep,find,ls,hashline_edit,pwsh)
     #[arg(
         long,
-        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit"
+        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit,pwsh"
     )]
     pub tools: String,
 
@@ -1036,6 +1036,7 @@ mod tests {
                 "find",
                 "ls",
                 "hashline_edit",
+                "pwsh",
             ]
         );
     }

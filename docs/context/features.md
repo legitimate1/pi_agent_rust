@@ -1,0 +1,64 @@
+# 功能目录
+
+## CLI 与交互
+
+| 功能 | 状态 | 涉及文件 |
+|:-----|:----:|:---------|
+| 交互式 TUI（流式渲染、Markdown、主题） | ✅ | `src/interactive.rs` + `src/tui.rs` |
+| 非交互式 Print 模式 | ✅ | `src/main.rs` |
+| RPC/stdin 服务器模式 | ✅ | `src/rpc.rs` |
+| CLI 子命令（doctor/config/list/info 等） | ✅ | `src/main.rs` |
+
+## Provider 层
+
+| 功能 | 状态 | 涉及文件 |
+|:-----|:----:|:---------|
+| Anthropic API（流式 + 扩展思考 + 工具） | ✅ | `src/providers/anthropic.rs` |
+| OpenAI Chat Completions | ✅ | `src/providers/openai.rs` |
+| OpenAI Responses / Codex Responses | ✅ | `src/providers/openai_responses.rs` |
+| Gemini（流式 + 工具） | ✅ | `src/providers/gemini.rs` |
+| Cohere（流式 + 工具） | ✅ | `src/providers/cohere.rs` |
+| Azure OpenAI | ✅ | `src/providers/azure.rs` |
+| Bedrock / Vertex AI / GitHub Copilot / GitLab Duo | ✅ | `src/providers/*.rs` |
+| 扩展 stream-simple Provider 桥接 | ✅ | `src/providers/mod.rs` |
+| Provider 工厂 + 路由 | ✅ | `src/providers/mod.rs` |
+
+## 工具系统
+
+| 功能 | 状态 | 涉及文件 |
+|:-----|:----:|:---------|
+| ToolRegistry — 工具注册表 | ✅ | `src/tools.rs:2646` |
+| 内置 9 工具（read/bash/edit/write/grep/find/ls/hashline_edit/pwsh） | ✅ | `src/tools.rs` |
+| 扩展工具收集 | ✅ | `src/extension_tools.rs:100` |
+| **扩展工具同名覆盖内置工具** | ✅ | `src/tools.rs:2697` `src/agent.rs:1209` |
+| **内置 pwsh 工具**（PowerShell 命令执行） | ✅ | `src/tools.rs` |
+| **运行时禁用内置工具**（`disabledTools` 配置） | ✅ | `src/config.rs:137` `src/main.rs:1393` |
+| Tool trait + JSON Schema 定义 | ✅ | `src/tools.rs` |
+
+## 扩展系统
+
+| 功能 | 状态 | 涉及文件 |
+|:-----|:----:|:---------|
+| JS/TS 扩展加载（QuickJS） | ✅ | `src/extensions_js.rs` |
+| Native Rust 扩展（`*.native.json`） | ✅ | `src/extensions.rs` |
+| WASM 扩展 | ✅ | `src/extensions.rs` |
+| 能力策略模型（Strict/Prompt/Permissive） | ✅ | `src/extensions.rs:1139` |
+| Hostcall 调度（tool/exec/http/session/ui/events/log） | ✅ | `src/extensions_js.rs` |
+| 虚拟模块系统（Node.js builtins + npm stubs） | ✅ | `src/extensions_js.rs` |
+
+## 会话管理
+
+| 功能 | 状态 | 涉及文件 |
+|:-----|:----:|:---------|
+| JSONL 会话（v3） | ✅ | `src/session.rs` |
+| 分支 / 树结构 | ✅ | `src/session.rs` |
+| SQLite 会话后端 | ✅ | `src/session.rs` |
+| 会话索引元数据 | ✅ | `src/session_index.rs` |
+
+## 模型注册表
+
+| 功能 | 状态 | 涉及文件 |
+|:-----|:----:|:---------|
+| 内置模型注册 | ✅ | `src/models.rs` |
+| `models.json` 自定义模型加载 | ✅ | `src/models.rs:698` |
+| Provider 元数据（别名 + 认证键） | ✅ | `src/provider_metadata.rs` |

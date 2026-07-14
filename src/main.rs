@@ -1390,6 +1390,14 @@ async fn run(
     };
 
     let enabled_tools = cli.enabled_tools();
+    let enabled_tools: Vec<&str> = {
+        let disabled: Vec<&str> = config
+            .disabled_tools
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        enabled_tools.into_iter().filter(|t| !disabled.contains(t)).collect()
+    };
     let skills_prompt = if enabled_tools.contains(&"read") {
         resources.format_skills_for_prompt()
     } else {
