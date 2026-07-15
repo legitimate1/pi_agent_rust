@@ -10,6 +10,14 @@ cargo build --release    # 发布构建（opt-level=3 + thin LTO + panic=abort�
 
 > ⚠️ **构建注意事项**：`cargo build --release` 耗时 5-10 分钟，请在**新开的终端窗口**中执行构建，不要占用当前交互终端。使用 `Start-Process` 或手动开新窗口。
 
+### 部署
+
+构建完成后，用脚本一键停进程+覆盖：
+
+```powershell
+.\scripts\deploy-release.ps1
+```
+
 ### 构建优化配置（`.cargo/config.toml`）
 
 - **LLD 链接器**：`lld-link.exe` 替代 MSVC `link.exe`，链接速度快 3-5x
