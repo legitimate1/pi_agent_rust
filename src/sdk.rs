@@ -392,7 +392,7 @@ pub trait ToolFactory: Send + Sync {
 /// (e.g. wrap each tool with an approval gate, or add a `Task` tool
 /// that spawns a nested session).
 pub fn default_tool_registry(enabled: &[&str], cwd: &Path, config: &Config) -> ToolRegistry {
-    ToolRegistry::new(enabled, cwd, Some(config))
+    ToolRegistry::new(enabled, cwd, Some(pi_core::tool_config::ToolConfig::from(config)))
 }
 
 /// Lightweight handle for programmatic embedding.
@@ -1747,7 +1747,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     };
 
     let tools = options.tool_factory.as_ref().map_or_else(
-        || ToolRegistry::new(&enabled_tools, &cwd, Some(&config)),
+        || ToolRegistry::new(&enabled_tools, &cwd, Some(pi_core::tool_config::ToolConfig::from(&config))),
         |factory| factory.create_tool_registry(&enabled_tools, &cwd, &config),
     );
     let session_arc = Arc::new(asupersync::sync::Mutex::new(session));

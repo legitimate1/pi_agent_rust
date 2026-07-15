@@ -1008,6 +1008,18 @@ impl Config {
     }
 }
 
+impl From<&Config> for pi_core::tool_config::ToolConfig {
+    fn from(c: &Config) -> Self {
+        pi_core::tool_config::ToolConfig {
+            shell_path: c.shell_path.clone(),
+            shell_command_prefix: c.shell_command_prefix.clone(),
+            image_auto_resize: c.image_auto_resize(),
+            block_images: c.image_block_images(),
+            tool_descriptions: c.tool_descriptions.clone().unwrap_or_default(),
+        }
+    }
+}
+
 fn env_lookup(var: &str) -> Option<String> {
     std::env::var(var).ok()
 }

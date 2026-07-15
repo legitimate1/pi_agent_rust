@@ -8945,7 +8945,7 @@ impl AgentSession {
         } else {
             let manager = ExtensionManager::new();
             manager.set_cwd(cwd.display().to_string());
-            let tools = Arc::new(ToolRegistry::new(enabled_tools, cwd, config));
+            let tools = Arc::new(ToolRegistry::new(enabled_tools, cwd, config.map(pi_core::tool_config::ToolConfig::from)));
 
             if let Some(cfg) = config {
                 let resolved_risk = cfg.resolve_extension_risk_with_metadata();

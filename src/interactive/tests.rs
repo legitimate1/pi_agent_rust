@@ -83,7 +83,7 @@ fn build_test_app(cwd: PathBuf) -> PiApp {
     let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
     let agent = Agent::new(
         provider,
-        ToolRegistry::new(&[], &cwd, Some(&config)),
+        ToolRegistry::new(&[], &cwd, Some(pi_core::tool_config::ToolConfig::from(&config))),
         AgentConfig::default(),
     );
     let resources = ResourceLoader::empty(config.enable_skill_commands());

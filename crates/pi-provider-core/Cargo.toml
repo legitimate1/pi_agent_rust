@@ -1,0 +1,22 @@
+[package]
+name = "pi-provider-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dev-dependencies]
+proptest = "1"
+
+[dependencies]
+pi-core = { path = "../pi-core" }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+futures = "0.3"
+regex = "1.12.3"
+asupersync = { version = "0.3.6", default-features = false, features = ["tls-webpki-roots", "test-internals"] }
+sqlmodel-core = { version = "0.2.2" }
+
+[lints.rust]
+unsafe_code = "forbid"

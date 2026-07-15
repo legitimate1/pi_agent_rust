@@ -1178,7 +1178,7 @@ async fn run(
             let pre_mgr = pi::extensions::ExtensionManager::new();
             pre_mgr.set_cwd(cwd.display().to_string());
 
-            let pre_tools = Arc::new(ToolRegistry::new(&pre_enabled_tools, &cwd, Some(&config)));
+            let pre_tools = Arc::new(ToolRegistry::new(&pre_enabled_tools, &cwd, Some(pi_core::tool_config::ToolConfig::from(&config))));
 
             let resolved_risk = config.resolve_extension_risk_with_metadata();
             pre_mgr.set_runtime_risk_config(resolved_risk.settings);
@@ -1225,7 +1225,7 @@ async fn run(
         let pre_enabled_tools = cli.enabled_tools();
         let pre_mgr = pi::extensions::ExtensionManager::new();
         pre_mgr.set_cwd(cwd.display().to_string());
-        let pre_tools = Arc::new(ToolRegistry::new(&pre_enabled_tools, &cwd, Some(&config)));
+        let pre_tools = Arc::new(ToolRegistry::new(&pre_enabled_tools, &cwd, Some(pi_core::tool_config::ToolConfig::from(&config))));
 
         let resolved_risk = config.resolve_extension_risk_with_metadata();
         pre_mgr.set_runtime_risk_config(resolved_risk.settings);
@@ -1439,7 +1439,7 @@ async fn run(
         tool_approval: None,
     };
 
-    let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&config));
+    let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(pi_core::tool_config::ToolConfig::from(&config)));
     let session_arc = Arc::new(Mutex::new(session));
     let compaction_settings = ResolvedCompactionSettings {
         enabled: config.compaction_enabled(),

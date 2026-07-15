@@ -57,9 +57,10 @@ mod tests;
 
 use crate::agent_cx::AgentCx;
 use crate::config::Config;
-use crate::error::{Error, Result};
-use crate::extensions::{safe_canonicalize, strip_unc_prefix};
-use crate::model::{ContentBlock, ImageContent, TextContent};
+use pi_core::path_utils::{safe_canonicalize, strip_unc_prefix};
+use pi_core::tool_config::ToolConfig;
+use pi_provider_core::error::{Error, Result};
+use pi_core::model::{ContentBlock, ImageContent, TextContent};
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(test)]
 use asupersync::time::{sleep, wall_now};
@@ -2164,8 +2165,8 @@ pub(crate) fn resolve_read_path(file_path: &str, cwd: &Path) -> PathBuf {
 }
 
 pub(crate) fn enforce_cwd_scope(path: &Path, cwd: &Path, action: &str) -> Result<PathBuf> {
-    let canonical_path = crate::extensions::safe_canonicalize(path);
-    let canonical_cwd = crate::extensions::safe_canonicalize(cwd);
+    let canonical_path = pi_core::path_utils::safe_canonicalize(path);
+    let canonical_cwd = pi_core::path_utils::safe_canonicalize(cwd);
     if !canonical_path.starts_with(&canonical_cwd) {
         return Err(Error::validation(format!(
             "Cannot {action} outside the working directory (resolved: {}, cwd: {})",
@@ -2192,13 +2193,13 @@ pub(crate) fn enforce_cwd_scope(path: &Path, cwd: &Path, action: &str) -> Result
 /// pointing at `/etc/passwd` resolves to `/etc/passwd` and fails the prefix
 /// test against both cwd and agent dir.
 fn enforce_read_scope_with_roots(path: &Path, cwd: &Path, agent_dir: &Path) -> Result<PathBuf> {
-    let canonical_path = crate::extensions::safe_canonicalize(path);
-    let canonical_cwd = crate::extensions::safe_canonicalize(cwd);
+    let canonical_path = pi_core::path_utils::safe_canonicalize(path);
+    let canonical_cwd = pi_core::path_utils::safe_canonicalize(cwd);
     if canonical_path.starts_with(&canonical_cwd) {
         return Ok(canonical_path);
     }
 
-    let canonical_agent = crate::extensions::safe_canonicalize(agent_dir);
+    let canonical_agent = pi_core::path_utils::safe_canonicalize(agent_dir);
     if canonical_path.starts_with(&canonical_agent) {
         return Ok(canonical_path);
     }
@@ -2763,14 +2764,13 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     /// Create a new registry with the specified tools enabled.
-    pub fn new(enabled: &[&str], cwd: &Path, config: Option<&Config>) -> Self {
+    pub fn new(enabled: &[&str], cwd: &Path, config: Option<ToolConfig>) -> Self {
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
-        let shell_path = config.and_then(|c| c.shell_path.clone());
-        let shell_command_prefix = config.and_then(|c| c.shell_command_prefix.clone());
-        let image_auto_resize = config.is_none_or(Config::image_auto_resize);
-        let block_images = config
-            .and_then(|c| c.images.as_ref().and_then(|i| i.block_images))
-            .unwrap_or(false);
+        let config = config.unwrap_or_default();
+        let shell_path = config.shell_path;
+        let shell_command_prefix = config.shell_command_prefix;
+        let image_auto_resize = config.image_auto_resize;
+        let block_images = config.block_images;
 
         for name in enabled {
             match *name {
@@ -2795,9 +2795,7 @@ impl ToolRegistry {
             }
         }
 
-        let description_overrides = config
-            .and_then(|c| c.tool_descriptions.clone())
-            .unwrap_or_default();
+        let description_overrides = config.tool_descriptions;
         Self {
             tools,
             description_overrides,

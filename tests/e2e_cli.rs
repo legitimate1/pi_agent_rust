@@ -2807,7 +2807,7 @@ fn expected_system_prompt(custom: &str) -> String {
 fn expected_anthropic_tools(enabled: &[&str]) -> Vec<serde_json::Value> {
     let cwd = Path::new(".");
     let config = Config::default();
-    let tools = ToolRegistry::new(enabled, cwd, Some(&config));
+    let tools = ToolRegistry::new(enabled, cwd, Some(pi_core::tool_config::ToolConfig::from(&config)));
 
     tools
         .tools()

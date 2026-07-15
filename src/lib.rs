@@ -65,7 +65,7 @@ pub mod acp;
 #[doc(hidden)]
 pub mod agent;
 #[doc(hidden)]
-pub mod agent_cx;
+pub use pi_core::agent_cx;
 #[doc(hidden)]
 pub mod app;
 #[doc(hidden)]
@@ -73,7 +73,7 @@ pub mod auth;
 #[doc(hidden)]
 pub mod autocomplete;
 #[doc(hidden)]
-pub mod buffer_shim;
+pub use pi_core::buffer_shim;
 #[doc(hidden)]
 pub mod cli;
 #[doc(hidden)]
@@ -93,7 +93,7 @@ pub mod crypto_shim;
 #[doc(hidden)]
 pub mod doctor;
 #[doc(hidden)]
-pub mod error;
+pub use pi_provider_core::error;
 #[doc(hidden)]
 pub mod error_hints;
 #[doc(hidden)]
@@ -125,7 +125,7 @@ pub mod extensions;
 #[doc(hidden)]
 pub mod extensions_js;
 #[doc(hidden)]
-pub mod file_lock;
+pub use pi_core::file_lock;
 #[doc(hidden)]
 pub mod flake_classifier;
 #[doc(hidden)]
@@ -154,7 +154,8 @@ pub mod keybindings;
 #[doc(hidden)]
 pub mod migrations;
 #[doc(hidden)]
-pub mod model;
+#[doc(hidden)]
+pub use pi_core::model;
 #[doc(hidden)]
 pub mod model_routing;
 #[doc(hidden)]
@@ -171,11 +172,11 @@ pub mod permissions;
 #[doc(hidden)]
 pub mod pi_wasm;
 #[doc(hidden)]
-pub mod platform;
+pub use pi_core::platform;
 #[doc(hidden)]
-pub mod provider;
+pub use pi_provider_core::provider;
 #[doc(hidden)]
-pub mod provider_metadata;
+pub use pi_provider_core::provider_metadata;
 #[doc(hidden)]
 pub mod providers;
 #[doc(hidden)]
@@ -204,7 +205,7 @@ pub mod session_sqlite;
 #[doc(hidden)]
 pub mod session_store_v2;
 #[doc(hidden)]
-pub mod sse;
+pub use pi_core::sse;
 #[doc(hidden)]
 pub mod swarm_activity_ledger;
 #[doc(hidden)]

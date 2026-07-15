@@ -223,7 +223,7 @@ async fn run_debug(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<(
         fail_closed_hooks: config.fail_closed_hooks(),
         tool_approval: None,
     };
-    let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&config));
+    let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(pi_core::tool_config::ToolConfig::from(&config)));
     let session_arc = Arc::new(Mutex::new(session));
     let compaction_settings = ResolvedCompactionSettings {
         enabled: config.compaction_enabled(),

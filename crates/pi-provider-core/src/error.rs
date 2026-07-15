@@ -1,6 +1,6 @@
 //! Error types for the Pi application.
 
-use pi_provider_core::provider_metadata::{canonical_provider_id, provider_auth_env_keys};
+use crate::provider_metadata::{canonical_provider_id, provider_auth_env_keys};
 use std::sync::OnceLock;
 use thiserror::Error;
 
@@ -2029,8 +2029,8 @@ mod tests {
             ("sap", "sap-ai-core"),
         ];
         for (alias, canonical) in alias_to_canonical {
-            let alias_keys = pi_provider_core::provider_metadata::provider_auth_env_keys(alias);
-            let canonical_keys = pi_provider_core::provider_metadata::provider_auth_env_keys(canonical);
+            let alias_keys = crate::provider_metadata::provider_auth_env_keys(alias);
+            let canonical_keys = crate::provider_metadata::provider_auth_env_keys(canonical);
             assert_eq!(
                 alias_keys, canonical_keys,
                 "alias {alias} env keys differ from canonical {canonical}"
@@ -2052,7 +2052,7 @@ mod tests {
             "sap-ai-core",
         ];
         for provider in &native_providers {
-            let keys = pi_provider_core::provider_metadata::provider_auth_env_keys(provider);
+            let keys = crate::provider_metadata::provider_auth_env_keys(provider);
             assert!(!keys.is_empty(), "provider {provider} has no auth env keys");
         }
     }
@@ -2217,7 +2217,7 @@ mod tests {
             ("xai", "XAI_API_KEY"),
         ];
         for (provider, expected_key) in providers_and_keys {
-            let keys = pi_provider_core::provider_metadata::provider_auth_env_keys(provider);
+            let keys = crate::provider_metadata::provider_auth_env_keys(provider);
             assert!(
                 keys.contains(expected_key),
                 "provider {provider} missing env key {expected_key}, got: {keys:?}"

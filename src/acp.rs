@@ -1336,7 +1336,7 @@ fn handle_session_new(
 
     // Set up the enabled tools (all standard tools).
     let enabled_tools: Vec<&str> = vec!["read", "bash", "edit", "write", "grep", "find", "ls"];
-    let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&options.config));
+    let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(pi_core::tool_config::ToolConfig::from(&options.config)));
 
     // ACP should respect the same configured default provider/model preference
     // as the normal startup path instead of picking an arbitrary ready model.

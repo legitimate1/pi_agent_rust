@@ -151,7 +151,7 @@ fn agent_loop_openai_vcr_basic() {
 
         let config = Config::default();
         let cwd = harness.temp_dir().to_path_buf();
-        let tools = ToolRegistry::new(&[], &cwd, Some(&config));
+        let tools = ToolRegistry::new(&[], &cwd, Some(pi_core::tool_config::ToolConfig::from(&config)));
         let agent_config = AgentConfig {
             system_prompt: None,
             max_tool_iterations: 2,
@@ -332,7 +332,7 @@ fn agent_loop_anthropic_simple_text() {
 
         let config = Config::default();
         let cwd = harness.temp_dir().to_path_buf();
-        let tools = ToolRegistry::new(&[], &cwd, Some(&config));
+        let tools = ToolRegistry::new(&[], &cwd, Some(pi_core::tool_config::ToolConfig::from(&config)));
         let agent_config = AgentConfig {
             system_prompt: Some(SYSTEM_PROMPT.to_string()),
             max_tool_iterations: 2,
@@ -432,7 +432,7 @@ fn agent_loop_anthropic_error_stream() {
 
         let config = Config::default();
         let cwd = harness.temp_dir().to_path_buf();
-        let tools = ToolRegistry::new(&[], &cwd, Some(&config));
+        let tools = ToolRegistry::new(&[], &cwd, Some(pi_core::tool_config::ToolConfig::from(&config)));
         let agent_config = AgentConfig {
             system_prompt: Some(SYSTEM_PROMPT.to_string()),
             max_tool_iterations: 0,
@@ -515,7 +515,7 @@ fn agent_loop_anthropic_tool_call_stop() {
 
         let config = Config::default();
         let cwd = harness.temp_dir().to_path_buf();
-        let tools = ToolRegistry::new(&[], &cwd, Some(&config));
+        let tools = ToolRegistry::new(&[], &cwd, Some(pi_core::tool_config::ToolConfig::from(&config)));
         let agent_config = AgentConfig {
             system_prompt: Some(SYSTEM_PROMPT.to_string()),
             max_tool_iterations: 0,

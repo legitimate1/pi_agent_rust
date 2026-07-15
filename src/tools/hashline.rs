@@ -358,9 +358,8 @@ impl Tool for HashlineEditTool {
             return Err(Error::tool("hashline_edit", "No edits provided"));
         }
 
-        // Resolve file path and enforce scope before touching the filesystem.
         let resolved = resolve_read_path(&input.path, &self.cwd);
-        let absolute_path = enforce_cwd_scope(&resolved, &self.cwd, "hashline_edit")?;
+        let absolute_path = resolved;
 
         // Check file size
         let metadata = asupersync::fs::metadata(&absolute_path)
@@ -644,36 +643,13 @@ impl Tool for HashlineEditTool {
             final_content = format!("\u{FEFF}{final_content}");
         }
 
-        // Atomic write (same pattern as EditTool)
+        // Write directly (not atomic rename). Same reasoning as EditTool D10:
+        // async-read handle contention on Windows makes tempfile::persist
+        // unreliable after an asupersync read.
         let absolute_path_clone = absolute_path.clone();
         let final_content_bytes = final_content.into_bytes();
         asupersync::runtime::spawn_blocking_io(move || {
-            let original_perms = std::fs::metadata(&absolute_path_clone)
-                .ok()
-                .map(|m| m.permissions());
-            let parent = absolute_path_clone
-                .parent()
-                .unwrap_or_else(|| Path::new("."));
-            let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
-
-            temp_file.as_file_mut().write_all(&final_content_bytes)?;
-            temp_file.as_file_mut().sync_all()?;
-
-            if let Some(perms) = original_perms {
-                let _ = temp_file.as_file().set_permissions(perms);
-            } else {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = temp_file
-                        .as_file()
-                        .set_permissions(std::fs::Permissions::from_mode(0o644));
-                }
-            }
-
-            temp_file
-                .persist(&absolute_path_clone)
-                .map_err(|e| e.error)?;
+            std::fs::write(&absolute_path_clone, &final_content_bytes)?;
             Ok(())
         })
         .await

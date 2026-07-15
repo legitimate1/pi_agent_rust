@@ -4458,6 +4458,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-core"
+version = "0.1.0"
+dependencies = [
+ "asupersync",
+ "futures",
+ "memchr",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "pi-provider-core"
+version = "0.1.0"
+dependencies = [
+ "asupersync",
+ "async-trait",
+ "futures",
+ "pi-core",
+ "proptest",
+ "regex",
+ "serde",
+ "serde_json",
+ "sqlmodel-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "pi_agent_rust"
 version = "0.1.22"
 dependencies = [
@@ -4499,6 +4528,8 @@ dependencies = [
  "md-5",
  "memchr",
  "pbkdf2",
+ "pi-core",
+ "pi-provider-core",
  "pretty_assertions",
  "proptest",
  "regex",
