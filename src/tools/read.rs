@@ -178,7 +178,6 @@ impl Tool for ReadTool {
         }
 
         let path = resolve_read_path(&input.path, &self.cwd);
-        let path = enforce_read_scope(&path, &self.cwd)?;
 
         let meta = asupersync::fs::metadata(&path).await.ok();
         if let Some(meta) = &meta {
@@ -373,7 +372,6 @@ impl Tool for ReadTool {
         // Diff mode: compare two files.
         if let Some(diff_target) = &input.diff {
             let diff_path = resolve_read_path(diff_target, &self.cwd);
-            let diff_path = enforce_read_scope(&diff_path, &self.cwd)?;
             if !diff_path.exists() {
                 return Err(Error::tool(
                     "read",

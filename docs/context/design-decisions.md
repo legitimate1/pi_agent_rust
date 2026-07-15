@@ -156,6 +156,24 @@
 
 **何时重新考虑**：如果 `asupersync` 底层修复了 Windows 句柄释放问题，或 edit 改为同步读文件，可恢复原子重命名。
 
+## D11: 移除 read 工具的 CWD/agent-dir 路径限制（2026-07-15）
+
+**决策**：移除 `read` 工具的 `enforce_read_scope()` 调用，允许读取任意绝对路径。
+
+**涉及改动**：
+1. `src/tools/read.rs` → 移除两处 `enforce_read_scope(&path, &self.cwd)?` 调用（主读取路径 + diff 目标路径）
+
+**理由**：
+- 与 D9（移除 write/edit 路径限制）一致——read 不应比 pwsh/bash 等 shell 工具有更多路径限制
+- 验证报错 `"Cannot read outside the working directory or agent dir"` 阻止了读取项目目录之外的必要文件（如 `~/.pi/` 配置文件、`/data/tmp/` 下的构建产物）
+- 用户工作流中需要读取 CWD 之外的文件（如跨项目引用、系统配置文件）
+
+**不选 B 的原因**：
+- 保留限制并改进错误提示——仍然只能读 CWD/agent-dir 内的文件
+- 改为白名单模式——增加了不必要的配置复杂度，与 D9 的决策不一致
+
+**何时重新考虑**：如果未来引入细粒度工具安全策略（per-tool allowlist），可重新加入路径限定。
+
 ## D8: Release 构建 — 栈溢出问题（2026-07-15）
 
 **问题**：Debug 构建的 `pi.exe` 在 Windows 上启动即崩溃，报 `thread 'main' has overflowed its stack`。Release 构建正常。

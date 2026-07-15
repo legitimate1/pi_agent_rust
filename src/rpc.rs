@@ -2046,7 +2046,10 @@ pub async fn run(
             }
 
             "get_commands" => {
-                let commands = options.resources.list_commands();
+                let mut commands = options.resources.list_commands();
+                if let Some(ref ext_mgr) = rpc_extension_manager {
+                    commands.extend(ext_mgr.list_commands());
+                }
                 let _ = out_tx.send(response_ok(
                     id,
                     "get_commands",

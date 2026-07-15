@@ -8,6 +8,7 @@
 | 非交互式 Print 模式 | ✅ | `src/main.rs` |
 | RPC/stdin 服务器模式（含 sessionId 修复） | ✅ | `src/rpc.rs` |
 | RPC 方法 `estimate_tokens`（会话 token 估算） | ✅ | `src/rpc.rs` `src/compaction.rs` |
+| **RPC 方法 `get_commands` — 合并扩展注册的斜杠命令** | ✅ | `src/rpc.rs` `src/extensions.rs` |
 | CLI 子命令（doctor/config/list/info 等） | ✅ | `src/main.rs` |
 | **`~/.pi/agent/SYSTEM.md` 覆盖默认系统提示词** | ✅ | `src/app.rs` |
 
@@ -32,7 +33,7 @@
 |:-----|:----:|:---------|
 | ToolRegistry — 工具注册表 | ✅ | `src/tools/mod.rs` |
 | 内置 9 工具（read/bash/pwsh/edit/write/grep/find/ls/hashline） | ✅ | `src/tools/` 各子模块 |
-| ReadTool — head/tail/info/diff 参数 + 编码自动检测 | ✅ | `src/tools/read.rs` |
+| **ReadTool — 无 CWD/agent-dir 路径限制** + head/tail/info/diff 参数 + 编码自动检测 | ✅ | `src/tools/read.rs` |
 | **WriteTool / EditTool — 无 CWD 路径限制**（可写入任意绝对路径） | ✅ | `src/tools/write.rs` `src/tools/edit.rs` |
 | **EditTool — 直接写入**（非 tempfile 原子重命名，避让 Windows 句柄冲突） | ✅ | `src/tools/edit.rs` |
 | 扩展工具收集 | ✅ | `src/extension_tools.rs:100` |
