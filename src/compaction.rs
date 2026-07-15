@@ -765,12 +765,16 @@ const fn get_assistant_usage(message: &SessionMessage) -> Option<&Usage> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ContextUsageEstimate {
-    tokens: u64,
-    last_usage_index: Option<usize>,
+pub struct ContextUsageEstimate {
+    pub tokens: u64,
+    pub last_usage_index: Option<usize>,
 }
 
-fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate {
+/// Estimate total context tokens for a list of session messages.
+///
+/// Prefers provider-reported usage for efficiency; falls back to heuristic
+/// estimation (chars / 3) per message.
+pub fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate {
     let mut last_usage: Option<(&Usage, usize)> = None;
     for (idx, msg) in messages.iter().enumerate().rev() {
         if let Some(usage) = get_assistant_usage(msg) {
@@ -827,7 +831,8 @@ fn should_compact(
     context_tokens >= window.saturating_sub(reserve)
 }
 
-fn estimate_tokens(message: &SessionMessage) -> u64 {
+/// Estimate token count for a single session message using a chars/3 heuristic.
+pub fn estimate_tokens(message: &SessionMessage) -> u64 {
     let mut chars: usize = 0;
 
     match message {
@@ -905,6 +910,15 @@ fn estimate_tokens(message: &SessionMessage) -> u64 {
         | SessionMessage::CompactionSummary { summary, .. } => chars = summary.len(),
     }
 
+    u64::try_from(chars.div_ceil(CHARS_PER_TOKEN_ESTIMATE)).unwrap_or(u64::MAX)
+}
+
+/// Estimate token count for a plain text string using the same chars/3 heuristic.
+///
+/// Useful for callers (e.g. RPC clients) that have raw text rather than
+/// structured [`SessionMessage`] values.
+pub fn estimate_text_tokens(text: &str) -> u64 {
+    let chars = text.len();
     u64::try_from(chars.div_ceil(CHARS_PER_TOKEN_ESTIMATE)).unwrap_or(u64::MAX)
 }
 

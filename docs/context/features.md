@@ -7,6 +7,7 @@
 | 交互式 TUI（流式渲染、Markdown、主题） | ✅ | `src/interactive.rs` + `src/tui.rs` |
 | 非交互式 Print 模式 | ✅ | `src/main.rs` |
 | RPC/stdin 服务器模式 | ✅ | `src/rpc.rs` |
+| RPC 方法 `estimate_tokens`（会话 token 估算） | ✅ | `src/rpc.rs` `src/compaction.rs` |
 | CLI 子命令（doctor/config/list/info 等） | ✅ | `src/main.rs` |
 | **`~/.pi/agent/SYSTEM.md` 覆盖默认系统提示词** | ✅ | `src/app.rs` |
 

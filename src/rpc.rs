@@ -15,7 +15,8 @@ use crate::agent::{AbortHandle, AgentEvent, AgentSession, InputSource, QueueMode
 use crate::agent_cx::AgentCx;
 use crate::auth::AuthStorage;
 use crate::compaction::{
-    ResolvedCompactionSettings, compact, compaction_details_to_value, prepare_compaction,
+    ResolvedCompactionSettings, compact, compaction_details_to_value, estimate_context_tokens,
+    estimate_text_tokens, prepare_compaction,
 };
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -2050,6 +2051,36 @@ pub async fn run(
                     "get_commands",
                     Some(json!({ "commands": commands })),
                 ));
+            }
+
+            "estimate_tokens" => {
+                let result = if let Some(messages_val) = parsed.get("messages") {
+                    match serde_json::from_value::<Vec<SessionMessage>>(messages_val.clone()) {
+                        Ok(messages) => {
+                            let estimate = estimate_context_tokens(&messages);
+                            json!({
+                                "tokens": estimate.tokens,
+                                "message_count": messages.len(),
+                            })
+                        }
+                        Err(e) => {
+                            let _ = out_tx.send(response_error(
+                                id,
+                                "estimate_tokens",
+                                format!("Invalid messages: {e}"),
+                            ));
+                            continue;
+                        }
+                    }
+                } else {
+                    let input = parsed.get("input").and_then(Value::as_str).unwrap_or("");
+                    let tokens = estimate_text_tokens(input);
+                    json!({
+                        "tokens": tokens,
+                        "input_length": input.len(),
+                    })
+                };
+                let _ = out_tx.send(response_ok(id, "estimate_tokens", Some(result)));
             }
 
             "extension_ui_response" => {
