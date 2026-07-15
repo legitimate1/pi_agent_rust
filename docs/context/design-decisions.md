@@ -5,8 +5,8 @@
 **决策**：当扩展注册的工具与内置工具同名时，扩展工具替换内置工具。
 
 **涉及改动**：
-1. `src/tools.rs:2697` → 新增 `ToolRegistry::retain()` 方法，支持按谓词移除工具
-2. `src/agent.rs:1209` → 重写 `Agent::extend_tools()`，先收集扩展工具名，移除同名的内置工具，再追加扩展工具
+1. `src/tools/mod.rs` → 新增 `ToolRegistry::retain()` 方法，支持按谓词移除工具
+2. `src/agent.rs` → 重写 `Agent::extend_tools()`，先收集扩展工具名，移除同名的内置工具，再追加扩展工具
 
 **理由**：
 - 旧版 Node.js Pi Agent 支持扩展覆盖同名内置工具，用户生态依赖此行为
@@ -31,7 +31,7 @@
 **决策**：在 `settings.json` 中增加 `disabledTools` 字段，启动时从启用列表过滤掉禁用的工具。
 
 **涉及改动**：
-1. `src/config.rs:140` → 新增 `disabled_tools: Option<Vec<String>>` 字段
+1. `src/config.rs` → 新增 `disabled_tools: Option<Vec<String>>` 字段
 2. `src/main.rs:1393-1398` → 读取配置并过滤 `enabled_tools`
 
 **理由**：
@@ -50,7 +50,7 @@
 **决策**：新增 `PwshTool` 作为第 9 个内置工具，通过 `pwsh -NoProfile -Command` 执行 PowerShell 命令。
 
 **涉及改动**：
-1. `src/tools.rs` → 新增 `PwshTool` 结构体 + `Tool` trait 实现 + `run_pwsh_command()` 函数
+1. `src/tools/pwsh.rs` → 新增 `PwshTool` 结构体 + `Tool` trait 实现 + `run_pwsh_command()` 函数
 2. `src/cli.rs` → 默认工具列表增加 `pwsh`
 
 **理由**：
@@ -64,3 +64,18 @@
 - 保持现状（只有 bash）——Windows 用户没有可用的 shell 工具
 
 **何时重新考虑**：如果 QuickJS 沙箱放开 `exec` 能力限制，可考虑回退到扩展方式。
+
+## D5: Release 构建 — 栈溢出问题（2026-07-15）
+
+**问题**：Debug 构建的 `pi.exe` 在 Windows 上启动即崩溃，报 `thread 'main' has overflowed its stack`。Release 构建正常。
+
+**原因**：Debug 模式下 Rust 不优化尾递归、增加栈安全检测（`__chkstk`），启动时的初始化链路在 Debug 模式超出默认栈大小（Windows 1MB）。Release 模式（LTO + 优化）消除了中间栈帧，绕过该问题。
+
+**对策**：
+- 日常使用始终用 `cargo build --release`
+- 如需 Debug 构建调试，需增大栈大小：
+  ```bash
+  # 通过 rustflag 设置 4MB 栈
+  # .cargo/config.toml: [target.'cfg(windows)'].rustflags = ["-C", "link-args=/STACK:4194304"]
+  ```
+- 当前 release profile 已从激进体积优化改为速度优先（`opt-level = 3`, `lto = "thin"`），编译速度与运行效率平衡

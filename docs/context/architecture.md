@@ -26,9 +26,9 @@ Session persistence + index (JSONL, optional SQLite)
               ▼                ▼                 ▼
     ┌─────────────────┐ ┌──────────────┐ ┌──────────────────┐
     │ Built-in tools   │ │ Extension    │ │ Collection point │
-    │ (read/write/...) │ │ tool wrappers│ │ (agent.rs:9093)  │
-    │ tools.rs:2661    │ │ extension_   │ │                  │
-    │                  │ │ tools.rs:100 │ │ extend_tools()   │
+│ (read/write/...) │ │ tool wrappers│ │ (agent.rs)       │
+│ tools/mod.rs     │ │ extension_   │ │                  │
+│                  │ │ tools.rs:100 │ │ extend_tools()   │
     └─────────────────┘ └──────────────┘ │ → dedup by name  │
                                          │ → replace builtin│
                                          │ → append new     │
@@ -48,7 +48,7 @@ Session persistence + index (JSONL, optional SQLite)
 
 | 模块 | 职责 |
 |:-----|:------|
-| `tools.rs` | ToolRegistry + 9 内置工具实现（含 pwsh） |
+| `tools/` 模块目录 | ToolRegistry + 9 内置工具模块（read/bash/pwsh/edit/write/grep/find/ls/hashline） |
 | `agent.rs` | Agent 循环（工具迭代、扩展合并） |
 | `extensions.rs` | 扩展管理器、能力策略、生命周期 |
 | `extensions_js.rs` | QuickJS 运行时、虚拟模块、HostcallKind |

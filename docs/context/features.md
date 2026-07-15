@@ -27,13 +27,14 @@
 
 | 功能 | 状态 | 涉及文件 |
 |:-----|:----:|:---------|
-| ToolRegistry — 工具注册表 | ✅ | `src/tools.rs:2646` |
-| 内置 9 工具（read/bash/edit/write/grep/find/ls/hashline_edit/pwsh） | ✅ | `src/tools.rs` |
+| ToolRegistry — 工具注册表 | ✅ | `src/tools/mod.rs` |
+| 内置 9 工具（read/bash/pwsh/edit/write/grep/find/ls/hashline） | ✅ | `src/tools/` 各子模块 |
+| ReadTool — head/tail/info/diff 参数 + 编码自动检测 | ✅ | `src/tools/read.rs` |
 | 扩展工具收集 | ✅ | `src/extension_tools.rs:100` |
-| **扩展工具同名覆盖内置工具** | ✅ | `src/tools.rs:2697` `src/agent.rs:1209` |
-| **内置 pwsh 工具**（PowerShell 命令执行） | ✅ | `src/tools.rs` |
-| **运行时禁用内置工具**（`disabledTools` 配置） | ✅ | `src/config.rs:137` `src/main.rs:1393` |
-| Tool trait + JSON Schema 定义 | ✅ | `src/tools.rs` |
+| **扩展工具同名覆盖内置工具** | ✅ | `src/tools/mod.rs` `src/agent.rs` |
+| **内置 pwsh 工具**（PowerShell 命令执行） | ✅ | `src/tools/pwsh.rs` |
+| **运行时禁用内置工具**（`disabledTools` 配置） | ✅ | `src/config.rs` `src/main.rs` |
+| Tool trait + JSON Schema 定义 | ✅ | `src/tools/mod.rs` |
 
 ## 扩展系统
 

@@ -5,7 +5,7 @@
 ```bash
 cargo check              # 快速检查编译错误
 cargo build              # Debug 构建（LLD 链接器 + sccache 缓存）
-cargo build --release    # 发布构建（LTO + size opt）
+cargo build --release    # 发布构建（opt-level=3 + thin LTO + panic=abort）
 ```
 
 ### 构建优化配置（`.cargo/config.toml`）
@@ -37,9 +37,8 @@ cargo fmt --check
 
 默认 profile：
 ```toml
-opt-level = "z"     # 按体积优化
-lto = true
-codegen-units = 1
+opt-level = 3       # 速度优化
+lto = "thin"        # 薄 LTO，兼顾编译速度与代码质量
 panic = "abort"
 strip = true
 ```
