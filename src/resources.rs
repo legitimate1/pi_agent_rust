@@ -1285,10 +1285,10 @@ pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
     }
 
     let mut lines = vec![
-        "\n\nThe following skills provide specialized instructions for specific tasks.".to_string(),
-        "Use the read tool to load a skill's file when the task matches its description."
+        "\n\n以下技能为特定任务提供专门的指令。".to_string(),
+        "当任务描述与某个技能匹配时，使用 read 工具加载该技能的 SKILL.md 文件。"
             .to_string(),
-        "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.".to_string(),
+        "当技能文件引用相对路径时，请将路径解析为技能目录（SKILL.md 所在目录）的绝对路径，然后在工具命令中使用该绝对路径。".to_string(),
         String::new(),
         "<available_skills>".to_string(),
     ];

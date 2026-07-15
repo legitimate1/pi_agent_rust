@@ -99,7 +99,7 @@ impl Tool for ReadTool {
         "read"
     }
     fn description(&self) -> &str {
-        "Read the contents of a file. Supports text, images (jpg, png, gif, webp), file info, diffs, and encoding detection. Use head/tail for partial reads, info for metadata only, diff to compare files, and encoding to override auto-detection. Truncated to 2000 lines or 1MB."
+        "读取文件内容。支持文本、图片（jpg/png/gif/webp）、文件信息、差异比较和编码检测。可使用 head/tail 进行部分读取、info 仅查看元数据、diff 比较文件、encoding 覆盖自动编码检测。输出限制为 2000 行或 1MB。"
     }
 
     fn parameters(&self) -> serde_json::Value {

@@ -296,10 +296,10 @@ impl Tool for HashlineEditTool {
         "hashline edit"
     }
     fn description(&self) -> &str {
-        "Apply precise file edits using LINE#HASH tags from a prior read with hashline=true. \
-         Each edit specifies an op (replace/prepend/append), a pos anchor (\"N#AB\"), an optional \
-         end anchor for range replace, and replacement lines. Edits are validated against current \
-         file hashes and applied bottom-up to avoid index invalidation."
+        "使用先前的 read 配合 hashline=true 获取的 LINE#HASH 标签进行精确文件编辑。 \
+         每次编辑指定操作类型（replace/prepend/append）、定位锚点（\"N#AB\"）、可选的 \
+         结束锚点用于范围替换，以及替换行内容。编辑会针对当前文件哈希进行验证， \
+         并按从下到上的顺序应用以避免索引失效。"
     }
 
     fn parameters(&self) -> serde_json::Value {

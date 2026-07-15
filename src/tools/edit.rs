@@ -607,7 +607,7 @@ impl Tool for EditTool {
         "edit"
     }
     fn description(&self) -> &str {
-        "Edit a file by replacing text. The oldText must match a unique region; matching is exact but normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace."
+        "通过替换文本来编辑文件。oldText 必须唯一匹配一个区域；匹配精确但会标准化换行符、Unicode 空格/引号/破折号，并忽略末尾空白。"
     }
 
     fn parameters(&self) -> serde_json::Value {

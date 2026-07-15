@@ -172,7 +172,7 @@ impl Tool for GrepTool {
         "grep"
     }
     fn description(&self) -> &str {
-        "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 1MB (whichever is hit first). Long lines are truncated to 500 chars. Use hashline=true to get N#AB content-hash tags for use with hashline_edit."
+        "在文件内容中搜索匹配模式。返回匹配行及文件路径与行号。遵循 .gitignore。输出限制为 100 条匹配或 1MB（以先到者为准）。超长行截断至 500 字符。使用 hashline=true 可获取 N#AB 内容哈希标签，配合 hashline_edit 使用。"
     }
 
     fn parameters(&self) -> serde_json::Value {

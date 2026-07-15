@@ -52,7 +52,7 @@ impl Tool for FindTool {
         "find"
     }
     fn description(&self) -> &str {
-        "Search for files by glob pattern. Returns matching file paths relative to the search directory. Sorted by modification time (newest first). Respects .gitignore. Output is truncated to 1000 results or 1MB (whichever is hit first)."
+        "按 glob 模式搜索文件。返回相对于搜索目录的匹配文件路径。按修改时间排序（最新在前）。遵循 .gitignore。输出限制为 1000 条结果或 1MB（以先到者为准）。"
     }
 
     fn parameters(&self) -> serde_json::Value {

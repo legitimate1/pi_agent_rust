@@ -39,7 +39,7 @@ impl Tool for WriteTool {
         "write"
     }
     fn description(&self) -> &str {
-        "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories."
+        "将内容写入文件。文件不存在则创建，存在则覆盖。自动创建父目录。"
     }
 
     fn parameters(&self) -> serde_json::Value {

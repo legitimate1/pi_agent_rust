@@ -452,7 +452,7 @@ impl Tool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 1MB (whichever is hit first). If truncated, full output is saved to a temp file. `timeout` defaults to 120 seconds; set `timeout: 0` to disable."
+        "在当前工作目录执行 bash 命令。返回 stdout 和 stderr。输出截断为最后 2000 行或 1MB（以先到者为准）。截断时完整输出会保存到临时文件。`timeout` 默认 120 秒；设为 `timeout: 0` 可禁用超时。"
     }
 
     fn parameters(&self) -> serde_json::Value {

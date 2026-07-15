@@ -4,6 +4,7 @@ use crate::agent::QueueMode;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -137,6 +138,10 @@ pub struct Config {
     // Extension tool hook behavior
     #[serde(alias = "failClosedHooks")]
     pub fail_closed_hooks: Option<bool>,
+
+    // Tool description overrides (loaded from settings.json)
+    #[serde(alias = "toolDescriptions")]
+    pub tool_descriptions: Option<HashMap<String, String>>,
 
     // Disabled built-in tools
     #[serde(alias = "disabledTools")]
@@ -568,6 +573,9 @@ impl Config {
             enable_skill_commands: other.enable_skill_commands.or(base.enable_skill_commands),
             fail_closed_hooks: other.fail_closed_hooks.or(base.fail_closed_hooks),
             disabled_tools: other.disabled_tools.or(base.disabled_tools),
+
+            // Tool description overrides
+            tool_descriptions: other.tool_descriptions.or(base.tool_descriptions),
 
             // Extension Policy
             extension_policy: merge_extension_policy(base.extension_policy, other.extension_policy),

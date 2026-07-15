@@ -511,7 +511,7 @@ pub const MAX_TOOL_ITERATIONS_DEFAULT: usize = 50;
 /// Guards against runaway loops from a typo while still leaving plenty of
 /// room for long, multi-step agentic tasks (large refactors, multi-phase
 /// spec implementations).
-pub const MAX_TOOL_ITERATIONS_CEILING: usize = 1_000;
+pub const MAX_TOOL_ITERATIONS_CEILING: usize = 10_000;
 
 /// Threshold (as a fraction of `max_tool_iterations`) at which the runtime
 /// emits a one-shot soft-handoff steering message so the agent can begin a
@@ -1310,10 +1310,18 @@ impl Agent {
                 .tools
                 .tools()
                 .iter()
-                .map(|t| ToolDef {
-                    name: t.name().to_string(),
-                    description: t.description().to_string(),
-                    parameters: t.parameters(),
+                .map(|t| {
+                    let name = t.name();
+                    let description = self
+                        .tools
+                        .description_override(name)
+                        .unwrap_or_else(|| t.description())
+                        .to_string();
+                    ToolDef {
+                        name: name.to_string(),
+                        description,
+                        parameters: t.parameters(),
+                    }
                 })
                 .collect();
             self.cached_tool_defs = Some(defs);
@@ -11103,7 +11111,7 @@ mod tests {
         );
         // The ceiling itself should pass through unchanged.
         assert_eq!(
-            resolve_max_tool_iterations(Some("1000")),
+            resolve_max_tool_iterations(Some("10000")),
             MAX_TOOL_ITERATIONS_CEILING
         );
     }

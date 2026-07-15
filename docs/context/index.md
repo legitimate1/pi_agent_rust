@@ -13,7 +13,8 @@ Rust 移植版 Pi Agent。提供流式交互终端、工具执行、会话持久
 | `src/main.rs` | CLI 入口 + 会话初始化（含 disabledTools 过滤） |
 | `src/agent.rs` | Agent 循环（工具迭代 + 扩展加载合并 + 工具去重） |
 | `src/tools/` 模块目录 | ToolRegistry + 9 个内置工具模块（read/bash/pwsh/edit/write/grep/find/ls/hashline） |
-| `src/config.rs` | 配置定义（含 disabled_tools 字段） |
+| `src/app.rs` | 系统提示词构建（SYSTEM.md 加载 + default_system_prompt） |
+| `src/config.rs` | 配置定义（含 disabled_tools / toolDescriptions 字段） |
 | `src/cli.rs` | CLI 参数解析（含 --tools 默认列表） |
 | `src/extensions.rs` | 扩展管理器、策略、调度 |
 | `src/extensions_js.rs` | QuickJS 运行时桥接 |
@@ -29,7 +30,8 @@ Rust 移植版 Pi Agent。提供流式交互终端、工具执行、会话持久
 - 项目架构、核心流程、模块关系 → `docs/context/architecture.md`
 - 命名规范、隐含假设、反模式 → `docs/context/conventions.md`
 - 开发命令、构建部署 → `docs/context/commands.md`
-- 关键设计决策（含本次扩展覆写内置工具改动） → `docs/context/design-decisions.md`
+- 关键设计决策 → `docs/context/design-decisions.md`
+- 系统提示词构建（SYSTEM.md + 工具描述外部化） → `src/app.rs`
 
 ## 知识库文件
 

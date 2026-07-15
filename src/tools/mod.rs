@@ -2757,6 +2757,7 @@ pub(crate) fn resize_image_if_needed(
 /// - Enumerating tool schemas when building provider requests.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    description_overrides: HashMap<String, String>,
 }
 
 impl ToolRegistry {
@@ -2793,12 +2794,21 @@ impl ToolRegistry {
             }
         }
 
-        Self { tools }
+        let description_overrides = config
+            .and_then(|c| c.tool_descriptions.clone())
+            .unwrap_or_default();
+        Self {
+            tools,
+            description_overrides,
+        }
     }
 
     /// Construct a registry from a pre-built tool list.
     pub fn from_tools(tools: Vec<Box<dyn Tool>>) -> Self {
-        Self { tools }
+        Self {
+            tools,
+            description_overrides: HashMap::new(),
+        }
     }
 
     /// Convert the registry into the owned tool list.
@@ -2838,6 +2848,11 @@ impl ToolRegistry {
             .iter()
             .find(|t| t.name() == name)
             .map(std::convert::AsRef::as_ref)
+    }
+
+    /// Get the description override for a tool, if any.
+    pub fn description_override(&self, name: &str) -> Option<&str> {
+        self.description_overrides.get(name).map(String::as_str)
     }
 }
 // ============================================================================

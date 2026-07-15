@@ -65,7 +65,59 @@
 
 **何时重新考虑**：如果 QuickJS 沙箱放开 `exec` 能力限制，可考虑回退到扩展方式。
 
-## D5: Release 构建 — 栈溢出问题（2026-07-15）
+## D5: `~/.pi/agent/SYSTEM.md` 覆盖默认系统提示词（2026-07-15）
+
+**决策**：当 `~/.pi/agent/SYSTEM.md` 存在时，替代 `default_system_prompt()` 作为 system prompt 的基础内容。
+
+**涉及改动**：
+1. `src/app.rs` → `build_system_prompt()` 新增 `system_md_override` 逻辑，在 `--system-prompt` 未提供时检查 `global_dir/SYSTEM.md`
+
+**理由**：
+- 原版 Node.js Pi Agent 支持此约定，用户生态依赖此行为
+- 允许用户完全自定义 LLM 的人格指令，而不需要每次通过 CLI 传入 `--system-prompt`
+- 后续的追加内容（`--append-system-prompt`、project context files、skills prompt、日期/CWD）仍然正常注入
+
+**不选 B 的原因**：
+- 要求用户改用 `--system-prompt` 参数——每次都需手动传入，无法持久化
+
+**何时重新考虑**：如果未来提供更细粒度的提示词分层机制（per-task prompt overlay），可合并。
+
+## D6: 工具描述外部化（2026-07-15）
+
+**决策**：支持通过 `settings.json` 的 `toolDescriptions` 字段，在运行时覆盖内置工具的 `description()`。
+
+**涉及改动**：
+1. `src/config.rs` → 新增 `tool_descriptions: Option<HashMap<String, String>>` 字段
+2. `src/tools/mod.rs` → `ToolRegistry` 新增 `description_overrides` 字段，从 Config 提取
+3. `src/agent.rs` → `build_context()` 构建 `ToolDef` 时优先使用 override
+
+**理由**：
+- 用户需要调整工具描述（如中文本地化）但不希望修改源码重新编译
+- settings.json 是已有配置入口，用户已熟悉
+
+**不选 B 的原因**：
+- 新增独立 `tools.json` 文件——增加配置入口数量，用户需额外学习
+- 环境变量——描述文本太长，不适合 env var
+
+**何时重新考虑**：如果未来工具数量大幅增长，可考虑拆为独立文件。
+
+## D7: 工具和技能提示词中文本地化（2026-07-15）
+
+**决策**：内置工具的 `description()` 和 skills prompt 提示文本改为中文。
+
+**涉及改动**：
+1. `src/tools/*.rs` → 9 个工具的 `description()` 全部改为中文
+2. `src/resources.rs` → `format_skills_for_prompt()` 的引导文本改为中文
+
+**理由**：
+- 用户使用中文交互，工具描述和技能提示使用中文更自然
+
+**不选 B 的原因**：
+- 保留英文——用户已确认系统提示词由 SYSTEM.md 接管，工具描述通过 API 发送，中文更一致
+
+**何时重新考虑**：如果未来需要多语言支持，可考虑 i18n 框架。
+
+## D8: Release 构建 — 栈溢出问题（2026-07-15）
 
 **问题**：Debug 构建的 `pi.exe` 在 Windows 上启动即崩溃，报 `thread 'main' has overflowed its stack`。Release 构建正常。
 

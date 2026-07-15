@@ -48,8 +48,9 @@ Session persistence + index (JSONL, optional SQLite)
 
 | 模块 | 职责 |
 |:-----|:------|
+| `app.rs` | 系统提示词构建（SYSTEM.md 加载、default_system_prompt、project context files） |
 | `tools/` 模块目录 | ToolRegistry + 9 内置工具模块（read/bash/pwsh/edit/write/grep/find/ls/hashline） |
-| `agent.rs` | Agent 循环（工具迭代、扩展合并） |
+| `agent.rs` | Agent 循环（工具迭代、扩展合并、ToolDef 构建） |
 | `extensions.rs` | 扩展管理器、能力策略、生命周期 |
 | `extensions_js.rs` | QuickJS 运行时、虚拟模块、HostcallKind |
 | `extension_tools.rs` | 扩展工具包装器 + 收集函数 |

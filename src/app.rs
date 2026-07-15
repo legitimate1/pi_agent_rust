@@ -169,8 +169,22 @@ pub fn build_system_prompt(
         load_project_context_files(cwd, global_dir)
     };
 
-    let mut prompt =
-        custom_prompt.unwrap_or_else(|| default_system_prompt(enabled_tools, package_dir));
+    // If --system-prompt is not given, fall back to ~/.pi/agent/SYSTEM.md (original Pi Agent convention).
+    let system_md_override = custom_prompt.is_none().then(|| -> Result<String> {
+        let path = global_dir.join("SYSTEM.md");
+        if path.exists() {
+            std::fs::read_to_string(&path)
+                .map_err(|err| anyhow::anyhow!("Could not read {}: {err}", path.display()))
+        } else {
+            Ok(String::new())
+        }
+    })
+    .transpose()?
+    .and_then(|s| if s.is_empty() { None } else { Some(s) });
+
+    let mut prompt = custom_prompt
+        .or(system_md_override)
+        .unwrap_or_else(|| default_system_prompt(enabled_tools, package_dir));
 
     if let Some(append_prompt) = append_prompt {
         prompt.push_str("\n\n");

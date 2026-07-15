@@ -37,7 +37,7 @@ impl Tool for PwshTool {
         "pwsh"
     }
     fn description(&self) -> &str {
-        "Run a PowerShell command via pwsh on Windows. Handles file listing, text processing, and system info - same as a terminal but returns the output as text. Use this for any shell operation."
+        "在 Windows 上通过 pwsh 执行 PowerShell 命令。支持文件列表、文本处理和系统信息 — 与终端行为一致，但将输出作为文本返回。可用于任何 shell 操作。"
     }
 
     fn parameters(&self) -> serde_json::Value {

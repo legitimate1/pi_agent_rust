@@ -50,7 +50,7 @@ impl Tool for LsTool {
         "ls"
     }
     fn description(&self) -> &str {
-        "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 1MB (whichever is hit first)."
+        "列出目录内容。返回按字母排序的条目，目录以 '/' 结尾。包含点文件。输出限制为 500 条或 1MB（以先到者为准）。"
     }
 
     fn parameters(&self) -> serde_json::Value {
