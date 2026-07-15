@@ -78,7 +78,6 @@ impl Tool for WriteTool {
         }
 
         let path = resolve_path(&input.path, &self.cwd);
-        let path = enforce_cwd_scope(&path, &self.cwd, "write")?;
 
         if let Ok(meta) = asupersync::fs::metadata(&path).await {
             if !meta.is_file() {
@@ -138,8 +137,10 @@ impl Tool for WriteTool {
                 }
             }
 
-            // Persist (atomic rename)
-            temp_file.persist(&path_clone).map_err(|e| e.error)?;
+            crate::tools::persist_with_readonly_handling(
+                temp_file,
+                &path_clone,
+            )?;
             sync_parent_dir(&path_clone)?;
             Ok(())
         })

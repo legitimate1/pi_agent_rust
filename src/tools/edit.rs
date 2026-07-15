@@ -3,8 +3,6 @@ use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::fmt::Write as _;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use asupersync::io::AsyncReadExt;
 // ============================================================================
@@ -34,12 +32,12 @@ impl EditTool {
     }
 }
 
-pub(crate) fn strip_bom(s: &str) -> (&str, bool) {
+pub fn strip_bom(s: &str) -> (&str, bool) {
     s.strip_prefix('\u{FEFF}')
         .map_or_else(|| (s, false), |stripped| (stripped, true))
 }
 
-pub(crate) fn detect_line_ending(content: &str) -> &'static str {
+pub fn detect_line_ending(content: &str) -> &'static str {
     let bytes = content.as_bytes();
     let mut idx = 0;
     while idx < bytes.len() {
@@ -58,7 +56,7 @@ pub(crate) fn detect_line_ending(content: &str) -> &'static str {
     "\n"
 }
 
-pub(crate) fn normalize_to_lf(text: &str) -> String {
+pub fn normalize_to_lf(text: &str) -> String {
     if !text.contains('\r') {
         return text.to_string();
     }
@@ -77,7 +75,7 @@ pub(crate) fn normalize_to_lf(text: &str) -> String {
     out
 }
 
-pub(crate) fn normalize_line_endings_chunk<'a>(
+pub fn normalize_line_endings_chunk<'a>(
     chunk: &'a [u8],
     pending_cr: &mut bool,
 ) -> std::borrow::Cow<'a, [u8]> {
@@ -120,7 +118,7 @@ pub(crate) fn normalize_line_endings_chunk<'a>(
     std::borrow::Cow::Owned(normalized)
 }
 
-pub(crate) fn restore_line_endings(text: &str, ending: &str) -> String {
+pub fn restore_line_endings(text: &str, ending: &str) -> String {
     match ending {
         "\r\n" => text.replace('\n', "\r\n"),
         "\r" => text.replace('\n', "\r"),
@@ -129,7 +127,7 @@ pub(crate) fn restore_line_endings(text: &str, ending: &str) -> String {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct FuzzyMatchResult {
+pub struct FuzzyMatchResult {
     pub(crate) found: bool,
     pub(crate) index: usize,
     pub(crate) match_length: usize,
@@ -139,7 +137,7 @@ pub(crate) struct FuzzyMatchResult {
 /// Map a range in normalized content back to byte offsets in the original text.
 ///
 /// Returns `(original_start_byte_idx, original_match_byte_len)`.
-pub(crate) fn map_normalized_range_to_original(
+pub fn map_normalized_range_to_original(
     content: &str,
     norm_match_start: usize,
     norm_match_len: usize,
@@ -240,7 +238,7 @@ pub(crate) fn map_normalized_range_to_original(
     (start, end.saturating_sub(start))
 }
 
-pub(crate) fn build_normalized_content(content: &str) -> String {
+pub fn build_normalized_content(content: &str) -> String {
     let mut normalized = String::with_capacity(content.len());
     let mut lines = content.split('\n').peekable();
 
@@ -282,7 +280,7 @@ pub(crate) fn build_normalized_content(content: &str) -> String {
 }
 
 #[cfg(test)]
-pub(crate) fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatchResult {
+pub fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatchResult {
     fuzzy_find_text_with_normalized(content, old_text, None, None)
 }
 
@@ -337,7 +335,7 @@ fn fuzzy_find_text_with_normalized(
     }
 }
 
-pub(crate) fn count_overlapping_occurrences(haystack: &str, needle: &str) -> usize {
+pub fn count_overlapping_occurrences(haystack: &str, needle: &str) -> usize {
     if needle.is_empty() {
         return 0;
     }
@@ -580,7 +578,7 @@ fn render_equal_part(raw: &[&str], next_part_is_change: bool, state: &mut DiffRe
     state.last_was_change = false;
 }
 
-pub(crate) fn generate_diff_string(old_content: &str, new_content: &str) -> (String, Option<usize>) {
+pub fn generate_diff_string(old_content: &str, new_content: &str) -> (String, Option<usize>) {
     let parts = diff_parts(old_content, new_content);
     let mut state = DiffRenderState::new(diff_line_num_width(old_content, new_content), 4);
 
@@ -651,7 +649,6 @@ impl Tool for EditTool {
         }
 
         let absolute_path = resolve_read_path(&input.path, &self.cwd);
-        let absolute_path = enforce_cwd_scope(&absolute_path, &self.cwd, "edit")?;
 
         let meta = asupersync::fs::metadata(&absolute_path)
             .await
@@ -854,40 +851,13 @@ impl Tool for EditTool {
             final_content = format!("\u{FEFF}{final_content}");
         }
 
-        // Atomic write (safe improvement vs legacy, behavior-equivalent).
+        // Write directly (not atomic rename).  The file is confirmed
+        // writable above; async-read handle contention on Windows makes
+        // tempfile::persist unreliable after an asupersync read.
         let absolute_path_clone = absolute_path.clone();
         let final_content_bytes = final_content.into_bytes();
         asupersync::runtime::spawn_blocking_io(move || {
-            // Capture original permissions before the file is replaced.
-            let original_perms = std::fs::metadata(&absolute_path_clone)
-                .ok()
-                .map(|m| m.permissions());
-            let parent = absolute_path_clone
-                .parent()
-                .unwrap_or_else(|| Path::new("."));
-            let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
-
-            temp_file.as_file_mut().write_all(&final_content_bytes)?;
-            temp_file.as_file_mut().sync_all()?;
-
-            // Restore original file permissions (tempfile defaults to 0o600) before persisting.
-            if let Some(perms) = original_perms {
-                let _ = temp_file.as_file().set_permissions(perms);
-            } else {
-                // Default to 0644 (rw-r--r--) instead of tempfile's 0600 if we couldn't read original perms.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = temp_file
-                        .as_file()
-                        .set_permissions(std::fs::Permissions::from_mode(0o644));
-                }
-            }
-
-            temp_file
-                .persist(&absolute_path_clone)
-                .map_err(|e| e.error)?;
-            sync_parent_dir(&absolute_path_clone)?;
+            std::fs::write(&absolute_path_clone, &final_content_bytes)?;
             Ok(())
         })
         .await

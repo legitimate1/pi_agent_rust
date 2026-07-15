@@ -3,8 +3,6 @@ use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
 use async_trait::async_trait;
 use serde::Deserialize;
-use sha2::Digest as _;
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -14,7 +12,7 @@ use super::edit::{normalize_to_lf, strip_bom, detect_line_ending, restore_line_e
 // ============================================================================
 
 /// Custom nibble-encoding alphabet used for hashline tags.
-pub(crate) const NIBBLE_STR: &[u8; 16] = b"ZPMQVRWSNKTXJBYH";
+pub const NIBBLE_STR: &[u8; 16] = b"ZPMQVRWSNKTXJBYH";
 
 /// Pre-computed 256-entry lookup table mapping each byte value to its
 /// 2-character NIBBLE_STR encoding.
@@ -39,7 +37,7 @@ fn hashline_dict() -> &'static [[u8; 2]; 256] {
 ///    otherwise seed = line index (to disambiguate punctuation-only or blank lines)
 /// 4. Compute `xxh32(significant_bytes, seed) & 0xFF`
 /// 5. Encode the low byte as 2 nibble chars from `NIBBLE_STR`
-pub(crate) fn compute_line_hash(line_idx: usize, line: &str) -> [u8; 2] {
+pub fn compute_line_hash(line_idx: usize, line: &str) -> [u8; 2] {
     let line = line.strip_suffix('\r').unwrap_or(line);
     // Remove all whitespace
     let significant: String = line.chars().filter(|c| !c.is_whitespace()).collect();
@@ -57,7 +55,7 @@ pub(crate) fn compute_line_hash(line_idx: usize, line: &str) -> [u8; 2] {
 }
 
 /// Format a hashline tag as `"N#AB"` where N is the 1-indexed line number.
-pub(crate) fn format_hashline_tag(line_idx: usize, line: &str) -> String {
+pub fn format_hashline_tag(line_idx: usize, line: &str) -> String {
     let h = compute_line_hash(line_idx, line);
     format!("{}#{}{}", line_idx + 1, h[0] as char, h[1] as char)
 }
@@ -83,7 +81,7 @@ fn compute_line_hash_with_bom(line_idx: usize, line: &str, had_bom: bool) -> [u8
 /// Tolerates leading whitespace, diff markers (`>`, `+`, `-`), and spaces around `#`.
 static HASHLINE_TAG_RE: OnceLock<regex::Regex> = OnceLock::new();
 
-pub(crate) fn hashline_tag_regex() -> &'static regex::Regex {
+pub fn hashline_tag_regex() -> &'static regex::Regex {
     HASHLINE_TAG_RE.get_or_init(|| {
         regex::Regex::new(r"^[\s>+\-]*(\d+)\s*#\s*([ZPMQVRWSNKTXJBYH]{2})")
             .expect("valid hashline regex")
@@ -91,7 +89,7 @@ pub(crate) fn hashline_tag_regex() -> &'static regex::Regex {
 }
 
 /// Parse a hashline tag reference string into (1-indexed line number, 2-byte hash).
-pub(crate) fn parse_hashline_tag(ref_str: &str) -> std::result::Result<(usize, [u8; 2]), String> {
+pub fn parse_hashline_tag(ref_str: &str) -> std::result::Result<(usize, [u8; 2]), String> {
     let re = hashline_tag_regex();
     let caps = re
         .captures(ref_str)
@@ -110,7 +108,7 @@ pub(crate) fn parse_hashline_tag(ref_str: &str) -> std::result::Result<(usize, [
 /// Matches patterns like `5#KJ:content` and returns just `content`.
 static HASHLINE_PREFIX_RE: OnceLock<regex::Regex> = OnceLock::new();
 
-pub(crate) fn strip_hashline_prefix(line: &str) -> &str {
+pub fn strip_hashline_prefix(line: &str) -> &str {
     let re = HASHLINE_PREFIX_RE.get_or_init(|| {
         regex::Regex::new(r"^[\s>+\-]*\d+\s*#\s*[ZPMQVRWSNKTXJBYH]{2}\s*:")
             .expect("valid hashline prefix regex")

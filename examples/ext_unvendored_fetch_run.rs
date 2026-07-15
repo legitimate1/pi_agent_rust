@@ -36,6 +36,7 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum CommandMode {
     /// Fetch and probe a corpus of candidates.
     RunAll(RunAllArgs),

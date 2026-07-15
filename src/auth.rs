@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::fs::{self, File};
+use std::fs::self;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -3223,6 +3223,7 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     File::open(parent)?.sync_all()
 }
 
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())

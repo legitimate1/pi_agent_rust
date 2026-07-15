@@ -1981,8 +1981,7 @@ fn collect_workspace_snapshot(workspace_root: &Path) -> WorkspaceSnapshot {
                     }
                     #[cfg(not(unix))]
                     {
-                        let _ = metadata;
-                        None
+                        Some(permission_octal(&metadata))
                     }
                 },
                 read_error: None,

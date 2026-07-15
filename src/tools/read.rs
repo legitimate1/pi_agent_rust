@@ -6,7 +6,6 @@ use serde::Deserialize;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use asupersync::io::{AsyncRead, ReadBuf, SeekFrom};
-use crate::agent_cx::AgentCx;
 use super::edit::normalize_line_endings_chunk;
 use super::hashline::format_hashline_tag;
 // ============================================================================
@@ -156,7 +155,7 @@ impl Tool for ReadTool {
         ToolEffects::read()
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
     async fn execute(
         &self,
         tool_call_id: &str,
@@ -424,7 +423,9 @@ impl Tool for ReadTool {
             input.offset
         };
         let effective_limit: Option<i64> = if let Some(n) = input.head {
-            Some(n as i64)
+            #[allow(clippy::cast_possible_wrap)]
+            let v = n as i64;
+            Some(v)
         } else {
             input.limit
         };
@@ -442,7 +443,10 @@ impl Tool for ReadTool {
             let total_lines = all_lines.len();
 
             let start_line_idx = match effective_offset {
-                Some(n) if n > 0 => n.saturating_sub(1) as usize,
+                Some(n) if n > 0 => {
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    { n.saturating_sub(1) as usize }
+                }
                 _ => 0,
             };
 
@@ -451,6 +455,7 @@ impl Tool for ReadTool {
                 let start = total_lines.saturating_sub(take);
                 all_lines[start..].to_vec()
             } else {
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                 let limit = effective_limit.map_or(usize::MAX, |l| l as usize);
                 let end = start_line_idx.saturating_add(limit).min(total_lines);
                 all_lines[start_line_idx..end].to_vec()
@@ -480,8 +485,8 @@ impl Tool for ReadTool {
             }
 
             if output_text.is_empty() {
-                output_text = "".to_string();
-            } else if !input.tail.is_some() && !input.head.is_some() && selected_lines.len() < total_lines - start_line_idx {
+                output_text = String::new();
+            } else if input.tail.is_none() && input.head.is_none() && selected_lines.len() < total_lines - start_line_idx {
                 let remaining = total_lines - start_line_idx - selected_lines.len();
                 let next_offset = start_line_idx + selected_lines.len() + 1;
                 let _ = write!(output_text, "\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]");

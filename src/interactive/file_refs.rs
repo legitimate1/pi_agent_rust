@@ -176,7 +176,7 @@ pub(super) fn is_file_ref_boundary(text: &str, at: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use super::*;
 

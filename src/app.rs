@@ -180,7 +180,7 @@ pub fn build_system_prompt(
         }
     })
     .transpose()?
-    .and_then(|s| if s.is_empty() { None } else { Some(s) });
+    .filter(|s| !s.is_empty());
 
     let mut prompt = custom_prompt
         .or(system_md_override)

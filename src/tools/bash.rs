@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -42,7 +42,7 @@ pub struct BashRunResult {
 }
 
 #[derive(Debug)]
-pub(crate) enum BashPipeFrame {
+pub enum BashPipeFrame {
     Chunk(Vec<u8>),
     Error(String),
 }
@@ -78,7 +78,7 @@ fn bash_cancellation_details(
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn run_bash_command(
+pub async fn run_bash_command(
     cwd: &Path,
     shell_path: Option<&str>,
     command_prefix: Option<&str>,

@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const DEFAULT_CLI_TIMEOUT_SECS: u64 = 120;
+#[cfg(unix)]
 const FAKE_NPM_SCRIPT: &str = r#"#!/bin/sh
 set -eu
 

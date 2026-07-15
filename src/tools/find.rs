@@ -6,7 +6,6 @@ use serde::Deserialize;
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::thread;
 use std::time::Duration;
 use asupersync::time::{sleep, wall_now};
 // ============================================================================

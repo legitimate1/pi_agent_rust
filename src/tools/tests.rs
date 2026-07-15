@@ -4,6 +4,8 @@ use proptest::prelude::*;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
+use super::edit::{detect_line_ending, normalize_to_lf, restore_line_endings, strip_bom};
+
 #[test]
 fn test_truncate_head() {
     let content = "line1\nline2\nline3\nline4\nline5".to_string();

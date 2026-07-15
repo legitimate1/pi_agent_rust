@@ -5,11 +5,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::{BufRead, Read};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 use asupersync::time::{sleep, wall_now};
 use tracing;
@@ -57,7 +55,7 @@ impl GrepTool {
 
 /// Result of truncating a single grep output line.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TruncateLineResult {
+pub struct TruncateLineResult {
     pub(crate) text: String,
     pub(crate) was_truncated: bool,
 }
@@ -65,7 +63,7 @@ pub(crate) struct TruncateLineResult {
 /// Truncate a single line to max characters, adding a marker suffix.
 ///
 /// Matches pi-mono behavior: `${line.slice(0, maxChars)}... [truncated]`.
-pub(crate) fn truncate_line(line: &str, max_chars: usize) -> TruncateLineResult {
+pub fn truncate_line(line: &str, max_chars: usize) -> TruncateLineResult {
     let mut chars = line.chars();
     let prefix: String = chars.by_ref().take(max_chars).collect();
     if chars.next().is_none() {
@@ -81,7 +79,7 @@ pub(crate) fn truncate_line(line: &str, max_chars: usize) -> TruncateLineResult 
     }
 }
 
-pub(crate) fn process_rg_json_match_line(
+pub fn process_rg_json_match_line(
     line_res: std::io::Result<String>,
     matches: &mut Vec<(PathBuf, usize)>,
     match_count: &mut usize,

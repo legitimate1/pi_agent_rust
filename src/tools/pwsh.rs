@@ -4,7 +4,6 @@ use crate::model::{ContentBlock, TextContent};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use asupersync::time::{sleep, wall_now};
 // ============================================================================
 // Pwsh Tool
@@ -29,6 +28,7 @@ impl PwshTool {
 }
 
 #[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
 impl Tool for PwshTool {
     fn name(&self) -> &str {
         "pwsh"
@@ -63,9 +63,9 @@ impl Tool for PwshTool {
 
     async fn execute(
         &self,
-        tool_call_id: &str,
+        _tool_call_id: &str,
         input: serde_json::Value,
-        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
         let input: PwshInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
@@ -99,7 +99,8 @@ impl Tool for PwshTool {
     }
 }
 
-pub(crate) async fn run_pwsh_command(
+#[allow(clippy::too_many_lines)]
+pub async fn run_pwsh_command(
     cwd: &Path,
     command: &str,
     timeout_secs: Option<u64>,
@@ -160,11 +161,10 @@ pub(crate) async fn run_pwsh_command(
         let mut tmp = [0u8; 4096];
         loop {
             match stdout.read(&mut tmp) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&tmp[..n]);
                 }
-                Err(_) => break,
             }
         }
         let _ = tx_out.send(PwshPipeFrame::Output(buf));
@@ -174,11 +174,10 @@ pub(crate) async fn run_pwsh_command(
         let mut tmp = [0u8; 4096];
         loop {
             match stderr.read(&mut tmp) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&tmp[..n]);
                 }
-                Err(_) => break,
             }
         }
         let _ = tx.send(PwshPipeFrame::Stderr(buf));
@@ -188,14 +187,13 @@ pub(crate) async fn run_pwsh_command(
     let start = std::time::Instant::now();
     let exit_code = loop {
         let remaining = timeout_secs
-            .map(|s| s.saturating_sub(start.elapsed().as_secs()))
-            .unwrap_or(u64::MAX);
+            .map_or(u64::MAX, |s| s.saturating_sub(start.elapsed().as_secs()));
         if remaining == 0 {
             let _ = child.kill();
             break None;
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status_code(&status)),
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status_code(status)),
             Ok(None) => {
                 // Wait a bit before polling again
             }
@@ -216,11 +214,10 @@ pub(crate) async fn run_pwsh_command(
 
     // Collect output
     let mut stdout_buf = Vec::new();
-    let mut stderr_buf = Vec::new();
     while let Ok(frame) = rx.try_recv() {
         match frame {
             PwshPipeFrame::Output(b) => stdout_buf = b,
-            PwshPipeFrame::Stderr(b) => stderr_buf = b,
+            PwshPipeFrame::Stderr(_) => {}
         }
     }
 
@@ -237,7 +234,7 @@ pub(crate) async fn run_pwsh_command(
     })
 }
 
-fn status_code(status: &std::process::ExitStatus) -> i32 {
+fn status_code(status: std::process::ExitStatus) -> i32 {
     status.code().unwrap_or(-1)
 }
 

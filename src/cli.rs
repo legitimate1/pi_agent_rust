@@ -1384,7 +1384,7 @@ mod tests {
         assert!(cli.list_models.is_none());
         assert!(cli.command.is_none());
         assert!(cli.args.is_empty());
-        assert_eq!(cli.tools, "read,bash,edit,write,grep,find,ls,hashline_edit");
+        assert_eq!(cli.tools, "read,bash,edit,write,grep,find,ls,hashline_edit,pwsh");
     }
 
     // ── 11. Combined flags ───────────────────────────────────────────

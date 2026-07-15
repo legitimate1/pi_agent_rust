@@ -1,6 +1,7 @@
+#![cfg(unix)]
+
 use pi::extensions_js::verify_repair_monotonicity;
 use std::fs;
-#[cfg(unix)]
 use std::os::unix::fs::symlink;
 
 #[test]

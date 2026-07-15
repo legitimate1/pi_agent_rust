@@ -712,6 +712,7 @@ fn check_auth(fix: bool, findings: &mut Vec<Finding>) {
     }
 
     // Check if auth.json parses
+    #[allow(clippy::redundant_clone)]
     let auth = match AuthStorage::load(auth_path.clone()) {
         Ok(auth) => {
             findings.push(Finding::pass(cat, "auth.json parses correctly"));

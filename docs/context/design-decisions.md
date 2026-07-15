@@ -117,6 +117,45 @@
 
 **何时重新考虑**：如果未来需要多语言支持，可考虑 i18n 框架。
 
+## D9: 移除 write/edit 工具的 CWD 路径限制（2026-07-15）
+
+**决策**：移除 `write` 和 `edit` 工具的 `enforce_cwd_scope()` 调用，允许写入任意绝对路径。
+
+**涉及改动**：
+1. `src/tools/write.rs` → 移除 `enforce_cwd_scope(&path, &self.cwd, "write")`
+2. `src/tools/edit.rs` → 移除 `enforce_cwd_scope(&absolute_path, &self.cwd, "edit")`
+
+**理由**：
+- CWD 路径限制在沙盒进程环境下反而产生误导——os error 5（拒绝访问）让用户误以为是权限问题，而实际是路径越界校验
+- write 工具不应比 pwsh/bash 等 shell 工具有更多路径限制
+- 用户需要写入项目目录之外的路径（如生成配置文件到 `~/.pi/`）
+
+**不选 B 的原因**：
+- 保留限制并改进错误提示——仍然无法写入 CWD 之外，功能不足
+- 改为白名单模式——增加了不必要的配置复杂度
+
+**何时重新考虑**：如果未来引入细粒度工具安全策略（per-tool allowlist），可重新加入路径限定。
+
+## D10: Edit 工具写入改为直接写（Windows 句柄冲突）（2026-07-15）
+
+**决策**：`EditTool` 的写入路径从 `tempfile::NamedTempFile::persist()`（原子重命名）改为 `std::fs::write()`（直接写入）。
+
+**涉及改动**：
+1. `src/tools/mod.rs` → 新增 `persist_with_readonly_handling()` 辅助函数，处理 Windows `FILE_ATTRIBUTE_READONLY` 导致 `MoveFileEx` 失败的问题（诊断式：先 persist，失败后检查 readonly，清除后重试）
+2. `src/tools/edit.rs` → `spawn_blocking_io` 内的写入替换为 `std::fs::write`
+
+**理由**：
+- `EditTool` 在写入前使用 `asupersync::fs::File::open` 读取文件内容，Windows 上 async 读操作可能未及时释放文件句柄，导致后续 `MoveFileEx`（persist 的底层调用）报 `ERROR_ACCESS_DENIED`
+- `WriteTool` 不受影响，因为它不先读取文件内容
+- 直接写入绕过 tempfile 的重命名链路，消除句柄冲突
+- 文件已通过前置权限检查确认可写，直接写入安全
+
+**不选 B 的原因**：
+- 继续排查 asupersync 的句柄释放时序——框架层修复周期长，且可能影响其他模块
+- 保留原子重命名并增加 retry——编辑场景下写入目标唯一，原子性非必须
+
+**何时重新考虑**：如果 `asupersync` 底层修复了 Windows 句柄释放问题，或 edit 改为同步读文件，可恢复原子重命名。
+
 ## D8: Release 构建 — 栈溢出问题（2026-07-15）
 
 **问题**：Debug 构建的 `pi.exe` 在 Windows 上启动即崩溃，报 `thread 'main' has overflowed its stack`。Release 构建正常。

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Fault-injection e2e persistence scripts with detailed trace logs (bd-3ar8v.2.10).
 //!
 //! These tests inject crashes, interruptions, and corruption at persistence

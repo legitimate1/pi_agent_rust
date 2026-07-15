@@ -436,6 +436,7 @@ fn sync_permissions_parent_dir(path: &Path) -> std::io::Result<()> {
     File::open(parent)?.sync_all()
 }
 
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 #[cfg(not(unix))]
 fn sync_permissions_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())

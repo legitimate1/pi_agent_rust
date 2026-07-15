@@ -106,6 +106,7 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     std::fs::File::open(parent)?.sync_all()
 }
 
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
@@ -11571,22 +11572,18 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
-            return;
         }
-
-        let result = run_async(async { session.save().await });
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let result = run_async(async { session.save().await });
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(result.is_err());
+            assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 1);
+            run_async(async { session.save().await }).unwrap();
+            assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 2);
         }
-
-        assert!(result.is_err());
-        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 1);
-
-        run_async(async { session.save().await }).unwrap();
-        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -11738,25 +11735,21 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
-            return;
         }
-
-        let result = run_async(async { session.save().await });
-        assert!(result.is_err());
-
-        assert_eq!(session.entries.len(), 2, "entries restored");
-        assert_eq!(session.entry_index.len(), 2);
-        assert!(session.header_dirty);
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let result = run_async(async { session.save().await });
+            assert!(result.is_err());
+            assert_eq!(session.entries.len(), 2, "entries restored");
+            assert_eq!(session.entry_index.len(), 2);
+            assert!(session.header_dirty);
             let parent = path.parent().unwrap();
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+            run_async(async { session.save().await }).unwrap();
+            assert!(!session.header_dirty);
         }
-
-        run_async(async { session.save().await }).unwrap();
-        assert!(!session.header_dirty);
     }
 
     #[test]
@@ -11785,28 +11778,24 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
-            return;
         }
-
-        session.append_message(make_test_message("msg B"));
-        let _ = run_async(async { session.save().await });
-
-        let m = session.autosave_metrics();
-        assert_eq!(m.flush_failed, 1);
-        assert!(m.pending_mutations > 0);
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            session.append_message(make_test_message("msg B"));
+            let _ = run_async(async { session.save().await });
+            let m = session.autosave_metrics();
+            assert_eq!(m.flush_failed, 1);
+            assert!(m.pending_mutations > 0);
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            run_async(async { session.save().await }).unwrap();
+            let m = session.autosave_metrics();
+            assert_eq!(m.flush_succeeded, 2);
+            assert_eq!(m.flush_failed, 1);
+            assert_eq!(m.pending_mutations, 0);
+            assert_eq!(m.flush_started, 3);
         }
-        run_async(async { session.save().await }).unwrap();
-
-        let m = session.autosave_metrics();
-        assert_eq!(m.flush_succeeded, 2);
-        assert_eq!(m.flush_failed, 1);
-        assert_eq!(m.pending_mutations, 0);
-        assert_eq!(m.flush_started, 3);
     }
 
     #[test]
@@ -11903,25 +11892,21 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
-            return;
         }
-
-        let result = run_async(async { session.save().await });
-        assert!(result.is_err());
-        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 1);
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let result = run_async(async { session.save().await });
+            assert!(result.is_err());
+            assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 1);
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            run_async(async { session.save().await }).unwrap();
+            assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 2);
+            let loaded =
+                run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+            assert_eq!(loaded.entries.len(), 2);
         }
-
-        run_async(async { session.save().await }).unwrap();
-        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 2);
-
-        let loaded =
-            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
-        assert_eq!(loaded.entries.len(), 2);
     }
 
     #[test]

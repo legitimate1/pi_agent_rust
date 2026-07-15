@@ -5,7 +5,6 @@ use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -1391,6 +1390,7 @@ fn sync_settings_parent_dir(path: &Path) -> std::io::Result<()> {
     File::open(parent)?.sync_all()
 }
 
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 #[cfg(not(unix))]
 fn sync_settings_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())

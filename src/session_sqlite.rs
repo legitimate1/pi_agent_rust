@@ -86,6 +86,7 @@ fn set_private_permissions_if_present(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 #[cfg(not(unix))]
 fn set_private_permissions_if_present(_path: &Path) -> Result<()> {
     Ok(())

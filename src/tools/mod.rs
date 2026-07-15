@@ -29,9 +29,8 @@ pub use hashline::HashlineEditTool;
 
 pub(crate) use bash::run_bash_command;
 pub(crate) use bash::BashPipeFrame;
-pub(crate) use pwsh::run_pwsh_command;
+#[cfg(test)]
 pub(crate) use hashline::format_hashline_tag;
-pub(crate) use edit::{detect_line_ending, normalize_to_lf, restore_line_endings, strip_bom};
 #[cfg(test)]
 pub(crate) use edit::{
     build_normalized_content,
@@ -61,20 +60,19 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::extensions::{safe_canonicalize, strip_unc_prefix};
 use crate::model::{ContentBlock, ImageContent, TextContent};
-use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf, SeekFrom};
+use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(test)]
 use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
-use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fmt::Write as _;
-use std::io::{BufRead, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock, mpsc};
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
@@ -379,7 +377,8 @@ pub(crate) fn detect_encoding(bytes: &[u8], hint: Option<&str>) -> (String, usiz
     // UTF-8 round-trip validation
     if let Ok(s) = std::str::from_utf8(bytes) {
         let re_encoded = s.as_bytes();
-        if re_encoded.len() as f64 >= bytes.len() as f64 * 0.95 {
+        #[allow(clippy::cast_precision_loss)]
+        if (re_encoded.len() as f64) >= (bytes.len() as f64) * 0.95 {
             return ("UTF-8".to_string(), 0);
         }
     }
@@ -408,7 +407,8 @@ pub(crate) fn decode_with_encoding(bytes: &[u8], encoding: &str, bom_skip: usize
 }
 
 /// Format file size in human-readable form.
-pub(crate) fn format_file_size(bytes: u64) -> String {
+#[allow(clippy::cast_precision_loss)]
+pub fn format_file_size(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
     } else if bytes < 1024 * 1024 {
@@ -2276,15 +2276,16 @@ pub fn fuzz_normalize_dot_segments(path: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-pub(crate) fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+pub fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
     std::fs::File::open(parent)?.sync_all()
 }
 
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 #[cfg(not(unix))]
-pub(crate) fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
+pub fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -3517,6 +3518,7 @@ fn command_with_default_sigpipe_for_cwd(
     Ok(command)
 }
 
+#[allow(clippy::unnecessary_wraps)]
 #[cfg(not(unix))]
 fn command_with_default_sigpipe_for_cwd(
     program: &OsStr,
@@ -3534,6 +3536,7 @@ pub(crate) fn resolve_executable_for_shell_trampoline(
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::PermissionsExt as _;
 
+    use std::ffi::OsString;
     fn executable_candidate(path: &Path) -> std::io::Result<bool> {
         let metadata = std::fs::metadata(path)?;
         Ok(metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
@@ -3589,7 +3592,8 @@ pub(crate) fn resolve_executable_for_shell_trampoline(
 }
 
 /// Detach a child process from pi's controlling terminal.
-pub(crate) fn isolate_command_process_group(command: &mut Command) {
+#[allow(clippy::missing_const_for_fn, clippy::needless_pass_by_ref_mut)]
+pub fn isolate_command_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -3602,7 +3606,7 @@ pub(crate) fn isolate_command_process_group(command: &mut Command) {
     }
 }
 
-pub(crate) fn format_grep_path(file_path: &Path, cwd: &Path) -> String {
+pub fn format_grep_path(file_path: &Path, cwd: &Path) -> String {
     if let Ok(rel) = file_path.strip_prefix(cwd) {
         let rel_str = rel.display().to_string().replace('\\', "/");
         if !rel_str.is_empty() {
@@ -3715,5 +3719,54 @@ pub(crate) fn find_rg_binary() -> Option<&'static str> {
         }
         None
     })
+}
+
+/// Try an atomic rename (`NamedTempFile::persist`).  On Windows,
+/// `MoveFileEx` fails with `ERROR_ACCESS_DENIED` when the destination
+/// file has `FILE_ATTRIBUTE_READONLY`.  If the first attempt hits
+/// `PermissionDenied` and the target has the readonly attribute, strip
+/// the attribute, retry, and restore it on the new file.
+pub fn persist_with_readonly_handling(
+    temp_file: tempfile::NamedTempFile,
+    target: &Path,
+) -> std::io::Result<()> {
+    match temp_file.persist(target) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let err = e.error;
+            if err.kind() != std::io::ErrorKind::PermissionDenied {
+                return Err(err);
+            }
+
+            let temp_file = e.file;
+
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt as _;
+
+                if let Ok(meta) = std::fs::metadata(target) {
+                    if meta.file_attributes() & 0x1 != 0 {
+                        let mut perms = meta.permissions();
+                        perms.set_readonly(false);
+                        std::fs::set_permissions(target, perms)?;
+
+                        match temp_file.persist(target) {
+                            Ok(_) => {
+                                if let Ok(meta) = std::fs::metadata(target) {
+                                    let mut perms = meta.permissions();
+                                    perms.set_readonly(true);
+                                    let _ = std::fs::set_permissions(target, perms);
+                                }
+                                return Ok(());
+                            }
+                            Err(e2) => return Err(e2.error),
+                        }
+                    }
+                }
+            }
+
+            Err(err)
+        }
+    }
 }
 

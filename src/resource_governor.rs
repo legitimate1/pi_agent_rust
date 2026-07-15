@@ -177,6 +177,7 @@ pub struct HostResourceSample {
 impl HostResourceSample {
     /// Sample the current process/host state.
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
     pub fn current() -> Self {
         Self {
             load_avg_1m: read_load_avg_1m(),
