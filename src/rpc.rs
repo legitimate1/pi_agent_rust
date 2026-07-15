@@ -225,11 +225,12 @@ fn rpc_agent_event_handler(
 
     move |event: AgentEvent| {
         let serialized = if let AgentEvent::AgentEnd {
-            messages, error, ..
+            messages, error, session_id, ..
         } = &event
         {
             json!({
                 "type": "agent_end",
+                "sessionId": session_id,
                 "messages": messages,
                 "error": error,
             })
@@ -1821,7 +1822,7 @@ pub async fn run(
                 let _ = out_tx.send(response_ok(
                     id,
                     "new_session",
-                    Some(json!({ "cancelled": false })),
+                    Some(json!({ "cancelled": false, "sessionId": session_id })),
                 ));
             }
 
@@ -1921,7 +1922,7 @@ pub async fn run(
                         let _ = out_tx.send(response_ok(
                             id,
                             "switch_session",
-                            Some(json!({ "cancelled": false })),
+                            Some(json!({ "cancelled": false, "sessionId": session_id })),
                         ));
                     }
                     Err(err) => {
@@ -1936,7 +1937,7 @@ pub async fn run(
                     continue;
                 };
 
-                let result: Result<String> =
+                let result: Result<(String, String)> =
                     async {
                         // Phase 1: Snapshot — brief lock to compute ForkPlan + extract metadata.
                         let (fork_plan, parent_path, session_dir, save_enabled, header_snapshot) = {
@@ -1978,7 +1979,7 @@ pub async fn run(
                         new_session.init_from_fork_plan(fork_plan);
 
                         let messages = new_session.to_messages_for_current_path();
-                        let session_id = new_session.header.id.clone();
+                        let fork_session_id = new_session.header.id.clone();
 
                         // Phase 3: Swap — brief lock to install the new session.
                         {
@@ -1991,7 +1992,7 @@ pub async fn run(
                             *inner = new_session;
                             drop(inner);
                             guard.agent.replace_messages(messages);
-                            guard.agent.stream_options_mut().session_id = Some(session_id);
+                            guard.agent.stream_options_mut().session_id = Some(fork_session_id.clone());
                         }
 
                         {
@@ -2002,16 +2003,16 @@ pub async fn run(
                             state.follow_up.clear();
                         }
 
-                        Ok(selected_text)
+                        Ok((selected_text, fork_session_id))
                     }
                     .await;
 
                 match result {
-                    Ok(selected_text) => {
+                    Ok((selected_text, fork_session_id)) => {
                         let _ = out_tx.send(response_ok(
                             id,
                             "fork",
-                            Some(json!({ "text": selected_text, "cancelled": false })),
+                            Some(json!({ "text": selected_text, "cancelled": false, "sessionId": fork_session_id })),
                         ));
                     }
                     Err(err) => {
@@ -2288,6 +2289,9 @@ async fn run_prompt_with_retry(
                         .or_else(|| Some("Request error".to_string()));
                     final_error_hints = None;
                     if message.stop_reason == StopReason::Aborted {
+                        // Agent loop already emitted agent_end via event_handler;
+                        // prevent the retry-loop fallback from sending a duplicate.
+                        success = true;
                         break;
                     }
                     // Check if this error is retryable. Context overflow and

@@ -865,6 +865,7 @@ const PROVIDER_DEFAULT_MODELS: &[(&str, &str)] = &[
     ("minimax-cn-coding-plan", "MiniMax-M3"),
     ("huggingface", "moonshotai/Kimi-K2.5"),
     ("opencode", "claude-opus-4-6"),
+    ("opencode-go", "deepseek-v4-flash"),
     // The Kimi for Coding plan exposes a single stable virtual model id
     // (`kimi-for-coding`) that the backend remaps to the latest model. Prefer
     // it for the synthesized ad-hoc entry, then fall back to concrete ids when

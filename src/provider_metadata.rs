@@ -1469,6 +1469,23 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
         test_obligations: TEST_REQUIRED,
     },
     ProviderMetadata {
+        canonical_id: "opencode-go",
+        display_name: Some("OpenCode Go"),
+        aliases: &[],
+        auth_env_keys: &["OPENCODE_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://opencode.ai/zen/go/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
         canonical_id: "vercel",
         display_name: Some("Vercel AI"),
         aliases: &["vercel-ai-gateway"],
