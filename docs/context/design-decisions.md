@@ -192,6 +192,25 @@
 
 **何时重新考虑**：如果未来 RPC 协议改用更明确的流式生命周期消息替代 `agent_end`，可整体重构。
 
+## D13: RPC 模式扩展交互 UI 传递 hasUI 上下文（2026-07-16）
+
+**决策**：`ExtensionManager::execute_command()` 构建 JS 上下文时，使用 snapshot 的 `has_ui` 字段，替代硬编码的空对象 `{}`。
+
+**涉及改动**：
+1. `src/extensions.rs:29959` → `Arc::new(json!({}))` 改为 `let ctx = json!({ "hasUI": self.read_snapshot().has_ui })`
+
+**理由**：
+- RPC 模式下 `ExtensionManager` 已配置 UI 通道（`ui_sender`），snapshot 的 `has_ui` 为 `true`
+- 但 `execute_command` 直接传空 `{}` 给 JS，导致 `__pi_make_extension_ctx` 中 `hasUI = false`
+- `hasUI = false` 时 JS 侧 `ctx.ui.select/confirm/input` 静默返回 `undefined/false`，不调用 `pi.ui()`，扩展 handler 收到空值后输出"已取消"
+- 使用 snapshot 的 `has_ui` 字段可准确反映当前是否有 UI 通道
+
+**不选 B 的原因**：
+- 硬编码 `true`——纯 headless 场景无 UI 通道，`select` 等操作无法完成，应返回 undefined
+- 手动传参——调用方繁多，遗漏风险大
+
+**何时重新考虑**：如果未来 UI 通道模型改为每个连接独立配置，可改为从调用上下文动态推导。
+
 ## D8: Release 构建 — 栈溢出问题（2026-07-15）
 
 **问题**：Debug 构建的 `pi.exe` 在 Windows 上启动即崩溃，报 `thread 'main' has overflowed its stack`。Release 构建正常。

@@ -52,6 +52,7 @@
 | WASM 扩展 | ✅ | `src/extensions.rs` |
 | 能力策略模型（Strict/Prompt/Permissive） | ✅ | `src/extensions.rs:1139` |
 | Hostcall 调度（tool/exec/http/session/ui/events/log） | ✅ | `src/extensions_js.rs` |
+| **RPC 模式扩展交互 UI（select/confirm/input）** | ✅ | `src/extensions.rs` `src/rpc.rs` |
 | 虚拟模块系统（Node.js builtins + npm stubs） | ✅ | `src/extensions_js.rs` |
 
 ## 会话管理
