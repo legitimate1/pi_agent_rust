@@ -19892,7 +19892,7 @@ function __pi_validate_tool_input(schema, input) {
     }
 }
 
-async function __pi_execute_tool(tool_name, tool_call_id, input, ctx_payload) {
+async function __pi_execute_tool(tool_name, tool_call_id, input, ctx_payload, onUpdateJs) {
     const name = String(tool_name || '').trim();
     const record = __pi_tool_index.get(name);
     if (!record) {
@@ -19902,8 +19902,15 @@ async function __pi_execute_tool(tool_name, tool_call_id, input, ctx_payload) {
     __pi_validate_tool_input(record.spec && record.spec.parameters, input);
 
     const ctx = __pi_make_extension_ctx(ctx_payload);
+    const onUpdate = typeof onUpdateJs === 'function'
+        ? (partial) => {
+            try {
+                onUpdateJs(JSON.stringify(partial.content ?? []), JSON.stringify(partial.details ?? null));
+            } catch (_) {}
+          }
+        : undefined;
     return __pi_with_extension_async(record.extensionId, () =>
-        record.execute(tool_call_id, input, undefined, undefined, ctx)
+        record.execute(tool_call_id, input, onUpdate, undefined, ctx)
     );
 }
 

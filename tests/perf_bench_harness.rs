@@ -490,6 +490,7 @@ fn run_tool_call(ext_name: &str, entry_path: &Path, cwd: &Path, iterations: usiz
             input,
             Arc::clone(&ctx_payload),
             5_000,
+            None,
         ));
 
         let elapsed_us = start.elapsed().as_micros() as f64;

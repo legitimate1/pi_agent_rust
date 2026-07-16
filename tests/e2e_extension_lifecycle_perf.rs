@@ -328,6 +328,7 @@ fn phase_tool_call(
             json!({"name": "test"}),
             std::sync::Arc::new(ctx.clone()),
             NORMAL_TIMEOUT_MS,
+            None,
         ));
         match result {
             Ok(_) => successes += 1,
@@ -1230,6 +1231,7 @@ fn per_extension_tool_isolation() {
                 json!({"name": "test"}),
                 std::sync::Arc::new(ctx.clone()),
                 NORMAL_TIMEOUT_MS,
+                None,
             ));
             samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
         }
@@ -1276,6 +1278,7 @@ fn per_extension_tool_isolation() {
                 json!({"name": "test"}),
                 std::sync::Arc::new(ctx.clone()),
                 NORMAL_TIMEOUT_MS,
+                None,
             ));
             samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
         }
@@ -1485,6 +1488,7 @@ fn measure_phase_latencies(
                 json!({"name": "test"}),
                 std::sync::Arc::new(ctx.clone()),
                 NORMAL_TIMEOUT_MS,
+                None,
             ));
             tool_samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
         }
@@ -1560,6 +1564,7 @@ fn measure_composed_phase_latencies(
                 json!({"name": "test"}),
                 std::sync::Arc::new(ctx.clone()),
                 NORMAL_TIMEOUT_MS,
+                None,
             ));
             tool_samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
         }

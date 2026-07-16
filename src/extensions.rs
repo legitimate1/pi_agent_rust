@@ -25,7 +25,7 @@ use crate::permissions::{PermissionStore, PersistedDecision};
 use crate::resources::ExtensionResourcePaths;
 use crate::scheduler::HostcallOutcome;
 use crate::session::SessionMessage;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolRegistry, ToolUpdate};
 use ast_grep_core::{AstGrep, Pattern};
 use ast_grep_language::SupportLang;
 use asupersync::channel::{mpsc, oneshot};
@@ -18055,8 +18055,9 @@ mod native_runtime_experimental {
             input: Value,
             ctx_payload: Arc<Value>,
             timeout_ms: u64,
+            on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         ) -> Result<Value> {
-            self.execute_tool_ref(&tool_name, &tool_call_id, input, ctx_payload, timeout_ms)
+            self.execute_tool_ref(&tool_name, &tool_call_id, input, ctx_payload, timeout_ms, on_update)
                 .await
         }
 
@@ -18067,6 +18068,7 @@ mod native_runtime_experimental {
             input: Value,
             ctx_payload: Arc<Value>,
             timeout_ms: u64,
+            on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         ) -> Result<Value> {
             match self {
                 Self::Js(runtime) => {
@@ -18077,6 +18079,7 @@ mod native_runtime_experimental {
                             input,
                             ctx_payload,
                             timeout_ms,
+                            on_update,
                         )
                         .await
                 }
@@ -18499,6 +18502,14 @@ impl JsRuntimeHost {
     }
 }
 
+struct ToolUpdateCallback(Box<dyn Fn(ToolUpdate) + Send + Sync>);
+
+impl std::fmt::Debug for ToolUpdateCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolUpdateCallback").finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 enum JsRuntimeCommand {
     LoadExtensions {
@@ -18531,6 +18542,7 @@ enum JsRuntimeCommand {
         input: Value,
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
+        on_update: Option<ToolUpdateCallback>,
         reply: oneshot::Sender<Result<Value>>,
     },
     ExecuteCommand {
@@ -19085,6 +19097,7 @@ impl JsExtensionRuntimeHandle {
                             input,
                             ctx_payload,
                             timeout_ms,
+                            on_update,
                             reply,
                         } => {
                             let result = execute_extension_tool(
@@ -19095,6 +19108,7 @@ impl JsExtensionRuntimeHandle {
                                 input,
                                 ctx_payload.as_ref(),
                                 timeout_ms,
+                                on_update.map(|cb| cb.0),
                             )
                             .await;
                             let _ = reply.send(&cx, result);
@@ -19465,6 +19479,7 @@ impl JsExtensionRuntimeHandle {
         input: Value,
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<Value> {
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, mut reply_rx) = oneshot::channel();
@@ -19474,6 +19489,7 @@ impl JsExtensionRuntimeHandle {
             input,
             ctx_payload,
             timeout_ms,
+            on_update: on_update.map(ToolUpdateCallback),
             reply: reply_tx,
         };
         let fut = async move {
@@ -20556,8 +20572,9 @@ mod native_runtime_duplicate_scaffold {
             input: Value,
             ctx_payload: Arc<Value>,
             timeout_ms: u64,
+            on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         ) -> Result<Value> {
-            self.execute_tool_ref(&tool_name, &tool_call_id, input, ctx_payload, timeout_ms)
+            self.execute_tool_ref(&tool_name, &tool_call_id, input, ctx_payload, timeout_ms, on_update)
                 .await
         }
 
@@ -20568,6 +20585,7 @@ mod native_runtime_duplicate_scaffold {
             input: Value,
             ctx_payload: Arc<Value>,
             timeout_ms: u64,
+            on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         ) -> Result<Value> {
             match self {
                 Self::Js(runtime) => {
@@ -20578,11 +20596,12 @@ mod native_runtime_duplicate_scaffold {
                             input,
                             ctx_payload,
                             timeout_ms,
+                            on_update,
                         )
                         .await
                 }
                 Self::NativeRust(runtime) => {
-                    let _ = ctx_payload;
+                    let _ = (ctx_payload, on_update);
                     runtime
                         .execute_tool_ref(tool_name, tool_call_id, input, timeout_ms)
                         .await
@@ -21723,6 +21742,7 @@ async fn execute_extension_tool(
     input: Value,
     ctx_payload: &Value,
     timeout_ms: u64,
+    on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
 ) -> Result<Value> {
     let started_at = Instant::now();
     tracing::info!(
@@ -21740,8 +21760,21 @@ async fn execute_extension_tool(
             let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
             let input_js = json_to_js(&ctx, &input)?;
             let ctx_js = json_to_js(&ctx, ctx_payload)?;
+            let on_update_fn: rquickjs::Value<'_> = match on_update {
+                Some(cb) => {
+                    rquickjs::Function::new(ctx.clone(), move |content_json: String, details_json: String| {
+                        let update = ToolUpdate {
+                            content: serde_json::from_str(&content_json).unwrap_or_default(),
+                            details: serde_json::from_str(&details_json).ok(),
+                        };
+                        cb(update);
+                    })?
+                    .into_value()
+                }
+                None => json_to_js(&ctx, &serde_json::Value::Null)?,
+            };
             let promise: rquickjs::Value<'_> =
-                exec_fn.call((tool_name, tool_call_id, input_js, ctx_js))?;
+                exec_fn.call((tool_name, tool_call_id, input_js, ctx_js, on_update_fn))?;
             let _task: String = task_start.call((task_id.as_str(), promise))?;
             Ok(())
         })

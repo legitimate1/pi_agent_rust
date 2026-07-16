@@ -1034,6 +1034,7 @@ fn extension_tool_execution_returns_result() {
                     json!({"name": "World"}),
                     std::sync::Arc::new(json!({})),
                     5000,
+                    None,
                 )
                 .await
                 .expect("execute tool")

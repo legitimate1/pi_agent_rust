@@ -179,7 +179,7 @@ impl Tool for ExtensionToolWrapper {
         &self,
         tool_call_id: &str,
         input: Value,
-        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
         let result = self
             .runtime
@@ -189,6 +189,7 @@ impl Tool for ExtensionToolWrapper {
                 input,
                 Arc::clone(&self.ctx_payload),
                 self.timeout_ms,
+                on_update,
             )
             .await
             .map_err(|err| Error::tool(self.name(), err.to_string()))?;

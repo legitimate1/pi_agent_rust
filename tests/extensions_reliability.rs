@@ -316,6 +316,7 @@ fn slow_tool_call_is_bounded_by_timeout() {
         json!({}),
         std::sync::Arc::new(ctx),
         1_000, // 1 second timeout vs 10s busy wait
+        None,
     ));
 
     let elapsed = start.elapsed();
@@ -392,6 +393,7 @@ fn throwing_tool_returns_error_not_crash() {
         json!({}),
         std::sync::Arc::new(ctx.clone()),
         5_000,
+        None,
     ));
 
     // Tool should return an error, not crash.
@@ -404,6 +406,7 @@ fn throwing_tool_returns_error_not_crash() {
         json!({}),
         std::sync::Arc::new(ctx),
         5_000,
+        None,
     ));
     eprintln!("[throwing_tool] result2: {result2:?}");
 
@@ -687,6 +690,7 @@ fn tool_call_with_zero_timeout_returns_quickly() {
         json!({"name": "zero"}),
         std::sync::Arc::new(ctx),
         0, // Zero timeout
+        None,
     ));
 
     let elapsed = start.elapsed();
