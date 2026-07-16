@@ -37,6 +37,7 @@
 | **WriteTool / EditTool — 无 CWD 路径限制**（可写入任意绝对路径） | ✅ | `src/tools/write.rs` `src/tools/edit.rs` |
 | **EditTool — 直接写入**（非 tempfile 原子重命名，避让 Windows 句柄冲突） | ✅ | `src/tools/edit.rs` |
 | 扩展工具收集 | ✅ | `src/extension_tools.rs:100` |
+| **扩展工具 onUpdate 流式进度推送**（工具执行中 `onUpdate({content, details})`，经 rquickjs Function 桥接到 Rust `ToolUpdate`） | ✅ | `src/extensions.rs` `src/extensions_js.rs` `src/extension_tools.rs` |
 | **扩展工具同名覆盖内置工具** | ✅ | `src/tools/mod.rs` `src/agent.rs` |
 | **内置 pwsh 工具**（PowerShell 命令执行） | ✅ | `src/tools/pwsh.rs` |
 | **运行时禁用内置工具**（`disabledTools` 配置） | ✅ | `src/config.rs` `src/main.rs` |
