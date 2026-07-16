@@ -174,6 +174,24 @@
 
 **何时重新考虑**：如果未来引入细粒度工具安全策略（per-tool allowlist），可重新加入路径限定。
 
+## D12: run_extension_command 总是发送 agent_end（2026-07-15）
+
+**决策**：`run_extension_command` 执行完毕后无论成功或失败，始终发送 `agent_end` 事件通知 RPC 客户端。
+
+**涉及改动**：
+1. `src/rpc.rs:2491-2501` → `agent_end` payload 移出 `if let Err` 分支，成功时不含 `error` 字段，失败时附带错误信息
+
+**理由**：
+- RPC 客户端（pidian）依赖 `agent_end` 事件触发 `finalizeStreaming()` 来终结流式渲染状态
+- 先前仅在错误时发送 `agent_end`，成功时客户端 `isStreaming=true` 永远不终结，消息内容无法 finalize
+- TUI 交互模式不受影响，因为它不依赖 `agent_end` 事件
+
+**不选 B 的原因**：
+- 在成功分支也补发 `agent_end` 但保持 `isStreaming=false` 的时序不变——逻辑等价，只是写法更冗余
+- 让 pidian 侧增加超时 fallback——治标不治本，掩盖了 pi-rust 的事件缺失问题
+
+**何时重新考虑**：如果未来 RPC 协议改用更明确的流式生命周期消息替代 `agent_end`，可整体重构。
+
 ## D8: Release 构建 — 栈溢出问题（2026-07-15）
 
 **问题**：Debug 构建的 `pi.exe` 在 Windows 上启动即崩溃，报 `thread 'main' has overflowed its stack`。Release 构建正常。

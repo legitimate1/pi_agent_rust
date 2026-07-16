@@ -2490,15 +2490,15 @@ async fn run_extension_command(
     }
     is_streaming.store(false, Ordering::SeqCst);
 
-    if let Err(err) = result {
-        let mut payload = json!({
-            "type": "agent_end",
-            "messages": [],
-            "error": err.to_string(),
-        });
-        payload["errorHints"] = error_hints_value(&err);
-        let _ = out_tx.send(event(&payload));
+    let mut payload = json!({
+        "type": "agent_end",
+        "messages": [],
+    });
+    if let Err(ref err) = result {
+        payload["error"] = json!(err.to_string());
+        payload["errorHints"] = error_hints_value(err);
     }
+    let _ = out_tx.send(event(&payload));
 }
 
 // =============================================================================
