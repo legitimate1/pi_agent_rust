@@ -40,7 +40,7 @@ use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::time::{sleep, wall_now};
 use memchr::memchr_iter;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -304,14 +304,23 @@ impl RpcOutputPressureState {
         class: RpcOutputPressureClass,
         serialized: String,
     ) {
-        match tx.try_send(serialized) {
-            Ok(()) => {}
-            Err(std::sync::mpsc::TrySendError::Full(serialized)) => {
-                self.coalesce(class, serialized);
+        match class {
+            // ToolUpdate events carry incremental progress that the frontend
+            // needs to see in real time.  Use blocking send instead of coalescing
+            // so intermediate progress is never lost.  The output thread runs on
+            // a dedicated OS thread and will drain the channel.
+            RpcOutputPressureClass::ToolUpdate => {
+                let _ = tx.send(serialized);
             }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                self.pending.clear();
-            }
+            _ => match tx.try_send(serialized) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(serialized)) => {
+                    self.coalesce(class, serialized);
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    self.pending.clear();
+                }
+            },
         }
     }
 
@@ -2042,6 +2051,73 @@ pub async fn run(
                     id,
                     "get_fork_messages",
                     Some(json!({ "messages": messages })),
+                ));
+            }
+
+            "get_tree" => {
+                let (entries, leaf_id) = {
+                    let guard = session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    let inner_session = guard.session.lock(&cx).await.map_err(|err| {
+                        Error::session(format!("inner session lock failed: {err}"))
+                    })?;
+                    (inner_session.entries.clone(), inner_session.leaf_id.clone())
+                };
+
+                let mut children: HashMap<String, Vec<String>> = HashMap::new();
+                let mut roots: Vec<String> = Vec::new();
+                for entry in &entries {
+                    if let Some(id) = entry.base_id().cloned() {
+                        match entry.base().parent_id.clone() {
+                            Some(parent) => {
+                                children.entry(parent).or_default().push(id);
+                            }
+                            None => {
+                                roots.push(id);
+                            }
+                        }
+                    }
+                }
+
+                let entries_map: HashMap<&str, &crate::session::SessionEntry> = entries
+                    .iter()
+                    .filter_map(|e| Some((e.base_id()?.as_str(), e)))
+                    .collect();
+
+                fn build_tree_node<'a>(
+                    entry_id: &str,
+                    children: &HashMap<String, Vec<String>>,
+                    entries_map: &HashMap<&'a str, &'a crate::session::SessionEntry>,
+                ) -> Value {
+                    let Some(entry) = entries_map.get(entry_id) else {
+                        return json!({ "entry": null, "children": [] });
+                    };
+                    let entry_val = session_entry_to_tree_value(entry);
+                    let child_nodes: Vec<Value> = children
+                        .get(entry_id)
+                        .map(|ids| {
+                            ids.iter()
+                                .map(|cid| build_tree_node(cid, children, entries_map))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    json!({ "entry": entry_val, "children": child_nodes })
+                }
+
+                let tree: Vec<Value> = roots
+                    .iter()
+                    .map(|root_id| build_tree_node(root_id, &children, &entries_map))
+                    .collect();
+
+                let _ = out_tx.send(response_ok(
+                    id,
+                    "get_tree",
+                    Some(json!({
+                        "tree": tree,
+                        "leafId": leaf_id,
+                    })),
                 ));
             }
 
@@ -5205,6 +5281,92 @@ fn fork_messages_from_entries(entries: &[crate::session::SessionEntry]) -> Vec<V
     result
 }
 
+/// Convert a SessionEntry to the RPC tree-compatible JSON value.
+fn session_entry_to_tree_value(entry: &crate::session::SessionEntry) -> Value {
+    let base = entry.base();
+    let id = base.id.clone().unwrap_or_default();
+    let parent_id = base.parent_id.clone();
+    let timestamp = base.timestamp.clone();
+
+    match entry {
+        crate::session::SessionEntry::Message(m) => {
+            let message_value = serde_json::to_value(&m.message).unwrap_or_default();
+            json!({
+                "type": "message",
+                "id": id,
+                "parentId": parent_id,
+                "timestamp": timestamp,
+                "message": message_value,
+            })
+        }
+        crate::session::SessionEntry::ModelChange(m) => {
+            json!({
+                "type": "model_change",
+                "id": id,
+                "parentId": parent_id,
+                "timestamp": timestamp,
+                "provider": m.provider,
+                "modelId": m.model_id,
+            })
+        }
+        crate::session::SessionEntry::ThinkingLevelChange(t) => {
+            json!({
+                "type": "thinking_level_change",
+                "id": id,
+                "parentId": parent_id,
+                "timestamp": timestamp,
+                "thinkingLevel": t.thinking_level,
+            })
+        }
+        crate::session::SessionEntry::Compaction(c) => {
+            json!({
+                "type": "compaction",
+                "id": id,
+                "parentId": parent_id,
+                "timestamp": timestamp,
+                "summary": c.summary,
+            })
+        }
+        crate::session::SessionEntry::BranchSummary(b) => {
+            json!({
+                "type": "branch_summary",
+                "id": id,
+                "parentId": parent_id,
+                "timestamp": timestamp,
+                "summary": b.summary,
+            })
+        }
+        crate::session::SessionEntry::Label(l) => {
+            json!({
+                "type": "label",
+                "id": id,
+                "parentId": parent_id,
+                "timestamp": timestamp,
+                "label": l.label,
+            })
+        }
+        crate::session::SessionEntry::SessionInfo(s) => {
+            json!({
+                "type": "session_info",
+                "id": id,
+                "parentId": parent_id,
+                "timestamp": timestamp,
+                "name": s.name,
+            })
+        }
+        crate::session::SessionEntry::Custom(c) => {
+            json!({
+                "type": "custom",
+                "id": id,
+                "parentId": parent_id,
+                "timestamp": timestamp,
+                "customType": c.custom_type,
+                "data": c.data,
+            })
+        }
+    }
+}
+
 fn extract_user_text(content: &crate::model::UserContent) -> Option<String> {
     match content {
         crate::model::UserContent::Text(text) => Some(text.clone()),
@@ -7188,24 +7350,17 @@ export default function init(pi) {
             .expect("seed occupied output slot");
         let mut pressure = RpcOutputPressureState::default();
 
+        // MessageDelta events (coalescible — try_send with Full → coalesced)
         let stale_delta = rpc_text_delta_event("first full text", "first");
         pressure.send_agent_event(&tx, &stale_delta, agent_event(stale_delta.clone()));
         let latest_delta = rpc_thinking_delta_event("latest thinking text", "latest-thinking");
         pressure.send_agent_event(&tx, &latest_delta, agent_event(latest_delta.clone()));
-        let stale_tool = rpc_tool_update_event("first tool output");
-        pressure.send_agent_event(&tx, &stale_tool, agent_event(stale_tool.clone()));
-        let latest_tool = rpc_tool_update_event("latest tool output");
-        pressure.send_agent_event(&tx, &latest_tool, agent_event(latest_tool.clone()));
 
-        let before_flush = pressure.snapshot();
-        assert_eq!(before_flush.pending, 2);
-        assert_eq!(before_flush.message_deltas_coalesced, 2);
-        assert_eq!(before_flush.tool_updates_coalesced, 2);
-
+        // Start receiver *before* ToolUpdate events so blocking send does not hang
         let recv_handle = std::thread::spawn(move || {
             let mut received = Vec::new();
             let deadline = Instant::now() + Duration::from_secs(2);
-            while received.len() < 4 && Instant::now() < deadline {
+            while received.len() < 5 && Instant::now() < deadline {
                 match rx.try_recv() {
                     Ok(line) => received.push(line),
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -7217,11 +7372,24 @@ export default function init(pi) {
             received
         });
 
+        // ToolUpdate events — now use blocking send, so they arrive immediately
+        let stale_tool = rpc_tool_update_event("first tool output");
+        pressure.send_agent_event(&tx, &stale_tool, agent_event(stale_tool.clone()));
+        let latest_tool = rpc_tool_update_event("latest tool output");
+        pressure.send_agent_event(&tx, &latest_tool, agent_event(latest_tool.clone()));
+
+        let before_flush = pressure.snapshot();
+        assert_eq!(before_flush.pending, 1); // only the pending MessageDelta
+        assert_eq!(before_flush.message_deltas_coalesced, 2);
+        assert_eq!(before_flush.tool_updates_coalesced, 0); // never coalesced
+
+        // Semantic event flushes pending delta
         let semantic = rpc_agent_end_event("semantic final text");
         pressure.send_agent_event(&tx, &semantic, agent_event(semantic.clone()));
         drop(tx);
 
         let received = recv_handle.join().expect("receiver thread should finish");
+        // Order: occupied, stale_tool, latest_tool, latest_delta, semantic
         assert_eq!(
             received.first().map(String::as_str),
             Some("occupied"),
@@ -7229,12 +7397,30 @@ export default function init(pi) {
         );
         assert_eq!(
             received.len(),
-            4,
-            "both pending classes and semantic event flush"
+            5,
+            "both pending delta and semantic event flush after non-coalesced tool updates"
         );
 
+        // Tool updates arrive via blocking send (immediate)
+        let tool1: Value =
+            serde_json::from_str(&received[1]).expect("parse tool update 1");
+        assert_eq!(tool1["type"], "tool_execution_update");
+        assert_eq!(
+            tool1["partialResult"]["content"][0]["text"],
+            "first tool output"
+        );
+
+        let tool2: Value =
+            serde_json::from_str(&received[2]).expect("parse tool update 2");
+        assert_eq!(tool2["type"], "tool_execution_update");
+        assert_eq!(
+            tool2["partialResult"]["content"][0]["text"],
+            "latest tool output"
+        );
+
+        // Flushed coalesced delta
         let message_update: Value =
-            serde_json::from_str(&received[1]).expect("parse flushed message update");
+            serde_json::from_str(&received[3]).expect("parse flushed message update");
         assert_eq!(message_update["type"], "message_update");
         assert_eq!(
             message_update["assistantMessageEvent"]["type"],
@@ -7245,15 +7431,7 @@ export default function init(pi) {
             "latest-thinking"
         );
 
-        let tool_update: Value =
-            serde_json::from_str(&received[2]).expect("parse flushed tool update");
-        assert_eq!(tool_update["type"], "tool_execution_update");
-        assert_eq!(
-            tool_update["partialResult"]["content"][0]["text"],
-            "latest tool output"
-        );
-
-        let agent_end: Value = serde_json::from_str(&received[3]).expect("parse semantic end");
+        let agent_end: Value = serde_json::from_str(&received[4]).expect("parse semantic end");
         assert_eq!(agent_end["type"], "agent_end");
         assert_eq!(
             agent_end["messages"][0]["content"][0]["text"],

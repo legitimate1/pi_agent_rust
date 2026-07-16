@@ -3824,16 +3824,16 @@ mod tests {
                 "resource_governor_direct": false,
                 "budget": {
                     "output_channel_capacity": 1,
-                    "coalescible_classes": ["message_delta", "tool_update"],
+                    "coalescible_classes": ["message_delta"],
                 },
                 "decision": {
-                    "action": "coalesce_and_flush_before_semantic",
+                    "action": "coalesce_message_delta_and_flush_before_semantic",
                     "reason_code": "rpc_output_semantic_preserved",
-                    "user_visible_outcome": "latest low-value update survives before final semantic event",
+                    "user_visible_outcome": "latest message delta survives before final semantic event; tool updates use blocking send and are never lost",
                 },
                 "semantic_preservation": {
                     "preserved_event": "agent_end",
-                    "proof": "semantic event flushes pending message and tool updates before sending",
+                    "proof": "semantic event flushes pending message delta before sending",
                 },
                 "evidence_pointer": "src/rpc.rs::rpc_output_pressure_conformance_matrix_flushes_each_coalesced_class_before_semantic",
             }),

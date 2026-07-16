@@ -9,6 +9,7 @@
 | RPC/stdin 服务器模式（含 sessionId 修复） | ✅ | `src/rpc.rs` |
 | RPC 方法 `estimate_tokens`（会话 token 估算） | ✅ | `src/rpc.rs` `src/compaction.rs` |
 | **RPC 方法 `get_commands` — 合并扩展注册的斜杠命令** | ✅ | `src/rpc.rs` `src/extensions.rs` |
+| **RPC 方法 `get_tree` — 查询会话树形结构（分支/叶子）** | ✅ | `src/rpc.rs` |
 | CLI 子命令（doctor/config/list/info 等） | ✅ | `src/main.rs` |
 | **`~/.pi/agent/SYSTEM.md` 覆盖默认系统提示词** | ✅ | `src/app.rs` |
 
