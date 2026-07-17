@@ -10970,6 +10970,18 @@ const __pi_vfs = (() => {
     return new TextDecoder().decode(bytes);
   }
 
+  function bytesToBase64(bytes) {
+    const chunkSize = 8192;
+    let result = '';
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const end = Math.min(i + chunkSize, bytes.length);
+      const chunk = [];
+      for (let j = i; j < end; j++) chunk.push(String.fromCharCode(bytes[j]));
+      result += globalThis.btoa(chunk.join(''));
+    }
+    return result;
+  }
+
   function resolveSymlinkPath(linkPath, target) {
     const raw = String(target ?? "");
     if (raw.startsWith("/")) {
@@ -11210,6 +11222,8 @@ const __pi_vfs = (() => {
   state.parseOpenFlags = parseOpenFlags;
   state.getFdEntry = getFdEntry;
   state.toWritableView = toWritableView;
+  // bytesToBase64: Uint8Array -> base64 string (chunked for performance)
+  state.bytesToBase64 = bytesToBase64;
   globalThis.__pi_vfs_state = state;
   return state;
 })();
@@ -11260,13 +11274,22 @@ export function appendFileSync(path, data, opts) {
   merged.set(next, current.byteLength);
   __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
   __pi_vfs.files.set(resolved, merged);
+  // Persist to real filesystem via host function (base64-encoded)
+  if (typeof globalThis.__pi_host_write_file_sync === "function") {
+    globalThis.__pi_host_write_file_sync(path, __pi_vfs.bytesToBase64(merged));
+  }
 }
 
 export function writeFileSync(path, data, opts) {
   const resolved = __pi_vfs.resolvePath(path, true);
   __pi_vfs.checkWriteAccess(resolved);
   __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
-  __pi_vfs.files.set(resolved, __pi_vfs.toBytes(data, opts));
+  const bytes = __pi_vfs.toBytes(data, opts);
+  __pi_vfs.files.set(resolved, bytes);
+  // Persist to real filesystem via host function (base64-encoded)
+  if (typeof globalThis.__pi_host_write_file_sync === "function") {
+    globalThis.__pi_host_write_file_sync(path, __pi_vfs.bytesToBase64(bytes));
+  }
 }
 
 export function readdirSync(path, opts) {
@@ -17310,6 +17333,97 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     "host write denied: path outside extension root".to_string(),
                                 ))
                             }
+                        }
+                    }),
+                )?;
+
+                // __pi_host_write_file_sync(path, data_base64) -> void (throws on error)
+                // Synchronous real-filesystem write for node:fs writeFileSync/appendFileSync.
+                // Writes are confined to the workspace root AND any registered extension
+                // roots, matching the same confinement as __pi_host_check_write_access.
+                // Data is passed as base64 to avoid encoding issues across the JS/Rust boundary.
+                global.set(
+                    "__pi_host_write_file_sync",
+                    Func::from({
+                        let process_cwd = process_cwd.clone();
+                        let allowed_read_roots = Arc::clone(&allowed_read_roots);
+                        let module_state = Rc::clone(&module_state);
+                        move |ctx: Ctx<'_>,
+                              path: String,
+                              data_base64: String|
+                              -> rquickjs::Result<()> {
+                            let extension_id = current_extension_id(&ctx);
+
+                            // Standalone PiJsRuntime without extension context: allow
+                            if extension_id.is_none() {
+                                return Ok(());
+                            }
+
+                            let workspace_root =
+                                crate::extensions::safe_canonicalize(Path::new(&process_cwd));
+                            let requested = PathBuf::from(&path);
+                            let requested_abs = if requested.is_absolute() {
+                                requested
+                            } else {
+                                workspace_root.join(requested)
+                            };
+
+                            // Canonicalize parent dir (file may not exist yet)
+                            let checked_path = if let Some(parent) = requested_abs.parent() {
+                                let canon_parent =
+                                    crate::extensions::safe_canonicalize(parent);
+                                canon_parent.join(
+                                    requested_abs.file_name().unwrap_or_default()
+                                )
+                            } else {
+                                requested_abs.clone()
+                            };
+
+                            let in_ext_root = path_is_in_allowed_extension_root(
+                                &checked_path,
+                                extension_id.as_deref(),
+                                &module_state,
+                                &allowed_read_roots,
+                            );
+
+                            let allowed =
+                                checked_path.starts_with(&workspace_root) || in_ext_root;
+
+                            if !allowed {
+                                return Err(rquickjs::Error::new_loading_message(
+                                    &path,
+                                    "host write denied: path outside extension root".to_string(),
+                                ));
+                            }
+
+                            // Decode base64 and write to disk
+                            let bytes = BASE64_STANDARD
+                                .decode(data_base64.as_bytes())
+                                .map_err(|e| {
+                                    rquickjs::Error::new_loading_message(
+                                        &path,
+                                        format!("host write: base64 decode error: {e}"),
+                                    )
+                                })?;
+
+                            // Ensure parent directory exists
+                            if let Some(parent) = checked_path.parent() {
+                                fs::create_dir_all(parent).map_err(|e| {
+                                    rquickjs::Error::new_loading_message(
+                                        &path,
+                                        format!("host write: mkdir error: {e}"),
+                                    )
+                                })?;
+                            }
+
+                            fs::write(&checked_path, &bytes).map_err(|e| {
+                                rquickjs::Error::new_loading_message(
+                                    &path,
+                                    format!("host write: write error: {e}"),
+                                )
+                            })?;
+
+                            Ok(())
                         }
                     }),
                 )?;
