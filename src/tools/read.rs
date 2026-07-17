@@ -16,7 +16,9 @@ use super::hashline::format_hashline_tag;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReadInput {
-    path: String,
+    path: Option<String>,
+    #[serde(default)]
+    paths: Option<Vec<String>>,
     offset: Option<i64>,
     limit: Option<i64>,
     #[serde(default)]
@@ -88,109 +90,27 @@ where
     .await
 }
 
-#[async_trait]
-#[allow(clippy::unnecessary_literal_bound)]
-impl Tool for ReadTool {
-    fn name(&self) -> &str {
-        "read"
-    }
-    fn label(&self) -> &str {
-        "read"
-    }
-    fn description(&self) -> &str {
-        "读取文件内容。支持文本、图片（jpg/png/gif/webp）、文件信息、差异比较和编码检测。可使用 head/tail 进行部分读取、info 仅查看元数据、diff 比较文件、encoding 覆盖自动编码检测。输出限制为 2000 行或 1MB。"
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file to read (relative or absolute)"
-                },
-                "offset": {
-                    "type": "integer",
-                    "description": "Line number to start reading from (1-indexed). Mutually exclusive with head/tail."
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of lines to read. Used with offset."
-                },
-                "hashline": {
-                    "type": "boolean",
-                    "description": "When true, output each line as N#AB:content where N is the line number and AB is a content hash. Use with hashline_edit tool for precise edits."
-                },
-                "head": {
-                    "type": "integer",
-                    "description": "Read only the first N lines. Mutually exclusive with offset/tail."
-                },
-                "tail": {
-                    "type": "integer",
-                    "description": "Read only the last N lines. Mutually exclusive with offset/head."
-                },
-                "info": {
-                    "type": "boolean",
-                    "description": "When true, show file metadata (size, line count, encoding, modified time) without reading content. Also shows structure preview."
-                },
-
-                "diff": {
-                    "type": "string",
-                    "description": "Compare this file with another file. Shows a unified diff between the two files."
-                },
-                "context": {
-                    "type": "integer",
-                    "description": "Lines of context for diff mode (default: 3)."
-                },
-                "summary_only": {
-                    "type": "boolean",
-                    "description": "When true and used with diff, show only diff statistics without the full diff."
-                }
-            },
-            "required": ["path"]
-        })
-    }
-
-    fn effects(&self) -> ToolEffects {
-        ToolEffects::read()
-    }
-
-    #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
-    async fn execute(
+impl ReadTool {
+    async fn read_single_file(
         &self,
+        path: &str,
+        input: &ReadInput,
         tool_call_id: &str,
-        input: serde_json::Value,
-        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        let input_value = input.clone();
-        let input: ReadInput =
-            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        let resolved = resolve_read_path(path, &self.cwd);
 
-        if matches!(input.limit, Some(limit) if limit <= 0) {
-            return Err(Error::validation(
-                "`limit` must be greater than 0".to_string(),
-            ));
-        }
-        if matches!(input.offset, Some(offset) if offset < 0) {
-            return Err(Error::validation(
-                "`offset` must be non-negative".to_string(),
-            ));
-        }
-
-        let path = resolve_read_path(&input.path, &self.cwd);
-
-        let meta = asupersync::fs::metadata(&path).await.ok();
+        let meta = asupersync::fs::metadata(&resolved).await.ok();
         if let Some(meta) = &meta {
             if !meta.is_file() {
                 return Err(Error::tool(
                     "read",
-                    format!("Path {} is not a regular file", path.display()),
+                    format!("Path {} is not a regular file", resolved.display()),
                 ));
             }
         } else {
             return Err(Error::tool(
                 "read",
-                format!("File not found: {}", path.display()),
+                format!("File not found: {}", resolved.display()),
             ));
         }
 
@@ -211,9 +131,8 @@ impl Tool for ReadTool {
                 }
             }).unwrap_or_default();
 
-            // Read first bytes for encoding detection
             let mut buf = [0u8; 8192];
-            let mut file = asupersync::fs::File::open(&path)
+            let mut file = asupersync::fs::File::open(&resolved)
                 .await
                 .map_err(|e| Error::tool("read", e.to_string()))?;
             let n = read_some(&mut file, &mut buf)
@@ -222,32 +141,30 @@ impl Tool for ReadTool {
             let (encoding, _) = detect_encoding(&buf[..n], None);
 
             let size_str = format_file_size(meta.len());
-            let output = ToolOutput {
+            return Ok(ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new(format!(
                     "📄 {} | {} | {} | encoding: {}",
-                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    resolved.file_name().unwrap_or_default().to_string_lossy(),
                     size_str,
                     mtime_str,
                     encoding,
                 )))],
                 details: None,
                 is_error: false,
-            };
-            return Ok(output);
+            });
         }
 
-        let cache_key = tool_cache_key("read", &self.cwd, &input_value);
+        let cache_key = tool_cache_key("read", &self.cwd, &serde_json::json!({ "path": path }));
         let cache_mode = ToolCacheFingerprintMode::FileContent;
-        let cache_deps = cache_dependency_for_path(&path, cache_mode);
+        let cache_deps = cache_dependency_for_path(&resolved, cache_mode);
         if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {
             return Ok(output);
         }
 
-        let mut file = asupersync::fs::File::open(&path)
+        let mut file = asupersync::fs::File::open(&resolved)
             .await
             .map_err(|e| Error::tool("read", e.to_string()))?;
 
-        // Read initial chunk for mime detection
         let mut buffer = [0u8; 8192];
         let mut initial_read = 0;
         loop {
@@ -272,9 +189,6 @@ impl Tool for ReadTool {
                 ));
             }
 
-            // For images, allow a larger on-disk source as long as it stays
-            // within the read-tool input bound; resize/re-encode may still
-            // bring the API payload under IMAGE_MAX_BYTES.
             let max_image_input_bytes = usize::try_from(READ_TOOL_MAX_BYTES).unwrap_or(usize::MAX);
             if let Some(meta) = &meta {
                 if meta.len() > READ_TOOL_MAX_BYTES {
@@ -369,7 +283,7 @@ impl Tool for ReadTool {
             });
         }
 
-        // Diff mode: compare two files.
+        // Diff mode
         if let Some(diff_target) = &input.diff {
             let diff_path = resolve_read_path(diff_target, &self.cwd);
             if !diff_path.exists() {
@@ -380,7 +294,7 @@ impl Tool for ReadTool {
             }
 
             let ctx = input.context.unwrap_or(3);
-            let content_a = asupersync::fs::read(&path).await
+            let content_a = asupersync::fs::read(&resolved).await
                 .map_err(|e| Error::tool("read", format!("Failed to read file for diff: {e}")))?;
             let content_b = asupersync::fs::read(&diff_path).await
                 .map_err(|e| Error::tool("read", format!("Failed to read diff target: {e}")))?;
@@ -395,7 +309,7 @@ impl Tool for ReadTool {
                 return Ok(ToolOutput {
                     content: vec![ContentBlock::Text(TextContent::new(format!(
                         "Diff: {} ↔ {}\nChanges: {changes} diff hunks, {lines} lines",
-                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        resolved.file_name().unwrap_or_default().to_string_lossy(),
                         diff_path.file_name().unwrap_or_default().to_string_lossy(),
                     )))],
                     details: None,
@@ -414,7 +328,7 @@ impl Tool for ReadTool {
             });
         }
 
-        // Check for head/tail parameters and translate to offset/limit.
+        // Text reading logic
         let effective_offset: Option<i64> = if input.head.is_some() {
             Some(1)
         } else {
@@ -428,13 +342,11 @@ impl Tool for ReadTool {
             input.limit
         };
 
-        // Encoding detection
         let (encoding_label, bom_skip) = detect_encoding(initial_bytes, None);
         let is_utf8 = encoding_label == "UTF-8" || encoding_label == "UTF-8 (BOM)";
 
-        // Tail mode or non-UTF-8: read entire file, decode, select tail/offset range.
         if input.tail.is_some() || !is_utf8 {
-            let full_bytes = asupersync::fs::read(&path).await
+            let full_bytes = asupersync::fs::read(&resolved).await
                 .map_err(|e| Error::tool("read", format!("Failed to read file: {e}")))?;
             let text_content = decode_with_encoding(&full_bytes, &encoding_label, bom_skip)?;
             let all_lines: Vec<&str> = text_content.split('\n').collect();
@@ -497,8 +409,7 @@ impl Tool for ReadTool {
             });
         }
 
-        // ── UTF-8 streaming path for offset/limit/head ──
-        // Reset file to start if we read some bytes
+        // ── UTF-8 streaming path ──
         if initial_read > 0 {
             file.seek(SeekFrom::Start(0))
                 .await
@@ -508,7 +419,6 @@ impl Tool for ReadTool {
         let mut raw_content = Vec::new();
         let mut newlines_seen = 0usize;
 
-        // Use effective_offset/limit (head translates to offset:1, limit:N).
         let start_line_idx = match effective_offset {
             Some(n) if n > 0 => n.saturating_sub(1).try_into().unwrap_or(usize::MAX),
             _ => 0,
@@ -518,13 +428,9 @@ impl Tool for ReadTool {
         let end_line_idx = start_line_idx.saturating_add(limit_lines);
 
         let mut collecting = start_line_idx == 0;
-        let mut buf = vec![0u8; 64 * 1024].into_boxed_slice(); // 64KB chunks
+        let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
         let mut last_byte_was_newline = false;
         let mut pending_cr = false;
-
-        // We need to track total_lines accurately for the output.
-        // We will respect MAX_BYTES for *collected* content, but continue scanning for line counts
-        // so pagination metadata is correct.
         let mut total_bytes_read = 0u64;
 
         loop {
@@ -544,11 +450,8 @@ impl Tool for ReadTool {
             let mut chunk_cursor = 0;
 
             for pos in memchr::memchr_iter(b'\n', &chunk) {
-                // Check if this newline marks the end of a line we are collecting
                 if collecting {
-                    // newlines_seen is the index of the line ending at this newline
                     if newlines_seen + 1 == end_line_idx {
-                        // We reached the limit. Collect up to this newline.
                         if raw_content.len() < DEFAULT_MAX_BYTES {
                             let remaining = DEFAULT_MAX_BYTES - raw_content.len();
                             let slice_len = (pos + 1 - chunk_cursor).min(remaining);
@@ -562,14 +465,12 @@ impl Tool for ReadTool {
 
                 newlines_seen += 1;
 
-                // Check if this newline marks the start of the window
                 if !collecting && newlines_seen == start_line_idx {
                     collecting = true;
                     chunk_cursor = pos + 1;
                 }
             }
 
-            // Append remainder of chunk if collecting
             if collecting && chunk_cursor < chunk.len() && raw_content.len() < DEFAULT_MAX_BYTES {
                 let remaining = DEFAULT_MAX_BYTES - raw_content.len();
                 let slice_len = (chunk.len() - chunk_cursor).min(remaining);
@@ -585,8 +486,6 @@ impl Tool for ReadTool {
             newlines_seen += 1;
         }
 
-        // A trailing newline terminates the last line rather than starting a new one.
-        // Also keep empty files at 0 lines so explicit positive offsets can error correctly.
         let total_lines = if total_bytes_read == 0 {
             0
         } else if last_byte_was_newline {
@@ -596,8 +495,6 @@ impl Tool for ReadTool {
         };
         let text_content = String::from_utf8_lossy(&raw_content).into_owned();
 
-        // Handle empty file.
-        // Offset=0 behaves like "start from beginning", but positive offsets should fail.
         if total_lines == 0 {
             if input.offset.unwrap_or(0) > 0 {
                 let offset_display = input.offset.unwrap_or(0);
@@ -615,14 +512,11 @@ impl Tool for ReadTool {
             };
             cache_tool_output(
                 cache_key,
-                stable_cache_dependency_for_path(&path, cache_mode, cache_deps.as_deref()),
+                stable_cache_dependency_for_path(&resolved, cache_mode, cache_deps.as_deref()),
                 &output,
             );
             return Ok(output);
         }
-
-        // Now we have the content (up to safety limit) in memory, but only for the requested window.
-        // `text_content` starts at `start_line_idx`.
 
         let start_line = start_line_idx;
         let start_line_display = start_line.saturating_add(1);
@@ -643,15 +537,11 @@ impl Tool for ReadTool {
             .unwrap_or(DEFAULT_MAX_LINES);
         let display_limit = max_lines_for_truncation.saturating_add(1);
 
-        // We calculate lines to take based on the limit, but since we already filtered
-        // during read, we can mostly trust `text_content`, except for `DEFAULT_MAX_BYTES` truncation.
-
         let lines_to_take = limit_lines.min(display_limit);
 
         let mut selected_content = String::new();
         let line_iter = text_content.split('\n');
 
-        // Note: we use skip(0) because text_content is already offset
         let effective_iter = if text_content.ends_with('\n') {
             line_iter.take(lines_to_take)
         } else {
@@ -668,7 +558,7 @@ impl Tool for ReadTool {
             if i > 0 {
                 selected_content.push('\n');
             }
-            let line_idx = start_line + i; // 0-indexed
+            let line_idx = start_line + i;
             let line = line.strip_suffix('\r').unwrap_or(line);
             if input.hashline {
                 let tag = format_hashline_tag(line_idx, line);
@@ -703,7 +593,7 @@ impl Tool for ReadTool {
             output_text = format!(
                 "[Line {start_line_display} is {first_line_size}, exceeds {} limit. Use bash: sed -n '{start_line_display}p' '{}' | head -c {DEFAULT_MAX_BYTES}]",
                 format_size(DEFAULT_MAX_BYTES),
-                input.path.replace('\'', "'\\''")
+                path.replace('\'', "'\\''")
             );
             details = Some(serde_json::json!({ "truncation": truncation }));
         } else if truncation.truncated {
@@ -727,7 +617,6 @@ impl Tool for ReadTool {
 
             details = Some(serde_json::json!({ "truncation": truncation }));
         } else {
-            // Calculate how many lines we actually displayed
             let displayed_lines = truncation.output_lines;
             let end_line_display = start_line_display
                 .saturating_add(displayed_lines)
@@ -762,10 +651,168 @@ impl Tool for ReadTool {
         };
         cache_tool_output(
             cache_key,
-            stable_cache_dependency_for_path(&path, cache_mode, cache_deps.as_deref()),
+            stable_cache_dependency_for_path(&resolved, cache_mode, cache_deps.as_deref()),
             &output,
         );
         Ok(output)
+    }
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Tool for ReadTool {
+    fn name(&self) -> &str {
+        "read"
+    }
+    fn label(&self) -> &str {
+        "read"
+    }
+    fn description(&self) -> &str {
+        "读取文件内容。支持文本、图片（jpg/png/gif/webp）、文件信息、差异比较和编码检测。可使用 head/tail 进行部分读取、info 仅查看元数据、diff 比较文件、encoding 覆盖自动编码检测。输出限制为 2000 行或 1MB。"
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to a single file to read (relative or absolute). Mutually exclusive with paths."
+                },
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Multiple file paths to read in batch (relative or absolute). Mutually exclusive with path."
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Line number to start reading from (1-indexed). Mutually exclusive with head/tail."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to read. Used with offset."
+                },
+                "hashline": {
+                    "type": "boolean",
+                    "description": "When true, output each line as N#AB:content where N is the line number and AB is a content hash. Use with hashline_edit tool for precise edits."
+                },
+                "head": {
+                    "type": "integer",
+                    "description": "Read only the first N lines. Mutually exclusive with offset/tail."
+                },
+                "tail": {
+                    "type": "integer",
+                    "description": "Read only the last N lines. Mutually exclusive with offset/head."
+                },
+                "info": {
+                    "type": "boolean",
+                    "description": "When true, show file metadata (size, line count, encoding, modified time) without reading content. Also shows structure preview."
+                },
+
+                "diff": {
+                    "type": "string",
+                    "description": "Compare this file with another file. Shows a unified diff between the two files."
+                },
+                "context": {
+                    "type": "integer",
+                    "description": "Lines of context for diff mode (default: 3)."
+                },
+                "summary_only": {
+                    "type": "boolean",
+                    "description": "When true and used with diff, show only diff statistics without the full diff."
+                }
+            },
+            "oneOf": [
+                { "required": ["path"] },
+                { "required": ["paths"] }
+            ]
+        })
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::read()
+    }
+
+    #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let input: ReadInput =
+            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+
+        if matches!(input.limit, Some(limit) if limit <= 0) {
+            return Err(Error::validation(
+                "`limit` must be greater than 0".to_string(),
+            ));
+        }
+        if matches!(input.offset, Some(offset) if offset < 0) {
+            return Err(Error::validation(
+                "`offset` must be non-negative".to_string(),
+            ));
+        }
+
+        let paths: Vec<&str> = match (&input.path, &input.paths) {
+            (Some(p), None) => vec![p.as_str()],
+            (None, Some(ps)) => {
+                if ps.is_empty() {
+                    return Err(Error::validation(
+                        "`paths` must contain at least one path".to_string(),
+                    ));
+                }
+                ps.iter().map(String::as_str).collect()
+            }
+            (Some(_), Some(_)) => {
+                return Err(Error::validation(
+                    "`path` and `paths` are mutually exclusive".to_string(),
+                ));
+            }
+            (None, None) => {
+                return Err(Error::validation(
+                    "Either `path` or `paths` must be provided".to_string(),
+                ));
+            }
+        };
+
+        if paths.len() == 1 {
+            return self.read_single_file(paths[0], &input, tool_call_id).await;
+        }
+
+        let mut all_text = String::new();
+        let combined_details: Option<serde_json::Value> = None;
+        let mut had_error = false;
+
+        for (i, p) in paths.iter().enumerate() {
+            match self.read_single_file(p, &input, tool_call_id).await {
+                Ok(output) => {
+                    if i > 0 {
+                        all_text.push_str("\n\n---\n\n");
+                    }
+                    let header = format!("File: {p}\n");
+                    all_text.push_str(&header);
+                    for block in &output.content {
+                        if let ContentBlock::Text(t) = block {
+                            all_text.push_str(&t.text);
+                        }
+                    }
+                }
+                Err(e) => {
+                    if i > 0 {
+                        all_text.push_str("\n\n---\n\n");
+                    }
+                    let _ = write!(all_text, "File: {p}\nError: {e}");
+                    had_error = true;
+                }
+            }
+        }
+
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(all_text))],
+            details: combined_details,
+            is_error: had_error,
+        })
     }
 }
 

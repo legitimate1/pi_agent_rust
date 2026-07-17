@@ -23,6 +23,14 @@ use asupersync::time::{timeout, wall_now};
 
 const DEFAULT_EXTENSION_TOOL_TIMEOUT_MS: u64 = 60_000;
 
+fn default_extension_tool_timeout_ms() -> u64 {
+    std::env::var("PI_EXTENSION_TOOL_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_EXTENSION_TOOL_TIMEOUT_MS)
+}
+
 /// Wraps a JS extension-registered tool so it can be used as a Rust [`Tool`].
 ///
 /// Note: This wrapper uses [`ExtensionRuntimeHandle`] rather than
@@ -45,7 +53,7 @@ impl ExtensionToolWrapper {
             def,
             runtime: runtime.into(),
             ctx_payload: Arc::new(Value::Object(serde_json::Map::new())),
-            timeout_ms: DEFAULT_EXTENSION_TOOL_TIMEOUT_MS,
+            timeout_ms: default_extension_tool_timeout_ms(),
         }
     }
 
@@ -78,11 +86,11 @@ pub struct WasmExtensionToolWrapper {
 #[cfg(feature = "wasm-host")]
 impl WasmExtensionToolWrapper {
     #[must_use]
-    pub const fn new(def: ExtensionToolDef, handle: WasmExtensionHandle) -> Self {
+    pub fn new(def: ExtensionToolDef, handle: WasmExtensionHandle) -> Self {
         Self {
             def,
             handle,
-            timeout_ms: DEFAULT_EXTENSION_TOOL_TIMEOUT_MS,
+            timeout_ms: default_extension_tool_timeout_ms(),
         }
     }
 

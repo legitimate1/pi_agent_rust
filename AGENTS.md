@@ -152,6 +152,20 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ---
 
+## Build & Deploy
+
+**Build always uses `--release` by default** (debug is an explicit exception):
+
+```bash
+# Standard build (release)
+cargo build --release
+
+# Deploy compiled binary to ~/.local/bin/
+.\scripts\deploy-release.ps1
+```
+
+---
+
 ## Testing
 
 ### Unit Tests
