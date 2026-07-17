@@ -1,10 +1,10 @@
 use super::*;
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
+use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use asupersync::time::{sleep, wall_now};
 // ============================================================================
 // Pwsh Tool
 // ============================================================================
@@ -186,14 +186,14 @@ pub async fn run_pwsh_command(
     // Wait for child with timeout
     let start = std::time::Instant::now();
     let exit_code = loop {
-        let remaining = timeout_secs
-            .map_or(u64::MAX, |s| s.saturating_sub(start.elapsed().as_secs()));
+        let remaining =
+            timeout_secs.map_or(u64::MAX, |s| s.saturating_sub(start.elapsed().as_secs()));
         if remaining == 0 {
             let _ = child.kill();
             break None;
         }
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status_code(status)),
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status_code(status)),
             Ok(None) => {
                 // Wait a bit before polling again
             }

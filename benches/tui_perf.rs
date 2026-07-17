@@ -119,7 +119,11 @@ fn create_bench_app() -> PiApp {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cwd = tmp.path().to_path_buf();
     let config = Config::default();
-    let tools = ToolRegistry::new(&[], &cwd, Some(pi_core::tool_config::ToolConfig::from(&config)));
+    let tools = ToolRegistry::new(
+        &[],
+        &cwd,
+        Some(pi_core::tool_config::ToolConfig::from(&config)),
+    );
     let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
     let agent = Agent::new(provider, tools, AgentConfig::default());
     let session = Arc::new(asupersync::sync::Mutex::new(Session::in_memory()));

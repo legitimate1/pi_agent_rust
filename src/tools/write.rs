@@ -137,10 +137,7 @@ impl Tool for WriteTool {
                 }
             }
 
-            crate::tools::persist_with_readonly_handling(
-                temp_file,
-                &path_clone,
-            )?;
+            crate::tools::persist_with_readonly_handling(temp_file, &path_clone)?;
             sync_parent_dir(&path_clone)?;
             Ok(())
         })

@@ -837,8 +837,7 @@ fn test_rg_match_requires_path_and_line_number() {
     let mut match_limit_reached = false;
     let scan_limit = 1;
 
-    let missing_line =
-        Ok(r#"{"type":"match","data":{"path":{"text":"file.txt"}}}"#.to_string());
+    let missing_line = Ok(r#"{"type":"match","data":{"path":{"text":"file.txt"}}}"#.to_string());
     process_rg_json_match_line(
         missing_line,
         &mut matches,
@@ -850,9 +849,8 @@ fn test_rg_match_requires_path_and_line_number() {
     assert_eq!(match_count, 0);
     assert!(!match_limit_reached);
 
-    let valid_line = Ok(
-        r#"{"type":"match","data":{"path":{"text":"file.txt"},"line_number":3}}"#.to_string(),
-    );
+    let valid_line =
+        Ok(r#"{"type":"match","data":{"path":{"text":"file.txt"},"line_number":3}}"#.to_string());
     process_rg_json_match_line(
         valid_line,
         &mut matches,
@@ -915,8 +913,7 @@ fn test_command_with_default_sigpipe_restores_pipe_disposition() {
 
     assert!(output.status.success(), "probe failed: {output:?}");
     let sigign = String::from_utf8(output.stdout).expect("SigIgn should be utf8");
-    let ignored_mask =
-        u64::from_str_radix(sigign.trim(), 16).expect("SigIgn should be a hex mask");
+    let ignored_mask = u64::from_str_radix(sigign.trim(), 16).expect("SigIgn should be a hex mask");
     let sigpipe_bit = 1_u64 << (13 - 1);
     assert_eq!(
         ignored_mask & sigpipe_bit,
@@ -1558,8 +1555,7 @@ fn test_read_resizes_large_source_image_before_api_limit_check() {
 fn test_read_blocked_images() {
     asupersync::test_utils::run_test(|| async {
         let tmp = tempfile::tempdir().unwrap();
-        let png_header: Vec<u8> =
-            vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00];
+        let png_header: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00];
         std::fs::write(tmp.path().join("test.png"), &png_header).unwrap();
 
         let tool = ReadTool::with_settings(tmp.path(), false, true);
@@ -3097,14 +3093,17 @@ fn test_find_append_non_matching_file_invariant() {
 }
 
 #[test]
-fn test_find_rejects_outside_cwd() {
+fn test_find_allows_outside_cwd() {
     asupersync::test_utils::run_test(|| async {
+        if find_fd_binary().is_none() {
+            return;
+        }
         let cwd = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
 
         let tool = FindTool::new(cwd.path());
-        let err = tool
+        let out = tool
             .execute(
                 "t",
                 serde_json::json!({
@@ -3114,8 +3113,12 @@ fn test_find_rejects_outside_cwd() {
                 None,
             )
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("outside the working directory"));
+            .unwrap();
+        let content = get_text(&out.content);
+        assert!(
+            content.contains("secret.txt"),
+            "find should work outside cwd: {content}"
+        );
     });
 }
 
@@ -5087,4 +5090,3 @@ fn test_hashline_edit_trailing_newline_semantics() {
         assert_eq!(content, "line1\nchanged\n");
     });
 }
-

@@ -18057,8 +18057,15 @@ mod native_runtime_experimental {
             timeout_ms: u64,
             on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         ) -> Result<Value> {
-            self.execute_tool_ref(&tool_name, &tool_call_id, input, ctx_payload, timeout_ms, on_update)
-                .await
+            self.execute_tool_ref(
+                &tool_name,
+                &tool_call_id,
+                input,
+                ctx_payload,
+                timeout_ms,
+                on_update,
+            )
+            .await
         }
 
         pub async fn execute_tool_ref(
@@ -20574,8 +20581,15 @@ mod native_runtime_duplicate_scaffold {
             timeout_ms: u64,
             on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         ) -> Result<Value> {
-            self.execute_tool_ref(&tool_name, &tool_call_id, input, ctx_payload, timeout_ms, on_update)
-                .await
+            self.execute_tool_ref(
+                &tool_name,
+                &tool_call_id,
+                input,
+                ctx_payload,
+                timeout_ms,
+                on_update,
+            )
+            .await
         }
 
         pub async fn execute_tool_ref(
@@ -21761,16 +21775,17 @@ async fn execute_extension_tool(
             let input_js = json_to_js(&ctx, &input)?;
             let ctx_js = json_to_js(&ctx, ctx_payload)?;
             let on_update_fn: rquickjs::Value<'_> = match on_update {
-                Some(cb) => {
-                    rquickjs::Function::new(ctx.clone(), move |content_json: String, details_json: String| {
+                Some(cb) => rquickjs::Function::new(
+                    ctx.clone(),
+                    move |content_json: String, details_json: String| {
                         let update = ToolUpdate {
                             content: serde_json::from_str(&content_json).unwrap_or_default(),
                             details: serde_json::from_str(&details_json).ok(),
                         };
                         cb(update);
-                    })?
-                    .into_value()
-                }
+                    },
+                )?
+                .into_value(),
                 None => json_to_js(&ctx, &serde_json::Value::Null)?,
             };
             let promise: rquickjs::Value<'_> =

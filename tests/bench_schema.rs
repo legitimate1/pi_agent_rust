@@ -21,7 +21,6 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-
 // ─── Schema Definitions ──────────────────────────────────────────────────────
 
 /// Common environment fingerprint included in every benchmark record.

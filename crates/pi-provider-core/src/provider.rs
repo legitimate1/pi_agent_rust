@@ -8,10 +8,10 @@
 //! - Emitting [`StreamEvent`] values as SSE/HTTP chunks arrive.
 //! - Advertising tool schemas to the model.
 
-pub use pi_core::model::StreamEvent;
-use pi_core::model::{Message, ThinkingLevel};
 use async_trait::async_trait;
 use futures::Stream;
+pub use pi_core::model::StreamEvent;
+use pi_core::model::{Message, ThinkingLevel};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;

@@ -113,7 +113,11 @@ fn dummy_model_entry() -> ModelEntry {
 fn build_perf_app(harness: &TestHarness, messages: Vec<ConversationMessage>) -> PiApp {
     let cwd = harness.temp_dir().to_path_buf();
     let config = common::hermetic_interactive_config(Config::default());
-    let tools = ToolRegistry::new(&[], &cwd, Some(pi_core::tool_config::ToolConfig::from(&config)));
+    let tools = ToolRegistry::new(
+        &[],
+        &cwd,
+        Some(pi_core::tool_config::ToolConfig::from(&config)),
+    );
     let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
     let agent = Agent::new(provider, tools, AgentConfig::default());
     let resources = ResourceLoader::empty(config.enable_skill_commands());

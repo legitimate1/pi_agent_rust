@@ -170,17 +170,19 @@ pub fn build_system_prompt(
     };
 
     // If --system-prompt is not given, fall back to ~/.pi/agent/SYSTEM.md (original Pi Agent convention).
-    let system_md_override = custom_prompt.is_none().then(|| -> Result<String> {
-        let path = global_dir.join("SYSTEM.md");
-        if path.exists() {
-            std::fs::read_to_string(&path)
-                .map_err(|err| anyhow::anyhow!("Could not read {}: {err}", path.display()))
-        } else {
-            Ok(String::new())
-        }
-    })
-    .transpose()?
-    .filter(|s| !s.is_empty());
+    let system_md_override = custom_prompt
+        .is_none()
+        .then(|| -> Result<String> {
+            let path = global_dir.join("SYSTEM.md");
+            if path.exists() {
+                std::fs::read_to_string(&path)
+                    .map_err(|err| anyhow::anyhow!("Could not read {}: {err}", path.display()))
+            } else {
+                Ok(String::new())
+            }
+        })
+        .transpose()?
+        .filter(|s| !s.is_empty());
 
     let mut prompt = custom_prompt
         .or(system_md_override)

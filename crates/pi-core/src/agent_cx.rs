@@ -162,8 +162,7 @@ pub struct AgentHttp<'a> {
 
 impl AgentHttp<'_> {
     #[must_use]
-    pub fn client(&self) -> () {
-    }
+    pub fn client(&self) -> () {}
 }
 
 /// Process-related operations.

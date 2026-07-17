@@ -1,13 +1,13 @@
 use super::*;
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
+use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-use asupersync::time::{sleep, wall_now};
 // ============================================================================
 // Find Tool
 // ============================================================================
@@ -98,7 +98,6 @@ impl Tool for FindTool {
 
         let search_dir = input.path.as_deref().unwrap_or(".");
         let search_path = resolve_read_path(search_dir, &self.cwd);
-        let search_path = enforce_cwd_scope(&search_path, &self.cwd, "find")?;
         let search_path = strip_unc_prefix(search_path);
         let effective_limit = input.limit.unwrap_or(DEFAULT_FIND_LIMIT);
         // Overfetch one result so limit notices only appear after confirmed overflow.
@@ -407,4 +406,3 @@ impl Tool for FindTool {
 }
 
 // ============================================================================
-

@@ -1,3 +1,6 @@
+use super::edit::{
+    detect_line_ending, generate_diff_string, normalize_to_lf, restore_line_endings, strip_bom,
+};
 use super::*;
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
@@ -6,7 +9,6 @@ use serde::Deserialize;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use super::edit::{normalize_to_lf, strip_bom, detect_line_ending, restore_line_endings, generate_diff_string};
 // ============================================================================
 // Hashline Edit Tool
 // ============================================================================
@@ -676,11 +678,3 @@ impl Tool for HashlineEditTool {
         })
     }
 }
-
-
-
-
-
-
-
-

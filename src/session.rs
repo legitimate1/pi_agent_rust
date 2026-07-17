@@ -11571,8 +11571,7 @@ mod tests {
             }
         }
         #[cfg(not(unix))]
-        {
-        }
+        {}
 
         #[cfg(unix)]
         {
@@ -11734,8 +11733,7 @@ mod tests {
             }
         }
         #[cfg(not(unix))]
-        {
-        }
+        {}
 
         #[cfg(unix)]
         {
@@ -11777,8 +11775,7 @@ mod tests {
             }
         }
         #[cfg(not(unix))]
-        {
-        }
+        {}
 
         #[cfg(unix)]
         {
@@ -11891,8 +11888,7 @@ mod tests {
             }
         }
         #[cfg(not(unix))]
-        {
-        }
+        {}
 
         #[cfg(unix)]
         {

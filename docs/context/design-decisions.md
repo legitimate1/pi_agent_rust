@@ -211,6 +211,24 @@
 
 **何时重新考虑**：如果未来 UI 通道模型改为每个连接独立配置，可改为从调用上下文动态推导。
 
+## D14: 移除 find 工具的 CWD 路径限制（2026-07-17）
+
+**决策**：移除 `find` 工具的 `enforce_cwd_scope()` 调用，允许在任意绝对路径下搜索文件。
+
+**涉及改动**：
+1. `src/tools/find.rs` → 移除 `enforce_cwd_scope(&search_path, &self.cwd, "find")?`
+
+**理由**：
+- 与 D9（移除 write/edit 路径限制）和 D11（移除 read 路径限制）一致 — find 不应比 pwsh/bash 等 shell 工具有更多路径限制
+- 验证报错 `"Cannot find outside the working directory"` 阻止了在 CWD 之外搜索必要文件（如 `~/.pi/agent/skills/` 下的技能文件、Home 目录下的配置文件）
+- Agent 工作流（如 think-mode 技能的步骤 ⑩）要求在 `~/` 下搜索文件
+
+**不选 B 的原因**：
+- 保留限制并改进错误提示——仍然只能在 CWD 内搜索
+- 改为白名单模式——增加了不必要的配置复杂度，与 D9/D11 的决策不一致
+
+**何时重新考虑**：如果未来引入细粒度工具安全策略（per-tool allowlist），可重新加入路径限定。
+
 ## D8: Release 构建 — 栈溢出问题（2026-07-15）
 
 **问题**：Debug 构建的 `pi.exe` 在 Windows 上启动即崩溃，报 `thread 'main' has overflowed its stack`。Release 构建正常。

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::fs::self;
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;

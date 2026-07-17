@@ -628,7 +628,14 @@ fn execute_tool(
         let tool_call_id = format!("tc-neg-{tool_name}");
         async move {
             runtime
-                .execute_tool(tool_name, tool_call_id, input, Arc::clone(&ctx), 10_000, None)
+                .execute_tool(
+                    tool_name,
+                    tool_call_id,
+                    input,
+                    Arc::clone(&ctx),
+                    10_000,
+                    None,
+                )
                 .await
                 .map_err(|e| format!("{e}"))
         }

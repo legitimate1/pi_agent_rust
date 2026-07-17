@@ -7,49 +7,40 @@
 //! rendering in the TUI and for inclusion in provider messages as tool results.
 
 // Tool sub-modules
-mod read;
 mod bash;
-mod pwsh;
 mod edit;
-mod write;
-mod grep;
 mod find;
-mod ls;
+mod grep;
 mod hashline;
+mod ls;
+mod pwsh;
+mod read;
+mod write;
 
-pub use read::ReadTool;
-pub use bash::{BashTool, BashRunResult};
-pub use pwsh::{PwshTool, PwshRunResult};
+pub use bash::{BashRunResult, BashTool};
 pub use edit::EditTool;
-pub use write::WriteTool;
-pub use grep::GrepTool;
 pub use find::FindTool;
-pub use ls::LsTool;
+pub use grep::GrepTool;
 pub use hashline::HashlineEditTool;
+pub use ls::LsTool;
+pub use pwsh::{PwshRunResult, PwshTool};
+pub use read::ReadTool;
+pub use write::WriteTool;
 
-pub(crate) use bash::run_bash_command;
 pub(crate) use bash::BashPipeFrame;
-#[cfg(test)]
-pub(crate) use hashline::format_hashline_tag;
+pub(crate) use bash::run_bash_command;
 #[cfg(test)]
 pub(crate) use edit::{
-    build_normalized_content,
-    count_overlapping_occurrences,
-    fuzzy_find_text,
+    build_normalized_content, count_overlapping_occurrences, fuzzy_find_text,
     map_normalized_range_to_original,
 };
 #[cfg(test)]
-pub(crate) use grep::{
-    process_rg_json_match_line,
-    truncate_line,
-};
+pub(crate) use grep::{process_rg_json_match_line, truncate_line};
+#[cfg(test)]
+pub(crate) use hashline::format_hashline_tag;
 #[cfg(test)]
 pub(crate) use hashline::{
-    compute_line_hash,
-    hashline_tag_regex,
-    NIBBLE_STR,
-    parse_hashline_tag,
-    strip_hashline_prefix,
+    NIBBLE_STR, compute_line_hash, hashline_tag_regex, parse_hashline_tag, strip_hashline_prefix,
 };
 
 #[cfg(test)]
@@ -57,14 +48,14 @@ mod tests;
 
 use crate::agent_cx::AgentCx;
 use crate::config::Config;
-use pi_core::path_utils::{safe_canonicalize, strip_unc_prefix};
-use pi_core::tool_config::ToolConfig;
-use pi_provider_core::error::{Error, Result};
-use pi_core::model::{ContentBlock, ImageContent, TextContent};
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(test)]
 use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
+use pi_core::model::{ContentBlock, ImageContent, TextContent};
+use pi_core::path_utils::{safe_canonicalize, strip_unc_prefix};
+use pi_core::tool_config::ToolConfig;
+use pi_provider_core::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use std::collections::{HashMap, VecDeque};
@@ -387,16 +378,28 @@ pub(crate) fn detect_encoding(bytes: &[u8], hint: Option<&str>) -> (String, usiz
 }
 
 /// Decode file bytes to string using the detected encoding label.
-pub(crate) fn decode_with_encoding(bytes: &[u8], encoding: &str, bom_skip: usize) -> Result<String> {
+pub(crate) fn decode_with_encoding(
+    bytes: &[u8],
+    encoding: &str,
+    bom_skip: usize,
+) -> Result<String> {
     let data = &bytes[bom_skip..];
     match encoding {
         e if e.starts_with("UTF-16 LE") => {
-            let u16_words: Vec<u16> = data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-            String::from_utf16(&u16_words).map_err(|_| Error::tool("read", "Invalid UTF-16 LE data"))
+            let u16_words: Vec<u16> = data
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16(&u16_words)
+                .map_err(|_| Error::tool("read", "Invalid UTF-16 LE data"))
         }
         e if e.starts_with("UTF-16 BE") => {
-            let u16_words: Vec<u16> = data.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
-            String::from_utf16(&u16_words).map_err(|_| Error::tool("read", "Invalid UTF-16 BE data"))
+            let u16_words: Vec<u16> = data
+                .chunks_exact(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16(&u16_words)
+                .map_err(|_| Error::tool("read", "Invalid UTF-16 BE data"))
         }
         e if e == "Latin-1 (or binary)" || e == "binary" => {
             Ok(data.iter().map(|&b| b as char).collect())
@@ -1020,7 +1023,10 @@ pub(crate) fn tool_output_artifact_session_id(tool_call_id: &str) -> Option<Stri
         .and_then(|sessions| sessions.get(tool_call_id).cloned())
 }
 
-pub(crate) fn tool_output_artifact_scope_dir(root: &Path, tool_call_id: &str) -> (PathBuf, Option<String>) {
+pub(crate) fn tool_output_artifact_scope_dir(
+    root: &Path,
+    tool_call_id: &str,
+) -> (PathBuf, Option<String>) {
     let call_scope = sanitize_artifact_scope(tool_call_id);
     if let Some(session_id) = tool_output_artifact_session_id(tool_call_id) {
         (
@@ -1220,7 +1226,9 @@ pub(crate) fn estimate_raw_secret_bytes(text: &str) -> usize {
         .saturating_add(token_bytes)
 }
 
-pub(crate) fn redact_tool_output_artifact_bytes(bytes: &[u8]) -> std::io::Result<RedactedToolOutputArtifact> {
+pub(crate) fn redact_tool_output_artifact_bytes(
+    bytes: &[u8],
+) -> std::io::Result<RedactedToolOutputArtifact> {
     let binary_suspect =
         memchr::memchr(b'\0', bytes).is_some() || std::str::from_utf8(bytes).is_err();
     let text = String::from_utf8_lossy(bytes);
@@ -1395,7 +1403,10 @@ pub(crate) fn copy_text_tool_output_artifact_from_path_at_root(
     Ok(artifact)
 }
 
-pub(crate) fn append_tool_output_artifact_notice(output_text: &mut String, artifact: &ToolOutputArtifactRef) {
+pub(crate) fn append_tool_output_artifact_notice(
+    output_text: &mut String,
+    artifact: &ToolOutputArtifactRef,
+) {
     let _ = write!(
         output_text,
         "\n\n[Full tool output artifact: {} ({} bytes, {} lines, sha256 {}). Use read on this path to inspect more.]",
@@ -1782,12 +1793,19 @@ pub(crate) fn is_side_effect_tool_cache_key(key: &str) -> bool {
     key.starts_with("write\0") || key.starts_with("edit\0") || key.starts_with("bash\0")
 }
 
-pub(crate) fn cached_tool_output(key: &str, deps: Option<&[ToolCacheDependency]>) -> Option<ToolOutput> {
+pub(crate) fn cached_tool_output(
+    key: &str,
+    deps: Option<&[ToolCacheDependency]>,
+) -> Option<ToolOutput> {
     let deps = deps?;
     lock_tool_output_cache().get(key, deps)
 }
 
-pub(crate) fn cache_tool_output(key: String, deps: Option<Vec<ToolCacheDependency>>, output: &ToolOutput) {
+pub(crate) fn cache_tool_output(
+    key: String,
+    deps: Option<Vec<ToolCacheDependency>>,
+    output: &ToolOutput,
+) {
     let Some(deps) = deps else {
         return;
     };
@@ -2183,10 +2201,9 @@ pub(crate) fn enforce_cwd_scope(path: &Path, cwd: &Path, action: &str) -> Result
 ///
 /// Read access is broadened so the model can fetch the bodies of skill files,
 /// prompt templates, and other resources that ship under the agent dir
-/// without needing to fall back to a `bash cat`. Write/edit/grep/find/list
-/// stay strictly cwd-only — broadening write access would let a misbehaving
-/// model persist instructions into the agent dir, which is a much higher-
-/// risk surface than the read case warrants. See pi_agent_rust#71.
+/// without needing to fall back to a `bash cat`. Grep/ls still enforce this
+/// restriction as of 2026-07-17. Find was already relaxed (D14). See
+/// pi_agent_rust#71.
 ///
 /// Symlink escapes remain blocked because `safe_canonicalize` resolves
 /// symlinks before the prefix check, so e.g. `~/.pi/agent/skills/foo/SKILL.md`
@@ -3767,4 +3784,3 @@ pub fn persist_with_readonly_handling(
         }
     }
 }
-

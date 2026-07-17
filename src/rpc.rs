@@ -225,7 +225,10 @@ fn rpc_agent_event_handler(
 
     move |event: AgentEvent| {
         let serialized = if let AgentEvent::AgentEnd {
-            messages, error, session_id, ..
+            messages,
+            error,
+            session_id,
+            ..
         } = &event
         {
             json!({
@@ -2001,7 +2004,8 @@ pub async fn run(
                             *inner = new_session;
                             drop(inner);
                             guard.agent.replace_messages(messages);
-                            guard.agent.stream_options_mut().session_id = Some(fork_session_id.clone());
+                            guard.agent.stream_options_mut().session_id =
+                                Some(fork_session_id.clone());
                         }
 
                         {
@@ -7402,16 +7406,14 @@ export default function init(pi) {
         );
 
         // Tool updates arrive via blocking send (immediate)
-        let tool1: Value =
-            serde_json::from_str(&received[1]).expect("parse tool update 1");
+        let tool1: Value = serde_json::from_str(&received[1]).expect("parse tool update 1");
         assert_eq!(tool1["type"], "tool_execution_update");
         assert_eq!(
             tool1["partialResult"]["content"][0]["text"],
             "first tool output"
         );
 
-        let tool2: Value =
-            serde_json::from_str(&received[2]).expect("parse tool update 2");
+        let tool2: Value = serde_json::from_str(&received[2]).expect("parse tool update 2");
         assert_eq!(tool2["type"], "tool_execution_update");
         assert_eq!(
             tool2["partialResult"]["content"][0]["text"],

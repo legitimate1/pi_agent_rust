@@ -1,13 +1,13 @@
+use super::edit::normalize_line_endings_chunk;
+use super::hashline::format_hashline_tag;
 use super::*;
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, ImageContent, TextContent};
+use asupersync::io::{AsyncRead, ReadBuf, SeekFrom};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use asupersync::io::{AsyncRead, ReadBuf, SeekFrom};
-use super::edit::normalize_line_endings_chunk;
-use super::hashline::format_hashline_tag;
 // ============================================================================
 // Read Tool
 // ============================================================================
@@ -118,18 +118,18 @@ impl ReadTool {
         if input.info {
             let meta = meta.as_ref().unwrap();
             let modified = meta.modified().ok();
-            let mtime_str = modified.map(|t| {
-                let duration = t
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                let secs = duration.as_secs();
-                let days = secs / 86400;
-                if days < 1 {
-                    format!("{}h ago", secs / 3600)
-                } else {
-                    format!("{days}d ago")
-                }
-            }).unwrap_or_default();
+            let mtime_str = modified
+                .map(|t| {
+                    let duration = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                    let secs = duration.as_secs();
+                    let days = secs / 86400;
+                    if days < 1 {
+                        format!("{}h ago", secs / 3600)
+                    } else {
+                        format!("{days}d ago")
+                    }
+                })
+                .unwrap_or_default();
 
             let mut buf = [0u8; 8192];
             let mut file = asupersync::fs::File::open(&resolved)
@@ -294,9 +294,11 @@ impl ReadTool {
             }
 
             let ctx = input.context.unwrap_or(3);
-            let content_a = asupersync::fs::read(&resolved).await
+            let content_a = asupersync::fs::read(&resolved)
+                .await
                 .map_err(|e| Error::tool("read", format!("Failed to read file for diff: {e}")))?;
-            let content_b = asupersync::fs::read(&diff_path).await
+            let content_b = asupersync::fs::read(&diff_path)
+                .await
                 .map_err(|e| Error::tool("read", format!("Failed to read diff target: {e}")))?;
             let text_a = String::from_utf8_lossy(&content_a);
             let text_b = String::from_utf8_lossy(&content_b);
@@ -346,7 +348,8 @@ impl ReadTool {
         let is_utf8 = encoding_label == "UTF-8" || encoding_label == "UTF-8 (BOM)";
 
         if input.tail.is_some() || !is_utf8 {
-            let full_bytes = asupersync::fs::read(&resolved).await
+            let full_bytes = asupersync::fs::read(&resolved)
+                .await
                 .map_err(|e| Error::tool("read", format!("Failed to read file: {e}")))?;
             let text_content = decode_with_encoding(&full_bytes, &encoding_label, bom_skip)?;
             let all_lines: Vec<&str> = text_content.split('\n').collect();
@@ -355,7 +358,9 @@ impl ReadTool {
             let start_line_idx = match effective_offset {
                 Some(n) if n > 0 => {
                     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                    { n.saturating_sub(1) as usize }
+                    {
+                        n.saturating_sub(1) as usize
+                    }
                 }
                 _ => 0,
             };
@@ -396,10 +401,16 @@ impl ReadTool {
 
             if output_text.is_empty() {
                 output_text = String::new();
-            } else if input.tail.is_none() && input.head.is_none() && selected_lines.len() < total_lines - start_line_idx {
+            } else if input.tail.is_none()
+                && input.head.is_none()
+                && selected_lines.len() < total_lines - start_line_idx
+            {
                 let remaining = total_lines - start_line_idx - selected_lines.len();
                 let next_offset = start_line_idx + selected_lines.len() + 1;
-                let _ = write!(output_text, "\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]");
+                let _ = write!(
+                    output_text,
+                    "\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]"
+                );
             }
 
             return Ok(ToolOutput {
@@ -423,8 +434,8 @@ impl ReadTool {
             Some(n) if n > 0 => n.saturating_sub(1).try_into().unwrap_or(usize::MAX),
             _ => 0,
         };
-        let limit_lines = effective_limit
-            .map_or(usize::MAX, |l| l.try_into().unwrap_or(usize::MAX));
+        let limit_lines =
+            effective_limit.map_or(usize::MAX, |l| l.try_into().unwrap_or(usize::MAX));
         let end_line_idx = start_line_idx.saturating_add(limit_lines);
 
         let mut collecting = start_line_idx == 0;
@@ -817,4 +828,3 @@ impl Tool for ReadTool {
 }
 
 // ============================================================================
-

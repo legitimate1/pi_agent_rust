@@ -1,6 +1,7 @@
 use super::*;
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
+use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::fmt::Write as _;
@@ -9,7 +10,6 @@ use std::process::Stdio;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
-use asupersync::time::{sleep, wall_now};
 // ============================================================================
 // Bash Tool
 // ============================================================================
@@ -544,4 +544,3 @@ impl Tool for BashTool {
 }
 
 // ============================================================================
-
