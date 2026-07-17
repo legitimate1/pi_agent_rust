@@ -154,14 +154,54 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ## Build & Deploy
 
-**Build always uses `--release` by default** (debug is an explicit exception):
+### 构建规则
+
+1. **每次构建前必须升版本号** — 使用 `cargo set-version --bump patch`
+2. **构建和部署是分离的两个步骤** — Agent 不得在构建后自动部署
+3. **Agent 不得私自构建或部署** — 必须由用户明确下达指令
+
+### 版本号管理
 
 ```bash
-# Standard build (release)
-cargo build --release
+# 升 patch 版本（日常使用，修复/小改动）
+cargo set-version --bump patch
 
-# Deploy compiled binary to ~/.local/bin/
+# 升 minor 版本（新功能）
+cargo set-version --bump minor
+
+# 升 major 版本（重大变更）
+cargo set-version --bump major
+```
+
+升版本号只改 `Cargo.toml`，不触发编译。执行后先提交版本号变更，再构建。
+
+### 标准流程
+
+用户说「构建」→ 执行以下流程，**然后停下**，等用户说「部署」：
+
+```bash
+# Step 1: 升版本号（只改 Cargo.toml，不编译）
+cargo set-version --bump patch
+
+# Step 2: 提交版本号变更
+git add Cargo.toml && git commit -m "chore: bump version to $(cargo pkgid | cut -d# -f2)"
+
+# Step 3: 构建 Release（耗时 5-10 分钟）
+cargo build --release
+```
+
+用户说「部署」→ 执行：
+
+```bash
 .\scripts\deploy-release.ps1
+```
+
+### 版本标识
+
+构建后的 `pi.exe` 使用 `pi --version` 可查看版本号和 Git SHA：
+
+```
+pi 0.1.23 (abc1234)
 ```
 
 ---

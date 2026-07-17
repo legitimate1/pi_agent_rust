@@ -157,6 +157,7 @@ fn normalize_command_type(command_type: &str) -> &str {
         "set-follow-up-mode" | "setFollowUpMode" => "set_follow_up_mode",
         "set-auto-compaction" | "setAutoCompaction" => "set_auto_compaction",
         "set-auto-retry" | "setAutoRetry" => "set_auto_retry",
+        "get-version" | "getVersion" => "get_version",
         _ => command_type,
     }
 }
@@ -2134,6 +2135,19 @@ pub async fn run(
                     id,
                     "get_commands",
                     Some(json!({ "commands": commands })),
+                ));
+            }
+
+            "get_version" => {
+                let version = env!("CARGO_PKG_VERSION");
+                let git_sha = option_env!("VERGEN_GIT_SHA").unwrap_or("unknown");
+                let _ = out_tx.send(response_ok(
+                    id,
+                    "get_version",
+                    Some(json!({
+                        "version": version,
+                        "gitSha": git_sha,
+                    })),
                 ));
             }
 
