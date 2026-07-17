@@ -10,6 +10,7 @@
 | RPC 方法 `estimate_tokens`（会话 token 估算） | ✅ | `src/rpc.rs` `src/compaction.rs` |
 | **RPC 方法 `get_commands` — 合并扩展注册的斜杠命令** | ✅ | `src/rpc.rs` `src/extensions.rs` |
 | **RPC 方法 `get_tree` — 查询会话树形结构（分支/叶子）** | ✅ | `src/rpc.rs` |
+| **RPC 方法 `get_version` — 返回 pi 版本号和 Git SHA** | ✅ | `src/rpc.rs` |
 | CLI 子命令（doctor/config/list/info 等） | ✅ | `src/main.rs` |
 | **`~/.pi/agent/SYSTEM.md` 覆盖默认系统提示词** | ✅ | `src/app.rs` |
 
@@ -37,6 +38,7 @@
 | **ReadTool — 无 CWD/agent-dir 路径限制** + head/tail/info/diff 参数 + 编码自动检测 | ✅ | `src/tools/read.rs` |
 | **WriteTool / EditTool — 无 CWD 路径限制**（可写入任意绝对路径） | ✅ | `src/tools/write.rs` `src/tools/edit.rs` |
 | **EditTool — 直接写入**（非 tempfile 原子重命名，避让 Windows 句柄冲突） | ✅ | `src/tools/edit.rs` |
+| **FindTool / GrepTool / LsTool — 无 CWD 路径限制**（可搜索/列出任意绝对路径） | ✅ | `src/tools/find.rs` `src/tools/grep.rs` `src/tools/ls.rs` |
 | 扩展工具收集 | ✅ | `src/extension_tools.rs:100` |
 | **扩展工具 onUpdate 流式进度推送**（工具执行中 `onUpdate({content, details})`，经 rquickjs Function 桥接到 Rust `ToolUpdate`） | ✅ | `src/extensions.rs` `src/extensions_js.rs` `src/extension_tools.rs` |
 | **扩展工具同名覆盖内置工具** | ✅ | `src/tools/mod.rs` `src/agent.rs` |
@@ -56,6 +58,7 @@
 | Hostcall 调度（tool/exec/http/session/ui/events/log） | ✅ | `src/extensions_js.rs` |
 | **RPC 模式扩展交互 UI（select/confirm/input）** | ✅ | `src/extensions.rs` `src/rpc.rs` |
 | 虚拟模块系统（Node.js builtins + npm stubs） | ✅ | `src/extensions_js.rs` |
+| **VFS write-through 落盘**（`writeFileSync`/`appendFileSync` 写 VFS 内存后同步写真实文件系统） | ✅ | `src/extensions_js.rs` |
 
 ## 会话管理
 

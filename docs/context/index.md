@@ -16,6 +16,7 @@ Rust 移植版 Pi Agent。提供流式交互终端、工具执行、会话持久
 | `src/app.rs` | 系统提示词构建（SYSTEM.md 加载 + default_system_prompt） |
 | `src/config.rs` | 配置定义（含 disabled_tools / toolDescriptions 字段） |
 | `src/cli.rs` | CLI 参数解析（含 --tools 默认列表） |
+| `src/rpc.rs` | RPC 服务器模式 + 方法分发（get_commands/get_tree/get_version 等） |
 | `src/extensions.rs` | 扩展管理器、策略、调度 |
 | `src/extensions_js.rs` | QuickJS 运行时桥接 |
 | `src/providers/mod.rs` | Provider 工厂 + 扩展 stream-simple 桥接 |

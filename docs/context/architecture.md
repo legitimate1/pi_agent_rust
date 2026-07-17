@@ -54,6 +54,7 @@ Session persistence + index (JSONL, optional SQLite)
 | `extensions.rs` | 扩展管理器、能力策略、生命周期 |
 | `extensions_js.rs` | QuickJS 运行时、虚拟模块、HostcallKind |
 | `extension_tools.rs` | 扩展工具包装器 + 收集函数 |
+| `rpc.rs` | RPC/stdin 服务器模式、RPC 方法分发（get_commands/get_tree/get_version 等） |
 | `providers/mod.rs` | Provider 工厂 + 扩展 stream-simple 桥接 |
 | `models.rs` | 内置 + models.json 模型注册表 |
 | `session.rs` | JSONL 会话持久化 |
