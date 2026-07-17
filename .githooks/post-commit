@@ -1,0 +1,68 @@
+#!/bin/sh
+#
+# post-commit hook — 每次提交后自动推送到远程，失败时提示
+#
+# 这是 agent-collab 技能的规范化版本。
+# 安装方式：
+#   1. 复制到仓库 .githooks/post-commit
+#   2. chmod +x .githooks/post-commit
+#   3. git config core.hooksPath .githooks
+#
+
+REMOTE="origin"
+BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)
+
+# ─── 检查 remote ───────────────────────────────────────
+if ! git remote get-url "$REMOTE" > /dev/null 2>&1; then
+  echo ""
+  echo "⚠️  自动推送失败：remote '$REMOTE' 未配置"
+  echo "   请先添加远程仓库：git remote add origin <url>"
+  echo ""
+  exit 1
+fi
+
+# ─── 检查分支 ───────────────────────────────────────────
+if [ -z "$BRANCH" ]; then
+  echo ""
+  echo "⚠️  自动推送失败：当前不在任何分支上（detached HEAD）"
+  echo ""
+  exit 1
+fi
+
+# ─── 尝试推送 ───────────────────────────────────────────
+UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>/dev/null) || true
+
+printf "📤 正在推送到 %s ..." "$REMOTE/$BRANCH"
+
+if [ -z "$UPSTREAM" ]; then
+  PUSH_OUTPUT=$(git push -u "$REMOTE" "$BRANCH" 2>&1)
+  EXIT_CODE=$?
+else
+  PUSH_OUTPUT=$(git push 2>&1)
+  EXIT_CODE=$?
+fi
+
+# ─── 结果处理 ───────────────────────────────────────────
+if [ $EXIT_CODE -eq 0 ]; then
+  if echo "$PUSH_OUTPUT" | grep -q "Everything up-to-date"; then
+    echo ""
+    echo "ℹ️  GitHub 已是最新，无需推送"
+    echo ""
+  else
+    echo " ✅"
+  fi
+else
+  echo " ❌"
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  自动推送失败！错误信息："
+  echo ""
+  echo "$PUSH_OUTPUT" | while IFS= read -r line; do
+    echo "    $line"
+  done
+  echo ""
+  echo "  请手动推送：git push"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  exit 1
+fi
