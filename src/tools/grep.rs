@@ -244,7 +244,7 @@ impl Tool for GrepTool {
 
         let search_dir = input.path.as_deref().unwrap_or(".");
         let search_path = resolve_read_path(search_dir, &self.cwd);
-        let search_path = enforce_cwd_scope(&search_path, &self.cwd, "grep")?;
+        // enforce_cwd_scope removed: grep now supports absolute paths
 
         let is_directory = asupersync::fs::metadata(&search_path)
             .await

@@ -2510,14 +2510,14 @@ fn test_grep_basic_pattern() {
 }
 
 #[test]
-fn test_grep_rejects_outside_cwd() {
+fn test_grep_allows_outside_cwd() {
     asupersync::test_utils::run_test(|| async {
         let cwd = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
 
         let tool = GrepTool::new(cwd.path());
-        let err = tool
+        let out = tool
             .execute(
                 "t",
                 serde_json::json!({
@@ -2527,8 +2527,12 @@ fn test_grep_rejects_outside_cwd() {
                 None,
             )
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("outside the working directory"));
+            .unwrap();
+        let text = get_text(&out.content);
+        assert!(
+            text.contains("secret"),
+            "grep should work outside cwd: {text}"
+        );
     });
 }
 
@@ -3422,22 +3426,26 @@ fn test_ls_directory_listing() {
 }
 
 #[test]
-fn test_ls_rejects_outside_cwd() {
+fn test_ls_allows_outside_cwd() {
     asupersync::test_utils::run_test(|| async {
         let cwd = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
 
         let tool = LsTool::new(cwd.path());
-        let err = tool
+        let out = tool
             .execute(
                 "t",
                 serde_json::json!({ "path": outside.path().to_string_lossy() }),
                 None,
             )
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("outside the working directory"));
+            .unwrap();
+        let text = get_text(&out.content);
+        assert!(
+            text.contains("secret"),
+            "ls should work outside cwd: {text}"
+        );
     });
 }
 

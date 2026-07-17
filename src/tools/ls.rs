@@ -92,7 +92,7 @@ impl Tool for LsTool {
             .path
             .as_ref()
             .map_or_else(|| self.cwd.clone(), |p| resolve_read_path(p, &self.cwd));
-        let dir_path = enforce_cwd_scope(&dir_path, &self.cwd, "list")?;
+        // enforce_cwd_scope removed: ls now supports absolute paths
 
         let effective_limit = input.limit.unwrap_or(DEFAULT_LS_LIMIT);
 

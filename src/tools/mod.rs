@@ -2201,9 +2201,7 @@ pub(crate) fn enforce_cwd_scope(path: &Path, cwd: &Path, action: &str) -> Result
 ///
 /// Read access is broadened so the model can fetch the bodies of skill files,
 /// prompt templates, and other resources that ship under the agent dir
-/// without needing to fall back to a `bash cat`. Grep/ls still enforce this
-/// restriction as of 2026-07-17. Find was already relaxed (D14). See
-/// pi_agent_rust#71.
+/// without needing to fall back to a `bash cat`. See pi_agent_rust#71.
 ///
 /// Symlink escapes remain blocked because `safe_canonicalize` resolves
 /// symlinks before the prefix check, so e.g. `~/.pi/agent/skills/foo/SKILL.md`

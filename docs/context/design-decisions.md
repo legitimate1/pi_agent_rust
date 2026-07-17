@@ -229,6 +229,23 @@
 
 **何时重新考虑**：如果未来引入细粒度工具安全策略（per-tool allowlist），可重新加入路径限定。
 
+## D15: 移除 grep/ls 工具的 CWD 路径限制（2026-07-17）
+
+**决策**：移除 `grep` 和 `ls` 工具的 `enforce_cwd_scope()` 调用，允许在任意绝对路径下使用。
+
+**涉及改动**：
+1. `src/tools/grep.rs` → 移除 `enforce_cwd_scope(&search_path, &self.cwd, "grep")?`
+2. `src/tools/ls.rs` → 移除 `enforce_cwd_scope(&dir_path, &self.cwd, "list")?`
+
+**理由**：
+- 与 D14（移除 find 限制）、D9/D11 保持一致 — 所有文件系统工具已全部放开 CWD 限制
+- grep/ls 不应比 pwsh/bash 等 shell 工具有更多路径限制
+
+**不选 B 的原因**：
+- 保留限制——与已放开的其他工具不一致，增加用户心智负担
+
+**何时重新考虑**：如果未来引入细粒度工具安全策略（per-tool allowlist），可重新加入路径限定。
+
 ## D8: Release 构建 — 栈溢出问题（2026-07-15）
 
 **问题**：Debug 构建的 `pi.exe` 在 Windows 上启动即崩溃，报 `thread 'main' has overflowed its stack`。Release 构建正常。
