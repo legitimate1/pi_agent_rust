@@ -10139,7 +10139,8 @@ export function execSync(command, options) {
   // execSync runs through a shell. Use platform-appropriate shell:
   //   - Windows: cmd.exe /d /s /c <command>
   //   - Unix:    /bin/sh -c <command>
-  const isWin = typeof process !== 'undefined' && process.platform === 'win32';
+  const isWin = (typeof __pi_platform_native === 'function' && __pi_platform_native() === 'win32')
+    || (typeof process !== 'undefined' && process.platform === 'win32');
   if (isWin) {
     const raw = __pi_exec_sync_native("cmd.exe", JSON.stringify(["/d", "/s", "/c", cmdStr]), cwd, timeout, maxBuffer);
     const result = __parseExecSyncResult(raw, cmdStr);
@@ -10374,7 +10375,8 @@ export function exec(command, optionsOrCallback, callbackArg) {
   if (normalized.cwd !== undefined) spawnOpts.cwd = normalized.cwd;
   if (normalized.timeoutMs !== undefined) spawnOpts.timeout = normalized.timeoutMs;
   // exec runs through a shell. Use platform-appropriate shell.
-  const isWin = typeof process !== 'undefined' && process.platform === 'win32';
+  const isWin = (typeof __pi_platform_native === 'function' && __pi_platform_native() === 'win32')
+    || (typeof process !== 'undefined' && process.platform === 'win32');
   const shell = isWin ? "cmd.exe" : "sh";
   const shellArgs = isWin ? ["/d", "/s", "/c", cmdStr] : ["-c", cmdStr];
   const child = spawn(shell, shellArgs, spawnOpts);
@@ -17126,6 +17128,20 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     }),
                 )?;
 
+                // __pi_platform_native() -> string
+                // Returns the host platform identifier without relying on env vars
+                // (which may be denied by policy). Used by JS to detect Windows vs Unix.
+                global.set(
+                    "__pi_platform_native",
+                    Func::from(move |_ctx: Ctx<'_>| -> rquickjs::Result<String> {
+                        Ok(match std::env::consts::OS {
+                            "windows" => "win32",
+                            "macos" => "darwin",
+                            other => other,
+                        }.to_string())
+                    }),
+                )?;
+
                 // __pi_env_get_native(key) -> string | null
                 global.set(
                     "__pi_env_get_native",
@@ -21705,11 +21721,14 @@ if (typeof globalThis.crypto.randomUUID !== 'function') {
 }
 
 if (typeof globalThis.process === 'undefined') {
-    const rawPlatform =
-        __pi_env_get_native('PI_PLATFORM') ||
-        __pi_env_get_native('OSTYPE') ||
-        __pi_env_get_native('OS') ||
-        'linux';
+    // Use the native platform function instead of env vars so that
+    // process.platform is correctly set even when env access is denied by policy.
+    const rawPlatform = (typeof __pi_platform_native === 'function')
+        ? __pi_platform_native()
+        : __pi_env_get_native('PI_PLATFORM') ||
+          __pi_env_get_native('OSTYPE') ||
+          __pi_env_get_native('OS') ||
+          'linux';
     // Normalize to Node.js conventions: strip version suffix from OSTYPE
     // (e.g. darwin24.0 -> darwin, linux-gnu -> linux, msys -> win32)
     const platform = (() => {
@@ -27386,14 +27405,24 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             let mut requests = runtime.drain_hostcall_requests();
             assert_eq!(requests.len(), 1);
             let request = requests.pop_front().expect("exec hostcall");
+            #[cfg(not(windows))]
+            let expected_shell = "sh";
+            #[cfg(windows)]
+            let expected_shell = "cmd.exe";
             assert!(
-                matches!(&request.kind, HostcallKind::Exec { cmd } if cmd == "sh"),
+                matches!(&request.kind, HostcallKind::Exec { cmd } if cmd == expected_shell),
                 "unexpected hostcall kind: {:?}",
                 request.kind
             );
+            #[cfg(not(windows))]
             assert_eq!(
                 request.payload["args"],
                 serde_json::json!(["-c", "echo hello-exec"])
+            );
+            #[cfg(windows)]
+            assert_eq!(
+                request.payload["args"],
+                serde_json::json!(["/d", "/s", "/c", "echo hello-exec"])
             );
             assert_eq!(request.payload["options"]["timeout"].as_i64(), Some(321));
             assert_eq!(
@@ -27484,8 +27513,12 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             let mut requests = runtime.drain_hostcall_requests();
             assert_eq!(requests.len(), 1);
             let request = requests.pop_front().expect("exec hostcall");
+            #[cfg(not(windows))]
+            let expected_shell = "sh";
+            #[cfg(windows)]
+            let expected_shell = "cmd.exe";
             assert!(
-                matches!(&request.kind, HostcallKind::Exec { cmd } if cmd == "sh"),
+                matches!(&request.kind, HostcallKind::Exec { cmd } if cmd == expected_shell),
                 "unexpected hostcall kind: {:?}",
                 request.kind
             );
@@ -30204,12 +30237,9 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .eval(
                     r#"
                     globalThis.syncMaxBuffer = {};
-                    import('node:child_process').then(({ execSync }) => {
+                    import('node:child_process').then(({ execFileSync }) => {
                         try {
-                            execSync(
-                                "python3 -c 'import sys; sys.stdout.write(\"x\" * 70000)'",
-                                { maxBuffer: 1024 }
-                            );
+                            execFileSync('python3', ['-c', 'import sys; sys.stdout.write("x" * 70000)'], { maxBuffer: 1024 });
                             globalThis.syncMaxBuffer.threw = false;
                         } catch (e) {
                             globalThis.syncMaxBuffer.threw = true;
@@ -30319,17 +30349,17 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
 
             runtime
                 .eval(
-                    r"
+                    r#"
                     globalThis.spawnSyncResult = {};
                     import('node:child_process').then(({ spawnSync }) => {
-                        const r = spawnSync('echo', ['spawn-test']);
+                        const r = spawnSync('python3', ['-c', 'print("spawn-test")']);
                         globalThis.spawnSyncResult.stdout = r.stdout.trim();
                         globalThis.spawnSyncResult.status = r.status;
                         globalThis.spawnSyncResult.hasOutput = Array.isArray(r.output);
                         globalThis.spawnSyncResult.noError = r.error === undefined;
                         globalThis.spawnSyncResult.done = true;
                     });
-                    ",
+                    "#,
                 )
                 .await
                 .expect("eval spawnSync test");
@@ -30351,15 +30381,15 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
 
             runtime
                 .eval(
-                    r"
+                    r#"
                     globalThis.spawnSyncFail = {};
                     import('node:child_process').then(({ spawnSync }) => {
-                        const r = spawnSync('sh', ['-c', 'exit 7']);
+                        const r = spawnSync('python3', ['-c', 'import sys; sys.exit(7)']);
                         globalThis.spawnSyncFail.status = r.status;
                         globalThis.spawnSyncFail.signal = r.signal;
                         globalThis.spawnSyncFail.done = true;
                     });
-                    ",
+                    "#,
                 )
                 .await
                 .expect("eval spawnSync fail");
@@ -30407,14 +30437,14 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
 
             runtime
                 .eval(
-                    r"
+                    r#"
                     globalThis.execFileResult = {};
                     import('node:child_process').then(({ execFileSync }) => {
-                        const output = execFileSync('echo', ['file-sync-test']);
+                        const output = execFileSync('python3', ['-c', 'print("file-sync-test")']);
                         globalThis.execFileResult.stdout = output.trim();
                         globalThis.execFileResult.done = true;
                     });
-                    ",
+                    "#,
                 )
                 .await
                 .expect("eval execFileSync test");
