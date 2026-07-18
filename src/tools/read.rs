@@ -154,7 +154,20 @@ impl ReadTool {
             });
         }
 
-        let cache_key = tool_cache_key("read", &self.cwd, &serde_json::json!({ "path": path }));
+        // Build cache key from path + view parameters so that reads with
+        // different offset/limit/head/tail/hashline return correct content.
+        let cache_key = tool_cache_key(
+            "read",
+            &self.cwd,
+            &serde_json::json!({
+                "path": path,
+                "offset": input.offset,
+                "limit": input.limit,
+                "head": input.head,
+                "tail": input.tail,
+                "hashline": input.hashline,
+            }),
+        );
         let cache_mode = ToolCacheFingerprintMode::FileContent;
         let cache_deps = cache_dependency_for_path(&resolved, cache_mode);
         if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {
