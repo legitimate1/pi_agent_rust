@@ -334,8 +334,6 @@ impl RpcSessionPersister {
                         if let Err(e) = writeln!(f, "{json_line}") {
                             tracing::warn!("rpc-persist: write failed: {e}");
                             file = None;
-                        } else if let Err(e) = f.sync_all() {
-                            tracing::warn!("rpc-persist: fsync failed: {e}");
                         }
                     }
                 }
