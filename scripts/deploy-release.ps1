@@ -30,7 +30,21 @@ if ($piProcess) {
     }
 }
 
-# Step 2: Copy new binary
-Start-Sleep 1
-Copy-Item -LiteralPath $sourcePath -Destination $Destination -Force
-Write-Output "Deployed $sourcePath -> $Destination"
+# Step 2: Copy new binary with retry (process may still hold handle after exit)
+$maxRetries = 5
+$retryDelay = 1
+for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+    try {
+        Copy-Item -LiteralPath $sourcePath -Destination $Destination -Force -ErrorAction Stop
+        Write-Output "Deployed $sourcePath -> $Destination"
+        return
+    } catch {
+        if ($attempt -lt $maxRetries) {
+            Write-Warning "Copy failed (attempt $attempt/$maxRetries): $($_.Exception.Message)"
+            Start-Sleep $retryDelay
+        } else {
+            Write-Error "Copy failed after $maxRetries attempts: $($_.Exception.Message)"
+            exit 1
+        }
+    }
+}
