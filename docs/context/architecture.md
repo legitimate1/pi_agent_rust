@@ -12,6 +12,8 @@ Tool Registry (built-ins + extension tools) ↔ Extension Runtime (QuickJS + cap
 Surfaces: Interactive TUI + RPC/stdin modes
                          ↓
 Session persistence + index (JSONL, optional SQLite)
+    • RPC 模式: 额外有 RpcSessionPersister 背景线程实时追加写入
+       (TurnEnd/ToolResult 等消息无需等 turn 结束即可落盘)
 ```
 
 ## 工具系统架构
@@ -54,7 +56,7 @@ Session persistence + index (JSONL, optional SQLite)
 | `extensions.rs` | 扩展管理器、能力策略、生命周期 |
 | `extensions_js.rs` | QuickJS 运行时、虚拟模块、HostcallKind |
 | `extension_tools.rs` | 扩展工具包装器 + 收集函数 |
-| `rpc.rs` | RPC/stdin 服务器模式、RPC 方法分发（get_commands/get_tree/get_version 等） |
+| `rpc.rs` | RPC/stdin 服务器模式、RPC 方法分发（get_commands/get_tree/get_version 等）、RpcSessionPersister（进程侧主动会话持久化） |
 | `providers/mod.rs` | Provider 工厂 + 扩展 stream-simple 桥接 |
 | `models.rs` | 内置 + models.json 模型注册表 |
 | `session.rs` | JSONL 会话持久化 |

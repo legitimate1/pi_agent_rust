@@ -260,3 +260,24 @@
   # .cargo/config.toml: [target.'cfg(windows)'].rustflags = ["-C", "link-args=/STACK:4194304"]
   ```
 - 当前 release profile 已从激进体积优化改为速度优先（`opt-level = 3`, `lto = "thin"`），编译速度与运行效率平衡
+
+## D16: RPC 进程侧主动会话持久化（2026-07-19）
+
+**决策**：在 `pi --mode rpc` 的 event handler 中捕获 `TurnEnd` 事件，通过背景线程（`RpcSessionPersister`）将已完成的 assistant/tool_result 消息实时追加写入 JSONL 文件。
+
+**涉及改动**：
+1. `src/rpc.rs` → 新增 `RpcSessionPersister` 结构体 + `writer_thread` 背景线程；`rpc_agent_event_handler` 新增 `session_persister` 参数；`run_prompt_with_retry` 在重试前创建 persister（仅 `save_enabled` 且有文件路径时）
+
+**理由**：
+- Obsidian 崩溃或卡死时，正在进行的会话数据全部丢失
+- 当前持久化完全依赖 pidian（Obsidian 插件侧）触发 `saveConversation()`，整个 turn 的数据只在 turn 结束后一次性写入
+- `RpcSessionPersister` 是独立进程的机制，Obsidian 崩溃不影响它，重启后可恢复已落盘的消息
+- 最终 `persist_new_messages` 的标准重写会覆盖我们的条目，不影响 session 的规范 ID
+
+**不选 B 的原因**：
+- 在 agent 核心循环中加中间落盘——侵入性强，影响所有模式
+- 周期性定时器 flush session——但 turn 运行中的消息在 `self.agent.messages()` 内存中，不在 session 对象里，flush 无效果
+- 提高 pidian 的 `saveConversation()` 频率——仍然依赖客户端触发，Obsidian 崩溃时没用
+
+**何时重新考虑**：如果以后不再依靠 JSONL 格式（如完全迁移到 SQLite 后端），可移除或替换。
+
