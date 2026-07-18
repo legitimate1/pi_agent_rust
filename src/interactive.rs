@@ -2838,18 +2838,6 @@ impl PiApp {
         self.memory_monitor.maybe_sample();
         self.run_memory_pressure_actions();
 
-        // Graceful shutdown via signal file (deploy-release uses this).
-        let shutdown_path = crate::config::Config::global_dir().join("graceful-shutdown");
-        if shutdown_path.exists() {
-            tracing::info!(
-                event = "pi.graceful_shutdown.signal_file_detected",
-                path = %shutdown_path.display(),
-                "Detected graceful-shutdown signal file, initiating quit"
-            );
-            let _ = std::fs::remove_file(&shutdown_path);
-            return Some(self.quit_cmd());
-        }
-
         // Handle our custom Pi messages (take ownership to avoid per-token clone).
         if msg.is::<PiMsg>() {
             let pi_msg = msg
