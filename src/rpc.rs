@@ -32,7 +32,7 @@ use crate::models::{ModelEntry, model_requires_configured_credential, normalize_
 use crate::provider_metadata::provider_ids_match;
 use crate::providers;
 use crate::resources::ResourceLoader;
-use crate::session::SessionMessage;
+use crate::session::{EntryBase, MessageEntry, SessionEntry, SessionMessage};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeHandle;
@@ -216,15 +216,176 @@ fn resolve_extension_command(
         .then_some((command_name, args))
 }
 
+// =============================================================================
+// RPC Session Persister — process-side proactive session persistence
+// =============================================================================
+//
+// Writes completed messages to the JSONL session file in real-time as the
+// agent produces them, ensuring data survives an Obsidian crash mid-turn.
+// The session's final persist_new_messages rewrites the file with canonical
+// entry IDs, so our entries are temporary but good enough for crash recovery.
+
+enum PersistOp {
+    Message(Message),
+    Flush,
+}
+
+/// Thread-safe handle to the background JSONL writer thread.
+#[derive(Clone)]
+struct RpcSessionPersister {
+    inner: Arc<RpcSessionPersisterHandle>,
+}
+
+struct RpcSessionPersisterHandle {
+    tx: std::sync::mpsc::Sender<PersistOp>,
+}
+
+impl RpcSessionPersister {
+    fn new(path: PathBuf) -> Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<PersistOp>();
+
+        std::thread::Builder::new()
+            .name("rpc-persist".into())
+            .spawn(move || {
+                Self::writer_thread(path, rx);
+            })
+            .map_err(|e| Error::session(format!("Failed to spawn persist thread: {e}")))?;
+
+        Ok(Self {
+            inner: Arc::new(RpcSessionPersisterHandle { tx }),
+        })
+    }
+
+    fn persist_messages(&self, messages: Vec<Message>) {
+        for msg in messages {
+            let _ = self.inner.tx.send(PersistOp::Message(msg));
+        }
+    }
+
+    fn flush(&self) {
+        let _ = self.inner.tx.send(PersistOp::Flush);
+    }
+
+    fn writer_thread(path: PathBuf, rx: std::sync::mpsc::Receiver<PersistOp>) {
+        use std::io::Write;
+
+        // Count existing entries to generate non-conflicting IDs.
+        let mut entry_count: u64 = 0;
+        let mut last_entry_id: Option<String> = None;
+        if let Ok(file) = std::fs::File::open(&path) {
+            let reader = std::io::BufReader::new(file);
+            let mut lines = reader.lines();
+            // Skip the session header (line 1).
+            let _ = lines.next();
+            while let Some(Ok(line)) = lines.next() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    entry_count += 1;
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                        if let Some(id) = val.get("id").and_then(|v| v.as_str()) {
+                            last_entry_id = Some(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Reusable file handle — open on first write, keep for the session.
+        let mut file: Option<std::fs::File> = None;
+
+        while let Ok(op) = rx.recv() {
+            match op {
+                PersistOp::Message(message) => {
+                    entry_count += 1;
+                    let id = format!("rp_{entry_count:06}");
+                    let parent_id = last_entry_id.clone();
+                    last_entry_id = Some(id.clone());
+
+                    let base = EntryBase::new(parent_id, id);
+                    let session_message = SessionMessage::from(message);
+                    let entry = SessionEntry::Message(MessageEntry {
+                        base,
+                        message: session_message,
+                    });
+
+                    let json_line = match serde_json::to_string(&entry) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!("rpc-persist: failed to serialize session entry: {e}");
+                            continue;
+                        }
+                    };
+
+                    if file.is_none() {
+                        match std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)
+                        {
+                            Ok(f) => file = Some(f),
+                            Err(e) => {
+                                tracing::warn!("rpc-persist: cannot open session file: {e}");
+                                continue;
+                            }
+                        }
+                    }
+
+                    if let Some(ref mut f) = file {
+                        if let Err(e) = writeln!(f, "{json_line}") {
+                            tracing::warn!("rpc-persist: write failed: {e}");
+                            file = None;
+                        } else if let Err(e) = f.sync_all() {
+                            tracing::warn!("rpc-persist: fsync failed: {e}");
+                        }
+                    }
+                }
+                PersistOp::Flush => {
+                    if let Some(ref mut f) = file {
+                        if let Err(e) = f.sync_all() {
+                            tracing::warn!("rpc-persist: fsync failed: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Final sync on shutdown.
+        if let Some(ref f) = file {
+            let _ = f.sync_all();
+        }
+    }
+}
+
 fn rpc_agent_event_handler(
     out_tx: std::sync::mpsc::SyncSender<String>,
     runtime_handle: RuntimeHandle,
     extensions: Option<ExtensionManager>,
+    session_persister: Option<RpcSessionPersister>,
 ) -> impl Fn(AgentEvent) + Send + Sync + 'static {
     let coalescer = extensions.map(crate::extensions::EventCoalescer::new);
     let output_pressure = Arc::new(std::sync::Mutex::new(RpcOutputPressureState::default()));
 
     move |event: AgentEvent| {
+        // === RPC session persister: write completed messages in real-time ===
+        if let Some(ref persister) = session_persister {
+            match &event {
+                AgentEvent::TurnEnd {
+                    message,
+                    tool_results,
+                    ..
+                } => {
+                    let mut msgs = Vec::with_capacity(1 + tool_results.len());
+                    msgs.push(message.clone());
+                    msgs.extend(tool_results.iter().cloned());
+                    persister.persist_messages(msgs);
+                }
+                AgentEvent::AgentEnd { .. } => {
+                    persister.flush();
+                }
+                _ => {}
+            }
+        }
+
         let serialized = if let AgentEvent::AgentEnd {
             messages,
             error,
@@ -2312,6 +2473,24 @@ async fn run_prompt_with_retry(
     retry_abort.store(false, Ordering::SeqCst);
     is_streaming.store(true, Ordering::SeqCst);
 
+    // Build the session persister once (not per retry) — it writes completed
+    // messages to the JSONL file in real-time to survive Obsidian crashes.
+    let session_persister: Option<RpcSessionPersister> = 'block: {
+        let Ok(guard) = session.lock(&cx).await else {
+            break 'block None;
+        };
+        if !guard.save_enabled() {
+            break 'block None;
+        }
+        let Ok(inner) = guard.session.lock(&cx).await else {
+            break 'block None;
+        };
+        let Some(path) = inner.path.clone() else {
+            break 'block None;
+        };
+        break 'block RpcSessionPersister::new(path).ok();
+    };
+
     let max_retries = options.config.retry_max_retries();
     let mut retry_count: u32 = 0;
     let mut success = false;
@@ -2345,8 +2524,12 @@ async fn run_prompt_with_retry(
                 }
             };
             let extensions = guard.extensions.as_ref().map(|r| r.manager().clone());
-            let event_handler =
-                rpc_agent_event_handler(out_tx.clone(), runtime_for_events, extensions);
+            let event_handler = rpc_agent_event_handler(
+                out_tx.clone(),
+                runtime_for_events,
+                extensions,
+                session_persister.clone(),
+            );
 
             if retry_count == 0 {
                 // First attempt: add the user message and run the turn.
@@ -2567,7 +2750,8 @@ async fn run_extension_command(
             .extensions
             .as_ref()
             .map(|region| region.manager().clone());
-        let event_handler = rpc_agent_event_handler(out_tx.clone(), runtime_handle, extensions);
+        let event_handler =
+            rpc_agent_event_handler(out_tx.clone(), runtime_handle, extensions, None);
         guard
             .execute_extension_command_with_abort(
                 &command_name,
