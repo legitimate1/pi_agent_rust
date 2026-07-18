@@ -17,7 +17,7 @@
 - **我的话优先** — 即使与下文冲突，听我的。
 - **删文件前先问** — 包括你自己创建的文件。你说过你删错过东西，所以这条不破。
 - **禁止危险命令** — `git reset --hard`、`git clean -fd`、`rm -rf` 必须由我明确手写命令才能执行。不确定就问。
-- **分支用 `main`** — 永远别碰 `master`。推送 `main` 后同步 `master`：`git push origin main:master`。
+- **分支用 `custom`** — 这是当前推送的主要分支。`main` 是 upstream 跟踪的分支，不做直接推送。
 
 ## 工具链
 
