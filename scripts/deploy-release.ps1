@@ -1,4 +1,4 @@
-# Deploy release build: stop running pi.exe and copy new binary
+# Deploy release build: notify running pi.exe to exit gracefully, then copy new binary
 param(
     [string]$Source = "target\release\pi.exe",
     [string]$Destination = "$env:USERPROFILE\.local\bin\pi.exe"
@@ -10,7 +10,27 @@ if (-not (Test-Path $sourcePath)) {
     exit 1
 }
 
-Get-Process -Name pi -ErrorAction SilentlyContinue | Stop-Process -Force
+# Step 1: Signal any running pi process to exit gracefully
+$piProcess = Get-Process -Name pi -ErrorAction SilentlyContinue
+if ($piProcess) {
+    Write-Host "Found running pi (PID $($piProcess.Id)), requesting graceful shutdown..."
+
+    $signalDir = "$env:USERPROFILE\.pi\agent"
+    $signalFile = Join-Path $signalDir "graceful-shutdown"
+    New-Item -Path $signalDir -ItemType Directory -Force | Out-Null
+    New-Item -Path $signalFile -ItemType File -Force | Out-Null
+
+    Write-Host "Waiting up to 10 seconds for pi to exit..."
+    $exited = $piProcess.WaitForExit(10000)
+    if ($exited) {
+        Write-Host "pi exited gracefully."
+    } else {
+        Write-Warning "pi did not exit within timeout, force killing..."
+        $piProcess | Stop-Process -Force
+    }
+}
+
+# Step 2: Copy new binary
 Start-Sleep 1
 Copy-Item -LiteralPath $sourcePath -Destination $Destination -Force
 Write-Output "Deployed $sourcePath -> $Destination"

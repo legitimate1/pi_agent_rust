@@ -9912,17 +9912,18 @@ const fn mode_strictness(m: ExtensionPolicyMode) -> u8 {
 //
 //   1. **Per-extension deny** — if the capability is in the extension
 //      override's `deny` list → Deny ("extension_deny").
-//   2. **Global deny_caps** — if the capability is in the global `deny_caps`
-//      list → Deny ("deny_caps").
-//   3. **Per-extension allow** — if the capability is in the extension
+//   2. **Per-extension allow** — if the capability is in the extension
 //      override's `allow` list → Allow ("extension_allow").
+//   3. **Global deny_caps** — if the capability is in the global `deny_caps`
+//      list → Deny ("deny_caps").
 //   4. **Global default_caps** — if the capability is in `default_caps`
 //      → Allow ("default_caps").
 //   5. **Mode fallback** — Strict → Deny, Prompt → Prompt, Permissive →
 //      Allow.
 //
-// The effective mode is the per-extension override mode if set, otherwise
-// the global mode.
+// Per-extension allow comes before global deny_caps so that trusted
+// extensions can be granted dangerous capabilities on an individual basis
+// without loosening the global security posture.
 
 impl ExtensionPolicy {
     /// Evaluate policy for a capability without extension context.
@@ -9963,20 +9964,7 @@ impl ExtensionPolicy {
             }
         }
 
-        // Layer 2: global deny_caps.
-        if self
-            .deny_caps
-            .iter()
-            .any(|cap| cap.eq_ignore_ascii_case(&normalized))
-        {
-            return PolicyCheck {
-                decision: PolicyDecision::Deny,
-                capability: normalized,
-                reason: "deny_caps".to_string(),
-            };
-        }
-
-        // Layer 3: per-extension allow.
+        // Layer 2: per-extension allow.
         if let Some(ovr) = ext_override {
             if ovr
                 .allow
@@ -9989,6 +9977,19 @@ impl ExtensionPolicy {
                     reason: "extension_allow".to_string(),
                 };
             }
+        }
+
+        // Layer 3: global deny_caps.
+        if self
+            .deny_caps
+            .iter()
+            .any(|cap| cap.eq_ignore_ascii_case(&normalized))
+        {
+            return PolicyCheck {
+                decision: PolicyDecision::Deny,
+                capability: normalized,
+                reason: "deny_caps".to_string(),
+            };
         }
 
         // Layer 4: global default_caps.
@@ -10355,7 +10356,7 @@ mod policy_snapshot_tests {
     }
 
     #[test]
-    fn snapshot_global_deny_wins_over_per_extension_allow() {
+    fn snapshot_per_extension_allow_overrides_global_deny() {
         let policy = make_policy_with_per_extension();
         let snapshot = PolicySnapshot::compile(&policy);
 
@@ -10363,9 +10364,9 @@ mod policy_snapshot_tests {
         let global = snapshot.lookup("exec", None);
         assert_eq!(global.decision, PolicyDecision::Deny);
 
-        // ext.special allows "exec", but global deny remains authoritative.
+        // ext.special allows "exec" — per-extension allow now overrides.
         let ext = snapshot.lookup("exec", Some("ext.special"));
-        assert_eq!(ext.decision, PolicyDecision::Deny);
+        assert_eq!(ext.decision, PolicyDecision::Allow);
     }
 }
 
