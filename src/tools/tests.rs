@@ -5098,3 +5098,79 @@ fn test_hashline_edit_trailing_newline_semantics() {
         assert_eq!(content, "line1\nchanged\n");
     });
 }
+
+#[test]
+fn test_read_large_file_different_offsets_produce_different_content() {
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::tempdir().unwrap();
+        // 12000 lines, ~59 bytes each = ~700KB — far past the 8KB initial_read
+        let mut content = String::with_capacity(700_000);
+        for i in 1..=12000 {
+            content.push_str(&format!(
+                "Line {i:05}: p p p p p p p p p p p p p p p p p p p p p p\n"
+            ));
+        }
+        std::fs::write(tmp.path().join("big.txt"), &content).unwrap();
+
+        let tool = ReadTool::new(tmp.path());
+
+        // Read offset=1 (beginning of file)
+        let out1 = tool
+            .execute(
+                "t1",
+                serde_json::json!({
+                    "path": tmp.path().join("big.txt").to_string_lossy(),
+                    "offset": 1,
+                    "limit": 5,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let text1 = get_text(&out1.content);
+
+        // Read offset=8001 (deep in the file, far past 8KB initial_read)
+        let out2 = tool
+            .execute(
+                "t2",
+                serde_json::json!({
+                    "path": tmp.path().join("big.txt").to_string_lossy(),
+                    "offset": 8001,
+                    "limit": 5,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let text2 = get_text(&out2.content);
+
+        eprintln!("=== offset=1 content (first 200 chars) ===");
+        eprintln!("{}", &text1[..text1.len().min(200)]);
+        eprintln!("=== offset=8001 content (first 200 chars) ===");
+        eprintln!("{}", &text2[..text2.len().min(200)]);
+
+        assert!(
+            text1.contains("00001"),
+            "offset=1 should contain line 00001"
+        );
+        assert!(
+            !text1.contains("08001"),
+            "offset=1 should NOT contain line 08001"
+        );
+        assert!(
+            text2.contains("08001"),
+            "offset=8001 should contain line 08001, got: {}",
+            &text2[..text2.len().min(300)]
+        );
+        assert!(
+            !text2.contains("00001"),
+            "offset=8001 should NOT contain line 00001"
+        );
+
+        let count2 = text2.lines().filter(|l| l.contains('→')).count();
+        assert!(
+            count2 >= 3 && count2 <= 6,
+            "offset=8001 should return ~5 lines, got {count2}"
+        );
+    });
+}
