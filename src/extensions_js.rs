@@ -10136,7 +10136,43 @@ export function execSync(command, options) {
   const timeout = typeof opts.timeout === "number" ? opts.timeout : 0;
   const maxBuffer = typeof opts.maxBuffer === "number" ? opts.maxBuffer : 1024 * 1024;
 
-  // execSync runs through a shell, so pass via sh -c
+  // execSync runs through a shell. Use platform-appropriate shell:
+  //   - Windows: cmd.exe /d /s /c <command>
+  //   - Unix:    /bin/sh -c <command>
+  const isWin = typeof process !== 'undefined' && process.platform === 'win32';
+  if (isWin) {
+    const raw = __pi_exec_sync_native("cmd.exe", JSON.stringify(["/d", "/s", "/c", cmdStr]), cwd, timeout, maxBuffer);
+    const result = __parseExecSyncResult(raw, cmdStr);
+    if (result.error) {
+      result.error.status = result.status;
+      result.error.stdout = result.stdout || "";
+      result.error.stderr = result.stderr || "";
+      result.error.pid = result.pid || 0;
+      result.error.signal = result.signal;
+      throw result.error;
+    }
+    if (result.status !== 0 && result.status !== null) {
+      const err = new Error(
+        `Command failed: ${cmdStr}\n${result.stderr || ""}`,
+      );
+      err.status = result.status;
+      err.stdout = result.stdout || "";
+      err.stderr = result.stderr || "";
+      err.pid = result.pid || 0;
+      err.signal = null;
+      throw err;
+    }
+    const stdout = result.stdout || "";
+    if (stdout.length > maxBuffer) {
+      const err = new Error(`stdout maxBuffer length exceeded`);
+      err.stdout = stdout.slice(0, maxBuffer);
+      err.stderr = result.stderr || "";
+      throw err;
+    }
+    return stdout;
+  }
+
+  // Unix: sh -c
   const raw = __pi_exec_sync_native("sh", JSON.stringify(["-c", cmdStr]), cwd, timeout, maxBuffer);
   const result = __parseExecSyncResult(raw, cmdStr);
 
@@ -10337,7 +10373,11 @@ export function exec(command, optionsOrCallback, callbackArg) {
   };
   if (normalized.cwd !== undefined) spawnOpts.cwd = normalized.cwd;
   if (normalized.timeoutMs !== undefined) spawnOpts.timeout = normalized.timeoutMs;
-  const child = spawn("sh", ["-c", cmdStr], spawnOpts);
+  // exec runs through a shell. Use platform-appropriate shell.
+  const isWin = typeof process !== 'undefined' && process.platform === 'win32';
+  const shell = isWin ? "cmd.exe" : "sh";
+  const shellArgs = isWin ? ["/d", "/s", "/c", cmdStr] : ["-c", cmdStr];
+  const child = spawn(shell, shellArgs, spawnOpts);
   return __wrapExecLike(cmdStr, child, normalized, callback);
 }
 

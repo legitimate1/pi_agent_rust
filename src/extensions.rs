@@ -18797,6 +18797,13 @@ impl JsExtensionRuntimeHandle {
             config.deny_env = false;
         }
 
+        // Allow sync child_process APIs when the policy does not globally deny `exec`.
+        // Per-extension capability and exec-mediation checks still gate individual
+        // extensions at runtime (see `__pi_exec_sync_native` in extensions_js.rs).
+        if !policy.deny_caps.contains(&"exec".to_string()) {
+            config.allow_unsafe_sync_exec = true;
+        }
+
         let host = JsRuntimeHost {
             tools,
             manager_ref: Arc::downgrade(&manager.inner),
