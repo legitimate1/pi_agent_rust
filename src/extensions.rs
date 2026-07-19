@@ -30035,12 +30035,12 @@ impl ExtensionManager {
         let runtime = self
             .runtime()
             .ok_or_else(|| Error::extension("Extension runtime not configured"))?;
-        let ctx = json!({ "hasUI": self.read_snapshot().has_ui });
+        let ctx_payload = self.get_or_build_ctx_payload().await;
         runtime
             .execute_command(
                 command_name.to_string(),
                 args.to_string(),
-                Arc::new(ctx),
+                ctx_payload,
                 timeout_ms,
             )
             .await
