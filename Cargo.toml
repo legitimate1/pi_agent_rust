@@ -8,7 +8,7 @@ members = [
 
 [package]
 name = "pi_agent_rust"
-version = "0.1.27"
+version = "0.1.28"
 edition = "2024"
 rust-version = "1.85"
 description = "High-performance AI coding agent CLI - Rust port of Pi Agent"
@@ -423,17 +423,7 @@ module_name_repetitions = "allow"
 #
 # IMPORTANT: Do NOT commit this section. To prevent accidental commits:
 #   git update-index --skip-worktree Cargo.toml
-# To re-enable tracking:
-#   git update-index --no-skip-worktree Cargo.toml
 #
-# [patch.crates-io]
-# asupersync = { path = "../asupersync" }
-# rich_rust = { path = "../rich_rust" }
-# charmed-bubbletea = { path = "../charmed_rust/crates/bubbletea" }
-# charmed-bubbletea-macros = { path = "../charmed_rust/crates/bubbletea-macros" }
-# charmed-lipgloss = { path = "../charmed_rust/crates/lipgloss" }
-# charmed-bubbles = { path = "../charmed_rust/crates/bubbles" }
-# charmed-glamour = { path = "../charmed_rust/crates/glamour" }
-# charmed-harmonica = { path = "../charmed_rust/crates/harmonica" }
-# sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
-# sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
+# Vendored charmed-bubbletea with flicker fix: ClearType::All -> ClearType::FromCursorDown
+[patch.crates-io]
+charmed-bubbletea = { path = "vendor/charmed-bubbletea" }

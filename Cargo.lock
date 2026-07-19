@@ -821,8 +821,6 @@ dependencies = [
 [[package]]
 name = "charmed-bubbletea"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5fbf47d60bc19491251ad01bf2e63a41432630eaa90f81c05eba3ac4cc97c1b"
 dependencies = [
  "charmed-bubbletea-macros",
  "crossterm",
@@ -4459,7 +4457,7 @@ dependencies = [
 
 [[package]]
 name = "pi-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "asupersync",
  "futures",
@@ -4472,7 +4470,7 @@ dependencies = [
 
 [[package]]
 name = "pi-provider-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "asupersync",
  "async-trait",
@@ -4488,7 +4486,7 @@ dependencies = [
 
 [[package]]
 name = "pi_agent_rust"
-version = "0.1.27"
+version = "0.1.28"
 dependencies = [
  "anyhow",
  "arbitrary",
