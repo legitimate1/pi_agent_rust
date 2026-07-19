@@ -26107,6 +26107,10 @@ pub(crate) struct RegistrySnapshot {
     pub cwd: Option<String>,
     /// Model registry key-value pairs.
     pub model_registry_values: HashMap<String, String>,
+    /// Full model registry entries (all registered models with metadata).
+    pub model_registry_all_entries: Vec<Value>,
+    /// Available (credentialed) model registry entries.
+    pub model_registry_available_entries: Vec<Value>,
     /// Current provider identifier.
     pub current_provider: Option<String>,
     /// Current model identifier.
@@ -26219,6 +26223,10 @@ struct ExtensionManagerInner {
     flags: Vec<Value>,
     cwd: Option<String>,
     model_registry_values: HashMap<String, String>,
+    /// Full model registry entries (all registered models with metadata).
+    model_registry_all_entries: Vec<Value>,
+    /// Available (credentialed) model registry entries.
+    model_registry_available_entries: Vec<Value>,
     current_provider: Option<String>,
     current_model_id: Option<String>,
     current_thinking_level: Option<String>,
@@ -26606,6 +26614,8 @@ impl ExtensionManager {
             flags: inner.flags.clone(),
             cwd: inner.cwd.clone(),
             model_registry_values: inner.model_registry_values.clone(),
+            model_registry_all_entries: inner.model_registry_all_entries.clone(),
+            model_registry_available_entries: inner.model_registry_available_entries.clone(),
             current_provider: inner.current_provider.clone(),
             current_model_id: inner.current_model_id.clone(),
             current_thinking_level: inner.current_thinking_level.clone(),
@@ -29292,6 +29302,23 @@ impl ExtensionManager {
         self.refresh_snapshot_with_guard_release(guard);
     }
 
+    /// Set the full and available model registry entry lists exposed to
+    /// extensions via `ctx.modelRegistry.getAll()` / `getAvailable()`.
+    pub fn set_model_registry_entries(
+        &self,
+        all_entries: Vec<Value>,
+        available_entries: Vec<Value>,
+    ) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.model_registry_all_entries = all_entries;
+        guard.model_registry_available_entries = available_entries;
+        guard.ctx_generation = guard.ctx_generation.wrapping_add(1);
+        self.refresh_snapshot_with_guard_release(guard);
+    }
+
     #[cfg(feature = "wasm-host")]
     fn handle(&self) -> ExtensionManagerHandle {
         ExtensionManagerHandle::new(self)
@@ -30367,6 +30394,8 @@ impl ExtensionManager {
         session: Option<Arc<dyn ExtensionSession>>,
         cwd_override: Option<String>,
         model_registry_values: &HashMap<String, String>,
+        model_registry_all_entries: &[Value],
+        model_registry_available_entries: &[Value],
     ) -> Value {
         let mut ctx = serde_json::Map::new();
         ctx.insert("hasUI".into(), Value::Bool(has_ui));
@@ -30384,6 +30413,19 @@ impl ExtensionManager {
                 map.insert(key.clone(), Value::String(value.clone()));
             }
             ctx.insert("modelRegistry".into(), Value::Object(map));
+        }
+
+        if !model_registry_all_entries.is_empty() {
+            ctx.insert(
+                "modelRegistryAll".into(),
+                Value::Array(model_registry_all_entries.to_vec()),
+            );
+        }
+        if !model_registry_available_entries.is_empty() {
+            ctx.insert(
+                "modelRegistryAvailable".into(),
+                Value::Array(model_registry_available_entries.to_vec()),
+            );
         }
 
         if let Some(session) = session {
@@ -30434,7 +30476,15 @@ impl ExtensionManager {
         // Rebuild directly from the snapshot to avoid cloning the full
         // model-registry map on cache misses.
         let payload = Arc::new(
-            Self::build_ctx_payload(has_ui, session, cwd, &snap.model_registry_values).await,
+            Self::build_ctx_payload(
+                has_ui,
+                session,
+                cwd,
+                &snap.model_registry_values,
+                &snap.model_registry_all_entries,
+                &snap.model_registry_available_entries,
+            )
+            .await,
         );
         drop(snap);
 

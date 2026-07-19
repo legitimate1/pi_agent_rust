@@ -3857,6 +3857,8 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             "branch": branch,
             "leafEntry": leaf_entry,
             "modelRegistry": {},
+            "modelRegistryAll": [],
+            "modelRegistryAvailable": [],
         })
     }
 

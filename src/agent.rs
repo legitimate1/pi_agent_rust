@@ -8012,7 +8012,16 @@ impl AgentSession {
     }
 
     pub fn set_model_registry(&mut self, registry: ModelRegistry) {
-        self.set_extension_ai_models(pi_ai_model_registry_values(&registry));
+        let all = pi_ai_model_registry_values(&registry);
+        let available: Vec<Value> = registry
+            .available_models()
+            .into_iter()
+            .map(pi_ai_model_entry_value)
+            .collect();
+        self.set_extension_ai_models(all.clone());
+        if let Some(ref ext) = self.agent.extensions {
+            ext.set_model_registry_entries(all, available);
+        }
         self.model_registry = Some(registry);
     }
 

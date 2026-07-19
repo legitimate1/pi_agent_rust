@@ -19795,6 +19795,10 @@ function __pi_make_extension_ctx(ctx_payload) {
     const modelRegistryValues =
         (ctx_payload && (ctx_payload.modelRegistry || ctx_payload.model_registry || ctx_payload.model_registry_values)) ||
         {};
+    const modelRegistryAll =
+        (ctx_payload && ctx_payload.modelRegistryAll) || [];
+    const modelRegistryAvailable =
+        (ctx_payload && ctx_payload.modelRegistryAvailable) || [];
 
     const sessionManager = {
         getEntries: () => entries,
@@ -19814,6 +19818,15 @@ function __pi_make_extension_ctx(ctx_payload) {
                 const value = modelRegistryValues[key];
                 if (value === undefined || value === null) return undefined;
                 return String(value);
+            },
+            getAll: () => modelRegistryAll,
+            getAvailable: () => modelRegistryAvailable,
+            getProviderNames: () => {
+                const names = new Set();
+                for (const entry of modelRegistryAll) {
+                    if (entry.provider) names.add(entry.provider);
+                }
+                return Array.from(names);
             },
         },
     };
