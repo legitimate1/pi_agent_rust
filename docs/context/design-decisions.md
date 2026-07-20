@@ -319,3 +319,23 @@
 
 **何时重新考虑**：如果未来引入更细粒度的技能可见性策略（per-skill scope、标签路由等），可合并。
 
+## D19: `global_skills` 白名单 — 选择加载特定全局技能（2026-07-20）
+
+**决策**：在 `.pi/settings.json` 中新增 `global_skills` 字符串数组配置，项目可指定只加载列表中的全局技能，其余全局技能被过滤。
+
+**涉及改动**：
+1. `src/package_manager.rs` → `SettingsSnapshot` 新增 `global_skills` 字段；`read_settings_snapshot()` 解析 `"global_skills"` 数组；新增 `skill_name_from_resolved_path()` 辅助函数（从路径父目录名提取技能名）；`resolve_with_roots()` 中合并到技能过滤逻辑，与 `skill_mode` 叠加
+
+**理由**：
+- 有些项目只需要少数几个全局技能（如 `add-tests`），不需要全部加载
+- 与 `skill_mode: "project_only"` 叠加使用：先排除全部全局技能，再按白名单恢复特定技能
+- `global_skills` 为空时表示"不过滤"，非空时才生效，向前兼容
+- 项目技能始终不受影响
+
+**不选 B 的原因**：
+- 通过 settings.json 的 `skills` 数组逐个 disable——需要先知道全局技能列表，维护成本高
+- 将技能移到项目目录——破坏全局技能的统一管理，无法复用更新
+- 环境变量——不适合传递列表，且不易持久化
+
+**何时重新考虑**：如果未来引入基于标签/分类的技能可见性系统，可合并或废弃。
+

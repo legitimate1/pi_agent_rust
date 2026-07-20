@@ -84,3 +84,4 @@
 | 功能 | 状态 | 涉及文件 |
 |:-----|:----:|:---------|
 | **`skill_mode: "project_only"` 配置** — 项目可跳过全局技能 | ✅ | `src/package_manager.rs` |
+| **`global_skills` 白名单** — 选择加载特定全局技能，可与 `project_only` 叠加 | ✅ | `src/package_manager.rs` |
