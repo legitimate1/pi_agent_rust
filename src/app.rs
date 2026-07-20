@@ -169,9 +169,23 @@ pub fn build_system_prompt(
         load_project_context_files(cwd, global_dir)
     };
 
-    // If --system-prompt is not given, fall back to ~/.pi/agent/SYSTEM.md (original Pi Agent convention).
-    let system_md_override = custom_prompt
+    // Priority: --system-prompt > .pi/SYSTEM.md (project) > ~/.pi/agent/SYSTEM.md (user) > default
+    let project_system_md = custom_prompt
         .is_none()
+        .then(|| -> Result<String> {
+            let path = cwd.join(".pi/SYSTEM.md");
+            if path.exists() {
+                std::fs::read_to_string(&path)
+                    .map_err(|err| anyhow::anyhow!("Could not read {}: {err}", path.display()))
+            } else {
+                Ok(String::new())
+            }
+        })
+        .transpose()?
+        .filter(|s| !s.is_empty());
+
+    // If --system-prompt and project SYSTEM.md not given, fall back to ~/.pi/agent/SYSTEM.md
+    let user_system_md = (custom_prompt.is_none() && project_system_md.is_none())
         .then(|| -> Result<String> {
             let path = global_dir.join("SYSTEM.md");
             if path.exists() {
@@ -185,7 +199,8 @@ pub fn build_system_prompt(
         .filter(|s| !s.is_empty());
 
     let mut prompt = custom_prompt
-        .or(system_md_override)
+        .or(project_system_md)
+        .or(user_system_md)
         .unwrap_or_else(|| default_system_prompt(enabled_tools, package_dir));
 
     if let Some(append_prompt) = append_prompt {
