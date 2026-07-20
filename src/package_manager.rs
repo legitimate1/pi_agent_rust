@@ -771,6 +771,18 @@ impl PackageManager {
                 accumulator.skills.items.retain(|r| r.metadata.scope != PackageScope::User);
             }
 
+            // 5) global_skills 白名单：非空时只保留列表中命名的全局技能
+            if !project.global_skills.is_empty() {
+                accumulator.skills.items.retain(|r| {
+                    if r.metadata.scope == PackageScope::User {
+                        skill_name_from_resolved_path(&r.path)
+                            .is_some_and(|name| project.global_skills.contains(&name))
+                    } else {
+                        true // 项目技能不受影响
+                    }
+                });
+            }
+
             let resolved = accumulator.clone().into_resolved_paths();
             drop(accumulator);
             maybe_emit_compat_ledgers(&resolved.extensions);
@@ -1600,6 +1612,7 @@ struct SettingsSnapshot {
     prompts: Vec<String>,
     themes: Vec<String>,
     skill_mode: SkillMode,
+    global_skills: Vec<String>,
 }
 
 impl Default for SettingsSnapshot {
@@ -1611,6 +1624,7 @@ impl Default for SettingsSnapshot {
             prompts: Vec::new(),
             themes: Vec::new(),
             skill_mode: SkillMode::All,
+            global_skills: Vec::new(),
         }
     }
 }
@@ -1657,6 +1671,7 @@ fn read_settings_snapshot(path: &Path) -> Result<SettingsSnapshot> {
         prompts: extract_string_array(value.get("prompts")),
         themes: extract_string_array(value.get("themes")),
         skill_mode,
+        global_skills: extract_string_array(value.get("global_skills")),
     })
 }
 
@@ -1817,6 +1832,16 @@ impl ResourceList {
             metadata: metadata.clone(),
         });
     }
+}
+
+/// 从 ResolvedResource 的路径中提取技能名称。
+///
+/// 技能路径遵循 `<skills-dir>/<skill-name>/SKILL.md` 的约定，
+/// 因此技能名 = SKILL.md 所在父目录的文件名。
+fn skill_name_from_resolved_path(path: &Path) -> Option<String> {
+    path.parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
 }
 
 impl PackageManager {
@@ -5661,6 +5686,7 @@ mod tests {
             prompts: vec!["prompt".to_string()],
             themes: vec!["theme".to_string()],
             skill_mode: SkillMode::All,
+            global_skills: Vec::new(),
         };
         assert_eq!(snapshot.entries_for(ResourceType::Extensions), &["ext"]);
         assert_eq!(snapshot.entries_for(ResourceType::Skills), &["skill"]);
