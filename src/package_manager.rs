@@ -75,6 +75,27 @@ pub enum ResourceOrigin {
     TopLevel,
 }
 
+/// 项目技能加载模式。
+///
+/// - `All`（默认）：全局技能 + 项目技能叠加发现
+/// - `ProjectOnly`：跳过全局技能，只加载项目技能
+///
+/// 在项目 `.pi/settings.json` 中配置：
+/// ```json
+/// { "skill_mode": "project_only" }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillMode {
+    All,
+    ProjectOnly,
+}
+
+impl Default for SkillMode {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedResource {
     pub path: PathBuf,
@@ -744,6 +765,11 @@ impl PackageManager {
                 &roots.project_base_dir,
                 roots.project_settings_enabled,
             );
+
+            // 4) 项目 skill_mode == project_only 时过滤掉全局（User scope）技能
+            if project.skill_mode == SkillMode::ProjectOnly {
+                accumulator.skills.items.retain(|r| r.metadata.scope != PackageScope::User);
+            }
 
             let resolved = accumulator.clone().into_resolved_paths();
             drop(accumulator);
@@ -1566,13 +1592,27 @@ struct PackageSpec {
     filter: Option<PackageFilter>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct SettingsSnapshot {
     packages: Vec<PackageSpec>,
     extensions: Vec<String>,
     skills: Vec<String>,
     prompts: Vec<String>,
     themes: Vec<String>,
+    skill_mode: SkillMode,
+}
+
+impl Default for SettingsSnapshot {
+    fn default() -> Self {
+        Self {
+            packages: Vec::new(),
+            extensions: Vec::new(),
+            skills: Vec::new(),
+            prompts: Vec::new(),
+            themes: Vec::new(),
+            skill_mode: SkillMode::All,
+        }
+    }
 }
 
 impl SettingsSnapshot {
@@ -1601,12 +1641,22 @@ fn read_settings_snapshot(path: &Path) -> Result<SettingsSnapshot> {
         }
     }
 
+    let skill_mode = value
+        .get("skill_mode")
+        .and_then(Value::as_str)
+        .map(|s| match s.trim() {
+            "project_only" => SkillMode::ProjectOnly,
+            _ => SkillMode::All,
+        })
+        .unwrap_or(SkillMode::All);
+
     Ok(SettingsSnapshot {
         packages,
         extensions: extract_string_array(value.get("extensions")),
         skills: extract_string_array(value.get("skills")),
         prompts: extract_string_array(value.get("prompts")),
         themes: extract_string_array(value.get("themes")),
+        skill_mode,
     })
 }
 
@@ -5610,6 +5660,7 @@ mod tests {
             skills: vec!["skill".to_string()],
             prompts: vec!["prompt".to_string()],
             themes: vec!["theme".to_string()],
+            skill_mode: SkillMode::All,
         };
         assert_eq!(snapshot.entries_for(ResourceType::Extensions), &["ext"]);
         assert_eq!(snapshot.entries_for(ResourceType::Skills), &["skill"]);
