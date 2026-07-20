@@ -766,19 +766,22 @@ impl PackageManager {
                 roots.project_settings_enabled,
             );
 
-            // 4) 项目 skill_mode == project_only 时过滤掉全局（User scope）技能
-            if project.skill_mode == SkillMode::ProjectOnly {
-                accumulator.skills.items.retain(|r| r.metadata.scope != PackageScope::User);
-            }
-
-            // 5) global_skills 白名单：非空时只保留列表中命名的全局技能
-            if !project.global_skills.is_empty() {
+            // 4) 技能过滤：project_only + global_skills 叠加
+            //     - project_only + 空 global_skills → 排除全部全局技能
+            //     - project_only + 有 global_skills → 排除全局技能，但白名单中的除外
+            //     - All + 有 global_skills → 只加载白名单中的全局技能
+            //     - All + 空 global_skills → 不过滤（保留全部）
+            if project.skill_mode == SkillMode::ProjectOnly || !project.global_skills.is_empty() {
                 accumulator.skills.items.retain(|r| {
-                    if r.metadata.scope == PackageScope::User {
+                    if r.metadata.scope != PackageScope::User {
+                        return true; // 项目技能不受影响
+                    }
+                    // 全局技能：出现在 global_skills 白名单中才保留
+                    if project.global_skills.is_empty() {
+                        false // project_only 且无白名单 → 全部排除
+                    } else {
                         skill_name_from_resolved_path(&r.path)
                             .is_some_and(|name| project.global_skills.contains(&name))
-                    } else {
-                        true // 项目技能不受影响
                     }
                 });
             }
