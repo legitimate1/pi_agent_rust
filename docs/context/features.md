@@ -14,6 +14,7 @@
 | **RPC 方法 `get_version` — 返回 pi 版本号和 Git SHA** | ✅ | `src/rpc.rs` |
 | CLI 子命令（doctor/config/list/info 等） | ✅ | `src/main.rs` |
 | **`~/.pi/agent/SYSTEM.md` 覆盖默认系统提示词** | ✅ | `src/app.rs` |
+| **`.pi/SYSTEM.md` 项目级系统提示词** — 优先级高于用户级 | ✅ | `src/app.rs` |
 
 ## Provider 层
 
@@ -77,3 +78,9 @@
 | 内置模型注册 | ✅ | `src/models.rs` |
 | `models.json` 自定义模型加载 | ✅ | `src/models.rs:698` |
 | Provider 元数据（别名 + 认证键） | ✅ | `src/provider_metadata.rs` |
+
+## 资源与配置管理
+
+| 功能 | 状态 | 涉及文件 |
+|:-----|:----:|:---------|
+| **`skill_mode: "project_only"` 配置** — 项目可跳过全局技能 | ✅ | `src/package_manager.rs` |

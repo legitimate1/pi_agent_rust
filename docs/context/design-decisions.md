@@ -281,3 +281,41 @@
 
 **何时重新考虑**：如果以后不再依靠 JSONL 格式（如完全迁移到 SQLite 后端），可移除或替换。
 
+## D17: 项目级 `.pi/SYSTEM.md` 覆盖（2026-07-20）
+
+**决策**：在 `build_system_prompt()` 中新增项目级 `.pi/SYSTEM.md` 检查，优先级介于 `--system-prompt` 与 `~/.pi/agent/SYSTEM.md` 之间。
+
+**涉及改动**：
+1. `src/app.rs` → 将原来的 `system_md_override`（只查 `global_dir/SYSTEM.md`）拆为 `project_system_md` + `user_system_md`，优先检查 `cwd/.pi/SYSTEM.md`
+
+**理由**：
+- 允许项目所有者锁定系统提示词内容，不被用户级 SYSTEM.md 意外覆盖
+- 避免团队项目中不同成员使用不同的 SYSTEM.md 导致行为不一致
+- 优先级链清晰：`--system-prompt > .pi/SYSTEM.md > ~/.pi/agent/SYSTEM.md > default`
+
+**不选 B 的原因**：
+- 复用 `~/.pi/agent/SYSTEM.md` 并覆盖——全局文件修改影响所有项目，粒度太粗
+- 要求用户改用 `--system-prompt` 参数——每次都需手动传入，无法持久化
+
+**何时重新考虑**：如果未来提供更细粒度的提示词分层机制（per-task prompt overlay），可合并。
+
+## D18: 项目技能加载模式 `skill_mode`（2026-07-20）
+
+**决策**：在 `.pi/settings.json` 中新增 `skill_mode: "project_only"` 配置，项目可跳过全局技能，只加载项目技能。
+
+**涉及改动**：
+1. `src/package_manager.rs` → 新增 `SkillMode` 枚举（`All` / `ProjectOnly`）；`SettingsSnapshot` 增加 `skill_mode` 字段；`read_settings_snapshot()` 解析 `"skill_mode"`；`resolve_with_roots()` 在汇总后过滤掉 `PackageScope::User` 的技能
+
+**理由**：
+- 某些项目携带了大量专属技能（如文档辅助、领域特定指令），全局技能反而干扰
+- 避免全局技能污染项目上下文，减少 token 消耗
+- 仅影响技能（skills），不影响 extensions/prompts/themes
+- 默认行为不变（`All`），只有显式配置才切换，不影响现有用户
+
+**不选 B 的原因**：
+- 用 `--no-skills` 全局关闭——粒度太粗，影响所有技能
+- 在技能清单中逐个 disable——维护成本高，容易遗漏
+- 通过 package 机制做白名单——对非 package 的自动发现技能无效
+
+**何时重新考虑**：如果未来引入更细粒度的技能可见性策略（per-skill scope、标签路由等），可合并。
+
