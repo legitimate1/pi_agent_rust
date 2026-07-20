@@ -12,6 +12,11 @@
 | **RPC 方法 `get_commands` — 合并扩展注册的斜杠命令** | ✅ | `src/rpc.rs` `src/extensions.rs` |
 | **RPC 方法 `get_tree` — 查询会话树形结构（分支/叶子）** | ✅ | `src/rpc.rs` |
 | **RPC 方法 `get_version` — 返回 pi 版本号和 Git SHA** | ✅ | `src/rpc.rs` |
+| **RPC 方法 `remove_from_queue` — 按 messageId 精确取消队列消息** | ✅ | `src/rpc.rs` |
+| **RPC 方法 `clear_queue` — 一键清空 steer/follow_up 队列** | ✅ | `src/rpc.rs` |
+| **RPC 方法 `get_queue` — 查询队列当前内容（steering + follow_up）** | ✅ | `src/rpc.rs` |
+| **`queue_update` 事件推送 — 队列状态变更时实时同步给客户端** | ✅ | `src/rpc.rs` |
+| **队列消息携带 `messageId` — 客户端分配或服务端 UUID fallback** | ✅ | `src/rpc.rs` |
 | CLI 子命令（doctor/config/list/info 等） | ✅ | `src/main.rs` |
 | **`~/.pi/agent/SYSTEM.md` 覆盖默认系统提示词** | ✅ | `src/app.rs` |
 | **`.pi/SYSTEM.md` 项目级系统提示词** — 优先级高于用户级 | ✅ | `src/app.rs` |

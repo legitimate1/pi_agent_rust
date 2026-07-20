@@ -339,3 +339,27 @@
 
 **何时重新考虑**：如果未来引入基于标签/分类的技能可见性系统，可合并或废弃。
 
+## D20: RPC 队列管理命令 + `queue_update` 事件 + 消息 ID（2026-07-21）
+
+**决策**：在 RPC 协议中新增 3 个队列管理命令（`remove_from_queue`、`clear_queue`、`get_queue`），新增 `queue_update` 事件实时推送队列状态，并为每条入队消息携带 `messageId`。
+
+**涉及改动**：
+1. `src/rpc.rs` → 新增 `QueuedMessage` 结构体（含 `message_id` + `Message`）；`RpcSharedState` 队列从 `VecDeque<Message>` 升级为 `VecDeque<QueuedMessage>`；新增 `remove_by_message_id()`、`clear()` 方法
+2. `src/rpc.rs` → 新增 3 个 RPC 命令 handler（`remove_from_queue`/`clear_queue`/`get_queue`）
+3. `src/rpc.rs` → 新增 `build_queue_snapshot()` 函数 + 在 `steer`/`follow_up`/`prompt` 入队成功后发射 `queue_update`
+4. `src/rpc.rs` → `steer`/`follow_up`/`prompt` 从请求中读取可选 `messageId`，未提供时 `uuid::Uuid::new_v4()` 生成
+
+**理由**：
+- pidian（Obsidian 插件）需要在 UI 上展示队列中每条消息并支持 `✕` 按钮精确取消
+- 原先队列只有入队/出队，客户端无法感知队列当前内容，也无法精确操作某条消息
+- `queue_update` 事件让客户端在所有队列变更时同步到 UI，无需轮询
+- `messageId` 作为消息的持久引用 ID，是 `remove_from_queue` 的操作手柄
+
+**不选 B 的原因**：
+- 用 `Message` 本身作引用——`Message` 包含完整 content，JSON 序列化后发回客户端做匹配，网络开销大且语义不清晰
+- 仅用索引引用——并发场景下索引漂移，竞态条件会导致误删
+- 客户端自行维护队列镜像——客户端和服务端状态可能不一致，且增加客户端复杂度
+- 整体替换队列（`replace_queue`）——使用场景不明确，过度设计
+
+**何时重新考虑**：如果未来 RPC 协议升级为双向流式 IDL（如 gRPC），可重新设计队列同步机制。
+
