@@ -21,14 +21,30 @@ for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
     try {
         Copy-Item -LiteralPath $sourcePath -Destination $Destination -Force -ErrorAction Stop
         Write-Output "Deployed $sourcePath -> $Destination"
-        exit 0
+        break
     } catch {
         if ($attempt -lt $maxRetries) {
             Write-Warning "Copy failed (attempt $attempt/$maxRetries): $($_.Exception.Message)"
             Start-Sleep $retryDelay
+            continue
         } else {
             Write-Error "Copy failed after $maxRetries attempts: $($_.Exception.Message)"
             exit 1
         }
     }
+}
+
+# Cleanup: stamp current build timestamp for cargo-sweep
+# Next `cargo sweep --file` will remove artifacts older than this deployment
+$projectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+Push-Location $projectRoot
+try {
+    if (Get-Command cargo-sweep -ErrorAction SilentlyContinue) {
+        cargo sweep --stamp
+        Write-Output "cargo-sweep: timestamp updated (run 'cargo sweep --file' to clean old artifacts)"
+    } else {
+        Write-Warning "cargo-sweep not installed. Install with: cargo install cargo-sweep"
+    }
+} finally {
+    Pop-Location
 }

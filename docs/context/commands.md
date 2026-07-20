@@ -12,11 +12,31 @@ cargo build --release    # 发布构建（opt-level=3 + thin LTO + panic=abort�
 
 ### 部署
 
-构建完成后，用脚本一键停进程+覆盖：
+构建完成后，用脚本一键停进程+覆盖（脚本还会自动更新 cargo-sweep 时间戳，为下次清理做准备）：
 
 ```powershell
 .\scripts\deploy-release.ps1
 ```
+
+### target/ 磁盘空间管理
+
+Cargo 设计上永不删除旧编译产物，每次构建（`cargo build`/`cargo test`）生成新的 hash 文件，日积月累会导致 `target/` 膨胀到数百 GB。使用 `cargo-sweep` 管理：
+
+```bash
+# 安装
+cargo install cargo-sweep
+
+# 标记当前构建时间戳（部署时自动执行）
+cargo sweep --stamp
+
+# 清理所有比标记时间戳旧的产物（回收几十~几百 GB）
+cargo sweep --file
+
+# 或按天数清理
+cargo sweep --time 30
+```
+
+部署脚本 `deploy-release.ps1` 已在末尾自动执行 `cargo sweep --stamp`，每次部署后跑一次 `cargo sweep --file` 即可清理旧产物。
 
 ### 构建优化配置（`.cargo/config.toml`）
 
