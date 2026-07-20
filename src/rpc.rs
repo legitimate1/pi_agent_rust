@@ -596,8 +596,8 @@ fn try_send_line_with_backpressure(tx: &mpsc::Sender<String>, mut line: String) 
 
 #[derive(Debug)]
 struct RpcSharedState {
-    steering: VecDeque<Message>,
-    follow_up: VecDeque<Message>,
+    steering: VecDeque<QueuedMessage>,
+    follow_up: VecDeque<QueuedMessage>,
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
     auto_compaction_enabled: bool,
@@ -622,37 +622,113 @@ impl RpcSharedState {
         self.steering.len() + self.follow_up.len()
     }
 
-    fn push_steering(&mut self, message: Message) -> Result<()> {
+    fn push_steering(&mut self, message_id: String, message: Message) -> Result<()> {
         if self.pending_count() >= MAX_RPC_PENDING_MESSAGES {
             return Err(Error::session(
                 "Steering queue is full (Do you have too many pending commands?)",
             ));
         }
-        self.steering.push_back(message);
+        self.steering.push_back(QueuedMessage {
+            message_id,
+            message,
+        });
         Ok(())
     }
 
-    fn push_follow_up(&mut self, message: Message) -> Result<()> {
+    fn push_follow_up(&mut self, message_id: String, message: Message) -> Result<()> {
         if self.pending_count() >= MAX_RPC_PENDING_MESSAGES {
             return Err(Error::session("Follow-up queue is full"));
         }
-        self.follow_up.push_back(message);
+        self.follow_up.push_back(QueuedMessage {
+            message_id,
+            message,
+        });
         Ok(())
     }
 
     fn pop_steering(&mut self) -> Vec<Message> {
-        match self.steering_mode {
+        let items: Vec<_> = match self.steering_mode {
             QueueMode::All => self.steering.drain(..).collect(),
             QueueMode::OneAtATime => self.steering.pop_front().into_iter().collect(),
-        }
+        };
+        items.into_iter().map(|qm| qm.message).collect()
     }
 
     fn pop_follow_up(&mut self) -> Vec<Message> {
-        match self.follow_up_mode {
+        let items: Vec<_> = match self.follow_up_mode {
             QueueMode::All => self.follow_up.drain(..).collect(),
             QueueMode::OneAtATime => self.follow_up.pop_front().into_iter().collect(),
+        };
+        items.into_iter().map(|qm| qm.message).collect()
+    }
+
+    fn remove_by_message_id(&mut self, message_id: &str) -> bool {
+        if let Some(pos) = self
+            .steering
+            .iter()
+            .position(|m| m.message_id == message_id)
+        {
+            self.steering.remove(pos);
+            return true;
+        }
+        if let Some(pos) = self
+            .follow_up
+            .iter()
+            .position(|m| m.message_id == message_id)
+        {
+            self.follow_up.remove(pos);
+            return true;
+        }
+        false
+    }
+
+    fn clear(&mut self) {
+        self.steering.clear();
+        self.follow_up.clear();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct QueuedMessage {
+    message_id: String,
+    message: Message,
+}
+
+impl QueuedMessage {
+    fn display_text(&self) -> String {
+        match &self.message {
+            Message::User(u) => match &u.content {
+                UserContent::Text(t) => t.clone(),
+                UserContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            },
+            _ => String::new(),
         }
     }
+
+    fn to_queue_item_json(&self) -> Value {
+        json!({
+            "messageId": self.message_id,
+            "text": self.display_text(),
+            "status": "pending",
+        })
+    }
+}
+
+fn build_queue_snapshot(
+    steering: &VecDeque<QueuedMessage>,
+    follow_up: &VecDeque<QueuedMessage>,
+) -> Value {
+    json!({
+        "steering": steering.iter().map(|qm| qm.to_queue_item_json()).collect::<Vec<_>>(),
+        "follow_up": follow_up.iter().map(|qm| qm.to_queue_item_json()).collect::<Vec<_>>(),
+    })
 }
 
 /// Tracks a running bash command so it can be aborted.
@@ -928,25 +1004,35 @@ pub async fn run(
                     }
 
                     let expanded = options.resources.expand_input(&message);
-                    let queued_result = {
-                        let mut state = shared_state
-                            .lock(&cx)
-                            .await
-                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                        match streaming_behavior {
-                            Some(StreamingBehavior::Steer) => {
-                                state.push_steering(build_user_message(&expanded, &images))
-                            }
-                            Some(StreamingBehavior::FollowUp) => {
-                                state.push_follow_up(build_user_message(&expanded, &images))
-                            }
-                            None => Ok(()), // Unreachable due to check above
-                        }
+                    let message_id = parsed
+                        .get("messageId")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    let mut state = shared_state
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+                    let msg = build_user_message(&expanded, &images);
+                    let queued_result = match streaming_behavior {
+                        Some(StreamingBehavior::Steer) => state.push_steering(message_id, msg),
+                        Some(StreamingBehavior::FollowUp) => state.push_follow_up(message_id, msg),
+                        None => Ok(()), // Unreachable due to check above
                     };
+
+                    let queue_update = match &queued_result {
+                        Ok(()) => Some(build_queue_snapshot(&state.steering, &state.follow_up)),
+                        Err(_) => None,
+                    };
+                    drop(state);
 
                     match queued_result {
                         Ok(()) => {
                             let _ = out_tx.send(response_ok(id, "prompt", None));
+                            if let Some(snapshot) = queue_update {
+                                let evt = json!({ "type": "queue_update", "data": snapshot });
+                                let _ = out_tx.send(event(&evt));
+                            }
                         }
                         Err(err) => {
                             let resp = response_error_with_hints(id, "prompt", &err);
@@ -1037,15 +1123,31 @@ pub async fn run(
 
                 let expanded = options.resources.expand_input(&message);
                 if is_streaming.load(Ordering::SeqCst) {
-                    let result = shared_state
+                    let message_id = parsed
+                        .get("messageId")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    let mut state = shared_state
                         .lock(&cx)
                         .await
-                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?
-                        .push_steering(build_user_message(&expanded, &[]));
+                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+                    let result =
+                        state.push_steering(message_id, build_user_message(&expanded, &[]));
+
+                    let queue_update = match &result {
+                        Ok(()) => Some(build_queue_snapshot(&state.steering, &state.follow_up)),
+                        Err(_) => None,
+                    };
+                    drop(state);
 
                     match result {
                         Ok(()) => {
                             let _ = out_tx.send(response_ok(id, "steer", None));
+                            if let Some(snapshot) = queue_update {
+                                let evt = json!({ "type": "queue_update", "data": snapshot });
+                                let _ = out_tx.send(event(&evt));
+                            }
                         }
                         Err(err) => {
                             let _ = out_tx.send(response_error_with_hints(id, "steer", &err));
@@ -1110,15 +1212,31 @@ pub async fn run(
 
                 let expanded = options.resources.expand_input(&message);
                 if is_streaming.load(Ordering::SeqCst) {
-                    let result = shared_state
+                    let message_id = parsed
+                        .get("messageId")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    let mut state = shared_state
                         .lock(&cx)
                         .await
-                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?
-                        .push_follow_up(build_user_message(&expanded, &[]));
+                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+                    let result =
+                        state.push_follow_up(message_id, build_user_message(&expanded, &[]));
+
+                    let queue_update = match &result {
+                        Ok(()) => Some(build_queue_snapshot(&state.steering, &state.follow_up)),
+                        Err(_) => None,
+                    };
+                    drop(state);
 
                     match result {
                         Ok(()) => {
                             let _ = out_tx.send(response_ok(id, "follow_up", None));
+                            if let Some(snapshot) = queue_update {
+                                let evt = json!({ "type": "queue_update", "data": snapshot });
+                                let _ = out_tx.send(event(&evt));
+                            }
                         }
                         Err(err) => {
                             let _ = out_tx.send(response_error_with_hints(id, "follow_up", &err));
@@ -1158,6 +1276,69 @@ pub async fn run(
                     )
                     .await;
                 }));
+            }
+
+            "remove_from_queue" => {
+                let Some(message_id) = parsed
+                    .get("messageId")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                else {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "remove_from_queue",
+                        "Missing messageId".to_string(),
+                    ));
+                    continue;
+                };
+
+                let mut state = shared_state
+                    .lock(&cx)
+                    .await
+                    .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+                let found = state.remove_by_message_id(&message_id);
+                let queue_update = if found {
+                    Some(build_queue_snapshot(&state.steering, &state.follow_up))
+                } else {
+                    None
+                };
+                drop(state);
+
+                if found {
+                    let _ = out_tx.send(response_ok(id, "remove_from_queue", None));
+                    if let Some(snapshot) = queue_update {
+                        let evt = json!({ "type": "queue_update", "data": snapshot });
+                        let _ = out_tx.send(event(&evt));
+                    }
+                } else {
+                    let _ =
+                        out_tx.send(response_error(id, "remove_from_queue", "message not found"));
+                }
+            }
+
+            "clear_queue" => {
+                let mut state = shared_state
+                    .lock(&cx)
+                    .await
+                    .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+                state.clear();
+                let snapshot = build_queue_snapshot(&state.steering, &state.follow_up);
+                drop(state);
+
+                let _ = out_tx.send(response_ok(id, "clear_queue", None));
+                let evt = json!({ "type": "queue_update", "data": snapshot });
+                let _ = out_tx.send(event(&evt));
+            }
+
+            "get_queue" => {
+                let state = shared_state
+                    .lock(&cx)
+                    .await
+                    .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+                let snapshot = build_queue_snapshot(&state.steering, &state.follow_up);
+                drop(state);
+
+                let _ = out_tx.send(response_ok(id, "get_queue", Some(snapshot)));
             }
 
             "abort" => {
