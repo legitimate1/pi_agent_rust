@@ -363,3 +363,22 @@
 
 **何时重新考虑**：如果未来 RPC 协议升级为双向流式 IDL（如 gRPC），可重新设计队列同步机制。
 
+## D21: OpenAI 兼容推理模型的 reasoning_effort 支持（2026-07-24）
+
+**决策**：新增 `ReasoningStyle::Standard` 变体，所有非 DeepSeek 的 OpenAI 兼容推理模型（`reasoning: true`）在请求中发送 `reasoning_effort` 字段（`low`/`medium`/`high`），而非静默丢弃。
+
+**涉及改动**：
+1. `src/providers/openai.rs` → `ReasoningStyle` 枚举新增 `Standard`；`reasoning_style()` 非 DeepSeek 推理模型返回 `Some(ReasoningStyle::Standard)` 而非 `None`；`build_request()` 新增 `Standard` 分支，读取 `compat.thinkingLevelMap` 映射或使用默认映射
+2. `src/providers/openai.rs` → `OpenAIRequest.reasoning_effort` 类型从 `Option<&'static str>` 改为 `Option<String>`，支持动态映射值
+3. `C:\Users\m\.pi\agent\models.json` → `gpt-5.6-sol` 的 `thinkingLevelMap` 从模型顶层移入 `compat` 对象内部（`ModelConfig` 无 `thinking_level_map` 字段，serde 静默丢弃；`CompatConfig` 才有）
+
+**理由**：
+- 原先 `reasoning_style()` 只在 DeepSeek 路径中返回 `Some(...)`，所有其他 OpenAI 兼容推理模型走 `None` 分支 → `(None, None)` → 不发送任何思考控制字段
+- Lucis API 的 `gpt-5.6-sol` 实测支持标准 OpenAI `reasoning_effort` 参数，但 Pi 从未发送该参数
+
+**不选 B 的原因**：
+- 把非 DeepSeek 推理模型也送入 DeepSeek 路径——会错误发送 `thinking: {type: "enabled"}` 对象，非 DeepSeek API 可能拒绝或忽略
+- 仅改 models.json 不改代码——`thinkingLevelMap` 在 `ModelConfig` 中不存在，无论如何都读不到
+
+**何时重新考虑**：如果未来 OpenAI 官方 Chat Completions API 原生支持 `reasoning_effort` 之外的思考参数，可统一所有推理模型到一个分支。
+

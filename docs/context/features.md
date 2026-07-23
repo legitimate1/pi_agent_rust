@@ -26,7 +26,7 @@
 | 功能 | 状态 | 涉及文件 |
 |:-----|:----:|:---------|
 | Anthropic API（流式 + 扩展思考 + 工具） | ✅ | `src/providers/anthropic.rs` |
-| OpenAI Chat Completions | ✅ | `src/providers/openai.rs` |
+| OpenAI Chat Completions（含所有兼容推理模型的 reasoning_effort） | ✅ | `src/providers/openai.rs` |
 | OpenAI Responses / Codex Responses | ✅ | `src/providers/openai_responses.rs` |
 | Gemini（流式 + 工具） | ✅ | `src/providers/gemini.rs` |
 | Cohere（流式 + 工具） | ✅ | `src/providers/cohere.rs` |
