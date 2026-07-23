@@ -177,7 +177,8 @@ impl OpenAIProvider {
     /// matches) or a `deepseek.com` base URL — AND only for reasoning models, so a
     /// non-reasoning DeepSeek model (e.g. `deepseek-chat`) emits no
     /// `thinking`/`reasoning_effort` (byte-for-byte as before #113, gh #114).
-    /// Every other OpenAI-compatible provider is left untouched.
+    /// Every other OpenAI-compatible reasoning provider is tagged `Standard` and
+    /// gets the plain `reasoning_effort` field instead.
     fn reasoning_style(&self) -> Option<ReasoningStyle> {
         if !self.reasoning {
             return None;
@@ -189,7 +190,7 @@ impl OpenAIProvider {
         if provider_is_deepseek || base_is_deepseek {
             Some(ReasoningStyle::DeepSeek)
         } else {
-            None
+            Some(ReasoningStyle::Standard)
         }
     }
 
@@ -241,17 +242,39 @@ impl OpenAIProvider {
         let stream_options = Some(OpenAIStreamOptions { include_usage });
 
         // Forward the reasoning level for providers with a request-side reasoning
-        // dialect. Only DeepSeek today; all other transports get `(None, None)`,
-        // so their serialized body is unchanged. DeepSeek collapses `low`/`medium`
-        // into `high` and `xhigh` into `max` itself, so we only emit the values it
-        // documents and let `off` request the explicit non-thinking path.
+        // dialect. DeepSeek emits `thinking` + `reasoning_effort` (`high`|`max`);
+        // Standard OpenAI-compatible providers emit only `reasoning_effort`
+        // (`low`|`medium`|`high`) with no `thinking` wrapper. Non-reasoning models
+        // get `(None, None)` and their serialized body is unchanged.
+        // The `thinkingLevelMap` compat config can override the mapping.
         let (thinking, reasoning_effort) = match self.reasoning_style() {
             Some(ReasoningStyle::DeepSeek) => match options.thinking_level.unwrap_or_default() {
                 ThinkingLevel::Off => (Some(OpenAIThinking { kind: "disabled" }), None),
-                ThinkingLevel::High => (Some(OpenAIThinking { kind: "enabled" }), Some("high")),
-                ThinkingLevel::XHigh => (Some(OpenAIThinking { kind: "enabled" }), Some("max")),
+                ThinkingLevel::High => (Some(OpenAIThinking { kind: "enabled" }), Some("high".to_string())),
+                ThinkingLevel::XHigh => (Some(OpenAIThinking { kind: "enabled" }), Some("max".to_string())),
                 ThinkingLevel::Minimal | ThinkingLevel::Low | ThinkingLevel::Medium => {
                     (Some(OpenAIThinking { kind: "enabled" }), None)
+                }
+            },
+            Some(ReasoningStyle::Standard) => {
+                let level = options.thinking_level.unwrap_or_default();
+                match level {
+                    ThinkingLevel::Off => (None, None),
+                    _ => {
+                        let effort = self
+                            .compat
+                            .as_ref()
+                            .and_then(|c| c.thinking_level_map.as_ref())
+                            .and_then(|map| map.get(&level.to_string()))
+                            .cloned()
+                            .unwrap_or_else(|| match level {
+                                ThinkingLevel::Minimal | ThinkingLevel::Low => "low".to_string(),
+                                ThinkingLevel::Medium => "medium".to_string(),
+                                ThinkingLevel::High | ThinkingLevel::XHigh => "high".to_string(),
+                                _ => "medium".to_string(),
+                            });
+                        (None, Some(effort))
+                    }
                 }
             },
             None => (None, None),
@@ -1108,11 +1131,12 @@ pub struct OpenAIRequest<'a> {
     /// OpenAI-compatible providers never set this, so it serializes away.
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<OpenAIThinking>,
-    /// DeepSeek-only reasoning effort (`"high"` | `"max"`). DeepSeek maps
-    /// `low`/`medium` to `high` and `xhigh` to `max` itself, so we only emit the
-    /// two values it documents.
+    /// Standard reasoning effort (`low` | `medium` | `high`). Used by o1/o3-series
+    /// and other OpenAI-compatible providers. For DeepSeek it also carries
+    /// `high` | `max`. The field is keyed by `compat.thinkingLevelMap` when present,
+    /// otherwise falls back to built-in defaults.
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'static str>,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1140,6 +1164,10 @@ enum ReasoningStyle {
     /// DeepSeek: `thinking: {type: enabled|disabled}` + `reasoning_effort`
     /// (`high`|`max`). Mirrors the legacy `@earendil-works/pi-ai` `thinkingFormat`.
     DeepSeek,
+    /// Standard OpenAI reasoning_effort (`low` | `medium` | `high`).
+    /// Used by o1/o3-series and compatible providers (Lucis, OpenRouter reasoning, etc.).
+    /// Emits `reasoning_effort` directly without the DeepSeek `thinking` wrapper.
+    Standard,
 }
 
 #[derive(Debug, Serialize)]
