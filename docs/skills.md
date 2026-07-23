@@ -32,15 +32,17 @@ You are an expert SQL developer. When writing queries:
 |-------|-------------|
 | `name` | Skill ID (must match directory name if in a subdir; mismatches emit a warning). |
 | `description` | **Required.** Short description used for selection; empty descriptions are skipped. |
-| `disable-model-invocation` | If `true`, the skill is not shown to the model in the system prompt. |
+| `disable-model-invocation` | If `true`, the skill is not shown to the model in the system prompt and the model is explicitly prohibited from loading or using it automatically. Users can still invoke it via `/skill:name`. |
 
 If `name` is omitted, the parent directory name is used.
 
 ## Usage
 
-### Auto-Discovery
+### Auto-Discovery (Model-Invoked)
 
 By default, Pi includes all enabled skills in the system prompt. The model can decide to "activate" a skill by reading its definition file using the `read` tool.
+
+**Hard constraint**: Skills with `disable-model-invocation: true` are excluded from the `<available_skills>` list in the system prompt, and the model is explicitly instructed **not** to load or use skills not present in that list. This prevents the model from automatically invoking skills that are intended for manual use only.
 
 ### Explicit Invocation
 

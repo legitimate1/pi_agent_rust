@@ -1286,8 +1286,9 @@ pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
 
     let mut lines = vec![
         "\n\n以下技能为特定任务提供专门的指令。".to_string(),
-        "当任务描述与某个技能匹配时，使用 read 工具加载该技能的 SKILL.md 文件。"
+        "仅当下方列表中存在匹配的技能时，才可使用 read 工具加载其 SKILL.md 文件。"
             .to_string(),
+        "未在列表中出现的技能禁止自动加载或使用——用户可通过 /skill:name 命令手动触发。".to_string(),
         "当技能文件引用相对路径时，请将路径解析为技能目录（SKILL.md 所在目录）的绝对路径，然后在工具命令中使用该绝对路径。".to_string(),
         String::new(),
         "<available_skills>".to_string(),
