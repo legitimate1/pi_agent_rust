@@ -49,7 +49,7 @@
 | 扩展工具收集 | ✅ | `src/extension_tools.rs:100` |
 | **扩展工具 onUpdate 流式进度推送**（工具执行中 `onUpdate({content, details})`，经 rquickjs Function 桥接到 Rust `ToolUpdate`） | ✅ | `src/extensions.rs` `src/extensions_js.rs` `src/extension_tools.rs` |
 | **扩展工具同名覆盖内置工具** | ✅ | `src/tools/mod.rs` `src/agent.rs` |
-| **内置 pwsh 工具**（PowerShell 命令执行） | ✅ | `src/tools/pwsh.rs` |
+| **内置 pwsh 工具**（PowerShell 命令执行、尾部截断 2000 行/1MB、exit 0 时自动过滤 stderr） | ✅ | `src/tools/pwsh.rs` |
 | **运行时禁用内置工具**（`disabledTools` 配置） | ✅ | `src/config.rs` `src/main.rs` |
 | **工具描述外部覆盖**（`toolDescriptions` 配置，免编译修改工具描述） | ✅ | `src/config.rs` `src/tools/mod.rs` `src/agent.rs` |
 | Tool trait + JSON Schema 定义 | ✅ | `src/tools/mod.rs` |
