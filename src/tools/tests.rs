@@ -5174,3 +5174,168 @@ fn test_read_large_file_different_offsets_produce_different_content() {
         );
     });
 }
+
+// ========================================================================
+// Pwsh Tool Tests
+// ========================================================================
+
+#[test]
+fn test_pwsh_simple_command() {
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = PwshTool::new(tmp.path());
+        let out = tool
+            .execute(
+                "t",
+                serde_json::json!({ "command": "echo hello_from_pwsh" }),
+                None,
+            )
+            .await
+            .unwrap();
+        let text = get_text(&out.content);
+        assert!(text.contains("hello_from_pwsh"));
+        assert!(!out.is_error);
+    });
+}
+
+#[test]
+fn test_pwsh_exit_code_nonzero() {
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = PwshTool::new(tmp.path());
+        let out = tool
+            .execute("t", serde_json::json!({ "command": "exit 42" }), None)
+            .await
+            .expect("non-zero exit should return Ok with is_error=true");
+        assert!(out.is_error, "non-zero exit must set is_error");
+    });
+}
+
+#[test]
+fn test_pwsh_stderr_capture_on_error() {
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = PwshTool::new(tmp.path());
+        let out = tool
+            .execute(
+                "t",
+                serde_json::json!({ "command": "Write-Error 'test_error_msg'; exit 1" }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        let text = get_text(&out.content);
+        assert!(
+            text.contains("test_error_msg"),
+            "expected stderr in output on error, got: {text}"
+        );
+    });
+}
+
+#[test]
+fn test_pwsh_timeout() {
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = PwshTool::new(tmp.path());
+        let out = tool
+            .execute(
+                "t",
+                serde_json::json!({ "command": "Start-Sleep 60", "timeout": 2 }),
+                None,
+            )
+            .await
+            .expect("timeout should return Ok with is_error=true");
+        assert!(out.is_error, "timeout must set is_error");
+    });
+}
+
+#[test]
+fn test_pwsh_multiline_output() {
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = PwshTool::new(tmp.path());
+        let out = tool
+            .execute(
+                "t",
+                serde_json::json!({ "command": "echo line1; echo line2; echo line3" }),
+                None,
+            )
+            .await
+            .unwrap();
+        let text = get_text(&out.content);
+        assert!(text.contains("line1"));
+        assert!(text.contains("line2"));
+        assert!(text.contains("line3"));
+        assert!(!out.is_error);
+    });
+}
+
+#[test]
+fn test_pwsh_working_directory() {
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = PwshTool::new(tmp.path());
+        let out = tool
+            .execute("t", serde_json::json!({ "command": "pwd" }), None)
+            .await
+            .unwrap();
+        let text = get_text(&out.content);
+        let cwd = tmp.path().canonicalize().unwrap();
+        // Windows canonicalize adds \\?\ prefix; pwsh outputs the regular path
+        let cwd_str = cwd.to_string_lossy();
+        let cwd_clean = cwd_str.strip_prefix(r"\\?\").unwrap_or(&cwd_str);
+        assert!(
+            text.contains(cwd_clean),
+            "expected cwd ({cwd_clean}) in output, got: {text}"
+        );
+    });
+}
+
+#[test]
+fn test_pwsh_cjk_output() {
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = PwshTool::new(tmp.path());
+        let out = tool
+            .execute(
+                "t",
+                serde_json::json!({ "command": "echo '你好世界'" }),
+                None,
+            )
+            .await
+            .unwrap();
+        let text = get_text(&out.content);
+        assert!(text.contains("你好世界"), "CJK output should be preserved");
+        assert!(!out.is_error);
+    });
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn test_pwsh_ambient_cancellation() {
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let ambient_cx = asupersync::Cx::for_testing();
+        let cancel_cx = ambient_cx.clone();
+        let _current = asupersync::Cx::set_current(Some(ambient_cx));
+
+        let cancel_thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            cancel_cx.set_cancel_requested(true);
+        });
+
+        let result = run_pwsh_command(tmp.path(), "Start-Sleep 60", Some(30))
+            .await
+            .expect("run_pwsh_command should complete");
+
+        cancel_thread.join().expect("cancel thread");
+
+        // Cancellation should produce a non-zero exit code
+        assert_ne!(
+            result.exit_code, 0,
+            "cancelled command should have non-zero exit"
+        );
+    });
+}

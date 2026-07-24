@@ -250,8 +250,14 @@ impl OpenAIProvider {
         let (thinking, reasoning_effort) = match self.reasoning_style() {
             Some(ReasoningStyle::DeepSeek) => match options.thinking_level.unwrap_or_default() {
                 ThinkingLevel::Off => (Some(OpenAIThinking { kind: "disabled" }), None),
-                ThinkingLevel::High => (Some(OpenAIThinking { kind: "enabled" }), Some("high".to_string())),
-                ThinkingLevel::XHigh => (Some(OpenAIThinking { kind: "enabled" }), Some("max".to_string())),
+                ThinkingLevel::High => (
+                    Some(OpenAIThinking { kind: "enabled" }),
+                    Some("high".to_string()),
+                ),
+                ThinkingLevel::XHigh => (
+                    Some(OpenAIThinking { kind: "enabled" }),
+                    Some("max".to_string()),
+                ),
                 ThinkingLevel::Minimal | ThinkingLevel::Low | ThinkingLevel::Medium => {
                     (Some(OpenAIThinking { kind: "enabled" }), None)
                 }
@@ -276,7 +282,7 @@ impl OpenAIProvider {
                         (None, Some(effort))
                     }
                 }
-            },
+            }
             None => (None, None),
         };
 

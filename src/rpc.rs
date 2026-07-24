@@ -7908,12 +7908,18 @@ export default function init(pi) {
 
         for idx in 0..MAX_RPC_PENDING_MESSAGES {
             shared
-                .push_steering(build_user_message(&format!("steer-{idx}"), &[]))
+                .push_steering(
+                    "test-id".to_string(),
+                    build_user_message(&format!("steer-{idx}"), &[]),
+                )
                 .expect("steering enqueue within total cap");
         }
 
         let err = shared
-            .push_follow_up(build_user_message("follow-up-overflow", &[]))
+            .push_follow_up(
+                "test-id".to_string(),
+                build_user_message("follow-up-overflow", &[]),
+            )
             .expect_err("follow-up enqueue should respect total pending cap");
         assert!(matches!(err, Error::Session(_)));
         assert_eq!(shared.pending_count(), MAX_RPC_PENDING_MESSAGES);
@@ -7926,12 +7932,18 @@ export default function init(pi) {
 
         for idx in 0..MAX_RPC_PENDING_MESSAGES {
             shared
-                .push_follow_up(build_user_message(&format!("follow-up-{idx}"), &[]))
+                .push_follow_up(
+                    "test-id".to_string(),
+                    build_user_message(&format!("follow-up-{idx}"), &[]),
+                )
                 .expect("follow-up enqueue within total cap");
         }
 
         let err = shared
-            .push_steering(build_user_message("steer-overflow", &[]))
+            .push_steering(
+                "test-id".to_string(),
+                build_user_message("steer-overflow", &[]),
+            )
             .expect_err("steering enqueue should respect total pending cap");
         assert!(matches!(err, Error::Session(_)));
         assert_eq!(shared.pending_count(), MAX_RPC_PENDING_MESSAGES);

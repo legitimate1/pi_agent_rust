@@ -42,6 +42,8 @@ pub(crate) use hashline::format_hashline_tag;
 pub(crate) use hashline::{
     NIBBLE_STR, compute_line_hash, hashline_tag_regex, parse_hashline_tag, strip_hashline_prefix,
 };
+#[cfg(test)]
+pub(crate) use pwsh::run_pwsh_command;
 
 #[cfg(test)]
 mod tests;
