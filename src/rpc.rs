@@ -2493,18 +2493,32 @@ pub async fn run(
             }
 
             "get_system_prompt" => {
-                let system_prompt = {
-                    let guard = session
+                let (system_prompt, tools) = {
+                    let mut guard = session
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    guard.agent.system_prompt().map(|s| s.to_string())
+                    (
+                        guard.agent.system_prompt().map(|s| s.to_string()),
+                        guard.agent.tool_defs(),
+                    )
                 };
+                let tools: Vec<Value> = tools
+                    .into_iter()
+                    .map(|t| {
+                        json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        })
+                    })
+                    .collect();
                 let _ = out_tx.send(response_ok(
                     id,
                     "get_system_prompt",
                     Some(json!({
                         "systemPrompt": system_prompt,
+                        "tools": tools,
                     })),
                 ));
             }

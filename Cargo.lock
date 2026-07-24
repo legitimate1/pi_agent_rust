@@ -4457,7 +4457,7 @@ dependencies = [
 
 [[package]]
 name = "pi-core"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "asupersync",
  "futures",
@@ -4470,7 +4470,7 @@ dependencies = [
 
 [[package]]
 name = "pi-provider-core"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "asupersync",
  "async-trait",
@@ -4486,7 +4486,7 @@ dependencies = [
 
 [[package]]
 name = "pi_agent_rust"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "anyhow",
  "arbitrary",

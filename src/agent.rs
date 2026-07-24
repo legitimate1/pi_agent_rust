@@ -1267,6 +1267,33 @@ impl Agent {
         self.config.system_prompt = system_prompt;
     }
 
+    /// Get the full tool definitions as they would be exposed to the model
+    /// (with description overrides applied).
+    pub fn tool_defs(&mut self) -> Vec<ToolDef> {
+        if self.cached_tool_defs.is_none() {
+            let defs: Vec<ToolDef> = self
+                .tools
+                .tools()
+                .iter()
+                .map(|t| {
+                    let name = t.name();
+                    let description = self
+                        .tools
+                        .description_override(name)
+                        .unwrap_or_else(|| t.description())
+                        .to_string();
+                    ToolDef {
+                        name: name.to_string(),
+                        description,
+                        parameters: t.parameters(),
+                    }
+                })
+                .collect();
+            self.cached_tool_defs = Some(defs);
+        }
+        self.cached_tool_defs.as_deref().unwrap().to_vec()
+    }
+
     /// Build context for a completion request.
     fn build_context(&mut self) -> Context<'_> {
         let messages: Cow<'_, [Message]> = if self.config.block_images {
