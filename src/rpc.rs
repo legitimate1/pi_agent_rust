@@ -158,6 +158,7 @@ fn normalize_command_type(command_type: &str) -> &str {
         "set-auto-compaction" | "setAutoCompaction" => "set_auto_compaction",
         "set-auto-retry" | "setAutoRetry" => "set_auto_retry",
         "get-version" | "getVersion" => "get_version",
+        "get-system-prompt" | "getSystemPrompt" => "get_system_prompt",
         _ => command_type,
     }
 }
@@ -2487,6 +2488,23 @@ pub async fn run(
                     Some(json!({
                         "version": version,
                         "gitSha": git_sha,
+                    })),
+                ));
+            }
+
+            "get_system_prompt" => {
+                let system_prompt = {
+                    let guard = session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    guard.agent.system_prompt().map(|s| s.to_string())
+                };
+                let _ = out_tx.send(response_ok(
+                    id,
+                    "get_system_prompt",
+                    Some(json!({
+                        "systemPrompt": system_prompt,
                     })),
                 ));
             }
