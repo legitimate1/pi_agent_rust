@@ -1,7 +1,7 @@
 use super::*;
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
-use asupersync::time::{sleep, wall_now};
+use crate::tools::{ProcessCleanupMode, ProcessGuard};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::fmt::Write as _;
@@ -154,6 +154,9 @@ pub async fn run_pwsh_command(
         .take()
         .ok_or_else(|| Error::tool("pwsh", "Missing stderr".to_string()))?;
 
+    // Wrap child in ProcessGuard for automatic cleanup on drop/cancellation
+    let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ChildOnly);
+
     // Read output in blocking threads
     let (tx, rx) = std::sync::mpsc::channel::<PwshPipeFrame>();
     let tx_out = tx.clone();
@@ -184,30 +187,12 @@ pub async fn run_pwsh_command(
         let _ = tx.send(PwshPipeFrame::Stderr(buf));
     });
 
-    // Wait for child with timeout
-    let start = std::time::Instant::now();
-    let exit_code = loop {
-        let remaining =
-            timeout_secs.map_or(u64::MAX, |s| s.saturating_sub(start.elapsed().as_secs()));
-        if remaining == 0 {
-            let _ = child.kill();
-            break None;
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status_code(status)),
-            Ok(None) => {
-                // Wait a bit before polling again
-            }
-            Err(_) => break None,
-        }
-        // Use a short sleep instead of busy-wait
-        let now = wall_now();
-        if remaining > 0 && remaining < 10 {
-            sleep(now, std::time::Duration::from_millis(50)).await;
-        } else {
-            sleep(now, std::time::Duration::from_millis(100)).await;
-        }
-    };
+    // Wait for child with timeout and ambient cancellation support
+    let exit_code = guard
+        .wait_with_cancellation(timeout_secs)
+        .await
+        .ok()
+        .flatten();
 
     // Wait for I/O threads
     stdout_thread.join().ok();
@@ -286,10 +271,6 @@ pub async fn run_pwsh_command(
         full_output_path,
         truncation: if truncated { Some(truncation) } else { None },
     })
-}
-
-fn status_code(status: std::process::ExitStatus) -> i32 {
-    status.code().unwrap_or(-1)
 }
 
 enum PwshPipeFrame {

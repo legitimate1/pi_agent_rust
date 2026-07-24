@@ -49,7 +49,6 @@ mod tests;
 use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(test)]
 use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
 use pi_core::model::{ContentBlock, ImageContent, TextContent};
@@ -3350,6 +3349,67 @@ impl ProcessGuard {
         Self {
             child: Some(child),
             cleanup_mode,
+        }
+    }
+
+    /// Spawn a command and wrap it in a `ProcessGuard`.
+    ///
+    /// Convenience constructor that spawns the command and wraps the child
+    /// process in a guard with automatic cleanup on drop.
+    pub(crate) fn spawn_managed(
+        cmd: &mut std::process::Command,
+        cleanup_mode: ProcessCleanupMode,
+    ) -> std::io::Result<Self> {
+        let child = cmd.spawn()?;
+        Ok(Self {
+            child: Some(child),
+            cleanup_mode,
+        })
+    }
+
+    /// Wait for the child process with timeout and ambient cancellation support.
+    ///
+    /// Polls the child in a loop, checking for:
+    /// - Ambient cancellation via [`AgentCx::checkpoint`]
+    /// - Timeout expiration
+    ///
+    /// Returns `Ok(Some(exit_code))` if the child exited normally.
+    /// Returns `Ok(None)` if the child was killed (timeout or cancellation).
+    /// Returns `Err(io::Error)` on I/O error.
+    pub(crate) async fn wait_with_cancellation(
+        &mut self,
+        timeout_secs: Option<u64>,
+    ) -> std::io::Result<Option<i32>> {
+        let start = std::time::Instant::now();
+        loop {
+            // Check for ambient cancellation
+            let agent_cx = AgentCx::for_current_or_request();
+            let cx = agent_cx.cx();
+            if cx.checkpoint().is_err() {
+                self.kill();
+                return Ok(None);
+            }
+
+            // Check timeout
+            let remaining =
+                timeout_secs.map_or(u64::MAX, |s| s.saturating_sub(start.elapsed().as_secs()));
+            if remaining == 0 {
+                self.kill();
+                return Ok(None);
+            }
+
+            // Try to get child exit status
+            if let Some(status) = self.try_wait_child()? {
+                return Ok(Some(status.code().unwrap_or(-1)));
+            }
+
+            // Adaptive sleep: shorter interval when close to timeout
+            let now = wall_now();
+            if remaining > 0 && remaining < 10 {
+                sleep(now, Duration::from_millis(50)).await;
+            } else {
+                sleep(now, Duration::from_millis(100)).await;
+            }
         }
     }
 
