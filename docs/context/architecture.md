@@ -35,6 +35,19 @@ Session persistence + index (JSONL, optional SQLite)
                                          │ → replace builtin│
                                          │ → append new     │
                                          └──────────────────┘
+
+    ┌──────────────────────────────────────────────┐
+    │  ProcessGuard 子进程生命周期管理              │
+    │  (tools/mod.rs:3337)                         │
+    │                                              │
+    │  spawn_managed() → 便捷构造器                │
+    │  wait_with_cancellation() → 标准 wait 循环    │
+    │    • ambient cancellation (cx.checkpoint)     │
+    │    • 超时 kill                                │
+    │  Drop → spawn 线程 kill + wait 回收子进程     │
+    │                                              │
+    │  被 pwsh / bash / grep / find 使用               │
+    └──────────────────────────────────────────────┘
 ```
 
 ## 扩展加载流程

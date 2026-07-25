@@ -53,6 +53,7 @@
 | **内置 pwsh 工具**（PowerShell 命令执行、尾部截断 2000 行/1MB、exit 0 时自动过滤 stderr） | ✅ | `src/tools/pwsh.rs` |
 | **运行时禁用内置工具**（`disabledTools` 配置） | ✅ | `src/config.rs` `src/main.rs` |
 | **工具描述外部覆盖**（`toolDescriptions` 配置，免编译修改工具描述） | ✅ | `src/config.rs` `src/tools/mod.rs` `src/agent.rs` |
+| **ProcessGuard 子进程生命周期管理** — 统一管理 spawn 子进程的清理：ambient cancellation、超时 kill、Drop 自动回收 | ✅ | `src/tools/mod.rs:3337` |
 | Tool trait + JSON Schema 定义 | ✅ | `src/tools/mod.rs` |
 
 ## 扩展系统
