@@ -8,7 +8,7 @@ cargo build              # Debug 构建（LLD 链接器 + sccache 缓存）
 cargo build --release    # 发布构建（opt-level=3 + thin LTO + panic=abort）
 ```
 
-> ⚠️ **构建注意事项**：`cargo build --release` 耗时 5-10 分钟，请在**新开的终端窗口**中执行构建，不要占用当前交互终端。使用 `Start-Process` 或手动开新窗口。
+
 
 ### 部署
 
@@ -56,12 +56,13 @@ cargo test conformance   # 一致性测试
 cargo test sse::tests    # 特定模块测试
 ```
 
-## 代码质量
+## 静态检查
 
 ```bash
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
+cargo clippy --all-targets -- -D warnings && cargo fmt --check
 ```
+
+> `cargo clippy` 已内含编译检查，无需单独跑 `cargo check`。详情见 AGENTS.md 的「静态检查」节。
 
 ## Release 构建
 

@@ -692,7 +692,7 @@ impl Tool for ReadTool {
         "read"
     }
     fn description(&self) -> &str {
-        "读取文件内容。支持文本、图片（jpg/png/gif/webp）、文件信息、差异比较和编码检测。可使用 head/tail 进行部分读取、info 仅查看元数据、diff 比较文件、encoding 覆盖自动编码检测。输出限制为 2000 行或 1MB。"
+        "读取文件内容。支持文本、图片（jpg/png/gif/webp）、文件信息、差异比较和编码检测。可使用 head/tail 进行部分读取、info 仅查看元数据、diff 比较文件。输出限制为 2000 行或 1MB。"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -730,7 +730,7 @@ impl Tool for ReadTool {
                 },
                 "info": {
                     "type": "boolean",
-                    "description": "When true, show file metadata (size, line count, encoding, modified time) without reading content. Also shows structure preview."
+                    "description": "When true, show file metadata (size, line count, encoding, modified time) without reading content."
                 },
 
                 "diff": {
@@ -777,6 +777,29 @@ impl Tool for ReadTool {
             return Err(Error::validation(
                 "`offset` must be non-negative".to_string(),
             ));
+        }
+
+        // head, offset, tail are mutually exclusive
+        let has_head = input.head.is_some();
+        let has_offset = input.offset.is_some();
+        let has_tail = input.tail.is_some();
+        let mutex_count = [has_head, has_offset, has_tail]
+            .iter()
+            .filter(|&&x| x)
+            .count();
+        if mutex_count > 1 {
+            let given = [
+                has_head.then_some("head"),
+                has_offset.then_some("offset"),
+                has_tail.then_some("tail"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("`, `");
+            return Err(Error::validation(format!(
+                "`{given}` are mutually exclusive, but all were provided"
+            )));
         }
 
         let paths: Vec<&str> = match (&input.path, &input.paths) {

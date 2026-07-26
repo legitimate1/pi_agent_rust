@@ -46,21 +46,19 @@
 
 除非 `docs/contracts/dropin-certification-contract.json` 的硬性条件满足，否则不要将 Pi Rust 描述为严格的 drop-in 替代品。`docs/evidence/dropin-certification-verdict.json` 的 `overall_verdict = CERTIFIED` 才是发布闸门。
 
-## 编译器检查
+## 静态检查（质量门禁）
 
 改代码后必须跑：
 
 ```bash
-cargo check --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
+cargo clippy --all-targets -- -D warnings && cargo fmt --check
 ```
 
 ## 构建与部署
 
 ### 规则
 1. 每次构建前升版本号：`cargo set-version --bump patch`
-2. 构建和部署分离 — 构建后等我指令再部署
+2. 构建和部署分离 — 构建后等用户指令再部署
 3. 不得私自构建或部署
 
 ### 流程
@@ -126,7 +124,7 @@ cargo test sse::tests         # 特定模块
 ## 会话结束
 
 1. 为未完成的工作创建问题
-2. 跑测试、clippy、构建
+2. 跑测试、静态检查、构建
 3. 更新问题状态
 4. **推送到远程（强制）：**
    ```bash
