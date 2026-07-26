@@ -693,6 +693,11 @@ mod tests {
 
     #[test]
     fn extension_tool_wrapper_default_timeout() {
+        // Skip if an environment override is active; this test checks the default.
+        if std::env::var("PI_EXTENSION_TOOL_TIMEOUT_MS").is_ok() {
+            eprintln!("skipping: PI_EXTENSION_TOOL_TIMEOUT_MS env var is set, cannot test default");
+            return;
+        }
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");

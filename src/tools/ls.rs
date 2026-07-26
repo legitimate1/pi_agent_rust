@@ -49,7 +49,7 @@ impl Tool for LsTool {
         "ls"
     }
     fn description(&self) -> &str {
-        "列出目录内容。返回按字母排序的条目，目录以 '/' 结尾。包含点文件。输出限制为 500 条或 1MB（以先到者为准）。"
+        "列出目录内容。返回字母排序的条目，目录以 '/' 结尾。包含点文件。路径须为目录（非目录路径报错）。条目超限自动截断。"
     }
 
     fn parameters(&self) -> serde_json::Value {

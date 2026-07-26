@@ -603,7 +603,7 @@ impl Tool for EditTool {
         "edit"
     }
     fn description(&self) -> &str {
-        "通过替换文本来编辑文件。oldText 必须唯一匹配一个区域；匹配精确但会标准化换行符、Unicode 空格/引号/破折号，并忽略末尾空白。"
+        "通过替换文本编辑现有文件。oldText 须唯一匹配文件中一处区域；替换无变化时报错。返回替换差异。文件限 100MB。"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -617,7 +617,7 @@ impl Tool for EditTool {
                 "oldText": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Text to find and replace (must match uniquely; matching normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace)"
+                    "description": "Text to find and replace. Must match exactly one region; matching normalizes line endings, Unicode whitespace/quotes/dashes, and ignores trailing whitespace."
                 },
                 "newText": {
                     "type": "string",

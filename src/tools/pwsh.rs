@@ -38,7 +38,7 @@ impl Tool for PwshTool {
         "pwsh"
     }
     fn description(&self) -> &str {
-        "在 Windows 上通过 pwsh 执行 PowerShell 命令。支持文件列表、文本处理和系统信息 — 与终端行为一致，但将输出作为文本返回。可用于任何 shell 操作。输出截断为最后 2000 行或 1MB（以先到者为准）。截断时完整输出会保存到临时文件。`timeout` 默认 120 秒；设为 `timeout: 0` 可禁用超时。"
+        "在 Windows 上通过 pwsh 执行 PowerShell 命令。返回输出文本。非零退出码视为错误。超限输出自动截断（完整输出以文件保留，路径见 details）。timeout 默认 120 秒，设 0 禁用。"
     }
 
     fn parameters(&self) -> serde_json::Value {

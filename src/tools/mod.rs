@@ -2930,6 +2930,28 @@ pub(crate) fn rg_available() -> bool {
     find_rg_binary().is_some()
 }
 
+/// Returns `true` if the `bash` binary is reachable on the current system.
+///
+/// Matches the shell resolution logic in [`run_bash_command`] so that
+/// tests skip consistently wherever the tool itself would fail to spawn.
+pub(crate) fn bash_available() -> bool {
+    // Mirror the exact lookup BashTool uses: check Unix paths, then fallback to "sh".
+    for path in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
+        if Path::new(path).exists() {
+            return true;
+        }
+    }
+    // On platforms where none of the Unix paths exist (e.g. Windows), fall back
+    // to checking whether "sh" is in PATH — the same fallback BashTool uses.
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg("true")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
 pub(crate) fn pump_stream<R: Read + Send + 'static>(
     mut reader: R,
     stream_name: &'static str,

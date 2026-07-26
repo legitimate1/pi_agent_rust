@@ -692,7 +692,7 @@ impl Tool for ReadTool {
         "read"
     }
     fn description(&self) -> &str {
-        "读取文件内容。支持文本、图片（jpg/png/gif/webp）、文件信息、差异比较和编码检测。可使用 head/tail 进行部分读取、info 仅查看元数据、diff 比较文件。输出限制为 2000 行或 1MB。"
+        "读取文件内容（文本及图片）。支持单文件/多文件批量读取、部分读取、元数据查看、文件差异比较、编码自动检测。超 100MB 文件拒绝读取；超限输出自动截断。"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -714,11 +714,11 @@ impl Tool for ReadTool {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of lines to read. Used with offset."
+                    "description": "Max lines to return (used with offset)"
                 },
                 "hashline": {
                     "type": "boolean",
-                    "description": "When true, output each line as N#AB:content where N is the line number and AB is a content hash. Use with hashline_edit tool for precise edits."
+                    "description": "Output each line as N#AB:content (line number + content hash). Used with hashline_edit for precise edits."
                 },
                 "head": {
                     "type": "integer",
@@ -735,7 +735,7 @@ impl Tool for ReadTool {
 
                 "diff": {
                     "type": "string",
-                    "description": "Compare this file with another file. Shows a unified diff between the two files."
+                    "description": "Compare this file with another. Produces unified diff."
                 },
                 "context": {
                     "type": "integer",
@@ -743,7 +743,7 @@ impl Tool for ReadTool {
                 },
                 "summary_only": {
                     "type": "boolean",
-                    "description": "When true and used with diff, show only diff statistics without the full diff."
+                    "description": "With diff: show statistics only, omit full diff."
                 }
             },
             "oneOf": [

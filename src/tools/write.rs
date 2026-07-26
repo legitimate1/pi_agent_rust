@@ -39,7 +39,7 @@ impl Tool for WriteTool {
         "write"
     }
     fn description(&self) -> &str {
-        "将内容写入文件。文件不存在则创建，存在则覆盖。自动创建父目录。"
+        "将内容写入文件。文件不存在则创建，存在则覆盖。自动创建父目录。单次写入限 100MB；路径须指向文件（非目录）。"
     }
 
     fn parameters(&self) -> serde_json::Value {

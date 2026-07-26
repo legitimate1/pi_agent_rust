@@ -170,7 +170,7 @@ impl Tool for GrepTool {
         "grep"
     }
     fn description(&self) -> &str {
-        "在文件内容中搜索匹配模式。返回匹配行及文件路径与行号。遵循 .gitignore。输出限制为 100 条匹配或 1MB（以先到者为准）。超长行截断至 500 字符。使用 hashline=true 可获取 N#AB 内容哈希标签，配合 hashline_edit 使用。"
+        "在文件内容中搜索匹配模式（正则或字面量）。返回匹配行及文件路径与行号。遵循 .gitignore。支持大小写忽略、glob 过滤、行上下文。匹配超限自动截断。"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -179,7 +179,7 @@ impl Tool for GrepTool {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Search pattern (regex or literal string)"
+                    "description": "Pattern to search (regex by default; set literal=true for plain-text search)"
                 },
                 "path": {
                     "type": "string",
@@ -207,7 +207,7 @@ impl Tool for GrepTool {
                 },
                 "hashline": {
                     "type": "boolean",
-                    "description": "When true, output each line as N#AB:content where N is the line number and AB is a content hash. Use with hashline_edit tool for precise edits."
+                    "description": "Output each line as N#AB:content (line number + content hash). Used with hashline_edit for precise edits."
                 }
             },
             "required": ["pattern"]

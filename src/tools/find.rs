@@ -51,7 +51,7 @@ impl Tool for FindTool {
         "find"
     }
     fn description(&self) -> &str {
-        "按 glob 模式搜索文件。返回相对于搜索目录的匹配文件路径。按修改时间排序（最新在前）。遵循 .gitignore。输出限制为 1000 条结果或 1MB（以先到者为准）。"
+        "按 glob 模式搜索文件。返回匹配文件路径（相对搜索目录），按修改时间排序（最新在前）。遵循 .gitignore。支持指定搜索目录。结果超限自动截断。"
     }
 
     fn parameters(&self) -> serde_json::Value {

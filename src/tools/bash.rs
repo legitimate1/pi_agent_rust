@@ -464,7 +464,7 @@ impl Tool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        "在当前工作目录执行 bash 命令。返回 stdout 和 stderr。输出截断为最后 2000 行或 1MB（以先到者为准）。截断时完整输出会保存到临时文件。`timeout` 默认 120 秒；设为 `timeout: 0` 可禁用超时。"
+        "在当前工作目录执行 bash 命令。返回合并的 stdout+stderr。非零退出码视为错误。超限输出自动截断（完整输出以文件保留，路径见 details）。timeout 默认 120 秒，设 0 禁用。"
     }
 
     fn parameters(&self) -> serde_json::Value {
