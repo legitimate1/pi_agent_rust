@@ -112,6 +112,7 @@ cargo test sse::tests         # 特定模块
 |:-------|:---------|
 | CLI 入口 + 子命令 | `src/main.rs` |
 | Agent 主循环 | `src/agent.rs` |
+| Abort 信号原语 | `src/abort.rs` |
 | Provider 层（10 个实现模块） | `src/providers/` |
 | 内置工具（9 个） | `src/tools/` |
 | 交互式 TUI | `src/interactive.rs` + `src/tui.rs` |

@@ -43,10 +43,12 @@ Session persistence + index (JSONL, optional SQLite)
     │  spawn_managed() → 便捷构造器                │
     │  wait_with_cancellation() → 标准 wait 循环    │
     │    • ambient cancellation (cx.checkpoint)     │
+    │    • abort 信号检查 (signal.is_aborted)       │
     │    • 超时 kill                                │
     │  Drop → spawn 线程 kill + wait 回收子进程     │
     │                                              │
-    │  被 pwsh / bash / grep / find 使用               │
+    │  被 pwsh / bash / grep / find 使用            │
+    │  全部使用 ProcessGroupTree + isolate 进程组   │
     └──────────────────────────────────────────────┘
 ```
 
@@ -63,6 +65,7 @@ Session persistence + index (JSONL, optional SQLite)
 
 | 模块 | 职责 |
 |:-----|:------|
+| `abort.rs` | 共享 AbortHandle/AbortSignal 原语，打破 agent ↔ tools 循环依赖 |
 | `app.rs` | 系统提示词构建（SYSTEM.md 加载、default_system_prompt、project context files） |
 | `tools/` 模块目录 | ToolRegistry + 9 内置工具模块（read/bash/pwsh/edit/write/grep/find/ls/hashline） |
 | `agent.rs` | Agent 循环（工具迭代、扩展合并、ToolDef 构建） |
@@ -73,3 +76,42 @@ Session persistence + index (JSONL, optional SQLite)
 | `providers/mod.rs` | Provider 工厂 + 扩展 stream-simple 桥接 |
 | `models.rs` | 内置 + models.json 模型注册表 |
 | `session.rs` | JSONL 会话持久化 |
+
+## Agent 循环中的 abort 传播
+
+```
+RPC "abort" → AbortHandle::abort()
+              ↓
+AbortSignal (AtomicBool + Notify)
+              ↓
+         ┌────┴──────────────────────────┐
+         │                                │
+   execute_tool_batch              stream_assistant_response
+         │                          select(abort_fut, stream)
+   传递给 execute_tool_owned               │
+         │                          "Aborted" StopReason
+   传递给 execute_tool                     │
+         │                          立刻返回
+   传递给 execute_tool_without_hooks
+         │
+   传递给 tool.execute(id, input, on_update, abort)
+         │
+    ┌────┴────┐
+    ▼         ▼
+Rust 工具   扩展工具
+bash/pwsh   execute_extension_tool
+循环检查     │
+abort +      await_js_task 循环检查
+guard.kill() abort + runtime.request_interrupt()
+            │
+            QuickJS interrupt hook
+            强制停止 JS 执行
+
+工具执行返回后 → run_loop 立即发送 TurnEnd + AgentEnd(error:"Aborted")
+```
+
+| 路径 | 机制 | 延迟 |
+|:-----|:-----|:-----|
+| bash/pwsh 工具 | 循环中 `signal.is_aborted()` → `guard.kill()` → `taskkill /F /T` | ≤100ms (轮询间隔) |
+| 扩展 JS 工具 | `await_js_task` 循环检查 → `runtime.request_interrupt()` → JS 中断 | ≤1ms (下一个 QuickJS interrupt) |
+| agent_end 发送 | 工具返回后 run_loop 检测 abort 标记，立即发送 TurnEnd + AgentEnd | 立即 |

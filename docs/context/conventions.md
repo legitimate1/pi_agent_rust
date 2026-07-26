@@ -31,27 +31,34 @@ let mut child = cmd.spawn()?;
 child.try_wait()...;
 
 // ✅ 正确：ProcessGuard 封装，Drop 时自动 kill + wait 回收
-let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ChildOnly);
-guard.wait_with_cancellation(timeout_secs).await?;
+let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
+guard.wait_with_cancellation(timeout_secs, abort.as_ref()).await?;
 ```
 
-### 选择 cleanup 模式
+### 清理模式：统一 ProcessGroupTree
 
-| 模式 | 适用场景 | 说明 |
+所有 spawn 子进程的工具（bash/pwsh/grep/find）统一使用 `ProcessGroupTree`：
+
+| 工具 | 清理模式 | 说明 |
 |:-----|:---------|:------|
-| `ChildOnly` | grep、find、pwsh | 只 kill 直接子进程，不涉及子进程组 |
-| `ProcessGroupTree` | bash | kill 整个进程组树，包括 shell 启动的后台进程 |
+| bash | `ProcessGroupTree` + `isolate_command_process_group` | shell 启动的后台进程一律被 `taskkill /F /T` 终止 |
+| pwsh | `ProcessGroupTree` + `isolate_command_process_group` | PowerShell 命令的子进程树被完整清理 |
+| grep | `ProcessGroupTree` + `isolate_command_process_group` | ripgrep 及其子进程被清理 |
+| find | `ProcessGroupTree` + `isolate_command_process_group` | fd 及其子进程被清理 |
+
+> `ChildOnly` 模式已废弃。新增 spawn 子进程的工具必须使用 `ProcessGroupTree` + `isolate_command_process_group`。
 
 ### 标准化 wait 方法
 
-优先使用 `guard.wait_with_cancellation(timeout_secs)`，它内置：
+优先使用 `guard.wait_with_cancellation(timeout_secs, abort.as_ref())`，它内置：
 - **Ambient cancellation** — 通过 `AgentCx::checkpoint()` 检测 abort
+- **Abort 信号** — 通过 `AbortSignal::is_aborted()` 检测外部取消
 - **超时 kill** — 超时后自动 kill 子进程
 - **适应性 sleep** — 接近超时时缩短轮询间隔
 
 ```rust
-// 推荐：一行涵盖 timeout + cancellation
-let exit_code = guard.wait_with_cancellation(timeout_secs).await
+// 推荐：一行涵盖 timeout + cancellation + abort
+let exit_code = guard.wait_with_cancellation(timeout_secs, abort.as_ref()).await
     .ok()
     .flatten()
     .unwrap_or(-1);
@@ -62,6 +69,29 @@ let exit_code = guard.wait_with_cancellation(timeout_secs).await
 - ❌ 直接使用 `std::process::Child` 裸对象
 - ❌ 手动实现 wait 循环时遗漏 cancellation 检查
 - ❌ wait 循环中用 `std::thread::sleep` 阻塞异步运行时（用 `asupersync::time::sleep` 代替）
+- ❌ `Tool::execute()` 实现中忽略 abort 参数（应至少传 `None` 给 trait 定义）
+
+## 扩展 abort 约定
+
+扩展工具（扩展注册的自定义工具）的 abort 传播路径不同于内置工具：
+
+1. `ExtensionToolWrapper::execute` 收到 abort 信号 → 不直接传给 JS runtime（由 command channel 异步转发）
+2. `await_js_task` 在循环中检查 `abort.is_aborted()` → 调用 `runtime.request_interrupt()` → QuickJS interrupt handler 触发 → JS 执行中断
+3. `InterruptBudget.external_trigger` 确保外部 abort 优先级高于 interrupt budget
+
+```rust
+// await_js_task 中的 abort 检查模式
+loop {
+    if let Some(signal) = abort {
+        if signal.is_aborted() {
+            runtime.request_interrupt();
+            return Err(Error::extension("aborted"));
+        }
+    }
+    pump_js_runtime_once(runtime, host).await?;
+    // ... 检查 task 状态
+}
+```
 
 ## 反模式
 

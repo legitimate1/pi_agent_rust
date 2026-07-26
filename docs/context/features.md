@@ -43,6 +43,9 @@
 |:-----|:----:|:---------|
 | ToolRegistry — 工具注册表 | ✅ | `src/tools/mod.rs` |
 | 内置 9 工具（read/bash/pwsh/edit/write/grep/find/ls/hashline） | ✅ | `src/tools/` 各子模块 |
+| **进程清理模式统一为 ProcessGroupTree** — 所有 spawn 子进程的工具（bash/pwsh/grep/find）均使用 `isolate_command_process_group` + `taskkill /F /T` 杀整个进程树 | ✅ | `src/tools/bash.rs` `src/tools/pwsh.rs` `src/tools/grep.rs` `src/tools/find.rs` |
+| **`Tool::execute()` 支持 abort 信号** — trait 新增 `abort: Option<AbortSignal>` 参数，long-running 工具在循环中检查并主动 kill 子进程 | ✅ | `src/tools/mod.rs` `src/abort.rs` |
+| **`ProcessGuard::wait_with_cancellation()` 支持 abort 信号** — 循环中检查外部 abort + cx.checkpoint + 超时 | ✅ | `src/tools/mod.rs:3381` |
 | **ReadTool — 无 CWD/agent-dir 路径限制** + head/tail/info/diff 参数 + 编码自动检测 | ✅ | `src/tools/read.rs` |
 | **WriteTool / EditTool — 无 CWD 路径限制**（可写入任意绝对路径） | ✅ | `src/tools/write.rs` `src/tools/edit.rs` |
 | **EditTool — 直接写入**（非 tempfile 原子重命名，避让 Windows 句柄冲突） | ✅ | `src/tools/edit.rs` |
@@ -53,14 +56,17 @@
 | **内置 pwsh 工具**（PowerShell 命令执行、尾部截断 2000 行/1MB、exit 0 时自动过滤 stderr） | ✅ | `src/tools/pwsh.rs` |
 | **运行时禁用内置工具**（`disabledTools` 配置） | ✅ | `src/config.rs` `src/main.rs` |
 | **工具描述外部覆盖**（`toolDescriptions` 配置，免编译修改工具描述） | ✅ | `src/config.rs` `src/tools/mod.rs` `src/agent.rs` |
-| **ProcessGuard 子进程生命周期管理** — 统一管理 spawn 子进程的清理：ambient cancellation、超时 kill、Drop 自动回收 | ✅ | `src/tools/mod.rs:3337` |
+| **ProcessGuard 子进程生命周期管理** — 统一管理 spawn 子进程的清理：ambient cancellation、超时 kill、abort 信号检查、Drop 自动回收 | ✅ | `src/tools/mod.rs:3337` |
 | Tool trait + JSON Schema 定义 | ✅ | `src/tools/mod.rs` |
+| **Abort 信号原语** — 共享 `AbortHandle`/`AbortSignal`，打破 agent.rs ↔ tools/mod.rs 循环依赖 | ✅ | `src/abort.rs` |
 
 ## 扩展系统
 
 | 功能 | 状态 | 涉及文件 |
 |:-----|:----:|:---------|
 | JS/TS 扩展加载（QuickJS） | ✅ | `src/extensions_js.rs` |
+| **JS Runtime 中断机制** — `InterruptBudget.external_trigger` 外部中断 + QuickJS interrupt hook 停止死循环 | ✅ | `src/extensions_js.rs:4616` |
+| **扩展工具 abort 传播** — `await_js_task` 循环检查 abort 信号，触发 runtime 中断 + 返回错误 | ✅ | `src/extensions.rs` `src/extensions_js.rs` |
 | Native Rust 扩展（`*.native.json`） | ✅ | `src/extensions.rs` |
 | WASM 扩展 | ✅ | `src/extensions.rs` |
 | 能力策略模型（Strict/Prompt/Permissive） | ✅ | `src/extensions.rs:1139` |
