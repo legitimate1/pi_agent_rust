@@ -67,11 +67,13 @@ impl Tool for PwshTool {
         _tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        _abort: Option<AbortSignal>,
     ) -> Result<ToolOutput> {
         let input: PwshInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
 
-        let result = run_pwsh_command(&self.cwd, &input.command, input.timeout).await?;
+        let result =
+            run_pwsh_command(&self.cwd, &input.command, input.timeout, _abort.as_ref()).await?;
 
         let mut details_map = serde_json::Map::new();
         if let Some(truncation) = result.truncation.as_ref() {
@@ -105,6 +107,7 @@ pub async fn run_pwsh_command(
     cwd: &Path,
     command: &str,
     timeout_secs: Option<u64>,
+    abort: Option<&AbortSignal>,
 ) -> Result<PwshRunResult> {
     let timeout_secs = match timeout_secs {
         None => Some(DEFAULT_BASH_TIMEOUT_SECS),
@@ -137,6 +140,7 @@ pub async fn run_pwsh_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    isolate_command_process_group(&mut cmd);
 
     let mut child = cmd.spawn().map_err(|e| {
         Error::tool(
@@ -155,7 +159,7 @@ pub async fn run_pwsh_command(
         .ok_or_else(|| Error::tool("pwsh", "Missing stderr".to_string()))?;
 
     // Wrap child in ProcessGuard for automatic cleanup on drop/cancellation
-    let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ChildOnly);
+    let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
 
     // Read output in blocking threads
     let (tx, rx) = std::sync::mpsc::channel::<PwshPipeFrame>();
@@ -187,9 +191,9 @@ pub async fn run_pwsh_command(
         let _ = tx.send(PwshPipeFrame::Stderr(buf));
     });
 
-    // Wait for child with timeout and ambient cancellation support
+    // Wait for child with timeout, ambient cancellation, and abort support
     let exit_code = guard
-        .wait_with_cancellation(timeout_secs)
+        .wait_with_cancellation(timeout_secs, abort)
         .await
         .ok()
         .flatten();

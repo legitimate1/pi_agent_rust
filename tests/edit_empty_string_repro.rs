@@ -20,6 +20,7 @@ mod tests {
                         "newText": "PREFIX"
                     }),
                     None,
+                    None,
                 )
                 .await
                 .expect_err("empty oldText should be rejected");

@@ -138,12 +138,19 @@ cargo test sse::tests         # 特定模块
 5. 清理暂存区、修剪远程分支
 6. 提供上下文给下一次会话
 
-## 按需查询
+## 接手时查阅
 
-| 你需要 | 读这个 |
-|:-------|:-------|
-| 完整功能清单（每条功能→文件映射） | docs/context/features.md |
-| 详细架构（工具系统、扩展加载流程、模块关系） | docs/context/architecture.md |
-| 命名规范、隐含假设、反模式 | docs/context/conventions.md |
-| 开发命令、构建部署、CLI 用法 | docs/context/commands.md |
-| 设计决策 | docs/context/design-decisions.md |
+### 核心必读（每次接手先读这 3 个）
+
+| 内容 | 文档 |
+|:-----|:-----|
+| 完整功能清单（每条功能→文件映射） | `docs/context/features.md` |
+| 详细架构（工具系统、扩展加载流程、模块关系） | `docs/context/architecture.md` |
+| 命名规范、隐含假设、反模式 | `docs/context/conventions.md` |
+
+### 按需查阅（仅特定场景需要）
+
+| 需要什么时读 | 文档 |
+|:------------|:-----|
+| 做架构级改动、理解历史决策背景 | `docs/context/design-decisions.md` |
+| 更新构建/测试/部署流程（日常开发看 AGENTS.md 的「构建」+「测试」+「会话结束」即可） | `docs/context/commands.md` |

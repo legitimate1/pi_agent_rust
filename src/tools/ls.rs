@@ -77,6 +77,7 @@ impl Tool for LsTool {
         tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        _abort: Option<AbortSignal>,
     ) -> Result<ToolOutput> {
         let input_value = input.clone();
         let input: LsInput =

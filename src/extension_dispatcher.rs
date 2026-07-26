@@ -2943,7 +2943,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             };
         };
 
-        match tool.execute(call_id, payload, None).await {
+        match tool.execute(call_id, payload, None, None).await {
             Ok(output) => match serde_json::to_value(output) {
                 Ok(value) => HostcallOutcome::Success(value),
                 Err(err) => HostcallOutcome::Error {

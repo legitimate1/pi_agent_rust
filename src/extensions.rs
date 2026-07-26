@@ -3,6 +3,7 @@
 //! This module defines the versioned extension protocol and provides
 //! validation utilities plus a minimal WASM host scaffold.
 
+use crate::abort::AbortSignal;
 use crate::agent::AgentEvent;
 use crate::config::Config;
 use crate::connectors::Connector;
@@ -14384,7 +14385,7 @@ mod wasm_host {
                 )
             })?;
 
-            let execute = tool.execute(&call.call_id, input, None);
+            let execute = tool.execute(&call.call_id, input, None, None);
             let output = if let Some(timeout_ms) = call_timeout_ms {
                 match timeout(
                     wall_now(),
@@ -15050,6 +15051,7 @@ mod wasm_host {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::abort::AbortSignal;
         use crate::connectors::http::HttpConnectorConfig;
         use crate::model::ContentBlock;
         use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
@@ -15376,6 +15378,7 @@ mod wasm_host {
                 _tool_call_id: &str,
                 _input: Value,
                 _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+                _abort: Option<AbortSignal>,
             ) -> Result<ToolOutput> {
                 sleep(wall_now(), Duration::from_millis(200)).await;
                 Ok(ToolOutput {
@@ -19124,6 +19127,7 @@ impl JsExtensionRuntimeHandle {
                                 ctx_payload.as_ref(),
                                 timeout_ms,
                                 on_update.map(|cb| cb.0),
+                                None,
                             )
                             .await;
                             let _ = reply.send(&cx, result);
@@ -19142,6 +19146,7 @@ impl JsExtensionRuntimeHandle {
                                 &args,
                                 ctx_payload.as_ref(),
                                 timeout_ms,
+                                None,
                             )
                             .await;
                             let _ = reply.send(&cx, result);
@@ -21613,7 +21618,7 @@ async fn load_one_extension(
             })
             .await;
         let load_result = match bootstrap_result {
-            Ok(()) => await_js_task(runtime, host, &task_id, Duration::from_secs(10))
+            Ok(()) => await_js_task(runtime, host, &task_id, Duration::from_secs(10), None)
                 .await
                 .map(|_| ()),
             Err(err) => Err(err),
@@ -21676,7 +21681,14 @@ async fn dispatch_extension_event(
         })
         .await?;
 
-    await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await
+    await_js_task(
+        runtime,
+        host,
+        &task_id,
+        Duration::from_millis(timeout_ms),
+        None,
+    )
+    .await
 }
 
 /// Dispatch multiple events in a single JS bridge call, sharing context construction.
@@ -21729,8 +21741,14 @@ async fn dispatch_extension_event_batch(
         })
         .await?;
 
-    let raw_result =
-        await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await?;
+    let raw_result = await_js_task(
+        runtime,
+        host,
+        &task_id,
+        Duration::from_millis(timeout_ms),
+        None,
+    )
+    .await?;
 
     // Parse the batch results array.
     let results_array = raw_result
@@ -21765,6 +21783,7 @@ async fn execute_extension_tool(
     ctx_payload: &Value,
     timeout_ms: u64,
     on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    abort: Option<&AbortSignal>,
 ) -> Result<Value> {
     let started_at = Instant::now();
     tracing::info!(
@@ -21803,7 +21822,14 @@ async fn execute_extension_tool(
         })
         .await?;
 
-    let result = await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await;
+    let result = await_js_task(
+        runtime,
+        host,
+        &task_id,
+        Duration::from_millis(timeout_ms),
+        abort,
+    )
+    .await;
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let is_err = result.is_err();
     tracing::info!(
@@ -21825,6 +21851,7 @@ async fn execute_extension_command(
     args: &str,
     ctx_payload: &Value,
     timeout_ms: u64,
+    abort: Option<&AbortSignal>,
 ) -> Result<Value> {
     let started_at = Instant::now();
     tracing::info!(
@@ -21846,7 +21873,14 @@ async fn execute_extension_command(
         })
         .await?;
 
-    let result = await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await;
+    let result = await_js_task(
+        runtime,
+        host,
+        &task_id,
+        Duration::from_millis(timeout_ms),
+        abort,
+    )
+    .await;
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let is_err = result.is_err();
     tracing::info!(
@@ -21887,7 +21921,14 @@ async fn execute_extension_shortcut(
         })
         .await?;
 
-    let result = await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await;
+    let result = await_js_task(
+        runtime,
+        host,
+        &task_id,
+        Duration::from_millis(timeout_ms),
+        None,
+    )
+    .await;
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let is_err = result.is_err();
     tracing::info!(
@@ -21934,7 +21975,14 @@ async fn start_extension_provider_stream_simple(
         })
         .await?;
 
-    let value = await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await?;
+    let value = await_js_task(
+        runtime,
+        host,
+        &task_id,
+        Duration::from_millis(timeout_ms),
+        None,
+    )
+    .await?;
     value
         .as_str()
         .map(ToString::to_string)
@@ -21960,7 +22008,14 @@ async fn next_extension_provider_stream_simple(
         })
         .await?;
 
-    let value = await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await?;
+    let value = await_js_task(
+        runtime,
+        host,
+        &task_id,
+        Duration::from_millis(timeout_ms),
+        None,
+    )
+    .await?;
     let result: JsProviderStreamNext = serde_json::from_value(value)
         .map_err(|err| Error::extension(format!("provider stream next: {err}")))?;
     if result.done {
@@ -21994,7 +22049,14 @@ async fn cancel_extension_provider_stream_simple(
         })
         .await?;
 
-    let _ = await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await?;
+    let _ = await_js_task(
+        runtime,
+        host,
+        &task_id,
+        Duration::from_millis(timeout_ms),
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -24359,7 +24421,7 @@ async fn dispatch_hostcall_tool(
         };
     };
 
-    match tool.execute(call_id, payload, None).await {
+    match tool.execute(call_id, payload, None, None).await {
         Ok(output) => match serde_json::to_value(output) {
             Ok(value) => HostcallOutcome::Success(value),
             Err(err) => HostcallOutcome::Error {
@@ -25928,6 +25990,7 @@ async fn await_js_task(
     host: &JsRuntimeHost,
     task_id: &str,
     timeout: Duration,
+    abort: Option<&AbortSignal>,
 ) -> Result<Value> {
     enum TaskTakeResult {
         Missing,
@@ -25953,6 +26016,14 @@ async fn await_js_task(
                 "JS task timed out after {}ms",
                 timeout.as_millis()
             )));
+        }
+
+        // Check for external abort signal
+        if let Some(signal) = abort {
+            if signal.is_aborted() {
+                runtime.request_interrupt();
+                return Err(Error::extension("Extension tool aborted by user request"));
+            }
         }
 
         let _has_pending = pump_js_runtime_once(runtime, host).await?;

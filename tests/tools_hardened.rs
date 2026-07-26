@@ -62,7 +62,7 @@ mod read_hardened {
 
             let tool = pi::tools::ReadTool::new(h.temp_dir());
             let input = serde_json::json!({"path": link.to_string_lossy()});
-            let result = tool.execute("h-read-1", input, None).await.unwrap();
+            let result = tool.execute("h-read-1", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info_ctx("verify", "symlink read", |ctx| {
                 ctx.push(("text".into(), text.clone()));
@@ -84,7 +84,7 @@ mod read_hardened {
             let tool = pi::tools::ReadTool::new(h.temp_dir());
             let input = serde_json::json!({"path": link.to_string_lossy()});
             let err = tool
-                .execute("h-read-2", input, None)
+                .execute("h-read-2", input, None, None)
                 .await
                 .expect_err("should fail on dir symlink");
             let msg = err.to_string();
@@ -106,7 +106,7 @@ mod read_hardened {
 
             let tool = pi::tools::ReadTool::new(h.temp_dir());
             let input = serde_json::json!({"path": deep.to_string_lossy()});
-            let result = tool.execute("h-read-3", input, None).await.unwrap();
+            let result = tool.execute("h-read-3", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             assert!(text.contains("deep content"));
         });
@@ -120,7 +120,7 @@ mod read_hardened {
 
             let tool = pi::tools::ReadTool::new(h.temp_dir());
             let input = serde_json::json!({"path": path.to_string_lossy()});
-            let result = tool.execute("h-read-4", input, None).await.unwrap();
+            let result = tool.execute("h-read-4", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             assert!(text.contains("unicode filename content"));
         });
@@ -135,7 +135,7 @@ mod read_hardened {
 
             let tool = pi::tools::ReadTool::new(h.temp_dir());
             let input = serde_json::json!({"path": path.to_string_lossy()});
-            let result = tool.execute("h-read-5", input, None).await.unwrap();
+            let result = tool.execute("h-read-5", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("text={text}"));
             assert!(text.contains("日本語テスト"), "should contain Japanese");
@@ -154,7 +154,7 @@ mod read_hardened {
 
             let tool = pi::tools::ReadTool::new(h.temp_dir());
             let input = serde_json::json!({"path": path.to_string_lossy()});
-            let result = tool.execute("h-read-6", input, None).await.unwrap();
+            let result = tool.execute("h-read-6", input, None, None).await.unwrap();
             // Should not error on a file that's all newlines
             assert!(!result.is_error);
         });
@@ -172,7 +172,7 @@ mod read_hardened {
 
             let tool = pi::tools::ReadTool::new(h.temp_dir());
             let input = serde_json::json!({"path": path.to_string_lossy()});
-            let result = tool.execute("h-read-7", input, None).await.unwrap();
+            let result = tool.execute("h-read-7", input, None, None).await.unwrap();
             // At or just below boundary should work without byte truncation
             assert!(!result.is_error);
         });
@@ -188,7 +188,7 @@ mod read_hardened {
 
             let tool = pi::tools::ReadTool::new(h.temp_dir());
             let input = serde_json::json!({"path": path.to_string_lossy()});
-            let result = tool.execute("h-read-8", input, None).await.unwrap();
+            let result = tool.execute("h-read-8", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             // Should contain truncation notice
             assert!(
@@ -213,7 +213,7 @@ mod read_hardened {
 
             let tool = pi::tools::ReadTool::new(h.temp_dir());
             let input = serde_json::json!({"path": path.to_string_lossy(), "offset": 0});
-            let result = tool.execute("h-read-9", input, None).await.unwrap();
+            let result = tool.execute("h-read-9", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             assert!(text.contains("line1"), "offset 0 should start at line 1");
         });
@@ -234,7 +234,7 @@ mod read_hardened {
             // Read exactly the last line
             let input =
                 serde_json::json!({"path": path.to_string_lossy(), "offset": 10, "limit": 1});
-            let result = tool.execute("h-read-10", input, None).await.unwrap();
+            let result = tool.execute("h-read-10", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             assert!(text.contains("line10"), "should contain line 10");
             assert!(!text.contains("line9"), "should not contain line 9");
@@ -262,7 +262,7 @@ mod write_hardened {
                 "path": link.to_string_lossy(),
                 "content": "overwritten via symlink"
             });
-            let result = tool.execute("h-write-1", input, None).await.unwrap();
+            let result = tool.execute("h-write-1", input, None, None).await.unwrap();
             assert!(!result.is_error);
 
             // Same-workspace symlinks resolve within the configured CWD and are
@@ -292,7 +292,7 @@ mod write_hardened {
                 "path": deep.to_string_lossy(),
                 "content": "deep write"
             });
-            let result = tool.execute("h-write-2", input, None).await.unwrap();
+            let result = tool.execute("h-write-2", input, None, None).await.unwrap();
             assert!(!result.is_error);
             assert!(deep.exists());
             assert_eq!(std::fs::read_to_string(&deep).unwrap(), "deep write");
@@ -310,7 +310,7 @@ mod write_hardened {
                 "path": path.to_string_lossy(),
                 "content": ""
             });
-            let result = tool.execute("h-write-3", input, None).await.unwrap();
+            let result = tool.execute("h-write-3", input, None, None).await.unwrap();
             assert!(!result.is_error);
             assert!(path.exists());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
@@ -329,7 +329,7 @@ mod write_hardened {
                 "path": path.to_string_lossy(),
                 "content": content
             });
-            let result = tool.execute("h-write-4", input, None).await.unwrap();
+            let result = tool.execute("h-write-4", input, None, None).await.unwrap();
             assert!(!result.is_error);
             let disk = std::fs::read_to_string(&path).unwrap();
             assert_eq!(disk, content, "unicode content should round-trip perfectly");
@@ -347,7 +347,7 @@ mod write_hardened {
                 "path": path.to_string_lossy(),
                 "content": "short"
             });
-            let result = tool.execute("h-write-5", input, None).await.unwrap();
+            let result = tool.execute("h-write-5", input, None, None).await.unwrap();
             assert!(!result.is_error);
             let disk = std::fs::read_to_string(&path).unwrap();
             assert_eq!(
@@ -368,7 +368,7 @@ mod write_hardened {
                 "path": path.to_string_lossy(),
                 "content": "spaces work"
             });
-            let result = tool.execute("h-write-6", input, None).await.unwrap();
+            let result = tool.execute("h-write-6", input, None, None).await.unwrap();
             assert!(!result.is_error);
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "spaces work");
         });
@@ -388,7 +388,7 @@ mod write_hardened {
                 "path": path.to_string_lossy(),
                 "content": content
             });
-            let result = tool.execute("h-write-7", input, None).await.unwrap();
+            let result = tool.execute("h-write-7", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info(
                 "verify",
@@ -417,7 +417,7 @@ mod write_hardened {
                 "content": "new content"
             });
             let err = tool
-                .execute("h-write-8", input, None)
+                .execute("h-write-8", input, None, None)
                 .await
                 .expect_err("write should fail on readonly existing file");
             let msg = err.to_string().to_lowercase();
@@ -456,7 +456,7 @@ mod edit_hardened {
                 "oldText": "array[0].method(arg1, arg2)",
                 "newText": "array[1].method(arg3)"
             });
-            let result = tool.execute("h-edit-1", input, None).await.unwrap();
+            let result = tool.execute("h-edit-1", input, None, None).await.unwrap();
             assert!(!result.is_error);
             let disk = std::fs::read_to_string(&path).unwrap();
             assert!(disk.contains("array[1].method(arg3)"));
@@ -476,7 +476,7 @@ mod edit_hardened {
                 "oldText": "entire old content",
                 "newText": "brand new content"
             });
-            let result = tool.execute("h-edit-2", input, None).await.unwrap();
+            let result = tool.execute("h-edit-2", input, None, None).await.unwrap();
             assert!(!result.is_error);
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "brand new content");
         });
@@ -495,7 +495,7 @@ mod edit_hardened {
                 "oldText": "fn main() {\n    println!(\"hello\");\n}",
                 "newText": "fn main() {\n    eprintln!(\"debug\");\n    println!(\"hello\");\n}"
             });
-            let result = tool.execute("h-edit-3", input, None).await.unwrap();
+            let result = tool.execute("h-edit-3", input, None, None).await.unwrap();
             assert!(!result.is_error);
             let disk = std::fs::read_to_string(&path).unwrap();
             assert!(disk.contains("eprintln!(\"debug\")"));
@@ -517,7 +517,7 @@ mod edit_hardened {
                 "oldText": "alpha",
                 "newText": "ALPHA"
             });
-            tool.execute("h-edit-4a", input, None).await.unwrap();
+            tool.execute("h-edit-4a", input, None, None).await.unwrap();
 
             // Second edit
             let input = serde_json::json!({
@@ -525,7 +525,7 @@ mod edit_hardened {
                 "oldText": "gamma",
                 "newText": "GAMMA"
             });
-            tool.execute("h-edit-4b", input, None).await.unwrap();
+            tool.execute("h-edit-4b", input, None, None).await.unwrap();
 
             let disk = std::fs::read_to_string(&path).unwrap();
             h.log().info("verify", format!("disk={disk}"));
@@ -549,7 +549,7 @@ mod edit_hardened {
                 "oldText": "TARGET",
                 "newText": "REPLACED"
             });
-            let result = tool.execute("h-edit-5", input, None).await.unwrap();
+            let result = tool.execute("h-edit-5", input, None, None).await.unwrap();
             assert!(!result.is_error);
 
             let bytes = std::fs::read(&path).unwrap();
@@ -577,7 +577,7 @@ mod edit_hardened {
                 "oldText": "世界",
                 "newText": "ワールド"
             });
-            let result = tool.execute("h-edit-6", input, None).await.unwrap();
+            let result = tool.execute("h-edit-6", input, None, None).await.unwrap();
             assert!(!result.is_error);
             let disk = std::fs::read_to_string(&path).unwrap();
             assert!(disk.contains("ワールド"));
@@ -602,7 +602,7 @@ mod edit_hardened {
                 "newText": "mutable"
             });
             let err = tool
-                .execute("h-edit-7", input, None)
+                .execute("h-edit-7", input, None, None)
                 .await
                 .expect_err("should fail on readonly");
             let msg = err.to_string().to_lowercase();
@@ -639,7 +639,7 @@ mod edit_hardened {
                 "oldText": "before",
                 "newText": "after"
             });
-            let result = tool.execute("h-edit-8", input, None).await.unwrap();
+            let result = tool.execute("h-edit-8", input, None, None).await.unwrap();
             let details = result.details.expect("should have details");
             let diff = details.get("diff").expect("should have diff field");
             let diff_str = diff.as_str().unwrap_or("");
@@ -663,7 +663,7 @@ mod bash_hardened {
             let input = serde_json::json!({
                 "command": "echo 'stdout_line' && echo 'stderr_line' >&2"
             });
-            let result = tool.execute("h-bash-1", input, None).await.unwrap();
+            let result = tool.execute("h-bash-1", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("text={text}"));
             assert!(text.contains("stdout_line"), "should capture stdout");
@@ -679,13 +679,13 @@ mod bash_hardened {
 
             // Exit 0 should succeed
             let input = serde_json::json!({"command": "exit 0"});
-            let result = tool.execute("h-bash-2a", input, None).await;
+            let result = tool.execute("h-bash-2a", input, None, None).await;
             assert!(result.is_ok(), "exit 0 should succeed");
 
             // Non-zero exits are successful tool invocations with is_error=true.
             let input = serde_json::json!({"command": "exit 1"});
             let output = tool
-                .execute("h-bash-2b", input, None)
+                .execute("h-bash-2b", input, None, None)
                 .await
                 .expect("exit 1 should return a tool error output");
             assert!(output.is_error, "exit 1 must set is_error");
@@ -695,7 +695,7 @@ mod bash_hardened {
             // Exit 127 (command not found convention)
             let input = serde_json::json!({"command": "exit 127"});
             let output = tool
-                .execute("h-bash-2c", input, None)
+                .execute("h-bash-2c", input, None, None)
                 .await
                 .expect("exit 127 should return a tool error output");
             assert!(output.is_error, "exit 127 must set is_error");
@@ -713,7 +713,7 @@ mod bash_hardened {
             let tool = pi::tools::BashTool::new(h.temp_dir());
             let input = serde_json::json!({"command": "if then else fi"});
             let output = tool
-                .execute("h-bash-3", input, None)
+                .execute("h-bash-3", input, None, None)
                 .await
                 .expect("syntax error should return a tool error output");
             assert!(output.is_error, "syntax error must set is_error");
@@ -734,7 +734,7 @@ mod bash_hardened {
             let input = serde_json::json!({
                 "command": "echo line1\necho line2\necho line3"
             });
-            let result = tool.execute("h-bash-4", input, None).await.unwrap();
+            let result = tool.execute("h-bash-4", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("text={text}"));
             assert!(text.contains("line1"), "should contain line1");
@@ -749,7 +749,7 @@ mod bash_hardened {
             let h = TestHarness::new("bash_working_directory_is_correct");
             let tool = pi::tools::BashTool::new(h.temp_dir());
             let input = serde_json::json!({"command": "pwd"});
-            let result = tool.execute("h-bash-5", input, None).await.unwrap();
+            let result = tool.execute("h-bash-5", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("pwd={text}"));
             // The pwd output should match or be within the temp dir
@@ -769,7 +769,7 @@ mod bash_hardened {
             let input = serde_json::json!({
                 "command": "for i in $(seq 1 500); do echo \"stderr line $i\" >&2; done"
             });
-            let result = tool.execute("h-bash-6", input, None).await.unwrap();
+            let result = tool.execute("h-bash-6", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("text_len={}", text.len()));
             assert!(text.contains("stderr line"), "should capture stderr output");
@@ -790,7 +790,7 @@ mod bash_hardened {
                 "timeout": 1
             });
             let output = tool
-                .execute("h-bash-7", input, None)
+                .execute("h-bash-7", input, None, None)
                 .await
                 .expect("timeout should return a tool error output");
             assert!(output.is_error, "timeout must set is_error");
@@ -814,7 +814,7 @@ mod bash_hardened {
             let tool = pi::tools::BashTool::new(h.temp_dir());
             let input = serde_json::json!({"command": ""});
             // Empty command should either succeed with empty output or fail gracefully
-            let result = tool.execute("h-bash-8", input, None).await;
+            let result = tool.execute("h-bash-8", input, None, None).await;
             h.log()
                 .info("verify", format!("result_ok={}", result.is_ok()));
             // Either way, should not panic
@@ -828,7 +828,7 @@ mod bash_hardened {
             let tool = pi::tools::BashTool::new(h.temp_dir());
             // Check that a random env var we set is accessible (bash inherits env)
             let input = serde_json::json!({"command": "echo $HOME"});
-            let result = tool.execute("h-bash-9", input, None).await.unwrap();
+            let result = tool.execute("h-bash-9", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("HOME={text}"));
             // HOME should be set (basic env inheritance check)
@@ -844,7 +844,7 @@ mod bash_hardened {
             let input = serde_json::json!({
                 "command": "echo 'hello world' | wc -w"
             });
-            let result = tool.execute("h-bash-10", input, None).await.unwrap();
+            let result = tool.execute("h-bash-10", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("wc={text}"));
             assert!(text.contains('2'), "should count 2 words");
@@ -874,7 +874,7 @@ mod grep_hardened {
             let tool = pi::tools::GrepTool::new(h.temp_dir());
             // Literal search for "Result<i32"
             let input = serde_json::json!({"pattern": "Result<i32"});
-            let result = tool.execute("h-grep-1", input, None).await.unwrap();
+            let result = tool.execute("h-grep-1", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("text={text}"));
             assert!(
@@ -899,7 +899,7 @@ mod grep_hardened {
 
             let tool = pi::tools::GrepTool::new(h.temp_dir());
             let input = serde_json::json!({"pattern": "世界"});
-            let result = tool.execute("h-grep-2", input, None).await.unwrap();
+            let result = tool.execute("h-grep-2", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("text={text}"));
             assert!(text.contains("Hello 世界"), "should match Unicode pattern");
@@ -930,7 +930,7 @@ mod grep_hardened {
                 "pattern": "target_match",
                 "path": "src"
             });
-            let result = tool.execute("h-grep-3", input, None).await.unwrap();
+            let result = tool.execute("h-grep-3", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("text={text}"));
             assert!(text.contains("main.rs"), "should find match in src/");
@@ -950,7 +950,7 @@ mod grep_hardened {
 
             let tool = pi::tools::GrepTool::new(h.temp_dir());
             let input = serde_json::json!({"pattern": "anything"});
-            let result = tool.execute("h-grep-4", input, None).await.unwrap();
+            let result = tool.execute("h-grep-4", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             assert!(
                 text.contains("No matches found"),
@@ -979,7 +979,7 @@ mod grep_hardened {
                 "pattern": "line10",
                 "context": 2
             });
-            let result = tool.execute("h-grep-5", input, None).await.unwrap();
+            let result = tool.execute("h-grep-5", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("text={text}"));
             assert!(text.contains("line10"), "should contain match");
@@ -1002,7 +1002,7 @@ mod grep_hardened {
 
             let tool = pi::tools::GrepTool::new(h.temp_dir());
             let input = serde_json::json!({"pattern": "needle"});
-            let result = tool.execute("h-grep-6", input, None).await.unwrap();
+            let result = tool.execute("h-grep-6", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("text={text}"));
             assert!(text.contains("a.txt"), "should find in a.txt");
@@ -1032,7 +1032,7 @@ mod find_hardened {
 
             let tool = pi::tools::FindTool::new(h.temp_dir());
             let input = serde_json::json!({"pattern": "*.rs"});
-            let result = tool.execute("h-find-1", input, None).await.unwrap();
+            let result = tool.execute("h-find-1", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("text={text}"));
             assert!(text.contains("main.rs"), "should find main.rs");
@@ -1058,7 +1058,7 @@ mod find_hardened {
                 "pattern": "*.rs",
                 "path": "src"
             });
-            let result = tool.execute("h-find-2", input, None).await.unwrap();
+            let result = tool.execute("h-find-2", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("text={text}"));
             assert!(text.contains("main.rs"), "should find main.rs in src/");
@@ -1077,7 +1077,7 @@ mod find_hardened {
 
             let tool = pi::tools::FindTool::new(h.temp_dir());
             let input = serde_json::json!({"pattern": "*.rs"});
-            let result = tool.execute("h-find-3", input, None).await.unwrap();
+            let result = tool.execute("h-find-3", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             assert!(
                 text.contains("No files found"),
@@ -1099,7 +1099,7 @@ mod find_hardened {
 
             let tool = pi::tools::FindTool::new(h.temp_dir());
             let input = serde_json::json!({"pattern": "*.txt"});
-            let result = tool.execute("h-find-4", input, None).await.unwrap();
+            let result = tool.execute("h-find-4", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("text={text}"));
             assert!(text.contains("café.txt"), "should find Unicode filename");
@@ -1121,7 +1121,7 @@ mod find_hardened {
 
             let tool = pi::tools::FindTool::new(h.temp_dir());
             let input = serde_json::json!({"pattern": "*.txt", "limit": 5});
-            let result = tool.execute("h-find-5", input, None).await.unwrap();
+            let result = tool.execute("h-find-5", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             let file_count = text.lines().filter(|l| l.contains(".txt")).count();
             h.log().info("verify", format!("found={file_count}"));
@@ -1154,7 +1154,7 @@ mod ls_hardened {
 
             let tool = pi::tools::LsTool::new(h.temp_dir());
             let input = serde_json::json!({});
-            let result = tool.execute("h-ls-1", input, None).await.unwrap();
+            let result = tool.execute("h-ls-1", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("text={text}"));
             assert!(text.contains("real.txt"), "should list real file");
@@ -1172,7 +1172,7 @@ mod ls_hardened {
 
             let tool = pi::tools::LsTool::new(h.temp_dir());
             let input = serde_json::json!({});
-            let result = tool.execute("h-ls-2", input, None).await.unwrap();
+            let result = tool.execute("h-ls-2", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             let line_count = text.lines().count();
             h.log().info("verify", format!("lines={line_count}"));
@@ -1193,7 +1193,7 @@ mod ls_hardened {
 
             let tool = pi::tools::LsTool::new(h.temp_dir());
             let input = serde_json::json!({});
-            let result = tool.execute("h-ls-3", input, None).await.unwrap();
+            let result = tool.execute("h-ls-3", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             let lines: Vec<&str> = text.lines().filter(|l| l.contains(".txt")).collect();
             h.log().info("verify", format!("lines={lines:?}"));
@@ -1219,7 +1219,7 @@ mod ls_hardened {
 
             let tool = pi::tools::LsTool::new(h.temp_dir());
             let input = serde_json::json!({});
-            let result = tool.execute("h-ls-4", input, None).await.unwrap();
+            let result = tool.execute("h-ls-4", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("text={text}"));
             assert!(text.contains("subdir_a/"), "dirs should have trailing /");
@@ -1245,7 +1245,7 @@ mod ls_hardened {
 
             let tool = pi::tools::LsTool::new(h.temp_dir());
             let input = serde_json::json!({"limit": 3});
-            let result = tool.execute("h-ls-5", input, None).await.unwrap();
+            let result = tool.execute("h-ls-5", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             assert!(
                 text.contains("entries limit reached"),
@@ -1268,7 +1268,7 @@ mod ls_hardened {
 
             let tool = pi::tools::LsTool::new(h.temp_dir());
             let input = serde_json::json!({});
-            let result = tool.execute("h-ls-6", input, None).await.unwrap();
+            let result = tool.execute("h-ls-6", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             h.log().info("verify", format!("text={text}"));
             assert!(text.contains("日本語.txt"), "should list Unicode filename");
@@ -1286,7 +1286,7 @@ mod ls_hardened {
 
             let tool = pi::tools::LsTool::new(h.temp_dir());
             let input = serde_json::json!({"path": h.temp_path("sub").to_string_lossy()});
-            let result = tool.execute("h-ls-7", input, None).await.unwrap();
+            let result = tool.execute("h-ls-7", input, None, None).await.unwrap();
             let text = get_text(&result.content);
             assert!(text.contains("a.txt"), "should list a.txt");
             assert!(text.contains("b.txt"), "should list b.txt");
@@ -1317,14 +1317,14 @@ mod cross_tool_hardened {
                 "content": "unique_marker_string_for_grep_test\n"
             });
             write_tool
-                .execute("cross-1a", write_input, None)
+                .execute("cross-1a", write_input, None, None)
                 .await
                 .unwrap();
 
             let grep_tool = pi::tools::GrepTool::new(h.temp_dir());
             let grep_input = serde_json::json!({"pattern": "unique_marker_string_for_grep_test"});
             let result = grep_tool
-                .execute("cross-1b", grep_input, None)
+                .execute("cross-1b", grep_input, None, None)
                 .await
                 .unwrap();
             let text = get_text(&result.content);
@@ -1351,14 +1351,14 @@ mod cross_tool_hardened {
                 "content": "fn discover() {}\n"
             });
             write_tool
-                .execute("cross-2a", write_input, None)
+                .execute("cross-2a", write_input, None, None)
                 .await
                 .unwrap();
 
             let find_tool = pi::tools::FindTool::new(h.temp_dir());
             let find_input = serde_json::json!({"pattern": "*.rs"});
             let result = find_tool
-                .execute("cross-2b", find_input, None)
+                .execute("cross-2b", find_input, None, None)
                 .await
                 .unwrap();
             let text = get_text(&result.content);
@@ -1381,14 +1381,14 @@ mod cross_tool_hardened {
                 "command": format!("echo 'bash wrote this' > '{file_str}'")
             });
             bash_tool
-                .execute("cross-3a", bash_input, None)
+                .execute("cross-3a", bash_input, None, None)
                 .await
                 .unwrap();
 
             let read_tool = pi::tools::ReadTool::new(h.temp_dir());
             let read_input = serde_json::json!({"path": file_str});
             let result = read_tool
-                .execute("cross-3b", read_input, None)
+                .execute("cross-3b", read_input, None, None)
                 .await
                 .unwrap();
             let text = get_text(&result.content);
@@ -1413,13 +1413,16 @@ mod cross_tool_hardened {
                 "newText": "new content"
             });
             edit_tool
-                .execute("cross-4a", edit_input, None)
+                .execute("cross-4a", edit_input, None, None)
                 .await
                 .unwrap();
 
             let ls_tool = pi::tools::LsTool::new(h.temp_dir());
             let ls_input = serde_json::json!({});
-            let result = ls_tool.execute("cross-4b", ls_input, None).await.unwrap();
+            let result = ls_tool
+                .execute("cross-4b", ls_input, None, None)
+                .await
+                .unwrap();
             let text = get_text(&result.content);
             assert!(
                 text.contains("target.txt"),

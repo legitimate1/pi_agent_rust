@@ -7,6 +7,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
+
+use crate::abort::AbortSignal;
 #[cfg(feature = "wasm-host")]
 use std::time::Duration;
 
@@ -188,6 +190,7 @@ impl Tool for ExtensionToolWrapper {
         tool_call_id: &str,
         input: Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        _abort: Option<AbortSignal>,
     ) -> Result<ToolOutput> {
         let result = self
             .runtime
@@ -235,6 +238,7 @@ impl Tool for WasmExtensionToolWrapper {
         _tool_call_id: &str,
         input: Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        _abort: Option<AbortSignal>,
     ) -> Result<ToolOutput> {
         let fut = self.handle.handle_tool(&self.def.name, &input);
         let output_json = if self.timeout_ms > 0 {
@@ -404,7 +408,7 @@ mod tests {
             }));
 
             let output = wrapper
-                .execute("call-1", json!({ "name": "pi" }), None)
+                .execute("call-1", json!({ "name": "pi" }), None, None)
                 .await
                 .expect("execute tool");
 
@@ -498,7 +502,7 @@ mod tests {
 
             let wrapper = ExtensionToolWrapper::new(def, js_runtime);
             let err = wrapper
-                .execute("call-1", json!({}), None)
+                .execute("call-1", json!({}), None, None)
                 .await
                 .expect_err("invalid tool output should fail");
 
@@ -953,7 +957,7 @@ mod tests {
 
             let wrapper = ExtensionToolWrapper::new(def, js_runtime);
             let err = wrapper
-                .execute("call-1", json!({}), None)
+                .execute("call-1", json!({}), None, None)
                 .await
                 .expect_err("throwing tool should fail");
 
@@ -994,7 +998,7 @@ mod tests {
 
             let wrapper = ExtensionToolWrapper::new(def, js_runtime);
             let output = wrapper
-                .execute("call-1", json!({}), None)
+                .execute("call-1", json!({}), None, None)
                 .await
                 .expect("execute tool");
 
@@ -1027,7 +1031,7 @@ mod tests {
 
             let wrapper = ExtensionToolWrapper::new(def, js_runtime);
             let output = wrapper
-                .execute("call-1", json!({}), None)
+                .execute("call-1", json!({}), None, None)
                 .await
                 .expect("execute tool");
 
@@ -1065,7 +1069,7 @@ mod tests {
 
             let wrapper = ExtensionToolWrapper::new(def, js_runtime);
             let output = wrapper
-                .execute("call-1", json!({"msg": "hello world"}), None)
+                .execute("call-1", json!({"msg": "hello world"}), None, None)
                 .await
                 .expect("execute tool");
 

@@ -85,6 +85,7 @@ pub async fn run_bash_command(
     command: &str,
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+    abort: Option<&AbortSignal>,
 ) -> Result<BashRunResult> {
     let timeout_secs = match timeout_secs {
         None => Some(DEFAULT_BASH_TIMEOUT_SECS),
@@ -232,6 +233,17 @@ pub async fn run_bash_command(
             let _ = guard.kill();
             exit_code = Some(-1);
             break;
+        }
+
+        // Check explicit abort signal
+        if let Some(signal) = abort {
+            if signal.is_aborted() {
+                cancelled = true;
+                cancellation_reason = Some(BashCancellationReason::AmbientCancellation);
+                let _ = guard.kill();
+                exit_code = Some(-1);
+                break;
+            }
         }
 
         sleep(now, tick).await;
@@ -482,6 +494,7 @@ impl Tool for BashTool {
         tool_call_id: &str,
         input: serde_json::Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        _abort: Option<AbortSignal>,
     ) -> Result<ToolOutput> {
         let input: BashInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
@@ -493,6 +506,7 @@ impl Tool for BashTool {
             &input.command,
             input.timeout,
             on_update.as_deref(),
+            _abort.as_ref(),
         )
         .await?;
 

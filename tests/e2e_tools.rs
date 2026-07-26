@@ -80,8 +80,13 @@ fn read_text_file_basic() {
 
     let output = common::run_async(async move {
         let tool = registry.get("read").unwrap();
-        tool.execute("call-1", json!({"path": file.display().to_string()}), None)
-            .await
+        tool.execute(
+            "call-1",
+            json!({"path": file.display().to_string()}),
+            None,
+            None,
+        )
+        .await
     });
 
     let result = output.unwrap();
@@ -112,6 +117,7 @@ fn read_with_offset_and_limit() {
             "call-2",
             json!({"path": file.display().to_string(), "offset": 5, "limit": 6}),
             None,
+            None,
         )
         .await
     });
@@ -141,8 +147,13 @@ fn read_large_file_truncation() {
 
     let output = common::run_async(async move {
         let tool = registry.get("read").unwrap();
-        tool.execute("call-3", json!({"path": file.display().to_string()}), None)
-            .await
+        tool.execute(
+            "call-3",
+            json!({"path": file.display().to_string()}),
+            None,
+            None,
+        )
+        .await
     });
 
     let result = output.unwrap();
@@ -175,6 +186,7 @@ fn read_missing_file_error() {
         tool.execute(
             "call-4",
             json!({"path": missing.display().to_string()}),
+            None,
             None,
         )
         .await
@@ -209,8 +221,13 @@ fn read_binary_file_returns_image() {
 
     let output = common::run_async(async move {
         let tool = registry.get("read").unwrap();
-        tool.execute("call-5", json!({"path": file.display().to_string()}), None)
-            .await
+        tool.execute(
+            "call-5",
+            json!({"path": file.display().to_string()}),
+            None,
+            None,
+        )
+        .await
     });
 
     let result = output.unwrap();
@@ -243,6 +260,7 @@ fn write_new_file() {
             "call-6",
             json!({"path": target_str, "content": "hello world"}),
             None,
+            None,
         )
         .await
     });
@@ -273,6 +291,7 @@ fn write_overwrite_existing() {
             "call-7",
             json!({"path": file_str, "content": "new content"}),
             None,
+            None,
         )
         .await
     });
@@ -298,6 +317,7 @@ fn write_reports_byte_count() {
         tool.execute(
             "call-8",
             json!({"path": file_str, "content": "abcde"}),
+            None,
             None,
         )
         .await
@@ -334,6 +354,7 @@ fn edit_exact_match() {
                 "oldText": "Foo Bar",
                 "newText": "Baz Qux"
             }),
+            None,
             None,
         )
         .await
@@ -372,6 +393,7 @@ fn edit_text_not_found_error() {
                 "newText": "replacement"
             }),
             None,
+            None,
         )
         .await
     });
@@ -400,6 +422,7 @@ fn edit_ambiguous_match_error() {
                 "oldText": "apple",
                 "newText": "banana"
             }),
+            None,
             None,
         )
         .await
@@ -430,6 +453,7 @@ fn edit_preserves_line_endings() {
                 "oldText": "line2",
                 "newText": "replaced"
             }),
+            None,
             None,
         )
         .await
@@ -463,7 +487,7 @@ fn bash_simple_command() {
 
     let output = common::run_async(async move {
         let tool = registry.get("bash").unwrap();
-        tool.execute("call-13", json!({"command": "echo hello"}), None)
+        tool.execute("call-13", json!({"command": "echo hello"}), None, None)
             .await
     });
 
@@ -492,6 +516,7 @@ fn write_permission_denied_reports_clear_error() {
         tool.execute(
             "call-write-perm-denied",
             json!({"path": target.display().to_string(), "content": "blocked"}),
+            None,
             None,
         )
         .await
@@ -524,6 +549,7 @@ fn bash_nonzero_exit() {
             "call-14",
             json!({"command": "echo stderr_msg >&2; exit 42"}),
             None,
+            None,
         )
         .await
     });
@@ -548,6 +574,7 @@ fn bash_timeout() {
             "call-15",
             json!({"command": "sleep 300", "timeout": 1}),
             None,
+            None,
         )
         .await
     });
@@ -571,6 +598,7 @@ fn bash_timeout_reports_partial_output_for_repro() {
         tool.execute(
             "call-15b",
             json!({"command": "printf 'before-timeout\\n'; sleep 300", "timeout": 1}),
+            None,
             None,
         )
         .await
@@ -598,7 +626,7 @@ fn bash_large_output_truncation() {
     let output = common::run_async(async move {
         let tool = registry.get("bash").unwrap();
         // Generate >50KB of output (each line ~11 bytes x 6000 > 60KB)
-        tool.execute("call-16", json!({"command": "seq 1 6000"}), None)
+        tool.execute("call-16", json!({"command": "seq 1 6000"}), None, None)
             .await
     });
 
@@ -628,7 +656,7 @@ fn grep_basic_match() {
 
     let output = common::run_async(async move {
         let tool = registry.get("grep").unwrap();
-        tool.execute("call-17", json!({"pattern": "hello"}), None)
+        tool.execute("call-17", json!({"pattern": "hello"}), None, None)
             .await
     });
 
@@ -658,6 +686,7 @@ fn grep_case_insensitive() {
             "call-18",
             json!({"pattern": "hello", "ignoreCase": true}),
             None,
+            None,
         )
         .await
     });
@@ -685,8 +714,13 @@ fn grep_no_matches() {
 
     let output = common::run_async(async move {
         let tool = registry.get("grep").unwrap();
-        tool.execute("call-19", json!({"pattern": "zzz_no_match_zzz"}), None)
-            .await
+        tool.execute(
+            "call-19",
+            json!({"pattern": "zzz_no_match_zzz"}),
+            None,
+            None,
+        )
+        .await
     });
 
     let result = output.unwrap();
@@ -713,8 +747,13 @@ fn grep_with_context() {
 
     let output = common::run_async(async move {
         let tool = registry.get("grep").unwrap();
-        tool.execute("call-20", json!({"pattern": "TARGET", "context": 1}), None)
-            .await
+        tool.execute(
+            "call-20",
+            json!({"pattern": "TARGET", "context": 1}),
+            None,
+            None,
+        )
+        .await
     });
 
     let result = output.unwrap();
@@ -746,7 +785,7 @@ fn find_glob_pattern() {
 
     let output = common::run_async(async move {
         let tool = registry.get("find").unwrap();
-        tool.execute("call-21", json!({"pattern": "*.txt"}), None)
+        tool.execute("call-21", json!({"pattern": "*.txt"}), None, None)
             .await
     });
 
@@ -773,7 +812,7 @@ fn find_no_matches() {
 
     let output = common::run_async(async move {
         let tool = registry.get("find").unwrap();
-        tool.execute("call-22", json!({"pattern": "*.zzz_no_match"}), None)
+        tool.execute("call-22", json!({"pattern": "*.zzz_no_match"}), None, None)
             .await
     });
 
@@ -803,8 +842,13 @@ fn find_with_limit() {
 
     let output = common::run_async(async move {
         let tool = registry.get("find").unwrap();
-        tool.execute("call-23", json!({"pattern": "*.txt", "limit": 3}), None)
-            .await
+        tool.execute(
+            "call-23",
+            json!({"pattern": "*.txt", "limit": 3}),
+            None,
+            None,
+        )
+        .await
     });
 
     let result = output.unwrap();
@@ -835,7 +879,7 @@ fn find_directory_suffix() {
 
     let output = common::run_async(async move {
         let tool = registry.get("find").unwrap();
-        tool.execute("call-24", json!({"pattern": "subdir_*"}), None)
+        tool.execute("call-24", json!({"pattern": "subdir_*"}), None, None)
             .await
     });
 
@@ -866,7 +910,7 @@ fn ls_directory_contents() {
     let dir_path = h.temp_dir().display().to_string();
     let output = common::run_async(async move {
         let tool = registry.get("ls").unwrap();
-        tool.execute("call-25", json!({"path": dir_path}), None)
+        tool.execute("call-25", json!({"path": dir_path}), None, None)
             .await
     });
 
@@ -892,7 +936,7 @@ fn ls_empty_directory() {
     let dir_str = empty.display().to_string();
     let output = common::run_async(async move {
         let tool = registry.get("ls").unwrap();
-        tool.execute("call-26", json!({"path": dir_str}), None)
+        tool.execute("call-26", json!({"path": dir_str}), None, None)
             .await
     });
 
@@ -915,7 +959,7 @@ fn ls_nonexistent_path_error() {
     let dir_str = missing.display().to_string();
     let output = common::run_async(async move {
         let tool = registry.get("ls").unwrap();
-        tool.execute("call-27", json!({"path": dir_str}), None)
+        tool.execute("call-27", json!({"path": dir_str}), None, None)
             .await
     });
 
@@ -947,6 +991,7 @@ fn write_edit_read_cycle() {
             "call-w",
             json!({"path": write_file, "content": "alpha\nbeta\ngamma\n"}),
             None,
+            None,
         )
         .await
     });
@@ -965,6 +1010,7 @@ fn write_edit_read_cycle() {
                 "newText": "BETA_REPLACED"
             }),
             None,
+            None,
         )
         .await
     });
@@ -974,7 +1020,7 @@ fn write_edit_read_cycle() {
     let read_file = file_str;
     let read_result = common::run_async(async move {
         let tool = registry.get("read").unwrap();
-        tool.execute("call-r", json!({"path": read_file}), None)
+        tool.execute("call-r", json!({"path": read_file}), None, None)
             .await
     });
     let result = read_result.unwrap();
@@ -1063,6 +1109,7 @@ fn bash_stderr_only_exit_zero() {
             "bash-stderr-0",
             json!({"command": "echo stderr_output >&2"}),
             None,
+            None,
         )
         .await
     });
@@ -1100,6 +1147,7 @@ fn bash_cwd_propagation() {
             "bash-cwd",
             json!({"command": "pwd && ls marker_file.txt"}),
             None,
+            None,
         )
         .await
     });
@@ -1130,6 +1178,7 @@ fn bash_mixed_stdout_stderr() {
             "bash-mixed",
             json!({"command": "echo stdout_first; echo stderr_middle >&2; echo stdout_last"}),
             None,
+            None,
         )
         .await
     });
@@ -1158,6 +1207,7 @@ fn bash_timeout_zero_disables_limit() {
         tool.execute(
             "bash-t0",
             json!({"command": "echo still_running", "timeout": 0}),
+            None,
             None,
         )
         .await
@@ -1242,7 +1292,7 @@ fn bash_nonexistent_cwd_error() {
 
     let output = common::run_async(async move {
         let tool = registry.get("bash").unwrap();
-        tool.execute("bash-badcwd", json!({"command": "echo test"}), None)
+        tool.execute("bash-badcwd", json!({"command": "echo test"}), None, None)
             .await
     });
 
@@ -1266,6 +1316,7 @@ fn bash_special_characters() {
         tool.execute(
             "bash-special",
             json!({"command": "echo 'single quotes' && echo \"double quotes\" && echo $HOME"}),
+            None,
             None,
         )
         .await
@@ -1291,6 +1342,7 @@ fn bash_pipe_command() {
         tool.execute(
             "bash-pipe",
             json!({"command": "cat data.txt | grep 'ap' | sort"}),
+            None,
             None,
         )
         .await
@@ -1318,6 +1370,7 @@ fn bash_exit_code_captured() {
             tool.execute(
                 "bash-exit",
                 json!({"command": format!("exit {code}")}),
+                None,
                 None,
             )
             .await
@@ -1352,7 +1405,7 @@ fn read_symlink_to_file() {
     let link_str = link.display().to_string();
     let output = common::run_async(async move {
         let tool = registry.get("read").unwrap();
-        tool.execute("read-sym", json!({"path": link_str}), None)
+        tool.execute("read-sym", json!({"path": link_str}), None, None)
             .await
     });
 
@@ -1377,7 +1430,7 @@ fn read_unicode_multibyte() {
     let file_str = file.display().to_string();
     let output = common::run_async(async move {
         let tool = registry.get("read").unwrap();
-        tool.execute("read-utf8", json!({"path": file_str}), None)
+        tool.execute("read-utf8", json!({"path": file_str}), None, None)
             .await
     });
 
@@ -1400,7 +1453,7 @@ fn read_empty_file_is_not_error() {
     let file_str = file.display().to_string();
     let output = common::run_async(async move {
         let tool = registry.get("read").unwrap();
-        tool.execute("read-empty", json!({"path": file_str}), None)
+        tool.execute("read-empty", json!({"path": file_str}), None, None)
             .await
     });
 
@@ -1419,7 +1472,7 @@ fn read_binary_non_image_file() {
     let file_str = file.display().to_string();
     let output = common::run_async(async move {
         let tool = registry.get("read").unwrap();
-        tool.execute("read-bin", json!({"path": file_str}), None)
+        tool.execute("read-bin", json!({"path": file_str}), None, None)
             .await
     });
 
@@ -1441,7 +1494,7 @@ fn read_crlf_line_endings() {
     let file_str = file.display().to_string();
     let output = common::run_async(async move {
         let tool = registry.get("read").unwrap();
-        tool.execute("read-crlf", json!({"path": file_str}), None)
+        tool.execute("read-crlf", json!({"path": file_str}), None, None)
             .await
     });
 
@@ -1484,6 +1537,7 @@ fn write_large_file() {
             "write-large",
             json!({"path": target_str, "content": content_clone}),
             None,
+            None,
         )
         .await
     });
@@ -1510,6 +1564,7 @@ fn write_unicode_content() {
             "write-unicode",
             json!({"path": target_str, "content": content}),
             None,
+            None,
         )
         .await
     });
@@ -1533,6 +1588,7 @@ fn write_deep_nested_dirs() {
         tool.execute(
             "write-deep",
             json!({"path": target_str, "content": "deep content"}),
+            None,
             None,
         )
         .await
@@ -1569,6 +1625,7 @@ fn edit_multiline_replace() {
                 "newText": "fn new_fn() {\n    println!(\"new\");\n    // updated\n}"
             }),
             None,
+            None,
         )
         .await
     });
@@ -1600,6 +1657,7 @@ fn edit_special_chars_in_search() {
                 "newText": "€10.00 (EUR)"
             }),
             None,
+            None,
         )
         .await
     });
@@ -1628,6 +1686,7 @@ fn edit_whitespace_sensitive() {
                 "oldText": "\tindented with tab",
                 "newText": "\treplaced tab line"
             }),
+            None,
             None,
         )
         .await
@@ -1664,6 +1723,7 @@ fn edit_at_file_start() {
                 "newText": "NEW_HEADER"
             }),
             None,
+            None,
         )
         .await
     });
@@ -1694,6 +1754,7 @@ fn edit_at_file_end() {
                 "oldText": "FOOTER",
                 "newText": "NEW_FOOTER"
             }),
+            None,
             None,
         )
         .await
@@ -1726,7 +1787,7 @@ fn grep_regex_pattern() {
 
     let output = common::run_async(async move {
         let tool = registry.get("grep").unwrap();
-        tool.execute("grep-regex", json!({"pattern": "fn \\w+\\("}), None)
+        tool.execute("grep-regex", json!({"pattern": "fn \\w+\\("}), None, None)
             .await
     });
 
@@ -1762,6 +1823,7 @@ fn grep_path_scoping() {
             "grep-scoped",
             json!({"pattern": "target_string", "path": "src"}),
             None,
+            None,
         )
         .await
     });
@@ -1796,8 +1858,13 @@ fn grep_match_limit_diagnostics() {
 
     let output = common::run_async(async move {
         let tool = registry.get("grep").unwrap();
-        tool.execute("grep-limit", json!({"pattern": "match", "limit": 5}), None)
-            .await
+        tool.execute(
+            "grep-limit",
+            json!({"pattern": "match", "limit": 5}),
+            None,
+            None,
+        )
+        .await
     });
 
     let result = output.unwrap();
@@ -1836,7 +1903,7 @@ fn find_deep_nested_structure() {
 
     let output = common::run_async(async move {
         let tool = registry.get("find").unwrap();
-        tool.execute("find-deep", json!({"pattern": "*.txt"}), None)
+        tool.execute("find-deep", json!({"pattern": "*.txt"}), None, None)
             .await
     });
 
@@ -1865,8 +1932,13 @@ fn find_many_files_limit() {
 
     let output = common::run_async(async move {
         let tool = registry.get("find").unwrap();
-        tool.execute("find-many", json!({"pattern": "*.dat", "limit": 5}), None)
-            .await
+        tool.execute(
+            "find-many",
+            json!({"pattern": "*.dat", "limit": 5}),
+            None,
+            None,
+        )
+        .await
     });
 
     let result = output.unwrap();
@@ -1896,7 +1968,7 @@ fn ls_hidden_dotfiles() {
     let dir_str = h.temp_dir().display().to_string();
     let output = common::run_async(async move {
         let tool = registry.get("ls").unwrap();
-        tool.execute("ls-hidden", json!({"path": dir_str}), None)
+        tool.execute("ls-hidden", json!({"path": dir_str}), None, None)
             .await
     });
 
@@ -1921,7 +1993,7 @@ fn ls_alphabetical_sorting() {
     let dir_str = h.temp_dir().display().to_string();
     let output = common::run_async(async move {
         let tool = registry.get("ls").unwrap();
-        tool.execute("ls-sort", json!({"path": dir_str}), None)
+        tool.execute("ls-sort", json!({"path": dir_str}), None, None)
             .await
     });
 
@@ -1953,7 +2025,7 @@ fn ls_mixed_files_and_dirs() {
     let dir_str = h.temp_dir().display().to_string();
     let output = common::run_async(async move {
         let tool = registry.get("ls").unwrap();
-        tool.execute("ls-mixed", json!({"path": dir_str}), None)
+        tool.execute("ls-mixed", json!({"path": dir_str}), None, None)
             .await
     });
 
@@ -1989,7 +2061,7 @@ fn ls_symlink_directory() {
     let dir_str = h.temp_dir().display().to_string();
     let output = common::run_async(async move {
         let tool = registry.get("ls").unwrap();
-        tool.execute("ls-symdir", json!({"path": dir_str}), None)
+        tool.execute("ls-symdir", json!({"path": dir_str}), None, None)
             .await
     });
 
@@ -2029,6 +2101,7 @@ fn cross_tool_write_grep_edit_read() {
                 "content": "def hello():\n    return \"old_value\"\n\ndef goodbye():\n    return \"stays\"\n"
             }),
             None,
+            None,
         )
         .await
     });
@@ -2038,7 +2111,7 @@ fn cross_tool_write_grep_edit_read() {
     let grep_reg = make_registry(h.temp_dir());
     let grep_result = common::run_async(async move {
         let tool = grep_reg.get("grep").unwrap();
-        tool.execute("xg-1", json!({"pattern": "old_value"}), None)
+        tool.execute("xg-1", json!({"pattern": "old_value"}), None, None)
             .await
     });
     let grep_output = grep_result.unwrap();
@@ -2058,6 +2131,7 @@ fn cross_tool_write_grep_edit_read() {
                 "newText": "\"new_value\""
             }),
             None,
+            None,
         )
         .await
     });
@@ -2068,7 +2142,8 @@ fn cross_tool_write_grep_edit_read() {
     let read_file = file_str;
     let read_result = common::run_async(async move {
         let tool = read_reg.get("read").unwrap();
-        tool.execute("xr-1", json!({"path": read_file}), None).await
+        tool.execute("xr-1", json!({"path": read_file}), None, None)
+            .await
     });
     let read_output = read_result.unwrap();
     let text = first_text(&read_output.content);
@@ -2099,6 +2174,7 @@ fn cross_tool_bash_find_read() {
                 "command": "mkdir -p generated && echo 'auto_content_A' > generated/a.txt && echo 'auto_content_B' > generated/b.txt"
             }),
             None,
+            None,
         )
         .await
     });
@@ -2111,6 +2187,7 @@ fn cross_tool_bash_find_read() {
         tool.execute(
             "xf-1",
             json!({"pattern": "*.txt", "path": "generated"}),
+            None,
             None,
         )
         .await
@@ -2125,7 +2202,8 @@ fn cross_tool_bash_find_read() {
     let read_path = h.temp_path("generated/a.txt").display().to_string();
     let read_result = common::run_async(async move {
         let tool = read_reg.get("read").unwrap();
-        tool.execute("xr-2", json!({"path": read_path}), None).await
+        tool.execute("xr-2", json!({"path": read_path}), None, None)
+            .await
     });
     let read_output = read_result.unwrap();
     let text = first_text(&read_output.content);

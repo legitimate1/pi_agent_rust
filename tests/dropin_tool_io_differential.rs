@@ -58,7 +58,7 @@ fn assert_not_contains(haystack: &str, needle: &str, scenario_id: &str) {
 }
 
 async fn execute<T: Tool + ?Sized>(tool: &T, input: Value) -> pi::PiResult<ToolOutput> {
-    tool.execute("g09-tool-io", input, None).await
+    tool.execute("g09-tool-io", input, None, None).await
 }
 
 async fn execute_text<T: Tool + ?Sized>(tool: &T, input: Value) -> pi::PiResult<String> {
@@ -189,6 +189,7 @@ async fn run_scenario(scenario: &Scenario) -> pi::PiResult<()> {
                     "g09-tool-io",
                     json!({"command": "for i in $(seq 1 5); do echo update-$i; sleep 0.02; done"}),
                     Some(on_update),
+                    None,
                 )
                 .await?;
             assert_contains(&output_text(&output), "update-5", &scenario.id);

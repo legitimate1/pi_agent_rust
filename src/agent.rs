@@ -47,6 +47,7 @@ use crate::semantic_workspace_graph::{ContextBundleItem, SemanticContextBundle};
 use crate::session::{AutosaveFlushTrigger, Session, SessionHandle};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolRegistry, ToolUpdate};
 use asupersync::runtime::{Runtime, RuntimeBuilder, RuntimeHandle};
+#[allow(unused_imports)]
 use asupersync::sync::{Mutex, Notify};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -1046,68 +1047,7 @@ pub enum AgentEvent {
 // Agent
 // ============================================================================
 
-/// Handle to request an abort of an in-flight agent run.
-#[derive(Debug, Clone)]
-pub struct AbortHandle {
-    inner: Arc<AbortSignalInner>,
-}
-
-/// Signal for observing abort requests.
-#[derive(Debug, Clone)]
-pub struct AbortSignal {
-    inner: Arc<AbortSignalInner>,
-}
-
-#[derive(Debug)]
-struct AbortSignalInner {
-    aborted: AtomicBool,
-    notify: Notify,
-}
-
-impl AbortHandle {
-    /// Create a new abort handle + signal pair.
-    #[must_use]
-    pub fn new() -> (Self, AbortSignal) {
-        let inner = Arc::new(AbortSignalInner {
-            aborted: AtomicBool::new(false),
-            notify: Notify::new(),
-        });
-        (
-            Self {
-                inner: Arc::clone(&inner),
-            },
-            AbortSignal { inner },
-        )
-    }
-
-    /// Trigger an abort.
-    pub fn abort(&self) {
-        if !self.inner.aborted.swap(true, Ordering::SeqCst) {
-            self.inner.notify.notify_waiters();
-        }
-    }
-}
-
-impl AbortSignal {
-    /// Check if an abort has already been requested.
-    #[must_use]
-    pub fn is_aborted(&self) -> bool {
-        self.inner.aborted.load(Ordering::SeqCst)
-    }
-
-    pub async fn wait(&self) {
-        if self.is_aborted() {
-            return;
-        }
-
-        loop {
-            self.inner.notify.notified().await;
-            if self.is_aborted() {
-                return;
-            }
-        }
-    }
-}
+pub use crate::abort::{AbortHandle, AbortSignal};
 
 /// The agent runtime that orchestrates LLM calls and tool execution.
 pub struct Agent {
@@ -1847,6 +1787,37 @@ impl Agent {
                         }
                     };
                     tool_results = outcome.tool_results;
+
+                    // Phase D: If abort was requested during tool execution,
+                    // immediately send agent_end instead of continuing the loop.
+                    if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+                        let tool_messages = tool_results
+                            .iter()
+                            .map(|r| Message::ToolResult(Arc::clone(r)))
+                            .collect::<Vec<_>>();
+                        new_messages.extend(tool_messages);
+
+                        let turn_end_event = AgentEvent::TurnEnd {
+                            session_id: session_id.clone(),
+                            turn_index: current_turn_index,
+                            message: assistant_event_message.clone(),
+                            tool_results: Vec::new(),
+                            latency_breakdown: snapshot_turn_latency(&turn_latency),
+                        };
+                        self.dispatch_extension_lifecycle_event(&turn_end_event)
+                            .await;
+                        on_event(turn_end_event);
+
+                        let agent_end_event = AgentEvent::AgentEnd {
+                            session_id: session_id.clone(),
+                            messages: std::mem::take(&mut new_messages),
+                            error: Some("Aborted".to_string()),
+                        };
+                        self.dispatch_extension_lifecycle_event(&agent_end_event)
+                            .await;
+                        on_event(agent_end_event);
+                        return Ok(self.build_abort_message(None));
+                    }
                     steering_after_tools = outcome.steering_messages;
                 }
 
@@ -2743,7 +2714,13 @@ impl Agent {
         let futures = batch.into_iter().map(|(idx, tc)| {
             let on_event = Arc::clone(&on_event);
             let latency = Arc::clone(&latency);
-            async move { (idx, self.execute_tool_owned(tc, on_event, latency).await) }
+            let abort = abort.clone();
+            async move {
+                (
+                    idx,
+                    self.execute_tool_owned(tc, on_event, latency, abort).await,
+                )
+            }
         });
 
         if let Some(signal) = abort.as_ref() {
@@ -2980,6 +2957,7 @@ impl Agent {
         tool_call: ToolCall,
         on_event: AgentEventHandler,
         latency: SharedTurnLatencyAccumulator,
+        abort: Option<AbortSignal>,
     ) -> (ToolOutput, bool) {
         let extensions = self.extensions.clone();
 
@@ -3004,7 +2982,7 @@ impl Agent {
             } else {
                 let tool_started_at = Instant::now();
                 let outcome = self
-                    .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event))
+                    .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event), abort.clone())
                     .await;
                 record_local_tool_latency(&latency, tool_started_at.elapsed());
                 outcome
@@ -3012,7 +2990,7 @@ impl Agent {
         } else {
             let tool_started_at = Instant::now();
             let outcome = self
-                .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event))
+                .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event), abort.clone())
                 .await;
             record_local_tool_latency(&latency, tool_started_at.elapsed());
             outcome
@@ -3070,14 +3048,16 @@ impl Agent {
         tool_call: ToolCall,
         on_event: AgentEventHandler,
         latency: SharedTurnLatencyAccumulator,
+        abort: Option<AbortSignal>,
     ) -> (ToolOutput, bool) {
-        self.execute_tool(tool_call, on_event, latency).await
+        self.execute_tool(tool_call, on_event, latency, abort).await
     }
 
     async fn execute_tool_without_hooks(
         &self,
         tool_call: &ToolCall,
         on_event: AgentEventHandler,
+        abort: Option<AbortSignal>,
     ) -> (ToolOutput, bool) {
         // Find the tool
         let Some(tool) = self.tools.get(&tool_call.name) else {
@@ -3116,6 +3096,7 @@ impl Agent {
                 &tool_call.id,
                 tool_call.arguments.clone(),
                 Some(Box::new(update_callback)),
+                abort,
             )
             .await
         {
@@ -4657,6 +4638,7 @@ mod extensions_integration_tests {
             _tool_call_id: &str,
             _input: serde_json::Value,
             _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+            _abort: Option<AbortSignal>,
         ) -> Result<ToolOutput> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ToolOutput {
@@ -4819,7 +4801,7 @@ mod extensions_integration_tests {
                 .expect("hello_tool registered");
 
             let output = tool
-                .execute("call-1", json!({ "name": "pi" }), None)
+                .execute("call-1", json!({ "name": "pi" }), None, None)
                 .await
                 .expect("execute tool");
 
@@ -4985,7 +4967,7 @@ mod extensions_integration_tests {
                 .expect("emit_message registered");
 
             let _ = tool
-                .execute("call-1", json!({}), None)
+                .execute("call-1", json!({}), None, None)
                 .await
                 .expect("execute tool");
 
@@ -5069,7 +5051,7 @@ mod extensions_integration_tests {
                 .expect("emit_message registered");
 
             let _ = tool
-                .execute("call-1", json!({}), None)
+                .execute("call-1", json!({}), None, None)
                 .await
                 .expect("execute tool");
 
@@ -5811,7 +5793,7 @@ mod extensions_integration_tests {
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
             let (output, is_error) = agent_session
                 .agent
-                .execute_tool(tool_call, on_event, test_turn_latency())
+                .execute_tool(tool_call, on_event, test_turn_latency(), None)
                 .await;
 
             assert!(is_error);
@@ -5876,7 +5858,7 @@ mod extensions_integration_tests {
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
             let (output, is_error) = agent_session
                 .agent
-                .execute_tool(tool_call, on_event, test_turn_latency())
+                .execute_tool(tool_call, on_event, test_turn_latency(), None)
                 .await;
 
             assert!(!is_error);
@@ -5938,7 +5920,7 @@ mod extensions_integration_tests {
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
             let (output, is_error) = agent_session
                 .agent
-                .execute_tool(tool_call, on_event, test_turn_latency())
+                .execute_tool(tool_call, on_event, test_turn_latency(), None)
                 .await;
 
             assert!(is_error);
@@ -5998,7 +5980,7 @@ mod extensions_integration_tests {
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
             let (output, is_error) = agent_session
                 .agent
-                .execute_tool(tool_call, on_event, test_turn_latency())
+                .execute_tool(tool_call, on_event, test_turn_latency(), None)
                 .await;
 
             assert!(!is_error);
@@ -6054,7 +6036,7 @@ mod extensions_integration_tests {
             });
             let (output, is_error) = agent_session
                 .agent
-                .execute_tool(tool_call, on_event, test_turn_latency())
+                .execute_tool(tool_call, on_event, test_turn_latency(), None)
                 .await;
 
             assert!(!is_error);
@@ -6116,7 +6098,7 @@ mod extensions_integration_tests {
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
             let (output, is_error) = agent_session
                 .agent
-                .execute_tool(tool_call, on_event, test_turn_latency())
+                .execute_tool(tool_call, on_event, test_turn_latency(), None)
                 .await;
 
             assert!(is_error);
@@ -6178,7 +6160,7 @@ mod extensions_integration_tests {
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
             let (output, is_error) = agent_session
                 .agent
-                .execute_tool(tool_call, on_event, test_turn_latency())
+                .execute_tool(tool_call, on_event, test_turn_latency(), None)
                 .await;
 
             assert!(!is_error);
@@ -6232,7 +6214,7 @@ mod extensions_integration_tests {
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
             let (output, is_error) = agent_session
                 .agent
-                .execute_tool(tool_call, on_event, test_turn_latency())
+                .execute_tool(tool_call, on_event, test_turn_latency(), None)
                 .await;
 
             assert!(is_error);
@@ -6305,7 +6287,7 @@ mod extensions_integration_tests {
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
             let (output, is_error) = agent_session
                 .agent
-                .execute_tool(tool_call, on_event, test_turn_latency())
+                .execute_tool(tool_call, on_event, test_turn_latency(), None)
                 .await;
 
             assert!(!is_error);
@@ -6373,7 +6355,7 @@ mod extensions_integration_tests {
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
             let (output, is_error) = agent_session
                 .agent
-                .execute_tool(tool_call, on_event, test_turn_latency())
+                .execute_tool(tool_call, on_event, test_turn_latency(), None)
                 .await;
 
             assert!(is_error);
@@ -6437,7 +6419,7 @@ mod extensions_integration_tests {
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
             let (output, is_error) = agent_session
                 .agent
-                .execute_tool(tool_call, on_event, test_turn_latency())
+                .execute_tool(tool_call, on_event, test_turn_latency(), None)
                 .await;
 
             assert!(!is_error);
@@ -6512,7 +6494,7 @@ mod extensions_integration_tests {
             let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
             let (output, is_error) = agent_session
                 .agent
-                .execute_tool(tool_call, on_event, test_turn_latency())
+                .execute_tool(tool_call, on_event, test_turn_latency(), None)
                 .await;
 
             assert!(is_error);
@@ -6794,6 +6776,7 @@ mod abort_tests {
             _tool_call_id: &str,
             _input: serde_json::Value,
             _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+            _abort: Option<AbortSignal>,
         ) -> crate::error::Result<ToolOutput> {
             futures::future::pending::<()>().await;
             unreachable!("hanging tool should be aborted by the agent")
@@ -7376,6 +7359,7 @@ mod turn_event_tests {
             _tool_call_id: &str,
             _input: serde_json::Value,
             _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+            _abort: Option<AbortSignal>,
         ) -> Result<ToolOutput> {
             Ok(ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new("tool-ok"))],

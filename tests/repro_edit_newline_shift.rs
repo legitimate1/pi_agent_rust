@@ -41,7 +41,7 @@ mod tests {
                 "newText": "fixed"
             });
 
-            let result = tool.execute("call_1", input, None).await.unwrap();
+            let result = tool.execute("call_1", input, None, None).await.unwrap();
             assert!(!result.is_error, "Tool execution failed: {result:?}");
 
             let new_content = std::fs::read_to_string(&file_path).unwrap();

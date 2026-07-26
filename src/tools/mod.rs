@@ -48,6 +48,7 @@ pub(crate) use pwsh::run_pwsh_command;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use crate::abort::AbortSignal;
 use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
@@ -215,11 +216,15 @@ pub trait Tool: Send + Sync {
     /// Tools may call `on_update` to stream incremental results (e.g. while a long-running `bash`
     /// command is still producing output). The final return value is a [`ToolOutput`] which is
     /// persisted into the session as a tool result message.
+    ///
+    /// The `abort` parameter provides a cancellation signal. Long-running tools (bash, pwsh)
+    /// should check `abort.is_aborted()` periodically and stop execution with a clean error.
     async fn execute(
         &self,
         tool_call_id: &str,
         input: serde_json::Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        abort: Option<AbortSignal>,
     ) -> Result<ToolOutput>;
 
     /// Declare the coarse side effects used by the agent scheduler.
@@ -3369,18 +3374,20 @@ impl ProcessGuard {
         })
     }
 
-    /// Wait for the child process with timeout and ambient cancellation support.
+    /// Wait for the child process with timeout, ambient cancellation, and abort signal support.
     ///
     /// Polls the child in a loop, checking for:
     /// - Ambient cancellation via [`AgentCx::checkpoint`]
+    /// - Explicit abort via [`AbortSignal`]
     /// - Timeout expiration
     ///
     /// Returns `Ok(Some(exit_code))` if the child exited normally.
-    /// Returns `Ok(None)` if the child was killed (timeout or cancellation).
+    /// Returns `Ok(None)` if the child was killed (timeout, cancellation, or abort).
     /// Returns `Err(io::Error)` on I/O error.
     pub(crate) async fn wait_with_cancellation(
         &mut self,
         timeout_secs: Option<u64>,
+        abort: Option<&AbortSignal>,
     ) -> std::io::Result<Option<i32>> {
         let start = std::time::Instant::now();
         loop {
@@ -3390,6 +3397,14 @@ impl ProcessGuard {
             if cx.checkpoint().is_err() {
                 self.kill();
                 return Ok(None);
+            }
+
+            // Check explicit abort signal
+            if let Some(signal) = abort {
+                if signal.is_aborted() {
+                    self.kill();
+                    return Ok(None);
+                }
             }
 
             // Check timeout

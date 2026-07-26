@@ -1088,7 +1088,7 @@ mod tool_errors {
                 "command": "nonexistent_command_xyz_12345"
             });
 
-            let result = tool.execute("test-id", input, None).await;
+            let result = tool.execute("test-id", input, None, None).await;
             match result {
                 Ok(output) => {
                     let text = get_text_content(&output.content);
@@ -1122,7 +1122,7 @@ mod tool_errors {
             let tool = pi::tools::BashTool::new(harness.temp_dir());
             let input = json!({ "command": "" });
 
-            let result = tool.execute("test-id", input, None).await;
+            let result = tool.execute("test-id", input, None, None).await;
             harness
                 .log()
                 .info_ctx("verify", "empty command result", |ctx| {
@@ -1140,7 +1140,7 @@ mod tool_errors {
             let input = json!({ "path": path.to_string_lossy() });
 
             let err = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect_err("should error");
             let msg = err.to_string();
@@ -1172,7 +1172,7 @@ mod tool_errors {
                 "content": "hello"
             });
 
-            let result = tool.execute("test-id", input, None).await;
+            let result = tool.execute("test-id", input, None, None).await;
             harness
                 .log()
                 .info_ctx("verify", "write to nonexistent parent", |ctx| {
@@ -1195,7 +1195,7 @@ mod tool_errors {
                 "path": harness.temp_dir().to_string_lossy()
             });
 
-            let result = tool.execute("test-id", input, None).await;
+            let result = tool.execute("test-id", input, None, None).await;
             match result {
                 Err(err) => {
                     let msg = err.to_string();
@@ -1227,7 +1227,7 @@ mod tool_errors {
                 "newText": "replacement"
             });
 
-            let result = tool.execute("test-id", input, None).await;
+            let result = tool.execute("test-id", input, None, None).await;
             harness
                 .log()
                 .info_ctx("verify", "empty old text result", |ctx| {
@@ -1247,7 +1247,7 @@ mod tool_errors {
                 "path": bad_path.to_string_lossy()
             });
 
-            let result = tool.execute("test-id", input, None).await;
+            let result = tool.execute("test-id", input, None, None).await;
             match result {
                 Err(err) => {
                     let msg = err.to_string();
@@ -1274,7 +1274,7 @@ mod tool_errors {
             let bad_path = harness.temp_dir().join("no_such_dir");
             let input = json!({ "path": bad_path.to_string_lossy() });
 
-            let result = tool.execute("test-id", input, None).await;
+            let result = tool.execute("test-id", input, None, None).await;
             match result {
                 Err(err) => {
                     let msg = err.to_string();

@@ -26,7 +26,7 @@ fn test_edit_tool_fails_on_invalid_utf8() {
             "newText": "Hi"
         });
 
-        let result = tool.execute("call1", input, None).await;
+        let result = tool.execute("call1", input, None, None).await;
 
         assert!(
             result.is_err(),

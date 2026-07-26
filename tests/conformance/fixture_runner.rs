@@ -62,7 +62,9 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
     };
 
     // Execute the tool
-    let result = tool.execute("test-id", case.input.clone(), None).await;
+    let result = tool
+        .execute("test-id", case.input.clone(), None, None)
+        .await;
 
     // Handle expected errors
     if case.expect_error {

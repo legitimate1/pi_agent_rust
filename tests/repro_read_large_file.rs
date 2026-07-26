@@ -27,6 +27,7 @@ fn test_read_large_file_offset() {
                     "limit": limit
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();

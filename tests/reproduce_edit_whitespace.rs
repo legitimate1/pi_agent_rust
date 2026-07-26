@@ -40,6 +40,7 @@ mod tests {
                         "newText": "bar"
                     }),
                     None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -59,6 +60,7 @@ mod tests {
                         "oldText": "bar ",
                         "newText": "baz"
                     }),
+                    None,
                     None,
                 )
                 .await
@@ -84,6 +86,7 @@ mod tests {
                         "oldText": "baz ",
                         "newText": "qux"
                     }),
+                    None,
                     None,
                 )
                 .await
@@ -114,6 +117,7 @@ mod tests {
                         "newText": "alpha\nbravo\n"
                     }),
                     None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -132,6 +136,7 @@ mod tests {
                         "oldText": "alpha\r\nbeta\r\n",
                         "newText": "alpha\r\nbravo\r\n"
                     }),
+                    None,
                     None,
                 )
                 .await

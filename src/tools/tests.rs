@@ -306,6 +306,7 @@ fn read_tool_spills_oversized_selected_text_window_to_artifact() {
                 "read-artifact-call",
                 serde_json::json!({ "path": "large.txt" }),
                 None,
+                None,
             )
             .await
             .expect("read large file");
@@ -363,6 +364,7 @@ fn bash_tool_spills_truncated_full_output_to_artifact() {
                     "timeout": 10
                 }),
                 None,
+                None,
             )
             .await
             .expect("bash large output");
@@ -397,6 +399,7 @@ fn bash_tool_redacts_secret_like_full_output_artifacts() {
                     "command": format!("printf 'API_TOKEN={leaked_token}\\n'; head -c 1001000 /dev/zero | tr '\\0' x"),
                     "timeout": 10
                 }),
+                None,
                 None,
             )
             .await
@@ -441,6 +444,7 @@ fn grep_tool_spills_large_search_results_with_lifecycle_manifest() {
                     "limit": 2200
                 }),
                 None,
+                None,
             )
             .await
             .expect("grep large output");
@@ -481,6 +485,7 @@ fn read_tool_denied_path_does_not_emit_lifecycle_artifact() {
                 "read-denied-artifact-call",
                 serde_json::json!({ "path": outside_path }),
                 None,
+                None,
             )
             .await
             .expect_err("outside read should be denied");
@@ -514,6 +519,7 @@ fn ls_tool_spills_oversized_directory_listing_to_artifact() {
                 "ls-artifact-call",
                 serde_json::json!({ "path": ".", "limit": 4500 }),
                 None,
+                None,
             )
             .await
             .expect("ls large directory");
@@ -542,14 +548,14 @@ async fn assert_read_cache_hit_and_stale(tmp: &Path) {
     let read_tool = ReadTool::new(tmp);
     let read_input = serde_json::json!({ "path": "note.txt" });
     let first = read_tool
-        .execute("read-1", read_input.clone(), None)
+        .execute("read-1", read_input.clone(), None, None)
         .await
         .expect("first read");
     assert!(first_text(&first).contains("alpha"));
 
     let hits_before = tool_output_cache_stats_for_tests().hits;
     let second = read_tool
-        .execute("read-2", read_input.clone(), None)
+        .execute("read-2", read_input.clone(), None, None)
         .await
         .expect("cached read");
     assert_eq!(first_text(&first), first_text(&second));
@@ -558,7 +564,7 @@ async fn assert_read_cache_hit_and_stale(tmp: &Path) {
     let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
     std::fs::write(&note, "beta\n").expect("rewrite note");
     let third = read_tool
-        .execute("read-3", read_input.clone(), None)
+        .execute("read-3", read_input.clone(), None, None)
         .await
         .expect("invalidated read");
     assert!(first_text(&third).contains("beta"));
@@ -570,14 +576,14 @@ async fn assert_ls_cache_hit_and_stale(tmp: &Path) {
     let ls_tool = LsTool::new(tmp);
     let ls_input = serde_json::json!({ "path": "." });
     let ls_first = ls_tool
-        .execute("ls-1", ls_input.clone(), None)
+        .execute("ls-1", ls_input.clone(), None, None)
         .await
         .expect("first ls");
     assert!(first_text(&ls_first).contains("note.txt"));
 
     let hits_before = tool_output_cache_stats_for_tests().hits;
     let ls_second = ls_tool
-        .execute("ls-2", ls_input.clone(), None)
+        .execute("ls-2", ls_input.clone(), None, None)
         .await
         .expect("cached ls");
     assert_eq!(first_text(&ls_first), first_text(&ls_second));
@@ -586,7 +592,7 @@ async fn assert_ls_cache_hit_and_stale(tmp: &Path) {
     let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
     std::fs::write(tmp.join("new.txt"), "new\n").expect("write new file");
     let ls_third = ls_tool
-        .execute("ls-3", ls_input.clone(), None)
+        .execute("ls-3", ls_input.clone(), None, None)
         .await
         .expect("invalidated ls");
     assert!(first_text(&ls_third).contains("new.txt"));
@@ -603,14 +609,14 @@ async fn assert_grep_cache_hit_and_stale_when_available(tmp: &Path) {
     std::fs::write(tmp.join("a.txt"), "needle\n").expect("write grep file");
 
     let grep_first = grep_tool
-        .execute("grep-1", grep_input.clone(), None)
+        .execute("grep-1", grep_input.clone(), None, None)
         .await
         .expect("first grep");
     assert!(first_text(&grep_first).contains("a.txt"));
 
     let hits_before = tool_output_cache_stats_for_tests().hits;
     let grep_second = grep_tool
-        .execute("grep-2", grep_input.clone(), None)
+        .execute("grep-2", grep_input.clone(), None, None)
         .await
         .expect("cached grep");
     assert_eq!(first_text(&grep_first), first_text(&grep_second));
@@ -619,7 +625,7 @@ async fn assert_grep_cache_hit_and_stale_when_available(tmp: &Path) {
     let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
     std::fs::write(tmp.join("b.txt"), "needle\n").expect("write new match");
     let grep_third = grep_tool
-        .execute("grep-3", grep_input.clone(), None)
+        .execute("grep-3", grep_input.clone(), None, None)
         .await
         .expect("invalidated grep");
     assert!(first_text(&grep_third).contains("b.txt"));
@@ -636,14 +642,14 @@ async fn assert_find_cache_hit_and_stale_when_available(tmp: &Path) {
     std::fs::write(tmp.join("find-a.txt"), "find\n").expect("write first find file");
 
     let find_first = find_tool
-        .execute("find-1", find_input.clone(), None)
+        .execute("find-1", find_input.clone(), None, None)
         .await
         .expect("first find");
     assert!(first_text(&find_first).contains("find-a.txt"));
 
     let hits_before = tool_output_cache_stats_for_tests().hits;
     let find_second = find_tool
-        .execute("find-2", find_input.clone(), None)
+        .execute("find-2", find_input.clone(), None, None)
         .await
         .expect("cached find");
     assert_eq!(first_text(&find_first), first_text(&find_second));
@@ -652,7 +658,7 @@ async fn assert_find_cache_hit_and_stale_when_available(tmp: &Path) {
     let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
     std::fs::write(tmp.join("find-b.txt"), "find\n").expect("write second find file");
     let find_third = find_tool
-        .execute("find-3", find_input.clone(), None)
+        .execute("find-3", find_input.clone(), None, None)
         .await
         .expect("invalidated find");
     assert!(first_text(&find_third).contains("find-b.txt"));
@@ -670,6 +676,7 @@ async fn assert_side_effect_tools_remain_uncached(tmp: &Path) {
                 "content": "one\n"
             }),
             None,
+            None,
         )
         .await
         .expect("write side-effect file");
@@ -684,6 +691,7 @@ async fn assert_side_effect_tools_remain_uncached(tmp: &Path) {
                 "newText": "two"
             }),
             None,
+            None,
         )
         .await
         .expect("edit side-effect file");
@@ -696,6 +704,7 @@ async fn assert_side_effect_tools_remain_uncached(tmp: &Path) {
                 "command": "printf 'cache-uncached\\n'",
                 "timeout": 5
             }),
+            None,
             None,
         )
         .await
@@ -1101,6 +1110,7 @@ fn test_read_valid_file() {
                 "t",
                 serde_json::json!({ "path": tmp.path().join("hello.txt").to_string_lossy() }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1122,6 +1132,7 @@ fn test_read_nonexistent_file() {
                 "t",
                 serde_json::json!({ "path": tmp.path().join("nope.txt").to_string_lossy() }),
                 None,
+                None,
             )
             .await;
         assert!(err.is_err());
@@ -1140,6 +1151,7 @@ fn test_read_rejects_outside_cwd() {
             .execute(
                 "t",
                 serde_json::json!({ "path": outside.path().join("secret.txt").to_string_lossy() }),
+                None,
                 None,
             )
             .await
@@ -1226,6 +1238,7 @@ fn test_read_empty_file() {
                 "t",
                 serde_json::json!({ "path": tmp.path().join("empty.txt").to_string_lossy() }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1250,6 +1263,7 @@ fn test_read_empty_file_positive_offset_errors() {
                     "offset": 1
                 }),
                 None,
+                None,
             )
             .await;
         assert!(err.is_err());
@@ -1272,6 +1286,7 @@ fn test_read_rejects_zero_limit() {
                     "path": tmp.path().join("lines.txt").to_string_lossy(),
                     "limit": 0
                 }),
+                None,
                 None,
             )
             .await;
@@ -1304,6 +1319,7 @@ fn test_read_offset_and_limit() {
                     "limit": 2
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1330,6 +1346,7 @@ fn test_read_offset_and_limit_with_cr_only_line_endings() {
                     "offset": 2,
                     "limit": 1
                 }),
+                None,
                 None,
             )
             .await
@@ -1361,6 +1378,7 @@ fn test_read_offset_and_limit_with_split_crlf_chunk_boundary() {
                     "limit": 1
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1386,6 +1404,7 @@ fn test_read_offset_beyond_eof() {
                     "path": tmp.path().join("short.txt").to_string_lossy(),
                     "offset": 100
                 }),
+                None,
                 None,
             )
             .await;
@@ -1434,6 +1453,7 @@ fn test_read_binary_file_lossy() {
                 "t",
                 serde_json::json!({ "path": tmp.path().join("binary.bin").to_string_lossy() }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1468,6 +1488,7 @@ fn test_read_image_detection() {
             .execute(
                 "t",
                 serde_json::json!({ "path": tmp.path().join("test.png").to_string_lossy() }),
+                None,
                 None,
             )
             .await
@@ -1530,6 +1551,7 @@ fn test_read_resizes_large_source_image_before_api_limit_check() {
                 "t",
                 serde_json::json!({ "path": image_path.to_string_lossy() }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1564,6 +1586,7 @@ fn test_read_blocked_images() {
                 "t",
                 serde_json::json!({ "path": tmp.path().join("test.png").to_string_lossy() }),
                 None,
+                None,
             )
             .await;
         assert!(err.is_err());
@@ -1587,6 +1610,7 @@ fn test_read_truncation_at_max_lines() {
                 "t",
                 serde_json::json!({ "path": tmp.path().join("big.txt").to_string_lossy() }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1609,6 +1633,7 @@ fn test_read_first_line_exceeds_max_bytes() {
             .execute(
                 "t",
                 serde_json::json!({ "path": tmp.path().join("too_long.txt").to_string_lossy() }),
+                None,
                 None,
             )
             .await
@@ -1643,6 +1668,7 @@ fn test_read_unicode_content() {
                 "t",
                 serde_json::json!({ "path": tmp.path().join("uni.txt").to_string_lossy() }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1670,6 +1696,7 @@ fn test_write_new_file() {
                     "content": "hello world"
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1694,6 +1721,7 @@ fn test_write_overwrite_existing() {
                     "content": "new content"
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1717,6 +1745,7 @@ fn test_write_creates_parent_dirs() {
                     "content": "deep file"
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1738,6 +1767,7 @@ fn test_write_empty_file() {
                     "path": tmp.path().join("empty.txt").to_string_lossy(),
                     "content": ""
                 }),
+                None,
                 None,
             )
             .await
@@ -1764,6 +1794,7 @@ fn test_write_rejects_outside_cwd() {
                     "content": "nope"
                 }),
                 None,
+                None,
             )
             .await
             .unwrap_err();
@@ -1776,6 +1807,7 @@ fn test_write_rejects_outside_cwd() {
                     "path": "../escape.txt",
                     "content": "nope"
                 }),
+                None,
                 None,
             )
             .await
@@ -1796,6 +1828,7 @@ fn test_write_unicode_content() {
                     "path": tmp.path().join("unicode.txt").to_string_lossy(),
                     "content": "日本語 🎉 Ñoño"
                 }),
+                None,
                 None,
             )
             .await
@@ -1821,6 +1854,7 @@ fn test_write_file_permissions_unix() {
                     "path": path.to_string_lossy(),
                     "content": "check perms"
                 }),
+                None,
                 None,
             )
             .await
@@ -1857,6 +1891,7 @@ fn test_edit_exact_match_replace() {
                     "newText": "baz()"
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1882,6 +1917,7 @@ fn test_edit_no_match_error() {
                     "newText": "replacement"
                 }),
                 None,
+                None,
             )
             .await;
         assert!(err.is_err());
@@ -1904,6 +1940,7 @@ fn test_edit_empty_old_text_error() {
                     "oldText": "",
                     "newText": "prefix"
                 }),
+                None,
                 None,
             )
             .await
@@ -1935,6 +1972,7 @@ fn test_edit_ambiguous_match_error() {
                     "newText": "world"
                 }),
                 None,
+                None,
             )
             .await;
         assert!(err.is_err(), "expected error for ambiguous match");
@@ -1960,6 +1998,7 @@ fn test_edit_multi_line_replacement() {
                     "oldText": "line 2\nline 3",
                     "newText": "replaced 2\nreplaced 3\nextra line"
                 }),
+                None,
                 None,
             )
             .await
@@ -1989,6 +2028,7 @@ fn test_edit_unicode_content() {
                     "newText": "Welt 🌎"
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2011,6 +2051,7 @@ fn test_edit_missing_file() {
                     "oldText": "foo",
                     "newText": "bar"
                 }),
+                None,
                 None,
             )
             .await;
@@ -2060,6 +2101,7 @@ fn test_bash_simple_command() {
                 "t",
                 serde_json::json!({ "command": "echo hello_from_bash" }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2075,7 +2117,7 @@ fn test_bash_exit_code_nonzero() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = BashTool::new(tmp.path());
         let out = tool
-            .execute("t", serde_json::json!({ "command": "exit 42" }), None)
+            .execute("t", serde_json::json!({ "command": "exit 42" }), None, None)
             .await
             .expect("non-zero exit should return Ok with is_error=true");
         assert!(out.is_error, "non-zero exit must set is_error");
@@ -2094,7 +2136,12 @@ fn test_bash_signal_termination_is_error() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = BashTool::new(tmp.path());
         let out = tool
-            .execute("t", serde_json::json!({ "command": "kill -KILL $$" }), None)
+            .execute(
+                "t",
+                serde_json::json!({ "command": "kill -KILL $$" }),
+                None,
+                None,
+            )
             .await
             .expect("signal-terminated shell should return Ok with is_error=true");
         assert!(
@@ -2123,6 +2170,7 @@ fn test_bash_stderr_capture() {
                 "t",
                 serde_json::json!({ "command": "echo stderr_msg >&2" }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2143,6 +2191,7 @@ fn test_bash_timeout() {
             .execute(
                 "t",
                 serde_json::json!({ "command": "sleep 60", "timeout": 2 }),
+                None,
                 None,
             )
             .await
@@ -2181,6 +2230,7 @@ fn test_bash_timeout_kills_process_tree() {
                     "command": "(sleep 3; echo leaked > leaked_child.txt) & sleep 10",
                     "timeout": 1
                 }),
+                None,
                 None,
             )
             .await
@@ -2443,7 +2493,7 @@ fn test_bash_working_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = BashTool::new(tmp.path());
         let out = tool
-            .execute("t", serde_json::json!({ "command": "pwd" }), None)
+            .execute("t", serde_json::json!({ "command": "pwd" }), None, None)
             .await
             .unwrap();
         let text = get_text(&out.content);
@@ -2464,6 +2514,7 @@ fn test_bash_multiline_output() {
             .execute(
                 "t",
                 serde_json::json!({ "command": "echo line1; echo line2; echo line3" }),
+                None,
                 None,
             )
             .await
@@ -2498,6 +2549,7 @@ fn test_grep_basic_pattern() {
                     "path": tmp.path().join("search.txt").to_string_lossy()
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2524,6 +2576,7 @@ fn test_grep_allows_outside_cwd() {
                     "pattern": "secret",
                     "path": outside.path().join("secret.txt").to_string_lossy()
                 }),
+                None,
                 None,
             )
             .await
@@ -2552,6 +2605,7 @@ fn test_grep_rejects_zero_limit() {
                     "limit": 0
                 }),
                 None,
+                None,
             )
             .await
             .unwrap_err();
@@ -2571,7 +2625,7 @@ fn test_grep_formats_paths_relative_to_symlinked_cwd() {
 
         let tool = GrepTool::new(&link);
         let out = tool
-            .execute("t", serde_json::json!({ "pattern": "needle" }), None)
+            .execute("t", serde_json::json!({ "pattern": "needle" }), None, None)
             .await
             .unwrap();
 
@@ -2606,6 +2660,7 @@ fn test_grep_regex_pattern() {
                     "path": tmp.path().join("regex.txt").to_string_lossy()
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2632,6 +2687,7 @@ fn test_grep_case_insensitive() {
                     "ignoreCase": true
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2656,6 +2712,7 @@ fn test_grep_case_sensitive_by_default() {
                     "pattern": "hello",
                     "path": tmp.path().join("case_sensitive.txt").to_string_lossy()
                 }),
+                None,
                 None,
             )
             .await
@@ -2685,6 +2742,7 @@ fn test_grep_append_non_matching_lines_invariant() {
                     "limit": 100
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2699,6 +2757,7 @@ fn test_grep_append_non_matching_lines_invariant() {
                     "path": file.to_string_lossy(),
                     "limit": 100
                 }),
+                None,
                 None,
             )
             .await
@@ -2726,6 +2785,7 @@ fn test_grep_no_matches() {
                     "pattern": "ZZZZZ_NOMATCH",
                     "path": tmp.path().join("nothing.txt").to_string_lossy()
                 }),
+                None,
                 None,
             )
             .await
@@ -2760,6 +2820,7 @@ fn test_grep_context_lines() {
                     "context": 1
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2789,6 +2850,7 @@ fn test_grep_limit() {
                     "path": tmp.path().join("many.txt").to_string_lossy(),
                     "limit": 5
                 }),
+                None,
                 None,
             )
             .await
@@ -2829,6 +2891,7 @@ fn test_grep_exact_limit_does_not_report_limit_reached() {
                     "path": tmp.path().join("exact.txt").to_string_lossy(),
                     "limit": 5
                 }),
+                None,
                 None,
             )
             .await
@@ -2872,6 +2935,7 @@ fn test_grep_large_output_does_not_deadlock_reader_threads() {
                 "limit": 6000
             }),
             None,
+            None,
         );
 
         let out = asupersync::time::timeout(
@@ -2898,7 +2962,7 @@ fn test_grep_respects_gitignore() {
 
         let tool = GrepTool::new(tmp.path());
         let out = tool
-            .execute("t", serde_json::json!({ "pattern": "needle" }), None)
+            .execute("t", serde_json::json!({ "pattern": "needle" }), None, None)
             .await
             .unwrap();
 
@@ -2925,6 +2989,7 @@ fn test_grep_literal_mode() {
                     "path": tmp.path().join("literal.txt").to_string_lossy(),
                     "literal": true
                 }),
+                None,
                 None,
             )
             .await
@@ -2953,6 +3018,7 @@ fn test_grep_hashline_output() {
                     "path": tmp.path().join("hash.txt").to_string_lossy(),
                     "hashline": true
                 }),
+                None,
                 None,
             )
             .await
@@ -2995,6 +3061,7 @@ fn test_grep_hashline_with_context() {
                     "hashline": true,
                     "context": 1
                 }),
+                None,
                 None,
             )
             .await
@@ -3042,6 +3109,7 @@ fn test_find_glob_pattern() {
                     "path": tmp.path().to_string_lossy()
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -3070,6 +3138,7 @@ fn test_find_append_non_matching_file_invariant() {
                     "path": tmp.path().to_string_lossy()
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -3083,6 +3152,7 @@ fn test_find_append_non_matching_file_invariant() {
                     "pattern": "*.txt",
                     "path": tmp.path().to_string_lossy()
                 }),
+                None,
                 None,
             )
             .await
@@ -3115,6 +3185,7 @@ fn test_find_allows_outside_cwd() {
                     "path": outside.path().to_string_lossy()
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -3146,6 +3217,7 @@ fn test_find_limit() {
                     "path": tmp.path().to_string_lossy(),
                     "limit": 5
                 }),
+                None,
                 None,
             )
             .await
@@ -3187,6 +3259,7 @@ fn test_find_exact_limit_does_not_report_limit_reached() {
                     "limit": 5
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -3226,6 +3299,7 @@ fn test_find_zero_limit_is_rejected() {
                     "limit": 0
                 }),
                 None,
+                None,
             )
             .await
             .expect_err("limit=0 should be rejected");
@@ -3254,6 +3328,7 @@ fn test_find_no_matches() {
                     "pattern": "*.rs",
                     "path": tmp.path().to_string_lossy()
                 }),
+                None,
                 None,
             )
             .await
@@ -3284,6 +3359,7 @@ fn test_find_nonexistent_path() {
                     "path": tmp.path().join("nonexistent").to_string_lossy()
                 }),
                 None,
+                None,
             )
             .await;
         assert!(err.is_err());
@@ -3310,6 +3386,7 @@ fn test_find_nested_directories() {
                     "pattern": "*.rs",
                     "path": tmp.path().to_string_lossy()
                 }),
+                None,
                 None,
             )
             .await
@@ -3347,6 +3424,7 @@ fn test_find_results_are_sorted() {
                     "pattern": "*.txt",
                     "path": tmp.path().to_string_lossy()
                 }),
+                None,
                 None,
             )
             .await
@@ -3386,6 +3464,7 @@ fn test_find_respects_gitignore() {
                     "path": tmp.path().to_string_lossy()
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -3415,6 +3494,7 @@ fn test_ls_directory_listing() {
                 "t",
                 serde_json::json!({ "path": tmp.path().to_string_lossy() }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -3437,6 +3517,7 @@ fn test_ls_allows_outside_cwd() {
             .execute(
                 "t",
                 serde_json::json!({ "path": outside.path().to_string_lossy() }),
+                None,
                 None,
             )
             .await
@@ -3461,6 +3542,7 @@ fn test_ls_trailing_slash_for_dirs() {
             .execute(
                 "t",
                 serde_json::json!({ "path": tmp.path().to_string_lossy() }),
+                None,
                 None,
             )
             .await
@@ -3489,6 +3571,7 @@ fn test_ls_limit() {
                     "path": tmp.path().to_string_lossy(),
                     "limit": 5
                 }),
+                None,
                 None,
             )
             .await
@@ -3524,6 +3607,7 @@ fn test_ls_zero_limit_is_rejected() {
                     "limit": 0
                 }),
                 None,
+                None,
             )
             .await
             .expect_err("limit=0 should be rejected");
@@ -3545,6 +3629,7 @@ fn test_ls_nonexistent_directory() {
                 "t",
                 serde_json::json!({ "path": tmp.path().join("nope").to_string_lossy() }),
                 None,
+                None,
             )
             .await;
         assert!(err.is_err());
@@ -3564,6 +3649,7 @@ fn test_ls_empty_directory() {
                 "t",
                 serde_json::json!({ "path": empty_dir.to_string_lossy() }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -3579,7 +3665,7 @@ fn test_ls_default_cwd() {
 
         let tool = LsTool::new(tmp.path());
         let out = tool
-            .execute("t", serde_json::json!({}), None)
+            .execute("t", serde_json::json!({}), None, None)
             .await
             .unwrap();
         let text = get_text(&out.content);
@@ -4346,6 +4432,7 @@ fn test_edit_crlf_content_correctness() {
                     "newText": "changed"
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -4374,6 +4461,7 @@ fn test_edit_cr_content_correctness() {
                     "oldText": "line2",
                     "newText": "changed"
                 }),
+                None,
                 None,
             )
             .await
@@ -4514,7 +4602,7 @@ fn test_hashline_edit_single_replace() {
             }]
         });
 
-        let out = tool.execute("test", input, None).await.unwrap();
+        let out = tool.execute("test", input, None, None).await.unwrap();
         assert!(!out.is_error);
 
         let content = std::fs::read_to_string(&file).unwrap();
@@ -4544,7 +4632,7 @@ fn test_hashline_edit_range_replace() {
             }]
         });
 
-        let out = tool.execute("test", input, None).await.unwrap();
+        let out = tool.execute("test", input, None, None).await.unwrap();
         assert!(!out.is_error);
 
         let content = std::fs::read_to_string(&file).unwrap();
@@ -4571,7 +4659,7 @@ fn test_hashline_edit_prepend() {
             }]
         });
 
-        let out = tool.execute("test", input, None).await.unwrap();
+        let out = tool.execute("test", input, None, None).await.unwrap();
         assert!(!out.is_error);
 
         let content = std::fs::read_to_string(&file).unwrap();
@@ -4598,7 +4686,7 @@ fn test_hashline_edit_append() {
             }]
         });
 
-        let out = tool.execute("test", input, None).await.unwrap();
+        let out = tool.execute("test", input, None, None).await.unwrap();
         assert!(!out.is_error);
 
         let content = std::fs::read_to_string(&file).unwrap();
@@ -4626,7 +4714,7 @@ fn test_hashline_edit_bottom_up_ordering() {
             ]
         });
 
-        let out = tool.execute("test", input, None).await.unwrap();
+        let out = tool.execute("test", input, None, None).await.unwrap();
         assert!(!out.is_error);
 
         let content = std::fs::read_to_string(&file).unwrap();
@@ -4653,7 +4741,7 @@ fn test_hashline_edit_hash_mismatch() {
             }]
         });
 
-        let result = tool.execute("test", input, None).await;
+        let result = tool.execute("test", input, None, None).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -4682,7 +4770,7 @@ fn test_hashline_edit_dedup() {
             ]
         });
 
-        let out = tool.execute("test", input, None).await.unwrap();
+        let out = tool.execute("test", input, None, None).await.unwrap();
         assert!(!out.is_error);
 
         let content = std::fs::read_to_string(&file).unwrap();
@@ -4710,7 +4798,7 @@ fn test_hashline_edit_noop_detection() {
             }]
         });
 
-        let result = tool.execute("test", input, None).await;
+        let result = tool.execute("test", input, None, None).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -4733,7 +4821,7 @@ fn test_hashline_read_output_format() {
             "hashline": true
         });
 
-        let out = tool.execute("test", input, None).await.unwrap();
+        let out = tool.execute("test", input, None, None).await.unwrap();
         assert!(!out.is_error);
         let text = get_text(&out.content);
 
@@ -4778,7 +4866,7 @@ fn test_hashline_edit_prefix_stripping() {
             }]
         });
 
-        let out = tool.execute("test", input, None).await.unwrap();
+        let out = tool.execute("test", input, None, None).await.unwrap();
         assert!(!out.is_error);
 
         let content = std::fs::read_to_string(&file).unwrap();
@@ -4808,7 +4896,7 @@ fn test_hashline_edit_delete_lines() {
             }]
         });
 
-        let out = tool.execute("test", input, None).await.unwrap();
+        let out = tool.execute("test", input, None, None).await.unwrap();
         assert!(!out.is_error);
 
         let content = std::fs::read_to_string(&file).unwrap();
@@ -4835,7 +4923,7 @@ fn test_hashline_edit_crlf_preservation() {
             }]
         });
 
-        let out = tool.execute("test", input, None).await.unwrap();
+        let out = tool.execute("test", input, None, None).await.unwrap();
         assert!(!out.is_error);
 
         let content = std::fs::read_to_string(&file).unwrap();
@@ -4862,7 +4950,7 @@ fn test_hashline_edit_cr_preservation() {
             }]
         });
 
-        let out = tool.execute("test", input, None).await.unwrap();
+        let out = tool.execute("test", input, None, None).await.unwrap();
         assert!(!out.is_error);
 
         let content = std::fs::read_to_string(&file).unwrap();
@@ -4888,7 +4976,7 @@ fn test_hashline_edit_empty_file_append() {
             }]
         });
 
-        let out = tool.execute("test", input, None).await.unwrap();
+        let out = tool.execute("test", input, None, None).await.unwrap();
         assert!(!out.is_error);
 
         let content = std::fs::read_to_string(&file).unwrap();
@@ -4915,7 +5003,7 @@ fn test_hashline_edit_single_line_no_trailing_newline() {
             }]
         });
 
-        let out = tool.execute("test", input, None).await.unwrap();
+        let out = tool.execute("test", input, None, None).await.unwrap();
         assert!(!out.is_error);
 
         let content = std::fs::read_to_string(&file).unwrap();
@@ -4943,7 +5031,7 @@ fn test_hashline_edit_preserves_bom_hash_validation() {
             }]
         });
 
-        let out = tool.execute("test", input, None).await.unwrap();
+        let out = tool.execute("test", input, None, None).await.unwrap();
         assert!(!out.is_error);
 
         let content = std::fs::read_to_string(&file).unwrap();
@@ -4969,7 +5057,7 @@ fn test_hashline_edit_bof_prepend_no_pos() {
             }]
         });
 
-        let out = tool.execute("test", input, None).await.unwrap();
+        let out = tool.execute("test", input, None, None).await.unwrap();
         assert!(!out.is_error);
 
         let content = std::fs::read_to_string(&file).unwrap();
@@ -4995,7 +5083,7 @@ fn test_hashline_edit_eof_append_no_pos() {
             }]
         });
 
-        let out = tool.execute("test", input, None).await.unwrap();
+        let out = tool.execute("test", input, None, None).await.unwrap();
         assert!(!out.is_error);
 
         let content = std::fs::read_to_string(&file).unwrap();
@@ -5028,7 +5116,7 @@ fn test_hashline_edit_overlapping_replace_ranges_rejected() {
             ]
         });
 
-        let result = tool.execute("test", input, None).await;
+        let result = tool.execute("test", input, None, None).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -5060,7 +5148,7 @@ fn test_hashline_edit_reversed_range_rejected() {
             }]
         });
 
-        let result = tool.execute("test", input, None).await;
+        let result = tool.execute("test", input, None, None).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -5091,7 +5179,7 @@ fn test_hashline_edit_trailing_newline_semantics() {
             }]
         });
 
-        let out = tool.execute("test", input, None).await.unwrap();
+        let out = tool.execute("test", input, None, None).await.unwrap();
         assert!(!out.is_error);
 
         let content = std::fs::read_to_string(&file).unwrap();
@@ -5124,6 +5212,7 @@ fn test_read_large_file_different_offsets_produce_different_content() {
                     "limit": 5,
                 }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -5138,6 +5227,7 @@ fn test_read_large_file_different_offsets_produce_different_content() {
                     "offset": 8001,
                     "limit": 5,
                 }),
+                None,
                 None,
             )
             .await
@@ -5189,6 +5279,7 @@ fn test_pwsh_simple_command() {
                 "t",
                 serde_json::json!({ "command": "echo hello_from_pwsh" }),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -5204,7 +5295,7 @@ fn test_pwsh_exit_code_nonzero() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = PwshTool::new(tmp.path());
         let out = tool
-            .execute("t", serde_json::json!({ "command": "exit 42" }), None)
+            .execute("t", serde_json::json!({ "command": "exit 42" }), None, None)
             .await
             .expect("non-zero exit should return Ok with is_error=true");
         assert!(out.is_error, "non-zero exit must set is_error");
@@ -5220,6 +5311,7 @@ fn test_pwsh_stderr_capture_on_error() {
             .execute(
                 "t",
                 serde_json::json!({ "command": "Write-Error 'test_error_msg'; exit 1" }),
+                None,
                 None,
             )
             .await
@@ -5243,6 +5335,7 @@ fn test_pwsh_timeout() {
                 "t",
                 serde_json::json!({ "command": "Start-Sleep 60", "timeout": 2 }),
                 None,
+                None,
             )
             .await
             .expect("timeout should return Ok with is_error=true");
@@ -5259,6 +5352,7 @@ fn test_pwsh_multiline_output() {
             .execute(
                 "t",
                 serde_json::json!({ "command": "echo line1; echo line2; echo line3" }),
+                None,
                 None,
             )
             .await
@@ -5277,7 +5371,7 @@ fn test_pwsh_working_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = PwshTool::new(tmp.path());
         let out = tool
-            .execute("t", serde_json::json!({ "command": "pwd" }), None)
+            .execute("t", serde_json::json!({ "command": "pwd" }), None, None)
             .await
             .unwrap();
         let text = get_text(&out.content);
@@ -5301,6 +5395,7 @@ fn test_pwsh_cjk_output() {
             .execute(
                 "t",
                 serde_json::json!({ "command": "echo '你好世界'" }),
+                None,
                 None,
             )
             .await
@@ -5326,7 +5421,7 @@ fn test_pwsh_ambient_cancellation() {
             cancel_cx.set_cancel_requested(true);
         });
 
-        let result = run_pwsh_command(tmp.path(), "Start-Sleep 60", Some(30))
+        let result = run_pwsh_command(tmp.path(), "Start-Sleep 60", Some(30), None)
             .await
             .expect("run_pwsh_command should complete");
 

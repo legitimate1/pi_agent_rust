@@ -17,7 +17,7 @@ mod common;
 use async_trait::async_trait;
 use common::{TestHarness, run_async};
 use futures::Stream;
-use pi::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession};
+use pi::agent::{AbortHandle, AbortSignal, Agent, AgentConfig, AgentEvent, AgentSession};
 use pi::compaction::ResolvedCompactionSettings;
 use pi::error::{Error, Result};
 use pi::model::{
@@ -673,6 +673,7 @@ impl Tool for FaultyPartialWriteTool {
         _tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        _abort: Option<AbortSignal>,
     ) -> Result<ToolOutput> {
         let input: FaultyWriteInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;

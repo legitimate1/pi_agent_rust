@@ -763,6 +763,7 @@ impl Tool for ReadTool {
         tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        _abort: Option<AbortSignal>,
     ) -> Result<ToolOutput> {
         let input: ReadInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;

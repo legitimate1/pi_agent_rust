@@ -28,7 +28,7 @@ mod common;
 use async_trait::async_trait;
 use common::{TestHarness, run_async};
 use futures::Stream;
-use pi::agent::{Agent, AgentConfig, AgentEvent, AgentSession};
+use pi::agent::{AbortSignal, Agent, AgentConfig, AgentEvent, AgentSession};
 use pi::compaction::ResolvedCompactionSettings;
 use pi::error::{Error, Result};
 use pi::model::{
@@ -62,7 +62,7 @@ struct ToolExecResult {
 /// Execute a tool and normalize the result: both Ok(ToolOutput) and Err(Error)
 /// are turned into a ToolExecResult for easy assertion.
 async fn exec_tool(tool: &dyn Tool, call_id: &str, input: serde_json::Value) -> ToolExecResult {
-    match tool.execute(call_id, input, None).await {
+    match tool.execute(call_id, input, None, None).await {
         Ok(output) => ToolExecResult {
             is_error: output.is_error,
             text: get_text(&output.content),
@@ -544,7 +544,10 @@ fn tool_write_deeply_nested_dirs() {
             "path": deep_path.to_string_lossy(),
             "content": "deeply nested content"
         });
-        let result = tool.execute("write-deep-1", input, None).await.unwrap();
+        let result = tool
+            .execute("write-deep-1", input, None, None)
+            .await
+            .unwrap();
 
         h.log().info_ctx("verify", "write deep dirs", |ctx| {
             ctx.push(("is_error".into(), result.is_error.to_string()));
@@ -976,6 +979,7 @@ impl Tool for FailingTool {
         _tool_call_id: &str,
         _input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        _abort: Option<AbortSignal>,
     ) -> std::result::Result<ToolOutput, pi::error::Error> {
         Err(pi::error::Error::tool(
             "failing_tool",

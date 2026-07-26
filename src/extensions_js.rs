@@ -48,7 +48,7 @@ use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, path::Path, path::PathBuf};
 use swc_common::{FileName, GLOBALS, Globals, Mark, SourceMap, sync::Lrc};
@@ -4617,23 +4617,33 @@ struct InterruptBudget {
     configured: Option<u64>,
     remaining: std::cell::Cell<Option<u64>>,
     tripped: std::cell::Cell<bool>,
+    /// External abort trigger — set from outside to interrupt running JS.
+    /// Checked before the budget counter so abort takes priority.
+    external_trigger: Arc<AtomicBool>,
 }
 
 impl InterruptBudget {
-    const fn new(configured: Option<u64>) -> Self {
+    fn new(configured: Option<u64>) -> Self {
         Self {
             configured,
             remaining: std::cell::Cell::new(None),
             tripped: std::cell::Cell::new(false),
+            external_trigger: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn reset(&self) {
         self.remaining.set(self.configured);
         self.tripped.set(false);
+        self.external_trigger.store(false, AtomicOrdering::SeqCst);
     }
 
     fn on_interrupt(&self) -> bool {
+        // Check external abort first — takes priority over budget counter
+        if self.external_trigger.load(AtomicOrdering::SeqCst) {
+            self.tripped.set(true);
+            return true;
+        }
         let Some(remaining) = self.remaining.get() else {
             return false;
         };
@@ -4643,6 +4653,14 @@ impl InterruptBudget {
         }
         self.remaining.set(Some(remaining - 1));
         false
+    }
+
+    fn trigger_external(&self) {
+        self.external_trigger.store(true, AtomicOrdering::SeqCst);
+    }
+
+    fn clear_external(&self) {
+        self.external_trigger.store(false, AtomicOrdering::SeqCst);
     }
 
     fn did_trip(&self) -> bool {
@@ -16153,6 +16171,20 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// Check whether a given hostcall is pending and not cancelled.
     pub fn is_hostcall_active(&self, call_id: &str) -> bool {
         self.hostcall_tracker.borrow().is_active(call_id)
+    }
+
+    /// Request an interrupt of any running JS execution (e.g. on abort).
+    ///
+    /// The interrupt handler will trip on the next opportunity, stopping the
+    /// currently executing script.  Call [`Self::clear_interrupt`] after the
+    /// runtime has settled.
+    pub fn request_interrupt(&self) {
+        self.interrupt_budget.trigger_external();
+    }
+
+    /// Clear a previously requested external interrupt.
+    pub fn clear_interrupt(&self) {
+        self.interrupt_budget.clear_external();
     }
 
     /// Get all tools registered by loaded JS extensions.

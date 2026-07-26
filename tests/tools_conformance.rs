@@ -30,7 +30,7 @@ mod read_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -59,7 +59,7 @@ mod read_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -84,6 +84,7 @@ mod read_tool {
                     "test-id",
                     serde_json::json!({ "path": test_file.to_string_lossy() }),
                     None,
+                    None,
                 )
                 .await
                 .expect("default read should succeed");
@@ -91,6 +92,7 @@ mod read_tool {
                 .execute(
                     "test-id",
                     serde_json::json!({ "path": test_file.to_string_lossy(), "offset": 0 }),
+                    None,
                     None,
                 )
                 .await
@@ -120,6 +122,7 @@ mod read_tool {
                     "test-id",
                     serde_json::json!({ "path": test_file.to_string_lossy() }),
                     None,
+                    None,
                 )
                 .await
                 .expect("default read should succeed");
@@ -127,6 +130,7 @@ mod read_tool {
                 .execute(
                     "test-id",
                     serde_json::json!({ "path": test_file.to_string_lossy(), "limit": 100 }),
+                    None,
                     None,
                 )
                 .await
@@ -158,6 +162,7 @@ mod read_tool {
                     "test-id",
                     serde_json::json!({ "path": lf_path.to_string_lossy() }),
                     None,
+                    None,
                 )
                 .await
                 .expect("should succeed");
@@ -165,6 +170,7 @@ mod read_tool {
                 .execute(
                     "test-id",
                     serde_json::json!({ "path": crlf_path.to_string_lossy() }),
+                    None,
                     None,
                 )
                 .await
@@ -196,6 +202,7 @@ mod read_tool {
                     "test-id",
                     serde_json::json!({ "path": lf_path.to_string_lossy() }),
                     None,
+                    None,
                 )
                 .await
                 .expect("should succeed");
@@ -203,6 +210,7 @@ mod read_tool {
                 .execute(
                     "test-id",
                     serde_json::json!({ "path": cr_path.to_string_lossy() }),
+                    None,
                     None,
                 )
                 .await
@@ -233,11 +241,11 @@ mod read_tool {
             });
 
             let first = tool
-                .execute("test-id", input.clone(), None)
+                .execute("test-id", input.clone(), None, None)
                 .await
                 .expect("first read should succeed");
             let second = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("second read should succeed");
 
@@ -263,6 +271,7 @@ mod read_tool {
                     "test-id",
                     serde_json::json!({ "path": path.to_string_lossy(), "hashline": true }),
                     None,
+                    None,
                 )
                 .await
                 .expect("full hashline read should succeed");
@@ -275,6 +284,7 @@ mod read_tool {
                         "offset": 3,
                         "limit": 2
                     }),
+                    None,
                     None,
                 )
                 .await
@@ -318,7 +328,7 @@ mod read_tool {
             });
 
             let err = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect_err("should error");
             let message = err.to_string();
@@ -343,7 +353,7 @@ mod read_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed with truncation guidance");
             let text = get_text_content(&result.content);
@@ -380,7 +390,7 @@ mod read_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should truncate");
             let text = get_text_content(&result.content);
@@ -429,7 +439,7 @@ mod read_tool {
             });
 
             let err = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect_err("should error");
             let message = err.to_string();
@@ -458,7 +468,7 @@ mod read_tool {
             });
 
             let err = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect_err("should error");
             let message = err.to_string();
@@ -481,7 +491,7 @@ mod read_tool {
                 "path": "/nonexistent/path/file.txt"
             });
 
-            let result = tool.execute("test-id", input, None).await;
+            let result = tool.execute("test-id", input, None, None).await;
             assert!(result.is_err());
         });
     }
@@ -495,7 +505,7 @@ mod read_tool {
                 "path": temp_dir.path().to_string_lossy()
             });
 
-            let result = tool.execute("test-id", input, None).await;
+            let result = tool.execute("test-id", input, None, None).await;
             assert!(result.is_err());
         });
     }
@@ -518,7 +528,7 @@ mod write_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -547,7 +557,7 @@ mod write_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -574,7 +584,7 @@ mod write_tool {
             });
 
             let err = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect_err("should error");
             let message = err.to_string();
@@ -599,7 +609,7 @@ mod write_tool {
                 "content": "content"
             });
 
-            let result = tool.execute("test-id", input, None).await;
+            let result = tool.execute("test-id", input, None, None).await;
             assert!(result.is_ok());
             assert!(test_file.exists());
         });
@@ -624,7 +634,7 @@ mod edit_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -666,6 +676,7 @@ mod edit_tool {
                         "newText": "delta"
                     }),
                     None,
+                    None,
                 )
                 .await
                 .expect("should succeed");
@@ -678,6 +689,7 @@ mod edit_tool {
                         "oldText": "beta",
                         "newText": "delta"
                     }),
+                    None,
                     None,
                 )
                 .await
@@ -728,6 +740,7 @@ mod edit_tool {
                         "newText": "delta"
                     }),
                     None,
+                    None,
                 )
                 .await
                 .expect("should succeed");
@@ -740,6 +753,7 @@ mod edit_tool {
                         "oldText": "beta",
                         "newText": "delta"
                     }),
+                    None,
                     None,
                 )
                 .await
@@ -782,7 +796,7 @@ mod edit_tool {
             });
 
             let err = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect_err("should error");
             let message = err.to_string();
@@ -808,7 +822,7 @@ mod edit_tool {
             });
 
             let err = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect_err("should error");
             let message = err.to_string();
@@ -834,7 +848,7 @@ mod edit_tool {
             });
 
             let err = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect_err("should error");
             let message = err.to_string().to_lowercase();
@@ -856,7 +870,7 @@ mod edit_tool {
                 "newText": "New"
             });
 
-            let result = tool.execute("test-id", input, None).await;
+            let result = tool.execute("test-id", input, None, None).await;
             assert!(result.is_err());
         });
     }
@@ -876,7 +890,7 @@ mod edit_tool {
             });
 
             let err = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect_err("should error");
             let message = err.to_string();
@@ -898,7 +912,7 @@ mod bash_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -919,7 +933,7 @@ mod bash_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("timeout should return a tool error output");
             assert!(result.is_error, "timeout must set is_error");
@@ -942,7 +956,7 @@ mod bash_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -962,7 +976,7 @@ mod bash_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("non-zero exit should return a tool error output");
             assert!(result.is_error, "non-zero exit must set is_error");
@@ -981,7 +995,7 @@ mod bash_tool {
                 "command": "ls test.txt"
             });
 
-            let result = tool.execute("test-id", input, None).await;
+            let result = tool.execute("test-id", input, None, None).await;
             assert!(result.is_ok());
         });
     }
@@ -1006,7 +1020,7 @@ mod grep_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -1028,7 +1042,7 @@ mod grep_tool {
             });
 
             let err = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect_err("should error");
             let message = err.to_string();
@@ -1054,7 +1068,7 @@ mod grep_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -1077,7 +1091,7 @@ mod grep_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -1106,7 +1120,7 @@ mod grep_tool {
             });
 
             let err = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect_err("should error");
             let message = err.to_string();
@@ -1129,7 +1143,7 @@ mod grep_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -1154,13 +1168,19 @@ mod grep_tool {
             let tool = pi::tools::GrepTool::new(harness.temp_dir());
 
             let base = tool
-                .execute("test-id", serde_json::json!({ "pattern": "alpha" }), None)
+                .execute(
+                    "test-id",
+                    serde_json::json!({ "pattern": "alpha" }),
+                    None,
+                    None,
+                )
                 .await
                 .expect("should succeed");
             let literal = tool
                 .execute(
                     "test-id",
                     serde_json::json!({ "pattern": "alpha", "literal": true }),
+                    None,
                     None,
                 )
                 .await
@@ -1187,6 +1207,7 @@ mod grep_tool {
                     "test-id",
                     serde_json::json!({ "pattern": "alpha", "ignoreCase": false }),
                     None,
+                    None,
                 )
                 .await
                 .expect("should succeed");
@@ -1194,6 +1215,7 @@ mod grep_tool {
                 .execute(
                     "test-id",
                     serde_json::json!({ "pattern": "alpha", "ignoreCase": true }),
+                    None,
                     None,
                 )
                 .await
@@ -1221,6 +1243,7 @@ mod grep_tool {
                     "test-id",
                     serde_json::json!({ "path": path.to_string_lossy(), "hashline": true }),
                     None,
+                    None,
                 )
                 .await
                 .expect("hashline read should succeed");
@@ -1241,6 +1264,7 @@ mod grep_tool {
                         "path": path.to_string_lossy(),
                         "hashline": true
                     }),
+                    None,
                     None,
                 )
                 .await
@@ -1269,7 +1293,7 @@ mod grep_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -1296,7 +1320,7 @@ mod find_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -1319,7 +1343,7 @@ mod find_tool {
             });
 
             let err = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect_err("should error");
             let message = err.to_string();
@@ -1345,7 +1369,7 @@ mod find_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -1371,7 +1395,7 @@ mod find_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -1389,13 +1413,19 @@ mod find_tool {
 
             let tool = pi::tools::FindTool::new(temp_dir.path());
             let base = tool
-                .execute("test-id", serde_json::json!({ "pattern": "*.txt" }), None)
+                .execute(
+                    "test-id",
+                    serde_json::json!({ "pattern": "*.txt" }),
+                    None,
+                    None,
+                )
                 .await
                 .expect("should succeed");
             let explicit = tool
                 .execute(
                     "test-id",
                     serde_json::json!({ "pattern": "*.txt", "path": "." }),
+                    None,
                     None,
                 )
                 .await
@@ -1434,6 +1464,7 @@ mod find_tool {
                     "test-id",
                     serde_json::json!({ "pattern": "**/*.txt", "path": "subdir" }),
                     None,
+                    None,
                 )
                 .await
                 .expect("should succeed");
@@ -1441,6 +1472,7 @@ mod find_tool {
                 .execute(
                     "test-id",
                     serde_json::json!({ "pattern": "**/*.txt", "path": "subdir/" }),
+                    None,
                     None,
                 )
                 .await
@@ -1471,14 +1503,24 @@ mod find_tool {
             let tool = pi::tools::FindTool::new(temp_dir.path());
 
             let base = tool
-                .execute("test-id", serde_json::json!({ "pattern": "*.rs" }), None)
+                .execute(
+                    "test-id",
+                    serde_json::json!({ "pattern": "*.rs" }),
+                    None,
+                    None,
+                )
                 .await
                 .expect("should succeed");
 
             std::fs::write(temp_dir.path().join("note.txt"), "").unwrap();
 
             let after = tool
-                .execute("test-id", serde_json::json!({ "pattern": "*.rs" }), None)
+                .execute(
+                    "test-id",
+                    serde_json::json!({ "pattern": "*.rs" }),
+                    None,
+                    None,
+                )
                 .await
                 .expect("should succeed");
 
@@ -1514,7 +1556,7 @@ mod ls_tool {
             let input = serde_json::json!({});
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -1534,11 +1576,11 @@ mod ls_tool {
 
             let tool = pi::tools::LsTool::new(temp_dir.path());
             let base = tool
-                .execute("test-id", serde_json::json!({}), None)
+                .execute("test-id", serde_json::json!({}), None, None)
                 .await
                 .expect("should succeed");
             let explicit = tool
-                .execute("test-id", serde_json::json!({ "path": "." }), None)
+                .execute("test-id", serde_json::json!({ "path": "." }), None, None)
                 .await
                 .expect("should succeed");
 
@@ -1570,11 +1612,21 @@ mod ls_tool {
 
             let tool = pi::tools::LsTool::new(temp_dir.path());
             let base = tool
-                .execute("test-id", serde_json::json!({ "path": "subdir" }), None)
+                .execute(
+                    "test-id",
+                    serde_json::json!({ "path": "subdir" }),
+                    None,
+                    None,
+                )
                 .await
                 .expect("should succeed");
             let explicit = tool
-                .execute("test-id", serde_json::json!({ "path": "subdir/" }), None)
+                .execute(
+                    "test-id",
+                    serde_json::json!({ "path": "subdir/" }),
+                    None,
+                    None,
+                )
                 .await
                 .expect("should succeed");
 
@@ -1604,7 +1656,7 @@ mod ls_tool {
                 "path": "/nonexistent/directory"
             });
 
-            let result = tool.execute("test-id", input, None).await;
+            let result = tool.execute("test-id", input, None, None).await;
             assert!(result.is_err());
         });
     }
@@ -1620,7 +1672,7 @@ mod ls_tool {
             });
 
             let err = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect_err("should error");
             let message = err.to_string();
@@ -1644,7 +1696,7 @@ mod ls_tool {
             });
 
             let err = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect_err("should error");
             let message = err.to_string();
@@ -1664,7 +1716,7 @@ mod ls_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -1694,7 +1746,7 @@ mod ls_tool {
 
                 let tool = pi::tools::LsTool::new(temp_dir.path());
                 let result = tool
-                    .execute("test-id", serde_json::json!({}), None)
+                    .execute("test-id", serde_json::json!({}), None, None)
                     .await
                     .expect("ls should succeed");
                 (get_text_content(&result.content), result.details)
@@ -1749,7 +1801,7 @@ mod ls_tool {
             let input = serde_json::json!({});
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("should succeed");
 
@@ -2226,7 +2278,7 @@ async fn execute_tool_with_diagnostics<T: Tool + ?Sized>(
     input: serde_json::Value,
 ) -> pi::PiResult<pi::tools::ToolOutput> {
     let execute_started = Instant::now();
-    let result = tool.execute(tool_call_id, input.clone(), None).await;
+    let result = tool.execute(tool_call_id, input.clone(), None, None).await;
     log_tool_execution(
         harness,
         tool_name,
@@ -3069,7 +3121,7 @@ fn e2e_all_tools_roundtrip() {
 
         // Verify edit with read
         let result = read_tool
-            .execute("rt-read2", read_input.clone(), None)
+            .execute("rt-read2", read_input.clone(), None, None)
             .await;
         let output = result.expect("read after edit should succeed");
         let text = get_text_content(&output.content);
@@ -3189,7 +3241,7 @@ mod security_path_traversal {
                 "path": "../outside.txt"
             });
             let err = tool
-                .execute("sec-read-01", input, None)
+                .execute("sec-read-01", input, None, None)
                 .await
                 .expect_err("read with ../ should be rejected");
             let text = err.to_string();
@@ -3215,7 +3267,7 @@ mod security_path_traversal {
                 "path": "subdir/../../outside.txt"
             });
             let err = tool
-                .execute("sec-read-04", input, None)
+                .execute("sec-read-04", input, None, None)
                 .await
                 .expect_err("dot-dot escape should be rejected");
             let text = err.to_string();
@@ -3241,7 +3293,7 @@ mod security_path_traversal {
                 "content": "ESCAPED_CONTENT"
             });
             let err = tool
-                .execute("sec-write-01", input, None)
+                .execute("sec-write-01", input, None, None)
                 .await
                 .expect_err("write with ../ should be rejected");
             let text = err.to_string();
@@ -3271,7 +3323,7 @@ mod security_path_traversal {
                 "content": "ESCAPED_CONTENT"
             });
             let err = tool
-                .execute("sec-write-03", input, None)
+                .execute("sec-write-03", input, None, None)
                 .await
                 .expect_err("dot-dot escape should be rejected");
             let text = err.to_string();
@@ -3304,7 +3356,7 @@ mod security_path_traversal {
                 "newText": "MODIFIED_CONTENT"
             });
             let err = tool
-                .execute("sec-edit-01", input, None)
+                .execute("sec-edit-01", input, None, None)
                 .await
                 .expect_err("edit with ../ should be rejected");
             let text = err.to_string();
@@ -3335,7 +3387,7 @@ mod security_path_traversal {
                 "newText": "MODIFIED_CONTENT"
             });
             let err = tool
-                .execute("sec-edit-02", input, None)
+                .execute("sec-edit-02", input, None, None)
                 .await
                 .expect_err("dot-dot escape should be rejected");
             let text = err.to_string();
@@ -3362,7 +3414,7 @@ mod security_path_traversal {
                 "path": outside_file.to_string_lossy()
             });
             let err = tool
-                .execute("sec-read-02", input, None)
+                .execute("sec-read-02", input, None, None)
                 .await
                 .expect_err("absolute path outside CWD should be rejected");
             let text = err.to_string();
@@ -3384,7 +3436,7 @@ mod security_path_traversal {
                 "content": "NOPE"
             });
             let err = tool
-                .execute("sec-write-04", input, None)
+                .execute("sec-write-04", input, None, None)
                 .await
                 .expect_err("absolute path outside CWD should be rejected");
             let text = err.to_string();
@@ -3415,7 +3467,7 @@ mod security_path_traversal {
                 "newText": "MODIFIED"
             });
             let err = tool
-                .execute("sec-edit-03", input, None)
+                .execute("sec-edit-03", input, None, None)
                 .await
                 .expect_err("absolute path outside CWD should be rejected");
             let text = err.to_string();
@@ -3446,7 +3498,7 @@ mod security_path_traversal {
                 "path": link.to_string_lossy()
             });
             let err = tool
-                .execute("sec-read-03", input, None)
+                .execute("sec-read-03", input, None, None)
                 .await
                 .expect_err("symlink escape should be rejected");
             let text = err.to_string();
@@ -3476,7 +3528,7 @@ mod security_path_traversal {
                 "content": "NEW_CONTENT"
             });
             let err = tool
-                .execute("sec-write-02", input, None)
+                .execute("sec-write-02", input, None, None)
                 .await
                 .expect_err("write at symlink path should be rejected");
             let text = err.to_string();
@@ -3509,7 +3561,7 @@ mod security_path_traversal {
                 "path": link.to_string_lossy(),
                 "content": "NEW_CONTENT"
             });
-            let result = tool.execute("sec-write-05", input, None).await;
+            let result = tool.execute("sec-write-05", input, None, None).await;
             result.expect("write at symlink inside cwd should succeed");
 
             let target_content = std::fs::read_to_string(&target).unwrap();
@@ -3532,7 +3584,7 @@ mod security_path_traversal {
             let input = serde_json::json!({
                 "path": link.to_string_lossy()
             });
-            let result = tool.execute("sec-read-05", input, None).await;
+            let result = tool.execute("sec-read-05", input, None, None).await;
             let output = result.expect("read at symlink inside cwd should succeed");
             let text = get_text_content(&output.content);
             assert!(text.contains("INSIDE_SECRET"));
@@ -3552,7 +3604,7 @@ mod security_command_injection {
             let input = serde_json::json!({
                 "command": "read -t 1 line; echo \"got: $line\""
             });
-            let result = tool.execute("sec-bash-01", input, None).await;
+            let result = tool.execute("sec-bash-01", input, None, None).await;
             // read from null stdin should fail or produce empty
             let output = result.expect("bash should succeed even with null stdin");
             let text = get_text_content(&output.content);
@@ -3577,7 +3629,7 @@ mod security_command_injection {
             let input = serde_json::json!({
                 "command": "trap -p EXIT"
             });
-            let result = tool.execute("sec-bash-02", input, None).await;
+            let result = tool.execute("sec-bash-02", input, None, None).await;
             let output = result.expect("trap -p should succeed");
             let text = get_text_content(&output.content);
             // Tool installs an EXIT trap
@@ -3597,7 +3649,7 @@ mod security_command_injection {
             let input = serde_json::json!({
                 "command": "echo A; echo B && echo C || echo D | cat"
             });
-            let result = tool.execute("sec-bash-03", input, None).await;
+            let result = tool.execute("sec-bash-03", input, None, None).await;
             let output = result.expect("metacharacters should execute");
             let text = get_text_content(&output.content);
             assert!(text.contains('A'), "semicolon chaining should work: {text}");
@@ -3615,7 +3667,7 @@ mod security_command_injection {
             let input = serde_json::json!({
                 "command": "echo \"user: $(whoami)\""
             });
-            let result = tool.execute("sec-bash-04", input, None).await;
+            let result = tool.execute("sec-bash-04", input, None, None).await;
             let output = result.expect("command substitution should work");
             let text = get_text_content(&output.content);
             assert!(
@@ -3644,7 +3696,7 @@ mod security_environment {
             let input = serde_json::json!({
                 "command": "echo \"PATH=$PATH\""
             });
-            let result = tool.execute("sec-env-01", input, None).await;
+            let result = tool.execute("sec-env-01", input, None, None).await;
             let output = result.expect("env should be accessible");
             let text = get_text_content(&output.content);
             assert!(
@@ -3663,7 +3715,7 @@ mod security_environment {
             let input = serde_json::json!({
                 "command": "pwd"
             });
-            let result = tool.execute("sec-env-02", input, None).await;
+            let result = tool.execute("sec-env-02", input, None, None).await;
             let output = result.expect("pwd should succeed");
             let text = get_text_content(&output.content);
             // Canonicalize both for comparison (temp dirs may have symlinks)
@@ -3688,7 +3740,7 @@ mod security_environment {
             let input = serde_json::json!({
                 "command": "echo $HOME"
             });
-            let result = tool.execute("sec-env-03", input, None).await;
+            let result = tool.execute("sec-env-03", input, None, None).await;
             let output = result.expect("HOME should be accessible");
             let text = get_text_content(&output.content);
             assert!(!text.trim().is_empty(), "HOME should be non-empty: {text}");
@@ -3721,7 +3773,7 @@ mod security_environment {
             let input = serde_json::json!({
                 "command": format!("echo ${key}")
             });
-            let result = tool.execute("sec-env-04", input, None).await;
+            let result = tool.execute("sec-env-04", input, None, None).await;
             let output = result.expect("LC_ALL should be accessible");
             let text = get_text_content(&output.content);
             assert!(
@@ -3746,7 +3798,7 @@ mod security_unsafe_writes {
                 "path": deep_path.to_string_lossy(),
                 "content": "DEEP_CONTENT"
             });
-            let result = tool.execute("sec-write-03", input, None).await;
+            let result = tool.execute("sec-write-03", input, None, None).await;
             result.expect("write should auto-create dirs");
             assert!(deep_path.exists());
             let content = std::fs::read_to_string(&deep_path).unwrap();
@@ -3767,7 +3819,7 @@ mod security_unsafe_writes {
                 "path": file.to_string_lossy(),
                 "content": "REPLACEMENT"
             });
-            let result = tool.execute("sec-write-04", input, None).await;
+            let result = tool.execute("sec-write-04", input, None, None).await;
             result.expect("overwrite should succeed");
 
             let content = std::fs::read_to_string(&file).unwrap();
@@ -3791,7 +3843,7 @@ mod security_unsafe_writes {
                 "path": file.to_string_lossy(),
                 "content": "DIRECT"
             });
-            let result = tool.execute("sec-write-05", input, None).await;
+            let result = tool.execute("sec-write-05", input, None, None).await;
             result.expect("write should succeed");
 
             // Only the target file should exist in the directory
@@ -3821,7 +3873,7 @@ mod security_unsafe_writes {
                 "path": hidden.to_string_lossy(),
                 "content": "hidden"
             });
-            let result = tool.execute("sec-write-06a", input, None).await;
+            let result = tool.execute("sec-write-06a", input, None, None).await;
             result.expect("hidden file creation should succeed");
             assert!(hidden.exists());
 
@@ -3831,7 +3883,7 @@ mod security_unsafe_writes {
                 "path": spaced.to_string_lossy(),
                 "content": "spaced"
             });
-            let result = tool.execute("sec-write-06b", input, None).await;
+            let result = tool.execute("sec-write-06b", input, None, None).await;
             result.expect("spaced filename should succeed");
             assert!(spaced.exists());
         });
@@ -3851,7 +3903,7 @@ mod security_unsafe_writes {
                 "oldText": "BEFORE_EDIT",
                 "newText": "AFTER_EDIT"
             });
-            let result = tool.execute("sec-edit-02", input, None).await;
+            let result = tool.execute("sec-edit-02", input, None, None).await;
             result.expect("edit should succeed");
 
             let content = std::fs::read_to_string(&file).unwrap();
@@ -3882,7 +3934,7 @@ mod hashline_edit_tool {
             "hashline": true
         });
         let result = tool
-            .execute("test-id", input, None)
+            .execute("test-id", input, None, None)
             .await
             .expect("read with hashline should succeed");
         let text = get_text_content(&result.content);
@@ -3917,7 +3969,7 @@ mod hashline_edit_tool {
             });
 
             let result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("edit should succeed");
 
@@ -3947,7 +3999,7 @@ mod hashline_edit_tool {
                 }]
             });
 
-            let result = tool.execute("test-id", input, None).await;
+            let result = tool.execute("test-id", input, None, None).await;
             assert!(result.is_err());
             let error_msg = result.unwrap_err().to_string();
             assert!(error_msg.contains("Line 5 out of range"));
@@ -3971,7 +4023,7 @@ mod hashline_edit_tool {
                 }]
             });
 
-            let result = tool.execute("test-id", input, None).await;
+            let result = tool.execute("test-id", input, None, None).await;
             assert!(result.is_err());
             let error_msg = result.unwrap_err().to_string();
             assert!(error_msg.contains("Hash mismatch at line 2"));
@@ -3997,7 +4049,7 @@ mod hashline_edit_tool {
             });
 
             let _result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("prepend to empty file should succeed");
 
@@ -4014,7 +4066,7 @@ mod hashline_edit_tool {
             });
 
             let _result = tool
-                .execute("test-id", input, None)
+                .execute("test-id", input, None, None)
                 .await
                 .expect("append should succeed");
 
@@ -4044,7 +4096,7 @@ mod hashline_edit_tool {
                 }]
             });
 
-            tool.execute("test-id", input, None)
+            tool.execute("test-id", input, None, None)
                 .await
                 .expect("multiline edit should succeed");
 
@@ -4074,7 +4126,7 @@ mod hashline_edit_tool {
                 }]
             });
 
-            tool.execute("test-id", input, None)
+            tool.execute("test-id", input, None, None)
                 .await
                 .expect("unicode edit should succeed");
 
@@ -4106,7 +4158,7 @@ mod hashline_edit_tool {
                 }]
             });
 
-            tool.execute("test-id", input, None)
+            tool.execute("test-id", input, None, None)
                 .await
                 .expect("range replace should succeed");
 

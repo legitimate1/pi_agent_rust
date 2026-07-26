@@ -85,6 +85,7 @@ impl Tool for FindTool {
         tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        _abort: Option<AbortSignal>,
     ) -> Result<ToolOutput> {
         let input_value = input.clone();
         let input: FindInput =
@@ -156,13 +157,15 @@ impl Tool for FindTool {
         args.push(input.pattern.clone());
         args.push(search_path.display().to_string());
 
-        let mut child = command_with_default_sigpipe_in_dir(fd_cmd, &self.cwd)
-            .map_err(|e| Error::tool("find", format!("Failed to prepare fd: {e}")))?
-            .args(args)
+        let mut cmd = command_with_default_sigpipe_in_dir(fd_cmd, &self.cwd)
+            .map_err(|e| Error::tool("find", format!("Failed to prepare fd: {e}")))?;
+        cmd.args(args)
             .current_dir(&self.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        isolate_command_process_group(&mut cmd);
+        let mut child = cmd
             .spawn()
             .map_err(|e| Error::tool("find", format!("Failed to run fd: {e}")))?;
 
@@ -175,7 +178,7 @@ impl Tool for FindTool {
             .take()
             .ok_or_else(|| Error::tool("find", "Missing stderr"))?;
 
-        let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ChildOnly);
+        let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
 
         let stdout_handle = std::thread::spawn(move || -> std::result::Result<Vec<u8>, String> {
             read_to_end_capped_and_drain(stdout_pipe, READ_TOOL_MAX_BYTES)

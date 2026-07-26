@@ -224,6 +224,7 @@ impl Tool for GrepTool {
         tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        _abort: Option<AbortSignal>,
     ) -> Result<ToolOutput> {
         let input_value = input.clone();
         let input: GrepInput =
@@ -327,11 +328,11 @@ impl Tool for GrepTool {
             )
         })?;
 
-        let mut child = command_with_default_sigpipe(rg_cmd)
-            .map_err(|e| Error::tool("grep", format!("Failed to prepare ripgrep: {e}")))?
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+        let mut cmd = command_with_default_sigpipe(rg_cmd)
+            .map_err(|e| Error::tool("grep", format!("Failed to prepare ripgrep: {e}")))?;
+        cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        isolate_command_process_group(&mut cmd);
+        let mut child = cmd
             .spawn()
             .map_err(|e| Error::tool("grep", format!("Failed to run ripgrep: {e}")))?;
 
@@ -344,7 +345,7 @@ impl Tool for GrepTool {
             .take()
             .ok_or_else(|| Error::tool("grep", "Missing stderr".to_string()))?;
 
-        let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ChildOnly);
+        let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
 
         let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel(1024);
         let (stderr_tx, stderr_rx) =
