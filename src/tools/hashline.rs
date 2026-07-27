@@ -124,6 +124,9 @@ pub fn strip_hashline_prefix(line: &str) -> &str {
 struct HashlineEditInput {
     path: String,
     edits: Vec<HashlineOp>,
+    /// If true, run syntax/format check after editing.
+    #[serde(default)]
+    verify: bool,
 }
 
 /// A single hashline edit operation.
@@ -299,7 +302,7 @@ impl Tool for HashlineEditTool {
         "使用 read 的 hashline 模式输出的 LINE#HASH 标签进行精确文件编辑。 \
          支持 replace/prepend/append 操作，定位锚点（\"N#AB\"）和可选结束锚点用于范围替换。 \
          lines 可为字符串数组（多行）、字符串（单行）或 null（删除）。编辑从下到上顺序执行，\
-         执行前验证目标行哈希以确保文件未被修改。"
+         执行前验证目标行哈希以确保文件未被修改。可选 verify 参数在编辑后运行语法检查。"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -340,6 +343,11 @@ impl Tool for HashlineEditTool {
                         },
                         "required": ["op"]
                     }
+                },
+                "verify": {
+                    "type": "boolean",
+                    "description": "若为 true，编辑后自动运行语法检查（.rs → rustfmt --check, .json/.toml → 进程内解析, .ts → prettier --check）。依赖工具需在 PATH 中可用。默认 false。",
+                    "default": false
                 }
             },
             "required": ["path", "edits"]
@@ -352,7 +360,7 @@ impl Tool for HashlineEditTool {
         _tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-        _abort: Option<AbortSignal>,
+        abort: Option<AbortSignal>,
     ) -> Result<ToolOutput> {
         let input: HashlineEditInput = serde_json::from_value(input)
             .map_err(|e| Error::tool("hashline_edit", format!("Invalid input: {e}")))?;
@@ -667,6 +675,27 @@ impl Tool for HashlineEditTool {
                 "firstChangedLine".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(line)),
             );
+        }
+
+        // Optional: run file verification after successful edit
+        if input.verify {
+            let verify_path = absolute_path.clone();
+            match crate::tools::verify::verify_file(verify_path, abort).await {
+                Ok(result) => {
+                    let verify_json = crate::tools::verify::verify_result_to_json(&result);
+                    details.insert("verify".to_string(), verify_json);
+                }
+                Err(e) => {
+                    details.insert(
+                        "verify".to_string(),
+                        serde_json::json!({
+                            "passed": false,
+                            "checker": "verify",
+                            "message": format!("Verification error: {e}"),
+                        }),
+                    );
+                }
+            }
         }
 
         Ok(ToolOutput {

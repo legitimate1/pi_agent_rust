@@ -53,7 +53,8 @@ cargo sweep --time 30
 cargo test               # 全部测试
 cargo test -- --nocapture  # 带输出
 cargo test conformance   # 一致性测试
-cargo test sse::tests    # 特定模块测试
+cargo test --lib sse::tests    # 特定 lib 模块单元测试
+cargo test --lib tools::verify::tests  # 特定内部模块（非集成测试 target）
 ```
 
 ## 静态检查

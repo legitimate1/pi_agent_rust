@@ -50,7 +50,7 @@
 
 改代码后必须跑：
 
-```bash
+```pwsh
 cargo clippy --all-targets -- -D warnings && cargo fmt --check
 ```
 
@@ -70,7 +70,7 @@ cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 ## 测试
 
-```bash
+```pwsh
 cargo test                    # 全部
 cargo test -- --nocapture     # 带输出
 cargo test conformance        # 一致性测试

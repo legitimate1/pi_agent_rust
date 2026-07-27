@@ -16,6 +16,9 @@ struct EditInput {
     path: String,
     old_text: String,
     new_text: String,
+    /// If true, run syntax/format check after editing.
+    #[serde(default)]
+    verify: bool,
 }
 
 pub struct EditTool {
@@ -603,7 +606,7 @@ impl Tool for EditTool {
         "edit"
     }
     fn description(&self) -> &str {
-        "通过替换文本编辑现有文件。oldText 须唯一匹配文件中一处区域；替换无变化时报错。返回替换差异。文件限 100MB。"
+        "通过替换文本编辑现有文件。oldText 须唯一匹配文件中一处区域；替换无变化时报错。返回替换差异。文件限 100MB。可选 verify 参数在编辑后运行语法检查。"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -622,6 +625,11 @@ impl Tool for EditTool {
                 "newText": {
                     "type": "string",
                     "description": "New text to replace the old text with"
+                },
+                "verify": {
+                    "type": "boolean",
+                    "description": "若为 true，编辑后自动运行语法检查（.rs → rustfmt --check, .json/.toml → 进程内解析, .ts → prettier --check）。依赖工具需在 PATH 中可用。默认 false。",
+                    "default": false
                 }
             },
             "required": ["path", "oldText", "newText"]
@@ -634,7 +642,7 @@ impl Tool for EditTool {
         _tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-        _abort: Option<AbortSignal>,
+        abort: Option<AbortSignal>,
     ) -> Result<ToolOutput> {
         let input: EditInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
@@ -871,6 +879,27 @@ impl Tool for EditTool {
                 "firstChangedLine".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(line)),
             );
+        }
+
+        // Optional: run file verification after successful edit
+        if input.verify {
+            let verify_path = absolute_path.clone();
+            match crate::tools::verify::verify_file(verify_path, abort).await {
+                Ok(result) => {
+                    let verify_json = crate::tools::verify::verify_result_to_json(&result);
+                    details.insert("verify".to_string(), verify_json);
+                }
+                Err(e) => {
+                    details.insert(
+                        "verify".to_string(),
+                        serde_json::json!({
+                            "passed": false,
+                            "checker": "verify",
+                            "message": format!("Verification error: {e}"),
+                        }),
+                    );
+                }
+            }
         }
 
         Ok(ToolOutput {

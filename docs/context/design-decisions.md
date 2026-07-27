@@ -382,3 +382,27 @@
 
 **何时重新考虑**：如果未来 OpenAI 官方 Chat Completions API 原生支持 `reasoning_effort` 之外的思考参数，可统一所有推理模型到一个分支。
 
+## D22: 编辑后轻量验证系统（Verify）（2026-07-27）
+
+**决策**：为 `edit`/`hashline_edit`/`write` 三个工具增加可选 `verify` 参数（默认 `false`），编辑成功后自动对文件运行轻量语法/格式检查。结果附在工具输出的 `details.verify` 字段中，不阻断编辑流程。
+
+**涉及改动**：
+1. `src/tools/verify.rs` → 新增内部验证引擎
+2. `src/tools/edit.rs` → `EditInput` 增加 `verify: bool` + 编辑成功后条件调用验证
+3. `src/tools/hashline.rs` → `HashlineEditInput` 增加 `verify: bool` + 所有 edits 应用完后调用验证
+4. `src/tools/write.rs` → `WriteInput` 增加 `verify: bool` + 写入成功后条件调用验证
+5. `Cargo.toml` → `toml` 从 dev-deps 提升为正式 deps
+6. `src/tools/mod.rs` → 注册 `pub(crate) mod verify`
+
+**理由**：
+- Agent 编辑文件后缺少自动格式/语法验证环节，需要额外手动检查，增加迭代来回
+- 进程内检查器（JSON/TOML）零额外开销，已在依赖中
+- 文件类型直接映射策略确定性强、零扫描成本，适合 agent 编辑循环
+
+**不选 B 的原因**：
+- 默认 `verify=true` → 中间态误报 + 批量编辑性能损耗
+- 暴露为独立 LLM-visible tool → LLM 已有 pwsh 可手动检查
+- 自动修正 → 违反"只报告不修"铁律
+
+**何时重新考虑**：需要支持更多文件类型时，扩展映射表即可。
+

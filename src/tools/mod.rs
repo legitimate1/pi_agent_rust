@@ -15,6 +15,7 @@ mod hashline;
 mod ls;
 mod pwsh;
 mod read;
+pub(crate) mod verify;
 mod write;
 
 pub use bash::{BashRunResult, BashTool};

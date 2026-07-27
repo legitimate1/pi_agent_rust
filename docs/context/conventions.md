@@ -102,3 +102,4 @@ loop {
 | 使用不安全的 `unsafe` 代码 | 纯 safe Rust | 项目 `forbid(unsafe_code)` |
 | 放任 `target/` 无限膨胀 | 定期 `cargo sweep --file` 清理旧产物 | Cargo 永不删除旧文件，debug .pdb 和增量缓存可累积到数百 GB |
 | 用裸 `std::process::Child` | 用 `ProcessGuard` 封装 | Drop 时不 kill 子进程，abort 后变孤儿 |
+| `cargo test <模块名>` 定位单元测试 | `cargo test --lib <模块名>` | 不加 `--lib` 会编译所有集成测试 target（e2e 等），大幅延长等待时间 |

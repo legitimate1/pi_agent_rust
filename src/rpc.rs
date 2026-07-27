@@ -885,7 +885,8 @@ pub async fn run(
             while let Ok(request) = extension_ui_rx.recv(&cx).await {
                 if request.expects_response() {
                     let emit_now = {
-                        let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&ui_state), &cx).await else {
+                        let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&ui_state), &cx).await
+                        else {
                             return;
                         };
                         if guard.active.is_none() {
@@ -2552,7 +2553,8 @@ pub async fn run(
                     };
 
                     let (response, next_request) = {
-                        let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&ui_state), &cx).await else {
+                        let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&ui_state), &cx).await
+                        else {
                             let _ = out_tx.send(response_error(
                                 id,
                                 "extension_ui_response",
