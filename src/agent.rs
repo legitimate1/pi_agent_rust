@@ -48,7 +48,7 @@ use crate::session::{AutosaveFlushTrigger, Session, SessionHandle};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolRegistry, ToolUpdate};
 use asupersync::runtime::{Runtime, RuntimeBuilder, RuntimeHandle};
 #[allow(unused_imports)]
-use asupersync::sync::{Mutex, Notify};
+use asupersync::sync::{Mutex, Notify, OwnedMutexGuard};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::FutureExt;
@@ -2437,7 +2437,11 @@ impl Agent {
                         });
                     }
                 }
-                StreamEvent::ToolCallStart { content_index, .. } => {
+                StreamEvent::ToolCallStart {
+                    content_index,
+                    id,
+                    name,
+                } => {
                     self.seed_partial_message_if_missing(&mut added_partial);
                     if let Some(Message::Assistant(msg_arc)) = self
                         .messages
@@ -2446,13 +2450,25 @@ impl Agent {
                         .find(|m| matches!(m, Message::Assistant(_)))
                     {
                         let msg = Arc::make_mut(msg_arc);
+                        // #129: seed `id`/`name` from the start event so every
+                        // emitted partial carries the correlation key from the
+                        // first `toolcall_delta`, not only at `toolcall_end`.
                         if content_index == msg.content.len() {
                             msg.content.push(ContentBlock::ToolCall(ToolCall {
-                                id: String::new(),
-                                name: String::new(),
+                                id,
+                                name,
                                 arguments: serde_json::Value::Null,
                                 thought_signature: None,
                             }));
+                        } else if let Some(ContentBlock::ToolCall(tc)) =
+                            msg.content.get_mut(content_index)
+                        {
+                            if tc.id.is_empty() {
+                                tc.id = id;
+                            }
+                            if tc.name.is_empty() {
+                                tc.name = name;
+                            }
                         }
                         let shared = Arc::clone(msg_arc);
                         if !sent_start {
@@ -8619,9 +8635,7 @@ impl AgentSession {
         from_extension: bool,
     ) -> Result<()> {
         let cx = crate::agent_cx::AgentCx::for_request();
-        let mut session = self
-            .session
-            .lock(cx.cx())
+        let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
             .await
             .map_err(|e| Error::session(e.to_string()))?;
 
@@ -9138,9 +9152,7 @@ impl AgentSession {
     pub async fn save_and_index(&mut self) -> Result<()> {
         if self.save_enabled {
             let cx = crate::agent_cx::AgentCx::for_request();
-            let mut session = self
-                .session
-                .lock(cx.cx())
+            let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             session
@@ -9155,9 +9167,7 @@ impl AgentSession {
             return Ok(());
         }
         let cx = crate::agent_cx::AgentCx::for_request();
-        let mut session = self
-            .session
-            .lock(cx.cx())
+        let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
             .await
             .map_err(|e| Error::session(e.to_string()))?;
         session
@@ -9711,9 +9721,7 @@ impl AgentSession {
 
         {
             let cx = crate::agent_cx::AgentCx::for_request();
-            let mut session = self
-                .session
-                .lock(cx.cx())
+            let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(prompt_message.clone());
@@ -9799,9 +9807,10 @@ impl AgentSession {
 
         {
             let cx = crate::agent_cx::AgentCx::for_request();
-            let mut session = self
-                .session
-                .lock(cx.cx())
+            // Owned guard: `MutexGuard` is `!Send` (asupersync 0.3.9); this future
+            // is reachable from `RuntimeHandle::spawn` (the ACP prompt task in
+            // src/acp.rs), which requires the whole future to be `Send`.
+            let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(user_message.clone());
@@ -9881,9 +9890,10 @@ impl AgentSession {
 
         {
             let cx = crate::agent_cx::AgentCx::for_request();
-            let mut session = self
-                .session
-                .lock(cx.cx())
+            // Owned guard: `MutexGuard` is `!Send` (asupersync 0.3.9); this future
+            // is reachable from `RuntimeHandle::spawn` (the ACP prompt task in
+            // src/acp.rs), which requires the whole future to be `Send`.
+            let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(user_message.clone());
@@ -9976,9 +9986,7 @@ impl AgentSession {
         let new_messages = self.agent.messages()[start_len..].to_vec();
         {
             let cx = crate::agent_cx::AgentCx::for_request();
-            let mut session = self
-                .session
-                .lock(cx.cx())
+            let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             for message in new_messages {

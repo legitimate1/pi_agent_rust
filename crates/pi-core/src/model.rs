@@ -274,6 +274,14 @@ pub enum StreamEvent {
 
     ToolCallStart {
         content_index: usize,
+        /// The tool-call identifier, if known at this point.
+        /// May be empty until [`ToolCallEnd`] for providers that send
+        /// ID only on the closing chunk.
+        id: String,
+        /// The tool name, if known at this point.
+        /// May be empty until [`ToolCallEnd`] for providers that send
+        /// name only on the closing chunk.
+        name: String,
     },
     ToolCallDelta {
         content_index: usize,

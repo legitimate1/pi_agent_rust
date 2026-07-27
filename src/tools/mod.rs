@@ -1271,7 +1271,7 @@ pub(crate) fn write_artifact_file_if_absent(path: &Path, bytes: &[u8]) -> std::i
     {
         Ok(mut file) => {
             file.write_all(bytes)?;
-            file.sync_all()?;
+            tolerate_fsync_refusal(file.sync_all(), "artifact file", path)?;
             Ok(())
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
@@ -2297,12 +2297,67 @@ pub fn fuzz_normalize_dot_segments(path: &Path) -> PathBuf {
     normalize_dot_segments(path)
 }
 
+/// Returns `true` when an `fsync`/`fdatasync` durability barrier was *refused*
+/// by the filesystem rather than reflecting a real write failure.
+///
+/// The bytes are already handed to the kernel by the preceding `write(2)`;
+/// `fsync` only asks the filesystem to make them durable. Some filesystems —
+/// notably virtiofs / FUSE bind mounts (Docker Desktop for macOS) and various
+/// network filesystems — do not implement `fsync` on a given descriptor and
+/// report it with `EBADF`, `EINVAL`, or an "unsupported" error even though the
+/// `write(2)` and the subsequent atomic `rename(2)` already landed the data
+/// correctly. Failing the whole write tool in that case is wrong: the file is
+/// complete and correct on disk. We downgrade these specific refusals to a
+/// warning. Genuine I/O failures (`EIO`, `ENOSPC`, `EDQUOT`, …) still
+/// propagate. See issue #136.
+pub(crate) fn is_fsync_refused(err: &std::io::Error) -> bool {
+    // EBADF = 9 and EINVAL = 22 on both Linux and macOS. `ErrorKind::Unsupported`
+    // captures ENOTSUP/EOPNOTSUPP/ENOSYS portably without a `libc` dependency
+    // (this crate is `#![forbid(unsafe_code)]`).
+    matches!(err.raw_os_error(), Some(9 | 22)) || err.kind() == std::io::ErrorKind::Unsupported
+}
+
+/// Runs a durability `fsync` (`result`), treating a filesystem *refusal* (see
+/// [`is_fsync_refused`]) as a non-fatal warning while still propagating real
+/// I/O errors. `what` and `path` are used only for the diagnostic log line.
+pub(crate) fn tolerate_fsync_refusal(
+    result: std::io::Result<()>,
+    what: &str,
+    path: &Path,
+) -> std::io::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if is_fsync_refused(&err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "{what} fsync refused by filesystem (non-POSIX durability semantics); \
+                 data already written, continuing without a durability barrier"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
 #[cfg(unix)]
 pub fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    std::fs::File::open(parent)?.sync_all()
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    // Directory fsync is a pure durability nicety (it makes the rename durable);
+    // on filesystems that refuse it the rename is still visible, so tolerate a
+    // refusal rather than failing the write. See issue #136.
+    tolerate_fsync_refusal(
+        std::fs::File::open(parent).and_then(|dir| dir.sync_all()),
+        "parent directory",
+        parent,
+    )
 }
 
 #[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]

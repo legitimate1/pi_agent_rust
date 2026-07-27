@@ -122,7 +122,11 @@ impl Tool for WriteTool {
             let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
 
             temp_file.as_file_mut().write_all(&content_bytes)?;
-            temp_file.as_file_mut().sync_all()?;
+            super::tolerate_fsync_refusal(
+                temp_file.as_file_mut().sync_all(),
+                "temp file",
+                &path_clone,
+            )?;
 
             // Restore original file permissions (tempfile defaults to 0o600) before persisting.
             if let Some(perms) = original_perms {
