@@ -13,11 +13,11 @@ pub fn safe_canonicalize(path: &Path) -> PathBuf {
             };
 
             for ancestor in absolute.ancestors().skip(1) {
-                if let Ok(canonical_ancestor) = std::fs::canonicalize(ancestor) {
-                    if let Ok(suffix) = absolute.strip_prefix(ancestor) {
-                        let combined = canonical_ancestor.join(suffix);
-                        return strip_unc_prefix(normalize_dot_segments(&combined));
-                    }
+                if let Ok(canonical_ancestor) = std::fs::canonicalize(ancestor)
+                    && let Ok(suffix) = absolute.strip_prefix(ancestor)
+                {
+                    let combined = canonical_ancestor.join(suffix);
+                    return strip_unc_prefix(normalize_dot_segments(&combined));
                 }
             }
 
@@ -73,10 +73,8 @@ pub fn strip_unc_prefix(path: PathBuf) -> PathBuf {
     {
         let s = path.to_string_lossy();
         if let Some(stripped) = s.strip_prefix(r"\\?\") {
-            if let Some(unc) = stripped.strip_prefix("UNC") {
-                if unc.starts_with('\\') {
-                    return PathBuf::from(format!(r"\{unc}"));
-                }
+            if let Some(unc) = stripped.strip_prefix("UNC") && unc.starts_with('\\') {
+                return PathBuf::from(format!(r"\{unc}"));
             }
             return PathBuf::from(stripped);
         }
