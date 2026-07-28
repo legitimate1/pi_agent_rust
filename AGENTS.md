@@ -57,14 +57,14 @@ cargo clippy --all-targets -- -D warnings && cargo fmt --check
 ## 构建与部署
 
 ### 规则
-1. 每次构建前升版本号：`cargo set-version --bump patch`
+1. 每次构建前升版本号：`cargo set-version --bump patch -p pi_agent_rust`（`-p pi_agent_rust` 限仅升主 crate，避免 workspace 成员全部跳版本）
 2. 构建和部署分离 — 构建后等用户指令再部署
 3. 不得私自构建或部署
 
 ### 流程
 
 ```
-用户说「构建」→ cargo set-version --bump patch → git add + commit → cargo build --release → 停下
+用户说「构建」→ cargo set-version --bump patch -p pi_agent_rust → git add + commit → cargo build --release → 停下
 用户说「部署」→ .\scripts\deploy-release.ps1
 ```
 
