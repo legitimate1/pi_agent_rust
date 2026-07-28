@@ -3,6 +3,7 @@ use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 // ============================================================================
@@ -158,6 +159,10 @@ impl Tool for WriteTool {
         .map_err(|e| Error::tool("write", format!("Failed to write file: {e}")))?;
 
         let mut details: Option<serde_json::Value> = None;
+        let mut output_text = format!(
+            "Successfully wrote {} bytes to {}",
+            bytes_written, input.path
+        );
 
         // Optional: run file verification after successful write
         if input.verify {
@@ -168,6 +173,14 @@ impl Tool for WriteTool {
                     let verify_json = crate::tools::verify::verify_result_to_json(&result);
                     details_map.insert("verify".to_string(), verify_json);
                     details = Some(serde_json::Value::Object(details_map));
+
+                    let status = if result.passed { "PASSED" } else { "FAILED" };
+                    let _ = write!(
+                        output_text,
+                        "\n[verify:{status}|{checker}|{time_ms}ms]",
+                        checker = result.checker,
+                        time_ms = result.time_ms,
+                    );
                 }
                 Err(e) => {
                     let mut details_map = serde_json::Map::new();
@@ -180,15 +193,14 @@ impl Tool for WriteTool {
                         }),
                     );
                     details = Some(serde_json::Value::Object(details_map));
+
+                    let _ = write!(output_text, "\n[verify:ERROR|{e}]");
                 }
             }
         }
 
         Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(format!(
-                "Successfully wrote {} bytes to {}",
-                bytes_written, input.path
-            )))],
+            content: vec![ContentBlock::Text(TextContent::new(output_text))],
             details,
             is_error: false,
         })

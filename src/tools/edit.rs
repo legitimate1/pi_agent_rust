@@ -4,6 +4,7 @@ use crate::model::{ContentBlock, TextContent};
 use asupersync::io::AsyncReadExt;
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 // ============================================================================
 // Write Tool
@@ -881,6 +882,11 @@ impl Tool for EditTool {
             );
         }
 
+        let mut output_text = format!(
+            "Successfully replaced text in {}.",
+            input.path
+        );
+
         // Optional: run file verification after successful edit
         if input.verify {
             let verify_path = absolute_path.clone();
@@ -888,6 +894,14 @@ impl Tool for EditTool {
                 Ok(result) => {
                     let verify_json = crate::tools::verify::verify_result_to_json(&result);
                     details.insert("verify".to_string(), verify_json);
+
+                    let status = if result.passed { "PASSED" } else { "FAILED" };
+                    let _ = write!(
+                        output_text,
+                        "\n[verify:{status}|{checker}|{time_ms}ms]",
+                        checker = result.checker,
+                        time_ms = result.time_ms,
+                    );
                 }
                 Err(e) => {
                     details.insert(
@@ -898,15 +912,13 @@ impl Tool for EditTool {
                             "message": format!("Verification error: {e}"),
                         }),
                     );
+                    let _ = write!(output_text, "\n[verify:ERROR|{e}]");
                 }
             }
         }
 
         Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(format!(
-                "Successfully replaced text in {}.",
-                input.path
-            )))],
+            content: vec![ContentBlock::Text(TextContent::new(output_text))],
             details: Some(serde_json::Value::Object(details)),
             is_error: false,
         })
