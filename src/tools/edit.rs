@@ -882,10 +882,7 @@ impl Tool for EditTool {
             );
         }
 
-        let mut output_text = format!(
-            "Successfully replaced text in {}.",
-            input.path
-        );
+        let mut output_text = format!("Successfully replaced text in {}.", input.path);
 
         // Optional: run file verification after successful edit
         if input.verify {

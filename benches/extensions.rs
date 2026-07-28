@@ -98,7 +98,7 @@ impl pi::extensions::ExtensionSession for BenchSession {
         Ok(())
     }
 
-    async fn set_model(&self, _provider: String, _model_id: String) -> pi::error::Result<()> {
+    async fn set_model(&self, _provider: String, _model_id: String, _persist: bool) -> pi::error::Result<()> {
         Ok(())
     }
 
@@ -106,7 +106,7 @@ impl pi::extensions::ExtensionSession for BenchSession {
         (None, None)
     }
 
-    async fn set_thinking_level(&self, _level: String) -> pi::error::Result<()> {
+    async fn set_thinking_level(&self, _level: String, _persist: bool) -> pi::error::Result<()> {
         Ok(())
     }
 

@@ -237,7 +237,7 @@ impl ExtensionSession for ConformanceMockSession {
         Ok(())
     }
 
-    async fn set_model(&self, provider: String, model_id: String) -> PiResult<()> {
+    async fn set_model(&self, provider: String, model_id: String, _persist: bool) -> PiResult<()> {
         self.capture.record(
             "set_model",
             Some(serde_json::json!({
@@ -263,7 +263,7 @@ impl ExtensionSession for ConformanceMockSession {
         result
     }
 
-    async fn set_thinking_level(&self, level: String) -> PiResult<()> {
+    async fn set_thinking_level(&self, level: String, _persist: bool) -> PiResult<()> {
         self.capture.record(
             "set_thinking_level",
             Some(serde_json::json!({ "level": level })),
@@ -609,10 +609,12 @@ fn mock_session_captures_mutations() {
         let s = Arc::clone(&session);
         async move {
             s.set_name("new-name".to_string()).await.unwrap();
-            s.set_model("openai".to_string(), "gpt-4".to_string())
+            s.set_model("openai".to_string(), "gpt-4".to_string(), true)
                 .await
                 .unwrap();
-            s.set_thinking_level("high".to_string()).await.unwrap();
+            s.set_thinking_level("high".to_string(), true)
+                .await
+                .unwrap();
             s.set_label("msg-123".to_string(), Some("important".to_string()))
                 .await
                 .unwrap();

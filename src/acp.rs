@@ -787,7 +787,13 @@ async fn run(
                     continue;
                 };
 
-                match apply_set_model(&session_state, &provider, &model, &cx).await {
+                let persist = request
+                    .params
+                    .get("persist")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+
+                match apply_set_model(&session_state, &provider, &model, persist, &cx).await {
                     Ok((provider, model)) => {
                         let _ = out_tx.send(json_rpc_ok(
                             id,
@@ -862,7 +868,7 @@ async fn run(
                     continue;
                 };
 
-                match apply_set_config_option(&session_state, option, &cx).await {
+                match apply_set_config_option(&session_state, option, true, &cx).await {
                     Ok(()) => {
                         let _ = out_tx.send(json_rpc_ok(
                             id,
@@ -1554,6 +1560,7 @@ async fn apply_set_model(
     session_state: &Arc<Mutex<AcpSessionState>>,
     provider: &str,
     model: &str,
+    _persist: bool,
     cx: &AgentCx,
 ) -> std::result::Result<(String, String), String> {
     let Ok(mut guard) = session_state.lock(cx).await else {
@@ -1563,7 +1570,7 @@ async fn apply_set_model(
         return Err("Cannot change model while a prompt is in progress".to_string());
     };
     agent_session
-        .set_provider_model(provider, model)
+        .set_provider_model(provider, model, _persist)
         .await
         .map_err(|e| e.to_string())?;
     Ok((provider.to_string(), model.to_string()))
@@ -1573,6 +1580,7 @@ async fn apply_set_model(
 async fn apply_set_config_option(
     session_state: &Arc<Mutex<AcpSessionState>>,
     option: RuntimeConfigOption,
+    _persist: bool,
     cx: &AgentCx,
 ) -> std::result::Result<(), String> {
     let Ok(mut guard) = session_state.lock(cx).await else {
@@ -1583,7 +1591,7 @@ async fn apply_set_config_option(
     };
     match option {
         RuntimeConfigOption::ThinkingLevel(level) => agent_session
-            .set_thinking_level(level)
+            .set_thinking_level(level, _persist)
             .await
             .map_err(|e| e.to_string()),
     }
@@ -2566,7 +2574,7 @@ mod tests {
             let cx = AgentCx::for_testing();
             let (state, _auth, _registry) = make_set_model_session_state();
 
-            let (provider, model) = apply_set_model(&state, "openai", "gpt-4o", &cx)
+            let (provider, model) = apply_set_model(&state, "openai", "gpt-4o", true, &cx)
                 .await
                 .expect("switch succeeds");
             assert_eq!(provider, "openai");
@@ -2593,6 +2601,7 @@ mod tests {
             apply_set_config_option(
                 &state,
                 RuntimeConfigOption::ThinkingLevel(crate::model::ThinkingLevel::Off),
+                true,
                 &cx,
             )
             .await
@@ -2618,7 +2627,7 @@ mod tests {
 
             // Provider exists but the model id is not in the registry → the
             // underlying set_provider_model rejects the switch.
-            let err = apply_set_model(&state, "openai", "no-such-model", &cx)
+            let err = apply_set_model(&state, "openai", "no-such-model", true, &cx)
                 .await
                 .expect_err("unknown model rejected");
             assert!(

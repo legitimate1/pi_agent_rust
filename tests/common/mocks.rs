@@ -501,7 +501,7 @@ impl ExtensionSession for RecordingSession {
         Ok(())
     }
 
-    async fn set_model(&self, provider: String, model_id: String) -> Result<()> {
+    async fn set_model(&self, provider: String, model_id: String, _persist: bool) -> Result<()> {
         self.record_call(
             "set_model",
             serde_json::json!({ "provider": provider, "model_id": model_id }),
@@ -528,7 +528,7 @@ impl ExtensionSession for RecordingSession {
         (provider, model_id)
     }
 
-    async fn set_thinking_level(&self, level: String) -> Result<()> {
+    async fn set_thinking_level(&self, level: String, _persist: bool) -> Result<()> {
         self.record_call("set_thinking_level", serde_json::json!({ "level": level }));
         let mut state = self.state.lock().unwrap();
         if let Value::Object(ref mut map) = *state {
@@ -933,7 +933,7 @@ mod tests {
             let s = Arc::clone(&session);
             async move {
                 s.set_name("test-session".to_string()).await.unwrap();
-                s.set_model("anthropic".to_string(), "claude-3".to_string())
+                s.set_model("anthropic".to_string(), "claude-3".to_string(), true)
                     .await
                     .unwrap();
                 s.append_custom_entry(

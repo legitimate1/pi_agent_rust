@@ -7877,11 +7877,17 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
         .await
     }
 
-    async fn set_model(&self, provider: String, model_id: String) -> crate::error::Result<()> {
+    async fn set_model(
+        &self,
+        provider: String,
+        model_id: String,
+        persist: bool,
+    ) -> crate::error::Result<()> {
         <SessionHandle as crate::extensions::ExtensionSession>::set_model(
             &self.handle,
             provider,
             model_id,
+            persist,
         )
         .await
     }
@@ -7890,14 +7896,14 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
         <SessionHandle as crate::extensions::ExtensionSession>::get_model(&self.handle).await
     }
 
-    async fn set_thinking_level(&self, level: String) -> crate::error::Result<()> {
+    async fn set_thinking_level(&self, level: String, persist: bool) -> crate::error::Result<()> {
         <SessionHandle as crate::extensions::ExtensionSession>::set_thinking_level(
             &self.handle,
             level,
+            persist,
         )
         .await
     }
-
     async fn get_thinking_level(&self) -> Option<String> {
         <SessionHandle as crate::extensions::ExtensionSession>::get_thinking_level(&self.handle)
             .await
@@ -8116,7 +8122,12 @@ impl AgentSession {
         self.compaction_settings.context_window_tokens = context_window_tokens;
     }
 
-    pub async fn set_provider_model(&mut self, provider_id: &str, model_id: &str) -> Result<()> {
+    pub async fn set_provider_model(
+        &mut self,
+        provider_id: &str,
+        model_id: &str,
+        persist: bool,
+    ) -> Result<()> {
         let already_active = {
             let provider = self.agent.provider();
             provider.name().eq(provider_id) && provider.model_id().eq(model_id)
@@ -8185,7 +8196,11 @@ impl AgentSession {
             }
         }
 
-        self.persist_session().await
+        if persist {
+            self.persist_session().await
+        } else {
+            Ok(())
+        }
     }
 
     /// Update the thinking/reasoning level for this session at runtime.
@@ -8196,7 +8211,11 @@ impl AgentSession {
     /// Mirrors [`crate::sdk::AgentSessionHandle::set_thinking_level`] but is
     /// callable directly on an [`AgentSession`] (e.g. from the ACP transport,
     /// which holds an `AgentSession` rather than an SDK handle).
-    pub async fn set_thinking_level(&mut self, level: crate::model::ThinkingLevel) -> Result<()> {
+    pub async fn set_thinking_level(
+        &mut self,
+        level: crate::model::ThinkingLevel,
+        persist: bool,
+    ) -> Result<()> {
         let cx = crate::agent_cx::AgentCx::for_request();
         let (effective_level, changed) = {
             let mut guard = self
@@ -8222,7 +8241,7 @@ impl AgentSession {
         };
         self.agent.stream_options_mut().thinking_level = Some(effective_level);
         self.refresh_extension_completion_host_state();
-        if changed {
+        if changed && persist {
             self.persist_session().await
         } else {
             Ok(())
@@ -11763,7 +11782,7 @@ mod tests {
             }
 
             let err = agent_session
-                .set_provider_model("missing-provider", "missing-model")
+                .set_provider_model("missing-provider", "missing-model", true)
                 .await
                 .expect_err("missing model should not switch");
             assert!(
@@ -11815,7 +11834,7 @@ mod tests {
             }
 
             let err = agent_session
-                .set_provider_model("openai", "gpt-4o")
+                .set_provider_model("openai", "gpt-4o", true)
                 .await
                 .expect_err("missing credentials should abort model switch");
             assert!(
@@ -11897,7 +11916,7 @@ mod tests {
             }
 
             agent_session
-                .set_provider_model("acme", "plain-model")
+                .set_provider_model("acme", "plain-model", true)
                 .await
                 .expect("switch should clamp unsupported thinking");
 
@@ -11945,11 +11964,11 @@ mod tests {
 
             let mut agent_session = build_switch_test_session(&auth);
             agent_session
-                .set_provider_model("openai", "gpt-4o")
+                .set_provider_model("openai", "gpt-4o", true)
                 .await
                 .expect("switch model");
             agent_session
-                .set_provider_model("openai", "gpt-4o")
+                .set_provider_model("openai", "gpt-4o", true)
                 .await
                 .expect("repeat same model");
 
@@ -12203,7 +12222,7 @@ mod tests {
                 Some(crate::model::ThinkingLevel::High);
 
             agent_session
-                .set_provider_model("anthropic", "claude-sonnet-4-5")
+                .set_provider_model("anthropic", "claude-sonnet-4-5", true)
                 .await
                 .expect("re-persisting the current model should succeed without a registry");
 

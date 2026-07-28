@@ -125,7 +125,11 @@ fn set_model_then_get_model_round_trip() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
         handle
-            .set_model("anthropic".to_string(), "claude-sonnet-4-5".to_string())
+            .set_model(
+                "anthropic".to_string(),
+                "claude-sonnet-4-5".to_string(),
+                true,
+            )
             .await
             .expect("set_model should succeed");
 
@@ -150,11 +154,11 @@ fn set_model_overwrites_previous() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
         handle
-            .set_model("openai".to_string(), "gpt-4o".to_string())
+            .set_model("openai".to_string(), "gpt-4o".to_string(), true)
             .await
             .expect("first set_model");
         handle
-            .set_model("anthropic".to_string(), "claude-opus-4".to_string())
+            .set_model("anthropic".to_string(), "claude-opus-4".to_string(), true)
             .await
             .expect("second set_model");
 
@@ -171,7 +175,7 @@ fn set_thinking_level_then_get_round_trip() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
         handle
-            .set_thinking_level("high".to_string())
+            .set_thinking_level("high".to_string(), true)
             .await
             .expect("set_thinking_level should succeed");
 
@@ -193,8 +197,14 @@ fn get_thinking_level_defaults_to_none() {
 fn set_thinking_level_overwrites_previous() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
-        handle.set_thinking_level("low".to_string()).await.unwrap();
-        handle.set_thinking_level("high".to_string()).await.unwrap();
+        handle
+            .set_thinking_level("low".to_string(), true)
+            .await
+            .unwrap();
+        handle
+            .set_thinking_level("high".to_string(), true)
+            .await
+            .unwrap();
 
         let level = handle.get_thinking_level().await;
         assert_eq!(level.as_deref(), Some("high"));
@@ -372,7 +382,7 @@ async fn dispatch_via_manager(mgr: &ExtensionManager, op: &str, payload: Value) 
                 return (false, "invalid_request".to_string());
             }
             session
-                .set_model(provider, model_id)
+                .set_model(provider, model_id, true)
                 .await
                 .map(|()| Value::Bool(true))
         }
@@ -390,7 +400,7 @@ async fn dispatch_via_manager(mgr: &ExtensionManager, op: &str, payload: Value) 
                 return (false, "invalid_request".to_string());
             }
             session
-                .set_thinking_level(level)
+                .set_thinking_level(level, true)
                 .await
                 .map(|()| Value::Null)
         }
@@ -641,7 +651,7 @@ fn get_model_response_shape_matches_spec() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
         handle
-            .set_model("anthropic".to_string(), "claude-opus-4".to_string())
+            .set_model("anthropic".to_string(), "claude-opus-4".to_string(), true)
             .await
             .unwrap();
 
@@ -680,7 +690,7 @@ fn multiple_model_switches_keep_last_value() {
         ];
         for (p, m) in &models {
             handle
-                .set_model(p.to_string(), m.to_string())
+                .set_model(p.to_string(), m.to_string(), true)
                 .await
                 .expect("set_model");
         }

@@ -1893,7 +1893,12 @@ impl ExtensionSession for ConformanceSession {
         Ok(())
     }
 
-    async fn set_model(&self, provider: String, model_id: String) -> pi::error::Result<()> {
+    async fn set_model(
+        &self,
+        provider: String,
+        model_id: String,
+        _persist: bool,
+    ) -> pi::error::Result<()> {
         *self.model.lock().unwrap() = (Some(provider), Some(model_id));
         Ok(())
     }
@@ -1902,7 +1907,7 @@ impl ExtensionSession for ConformanceSession {
         self.model.lock().unwrap().clone()
     }
 
-    async fn set_thinking_level(&self, level: String) -> pi::error::Result<()> {
+    async fn set_thinking_level(&self, level: String, _persist: bool) -> pi::error::Result<()> {
         *self.thinking_level.lock().unwrap() = Some(level);
         Ok(())
     }

@@ -386,7 +386,12 @@ impl ExtensionSession for InteractiveExtensionSession {
         Ok(())
     }
 
-    async fn set_model(&self, provider: String, model_id: String) -> crate::error::Result<()> {
+    async fn set_model(
+        &self,
+        provider: String,
+        model_id: String,
+        _persist: bool,
+    ) -> crate::error::Result<()> {
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
         let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
             .await
@@ -421,7 +426,7 @@ impl ExtensionSession for InteractiveExtensionSession {
         current_path_model_fields(&guard)
     }
 
-    async fn set_thinking_level(&self, level: String) -> crate::error::Result<()> {
+    async fn set_thinking_level(&self, level: String, _persist: bool) -> crate::error::Result<()> {
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
         let shared_model = self.model_entry.lock().map(|entry| entry.clone()).ok();
         let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
@@ -1070,11 +1075,11 @@ mod tests {
             };
 
             ext_session
-                .set_thinking_level("high".to_string())
+                .set_thinking_level("high".to_string(), true)
                 .await
                 .expect("first thinking update");
             ext_session
-                .set_thinking_level("high".to_string())
+                .set_thinking_level("high".to_string(), true)
                 .await
                 .expect("second thinking update");
 
@@ -1121,7 +1126,7 @@ mod tests {
             };
 
             ext_session
-                .set_thinking_level("high".to_string())
+                .set_thinking_level("high".to_string(), true)
                 .await
                 .expect("thinking update should preserve requested level");
 
@@ -1157,11 +1162,19 @@ mod tests {
             };
 
             ext_session
-                .set_model("anthropic".to_string(), "claude-sonnet-4-5".to_string())
+                .set_model(
+                    "anthropic".to_string(),
+                    "claude-sonnet-4-5".to_string(),
+                    true,
+                )
                 .await
                 .expect("first model update");
             ext_session
-                .set_model("anthropic".to_string(), "claude-sonnet-4-5".to_string())
+                .set_model(
+                    "anthropic".to_string(),
+                    "claude-sonnet-4-5".to_string(),
+                    true,
+                )
                 .await
                 .expect("second model update");
 
@@ -1204,7 +1217,7 @@ mod tests {
             };
 
             ext_session
-                .set_model("gemini".to_string(), "gemini-2.5-pro".to_string())
+                .set_model("gemini".to_string(), "gemini-2.5-pro".to_string(), true)
                 .await
                 .expect("alias target should dedupe");
 
@@ -1377,11 +1390,11 @@ mod tests {
             };
 
             ext_session
-                .set_model("openai".to_string(), "gpt-4o".to_string())
+                .set_model("openai".to_string(), "gpt-4o".to_string(), true)
                 .await
                 .expect("same-branch model should dedupe");
             ext_session
-                .set_thinking_level("low".to_string())
+                .set_thinking_level("low".to_string(), true)
                 .await
                 .expect("same-branch thinking should dedupe");
 

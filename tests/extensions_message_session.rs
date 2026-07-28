@@ -239,7 +239,7 @@ fn session_set_model_persists() {
         let session = mgr.session_handle().expect("session attached");
         async move {
             session
-                .set_model("openai".to_string(), "gpt-4o".to_string())
+                .set_model("openai".to_string(), "gpt-4o".to_string(), true)
                 .await
                 .unwrap();
 
@@ -264,6 +264,7 @@ fn session_get_model_returns_stored_value() {
                 .set_model(
                     "anthropic".to_string(),
                     "claude-opus-4-5-20251101".to_string(),
+                    true,
                 )
                 .await
                 .unwrap();
@@ -285,7 +286,7 @@ fn session_set_thinking_level_persists() {
         let session = mgr.session_handle().expect("session attached");
         async move {
             session
-                .set_thinking_level("high".to_string())
+                .set_thinking_level("high".to_string(), true)
                 .await
                 .unwrap();
             let level = session.get_thinking_level().await;
@@ -305,7 +306,7 @@ fn session_get_thinking_level_returns_stored_value() {
         async move {
             // Set thinking level via the real session path, then verify read-back
             session
-                .set_thinking_level("medium".to_string())
+                .set_thinking_level("medium".to_string(), true)
                 .await
                 .unwrap();
             let level = session.get_thinking_level().await;

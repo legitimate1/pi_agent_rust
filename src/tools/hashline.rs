@@ -677,10 +677,7 @@ impl Tool for HashlineEditTool {
             );
         }
 
-        let mut output_text = format!(
-            "Successfully applied hashline edits to {}.",
-            input.path
-        );
+        let mut output_text = format!("Successfully applied hashline edits to {}.", input.path);
 
         // Optional: run file verification after successful edit
         if input.verify {

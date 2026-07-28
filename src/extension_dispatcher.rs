@@ -3565,6 +3565,10 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     .or_else(|| payload.get("model_id").and_then(Value::as_str))
                     .unwrap_or_default()
                     .to_string();
+                let persist = payload
+                    .get("persist")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
                 if provider.is_empty() || model_id.is_empty() {
                     Err((
                         HostCallErrorCode::InvalidRequest,
@@ -3572,7 +3576,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     ))
                 } else {
                     self.session
-                        .set_model(provider, model_id)
+                        .set_model(provider, model_id, persist)
                         .await
                         .map(|()| Value::Bool(true))
                         .map_err(|err| (HostCallErrorCode::Io, err.to_string()))
@@ -3593,6 +3597,10 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     .or_else(|| payload.get("thinking_level").and_then(Value::as_str))
                     .unwrap_or_default()
                     .to_string();
+                let persist = payload
+                    .get("persist")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
                 if level.is_empty() {
                     Err((
                         HostCallErrorCode::InvalidRequest,
@@ -3600,7 +3608,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     ))
                 } else {
                     self.session
-                        .set_thinking_level(level)
+                        .set_thinking_level(level, persist)
                         .await
                         .map(|()| Value::Null)
                         .map_err(|err| (HostCallErrorCode::Io, err.to_string()))
@@ -4172,7 +4180,12 @@ mod tests {
             Ok(())
         }
 
-        async fn set_model(&self, _provider: String, _model_id: String) -> Result<()> {
+        async fn set_model(
+            &self,
+            _provider: String,
+            _model_id: String,
+            _persist: bool,
+        ) -> Result<()> {
             Ok(())
         }
 
@@ -4180,7 +4193,7 @@ mod tests {
             (None, None)
         }
 
-        async fn set_thinking_level(&self, _level: String) -> Result<()> {
+        async fn set_thinking_level(&self, _level: String, _persist: bool) -> Result<()> {
             Ok(())
         }
 
@@ -4312,7 +4325,12 @@ mod tests {
             Ok(())
         }
 
-        async fn set_model(&self, provider: String, model_id: String) -> Result<()> {
+        async fn set_model(
+            &self,
+            provider: String,
+            model_id: String,
+            _persist: bool,
+        ) -> Result<()> {
             let mut state = self
                 .state
                 .lock()
@@ -4342,7 +4360,7 @@ mod tests {
             (provider, model_id)
         }
 
-        async fn set_thinking_level(&self, level: String) -> Result<()> {
+        async fn set_thinking_level(&self, level: String, _persist: bool) -> Result<()> {
             let mut state = self
                 .state
                 .lock()
@@ -10472,7 +10490,12 @@ mod tests {
                         "disk full",
                     )))
                 }
-                async fn set_model(&self, _provider: String, _model_id: String) -> Result<()> {
+                async fn set_model(
+                    &self,
+                    _provider: String,
+                    _model_id: String,
+                    _persist: bool,
+                ) -> Result<()> {
                     Err(crate::error::Error::from(std::io::Error::other(
                         "disk full",
                     )))
@@ -10480,7 +10503,7 @@ mod tests {
                 async fn get_model(&self) -> (Option<String>, Option<String>) {
                     (None, None)
                 }
-                async fn set_thinking_level(&self, _level: String) -> Result<()> {
+                async fn set_thinking_level(&self, _level: String, _persist: bool) -> Result<()> {
                     Err(crate::error::Error::from(std::io::Error::other(
                         "disk full",
                     )))
@@ -13300,7 +13323,12 @@ mod tests {
                     Ok(())
                 }
 
-                async fn set_model(&self, _provider: String, _model_id: String) -> Result<()> {
+                async fn set_model(
+                    &self,
+                    _provider: String,
+                    _model_id: String,
+                    _persist: bool,
+                ) -> Result<()> {
                     Ok(())
                 }
 
@@ -13308,7 +13336,7 @@ mod tests {
                     (None, None)
                 }
 
-                async fn set_thinking_level(&self, _level: String) -> Result<()> {
+                async fn set_thinking_level(&self, _level: String, _persist: bool) -> Result<()> {
                     Ok(())
                 }
 

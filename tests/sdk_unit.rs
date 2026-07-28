@@ -301,7 +301,7 @@ fn lifecycle_state_after_model_switch() {
     let mut handle = run_async(create_agent_session(options)).expect("create session");
     let (state_before, state_after) = run_async(async move {
         let state_before = handle.state().await?;
-        handle.set_model("openai", "gpt-4o").await?;
+        handle.set_model("openai", "gpt-4o", true).await?;
         let state_after = handle.state().await?;
         Ok::<_, pi::error::Error>((state_before, state_after))
     })

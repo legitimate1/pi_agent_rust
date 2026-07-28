@@ -13460,9 +13460,9 @@ pub trait ExtensionSession: Send + Sync {
     async fn set_name(&self, name: String) -> Result<()>;
     async fn append_message(&self, message: SessionMessage) -> Result<()>;
     async fn append_custom_entry(&self, custom_type: String, data: Option<Value>) -> Result<()>;
-    async fn set_model(&self, provider: String, model_id: String) -> Result<()>;
+    async fn set_model(&self, provider: String, model_id: String, persist: bool) -> Result<()>;
     async fn get_model(&self) -> (Option<String>, Option<String>);
-    async fn set_thinking_level(&self, level: String) -> Result<()>;
+    async fn set_thinking_level(&self, level: String, persist: bool) -> Result<()>;
     async fn get_thinking_level(&self) -> Option<String>;
     async fn set_label(&self, target_id: String, label: Option<String>) -> Result<()>;
 }
@@ -23667,7 +23667,7 @@ async fn dispatch_hostcall_session_fast_ref(
                 };
             }
             session
-                .set_model(provider, model_id)
+                .set_model(provider, model_id, true)
                 .await
                 .map(|()| Value::Bool(true))
         }
@@ -23693,7 +23693,7 @@ async fn dispatch_hostcall_session_fast_ref(
                 };
             }
             session
-                .set_thinking_level(level)
+                .set_thinking_level(level, true)
                 .await
                 .map(|()| Value::Null)
         }
@@ -25247,7 +25247,7 @@ async fn dispatch_hostcall_session_ref(
                 };
             }
             session
-                .set_model(provider, model_id)
+                .set_model(provider, model_id, true)
                 .await
                 .map(|()| Value::Bool(true))
         }
@@ -25273,7 +25273,7 @@ async fn dispatch_hostcall_session_ref(
                 };
             }
             session
-                .set_thinking_level(level)
+                .set_thinking_level(level, true)
                 .await
                 .map(|()| Value::Null)
         }
@@ -25919,7 +25919,7 @@ async fn dispatch_hostcall_events_ref(
                 let p = provider.unwrap_or_default();
                 let m = model_id.unwrap_or_default();
                 if !p.is_empty() && !m.is_empty() {
-                    if let Err(err) = session.set_model(p, m).await {
+                    if let Err(err) = session.set_model(p, m, true).await {
                         return HostcallOutcome::Error {
                             code: "io".to_string(),
                             message: format!("setModel: session update failed: {err}"),
@@ -25952,7 +25952,7 @@ async fn dispatch_hostcall_events_ref(
             // Persist via session (creates ThinkingLevelChangeEntry + updates header).
             if let Some(session) = manager.session_handle() {
                 if let Some(ref lvl) = level {
-                    if let Err(err) = session.set_thinking_level(lvl.clone()).await {
+                    if let Err(err) = session.set_thinking_level(lvl.clone(), true).await {
                         return HostcallOutcome::Error {
                             code: "io".to_string(),
                             message: format!("setThinkingLevel: session update failed: {err}"),
@@ -37060,7 +37060,12 @@ mod tests {
         ) -> Result<()> {
             Ok(())
         }
-        async fn set_model(&self, provider: String, model_id: String) -> Result<()> {
+        async fn set_model(
+            &self,
+            provider: String,
+            model_id: String,
+            _persist: bool,
+        ) -> Result<()> {
             *self
                 .model
                 .lock()
@@ -37074,7 +37079,7 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
         }
-        async fn set_thinking_level(&self, level: String) -> Result<()> {
+        async fn set_thinking_level(&self, level: String, _persist: bool) -> Result<()> {
             *self
                 .thinking_level
                 .lock()
@@ -53840,13 +53845,18 @@ mod tests {
         ) -> Result<()> {
             Ok(())
         }
-        async fn set_model(&self, _provider: String, _model_id: String) -> Result<()> {
+        async fn set_model(
+            &self,
+            _provider: String,
+            _model_id: String,
+            _persist: bool,
+        ) -> Result<()> {
             Ok(())
         }
         async fn get_model(&self) -> (Option<String>, Option<String>) {
             (None, None)
         }
-        async fn set_thinking_level(&self, _level: String) -> Result<()> {
+        async fn set_thinking_level(&self, _level: String, _persist: bool) -> Result<()> {
             Ok(())
         }
         async fn get_thinking_level(&self) -> Option<String> {

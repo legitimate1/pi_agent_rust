@@ -1474,6 +1474,11 @@ pub async fn run(
                     continue;
                 }
 
+                let persist = parsed
+                    .get("persist")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+
                 let result: Result<()> = async {
                     let clamped_level = {
                         let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
@@ -1494,7 +1499,7 @@ pub async fn run(
                             .headers
                             .clone_from(&entry.headers);
 
-                        apply_model_change(&mut guard, &entry).await?;
+                        apply_model_change(&mut guard, &entry, persist).await?;
 
                         let current_thinking = guard
                             .agent
@@ -1505,7 +1510,7 @@ pub async fn run(
                     }; // Drop guard here
 
                     // Apply thinking level without holding lock across await
-                    apply_thinking_level(Arc::clone(&session), clamped_level).await?;
+                    apply_thinking_level(Arc::clone(&session), clamped_level, persist).await?;
                     Ok(())
                 }
                 .await;
@@ -1535,8 +1540,13 @@ pub async fn run(
 
                     if let Some((entry, thinking_level, is_scoped)) = cycle_result {
                         // Apply thinking level after dropping lock
-                        apply_thinking_level_for_session(session.clone(), thinking_level, &cx)
-                            .await?;
+                        apply_thinking_level_for_session(
+                            session.clone(),
+                            thinking_level,
+                            true,
+                            &cx,
+                        )
+                        .await?;
                         Ok(Some((entry, thinking_level, is_scoped)))
                     } else {
                         Ok(None)
@@ -1584,6 +1594,11 @@ pub async fn run(
                     }
                 };
 
+                let persist = parsed
+                    .get("persist")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+
                 // Get the properly clamped level first
                 let clamped_level = {
                     let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
@@ -1606,7 +1621,8 @@ pub async fn run(
                 // Apply the thinking level without holding the lock across await
                 let result = {
                     let session_clone = Arc::clone(&session);
-                    apply_thinking_level_for_session(session_clone, clamped_level, &cx).await
+                    apply_thinking_level_for_session(session_clone, clamped_level, persist, &cx)
+                        .await
                 };
 
                 if let Err(err) = result {
@@ -1665,7 +1681,7 @@ pub async fn run(
                 }; // Drop guard here
 
                 // Apply thinking level without holding lock across await
-                if let Err(err) = apply_thinking_level(Arc::clone(&session), next).await {
+                if let Err(err) = apply_thinking_level(Arc::clone(&session), next, true).await {
                     let _ = out_tx.send(response_error_with_hints(
                         id.clone(),
                         "cycle_thinking_level",
@@ -5570,6 +5586,7 @@ fn model_entry_for_provider_and_id<'a>(
 async fn apply_thinking_level(
     session: Arc<asupersync::sync::Mutex<AgentSession>>,
     level: crate::model::ThinkingLevel,
+    persist: bool,
 ) -> Result<()> {
     let cx = AgentCx::for_current_or_request();
     let level_str = level.to_string();
@@ -5599,12 +5616,16 @@ async fn apply_thinking_level(
     let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
         .await
         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-    guard.persist_session().await
+    if persist {
+        guard.persist_session().await
+    } else {
+        Ok(())
+    }
 }
-
 async fn apply_thinking_level_for_session(
     session: Arc<asupersync::sync::Mutex<AgentSession>>,
     level: crate::model::ThinkingLevel,
+    persist: bool,
     cx: &AgentCx,
 ) -> Result<()> {
     // Apply thinking level changes without holding lock across persist_session await
@@ -5633,10 +5654,18 @@ async fn apply_thinking_level_for_session(
     let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), cx)
         .await
         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-    guard.persist_session().await
+    if persist {
+        guard.persist_session().await
+    } else {
+        Ok(())
+    }
 }
 
-async fn apply_model_change(guard: &mut AgentSession, entry: &ModelEntry) -> Result<()> {
+async fn apply_model_change(
+    guard: &mut AgentSession,
+    entry: &ModelEntry,
+    persist: bool,
+) -> Result<()> {
     let cx = AgentCx::for_current_or_request();
     {
         let mut inner_session = guard
@@ -5648,7 +5677,11 @@ async fn apply_model_change(guard: &mut AgentSession, entry: &ModelEntry) -> Res
         inner_session.header.model_id = Some(entry.model.id.clone());
         inner_session.append_model_change(entry.model.provider.clone(), entry.model.id.clone());
     }
-    guard.persist_session().await
+    if persist {
+        guard.persist_session().await
+    } else {
+        Ok(())
+    }
 }
 
 /// Extract user messages from a pre-captured list of session entries.
@@ -5886,7 +5919,7 @@ async fn cycle_model_for_rpc(
         .headers
         .clone_from(&next_entry.headers);
 
-    apply_model_change(guard, &next_entry).await?;
+    apply_model_change(guard, &next_entry, true).await?;
 
     let desired_thinking = if is_scoped {
         options.scoped_models[next_index]
@@ -8715,7 +8748,8 @@ export default function init(pi) {
             let _current = asupersync::Cx::set_current(Some(ambient_cx));
 
             let err = {
-                let apply = apply_thinking_level(Arc::clone(&session_handle), ThinkingLevel::High);
+                let apply =
+                    apply_thinking_level(Arc::clone(&session_handle), ThinkingLevel::High, true);
                 futures::pin_mut!(apply);
                 let inner = asupersync::time::timeout(
                     asupersync::time::wall_now(),
@@ -8765,7 +8799,7 @@ export default function init(pi) {
             let agent_session = build_test_agent_session(session);
             let session_handle = Arc::new(asupersync::sync::Mutex::new(agent_session));
 
-            apply_thinking_level(Arc::clone(&session_handle), ThinkingLevel::High)
+            apply_thinking_level(Arc::clone(&session_handle), ThinkingLevel::High, true)
                 .await
                 .expect("apply thinking level");
 

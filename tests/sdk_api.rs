@@ -159,7 +159,7 @@ done
         assert_eq!(models[0].id, "m1");
 
         let model = client
-            .set_model("anthropic", "m1")
+            .set_model("anthropic", "m1", true)
             .await
             .expect("set_model");
         assert_eq!(model.provider, "anthropic");

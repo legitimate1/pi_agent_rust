@@ -617,7 +617,7 @@ fn sdk_model_switching() {
 
     // Switch to openai/gpt-4o
     let (prov, model) = run_async(async move {
-        handle.set_model("openai", "gpt-4o").await?;
+        handle.set_model("openai", "gpt-4o", true).await?;
         Ok::<(String, String), Error>(handle.model())
     })
     .expect("set model");

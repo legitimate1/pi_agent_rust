@@ -724,11 +724,11 @@ impl SessionTransport {
     }
 
     /// Update provider/model for the active transport.
-    pub async fn set_model(&mut self, provider: &str, model_id: &str) -> Result<()> {
+    pub async fn set_model(&mut self, provider: &str, model_id: &str, persist: bool) -> Result<()> {
         match self {
-            Self::InProcess(handle) => handle.set_model(provider, model_id).await,
+            Self::InProcess(handle) => handle.set_model(provider, model_id, persist).await,
             Self::RpcSubprocess(client) => {
-                let _ = client.set_model(provider, model_id).await?;
+                let _ = client.set_model(provider, model_id, persist).await?;
                 Ok(())
             }
         }
@@ -873,10 +873,16 @@ impl RpcTransportClient {
         Ok(payload.models)
     }
 
-    pub async fn set_model(&mut self, provider: &str, model_id: &str) -> Result<RpcModelInfo> {
+    pub async fn set_model(
+        &mut self,
+        provider: &str,
+        model_id: &str,
+        persist: bool,
+    ) -> Result<RpcModelInfo> {
         let mut payload = Map::new();
         payload.insert("provider".to_string(), Value::String(provider.to_string()));
         payload.insert("modelId".to_string(), Value::String(model_id.to_string()));
+        payload.insert("persist".to_string(), Value::Bool(persist));
         self.request_typed("set_model", payload).await
     }
 
@@ -1339,8 +1345,10 @@ impl AgentSessionHandle {
     }
 
     /// Update the active provider/model pair and persist it to session metadata.
-    pub async fn set_model(&mut self, provider: &str, model_id: &str) -> Result<()> {
-        self.session.set_provider_model(provider, model_id).await
+    pub async fn set_model(&mut self, provider: &str, model_id: &str, persist: bool) -> Result<()> {
+        self.session
+            .set_provider_model(provider, model_id, persist)
+            .await
     }
 
     /// Return the currently configured thinking level.
@@ -1359,8 +1367,12 @@ impl AgentSessionHandle {
     /// reconfiguration logic (clamping, history dedupe, persistence) lives in
     /// one place and stays consistent across the SDK handle and the ACP
     /// transport, which both need it.
-    pub async fn set_thinking_level(&mut self, level: crate::model::ThinkingLevel) -> Result<()> {
-        self.session.set_thinking_level(level).await
+    pub async fn set_thinking_level(
+        &mut self,
+        level: crate::model::ThinkingLevel,
+        persist: bool,
+    ) -> Result<()> {
+        self.session.set_thinking_level(level, persist).await
     }
 
     /// Update the persisted session display name.
@@ -2144,7 +2156,7 @@ mod tests {
 
         let mut handle =
             AgentSessionHandle::from_session_with_listeners(agent_session, EventListeners::new());
-        run_async(handle.set_model("openai", "gpt-4o")).expect("set model");
+        run_async(handle.set_model("openai", "gpt-4o", true)).expect("set model");
         let provider = handle.session().agent.provider();
         assert_eq!(provider.name(), "openai");
         assert_eq!(provider.model_id(), "gpt-4o");
@@ -2163,9 +2175,9 @@ mod tests {
         };
 
         let mut handle = run_async(create_agent_session(options)).expect("create session");
-        run_async(handle.set_thinking_level(crate::model::ThinkingLevel::High))
+        run_async(handle.set_thinking_level(crate::model::ThinkingLevel::High, true))
             .expect("set thinking");
-        run_async(handle.set_thinking_level(crate::model::ThinkingLevel::High))
+        run_async(handle.set_thinking_level(crate::model::ThinkingLevel::High, true))
             .expect("reapply thinking");
 
         assert_eq!(
@@ -2256,7 +2268,7 @@ mod tests {
 
         let mut handle =
             AgentSessionHandle::from_session_with_listeners(agent_session, EventListeners::new());
-        run_async(handle.set_thinking_level(crate::model::ThinkingLevel::High))
+        run_async(handle.set_thinking_level(crate::model::ThinkingLevel::High, true))
             .expect("set thinking");
 
         assert_eq!(

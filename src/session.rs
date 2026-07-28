@@ -448,7 +448,7 @@ impl ExtensionSession for SessionHandle {
         Ok(())
     }
 
-    async fn set_model(&self, provider: String, model_id: String) -> Result<()> {
+    async fn set_model(&self, provider: String, model_id: String, _persist: bool) -> Result<()> {
         let cx = AgentCx::for_current_or_request();
         let mut session = self
             .0
@@ -482,7 +482,7 @@ impl ExtensionSession for SessionHandle {
         current_path_model_fields(&session)
     }
 
-    async fn set_thinking_level(&self, level: String) -> Result<()> {
+    async fn set_thinking_level(&self, level: String, _persist: bool) -> Result<()> {
         let cx = AgentCx::for_current_or_request();
         let mut session = self
             .0
@@ -6207,11 +6207,11 @@ mod tests {
         .expect("append_custom_entry should not trigger immediate save");
         run_async(async {
             handle
-                .set_model("prov".to_string(), "model".to_string())
+                .set_model("prov".to_string(), "model".to_string(), true)
                 .await
         })
         .expect("set_model should not trigger immediate save");
-        run_async(async { handle.set_thinking_level("high".to_string()).await })
+        run_async(async { handle.set_thinking_level("high".to_string(), true).await })
             .expect("set_thinking_level should not trigger immediate save");
 
         let branch = run_async(async { handle.get_branch().await });
@@ -6374,19 +6374,27 @@ mod tests {
 
         run_async(async {
             handle
-                .set_model("anthropic".to_string(), "claude-sonnet-4-5".to_string())
+                .set_model(
+                    "anthropic".to_string(),
+                    "claude-sonnet-4-5".to_string(),
+                    true,
+                )
                 .await
         })
         .expect("set model");
         run_async(async {
             handle
-                .set_model("anthropic".to_string(), "claude-sonnet-4-5".to_string())
+                .set_model(
+                    "anthropic".to_string(),
+                    "claude-sonnet-4-5".to_string(),
+                    true,
+                )
                 .await
         })
         .expect("repeat model");
-        run_async(async { handle.set_thinking_level("high".to_string()).await })
+        run_async(async { handle.set_thinking_level("high".to_string(), true).await })
             .expect("set thinking");
-        run_async(async { handle.set_thinking_level("high".to_string()).await })
+        run_async(async { handle.set_thinking_level("high".to_string(), true).await })
             .expect("repeat thinking");
 
         let branch = run_async(async { handle.get_branch().await });
@@ -6425,7 +6433,7 @@ mod tests {
 
         run_async(async {
             handle
-                .set_model("gemini".to_string(), "GEMINI-2.5-PRO".to_string())
+                .set_model("gemini".to_string(), "GEMINI-2.5-PRO".to_string(), true)
                 .await
         })
         .expect("alias-equivalent model should dedupe");
@@ -6543,11 +6551,11 @@ mod tests {
 
         run_async(async {
             handle
-                .set_model("openai".to_string(), "gpt-4o".to_string())
+                .set_model("openai".to_string(), "gpt-4o".to_string(), true)
                 .await
         })
         .expect("same-branch model should dedupe");
-        run_async(async { handle.set_thinking_level("low".to_string()).await })
+        run_async(async { handle.set_thinking_level("low".to_string(), true).await })
             .expect("same-branch thinking should dedupe");
 
         let branch = run_async(async { handle.get_branch().await });
