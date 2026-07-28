@@ -16,7 +16,7 @@ struct WriteInput {
     path: String,
     content: String,
     /// If true, run syntax/format check after writing.
-    #[serde(default)]
+    #[serde(default = "default_verify")]
     verify: bool,
 }
 
@@ -42,7 +42,7 @@ impl Tool for WriteTool {
         "write"
     }
     fn description(&self) -> &str {
-        "将内容写入文件。文件不存在则创建，存在则覆盖。自动创建父目录。单次写入限 100MB；路径须指向文件（非目录）。可选 verify 参数在写入后运行语法检查。"
+        "将内容写入文件。文件不存在则创建，存在则覆盖。自动创建父目录。单次写入限 100MB；路径须指向文件（非目录）。默认在写入后运行语法检查（verify=true），设 false 跳过。"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -59,8 +59,8 @@ impl Tool for WriteTool {
                 },
                 "verify": {
                     "type": "boolean",
-                    "description": "若为 true，写入后自动运行语法检查（.rs → rustfmt --check, .json/.toml → 进程内解析, .ts → prettier --check）。依赖工具需在 PATH 中可用。默认 false。",
-                    "default": false
+                    "description": "若为 true，写入后自动运行语法检查（.rs → rustfmt --check, .json/.toml → 进程内解析, .ts → prettier --check）。依赖工具需在 PATH 中可用。默认 true。",
+                    "default": true
                 }
             },
             "required": ["path", "content"]

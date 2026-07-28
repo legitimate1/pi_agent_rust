@@ -17,7 +17,7 @@ struct EditInput {
     old_text: String,
     new_text: String,
     /// If true, run syntax/format check after editing.
-    #[serde(default)]
+    #[serde(default = "default_verify")]
     verify: bool,
 }
 
@@ -606,7 +606,7 @@ impl Tool for EditTool {
         "edit"
     }
     fn description(&self) -> &str {
-        "通过替换文本编辑现有文件。oldText 须唯一匹配文件中一处区域；替换无变化时报错。返回替换差异。文件限 100MB。可选 verify 参数在编辑后运行语法检查。"
+        "通过替换文本编辑现有文件。oldText 须唯一匹配文件中一处区域；替换无变化时报错。返回替换差异。文件限 100MB。默认在编辑后运行语法检查（verify=true），设 false 跳过。"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -628,8 +628,8 @@ impl Tool for EditTool {
                 },
                 "verify": {
                     "type": "boolean",
-                    "description": "若为 true，编辑后自动运行语法检查（.rs → rustfmt --check, .json/.toml → 进程内解析, .ts → prettier --check）。依赖工具需在 PATH 中可用。默认 false。",
-                    "default": false
+                    "description": "若为 true，编辑后自动运行语法检查（.rs → rustfmt --check, .json/.toml → 进程内解析, .ts → prettier --check）。依赖工具需在 PATH 中可用。默认 true。",
+                    "default": true
                 }
             },
             "required": ["path", "oldText", "newText"]

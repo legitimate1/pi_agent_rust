@@ -300,6 +300,11 @@ pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 const BASH_TERMINATE_GRACE_SECS: u64 = 5;
 const BASH_CANCELLATION_SCHEMA_V1: &str = "pi.tool.bash.cancellation.v1";
 
+/// Default value for edit/hashline_edit/write `verify` parameter.
+pub(crate) const fn default_verify() -> bool {
+    true
+}
+
 /// Hard limit for bash output file size (1GB) to prevent disk exhaustion DoS.
 pub(crate) const BASH_FILE_LIMIT_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
 

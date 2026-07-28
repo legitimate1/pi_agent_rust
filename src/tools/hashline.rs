@@ -125,7 +125,7 @@ struct HashlineEditInput {
     path: String,
     edits: Vec<HashlineOp>,
     /// If true, run syntax/format check after editing.
-    #[serde(default)]
+    #[serde(default = "default_verify")]
     verify: bool,
 }
 
@@ -302,7 +302,7 @@ impl Tool for HashlineEditTool {
         "使用 read 的 hashline 模式输出的 LINE#HASH 标签进行精确文件编辑。 \
          支持 replace/prepend/append 操作，定位锚点（\"N#AB\"）和可选结束锚点用于范围替换。 \
          lines 可为字符串数组（多行）、字符串（单行）或 null（删除）。编辑从下到上顺序执行，\
-         执行前验证目标行哈希以确保文件未被修改。可选 verify 参数在编辑后运行语法检查。"
+         执行前验证目标行哈希以确保文件未被修改。默认在编辑后运行语法检查（verify=true），设 false 跳过。"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -346,8 +346,8 @@ impl Tool for HashlineEditTool {
                 },
                 "verify": {
                     "type": "boolean",
-                    "description": "若为 true，编辑后自动运行语法检查（.rs → rustfmt --check, .json/.toml → 进程内解析, .ts → prettier --check）。依赖工具需在 PATH 中可用。默认 false。",
-                    "default": false
+                    "description": "若为 true，编辑后自动运行语法检查（.rs → rustfmt --check, .json/.toml → 进程内解析, .ts → prettier --check）。依赖工具需在 PATH 中可用。默认 true。",
+                    "default": true
                 }
             },
             "required": ["path", "edits"]

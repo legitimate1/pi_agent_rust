@@ -2,10 +2,12 @@ use super::*;
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
 use crate::tools::{ProcessCleanupMode, ProcessGuard};
+use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 // ============================================================================
 // Pwsh Tool
 // ============================================================================
@@ -161,7 +163,7 @@ pub async fn run_pwsh_command(
     // Wrap child in ProcessGuard for automatic cleanup on drop/cancellation
     let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
 
-    // Read output in blocking threads
+    // Read output in blocking threads (incremental chunks for safety)
     let (tx, rx) = std::sync::mpsc::channel::<PwshPipeFrame>();
     let tx_out = tx.clone();
     let stdout_thread = std::thread::spawn(move || {
@@ -172,10 +174,19 @@ pub async fn run_pwsh_command(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&tmp[..n]);
+                    // Flush incrementally so output is available in channel
+                    // even if a later read() blocks forever (grandchild
+                    // inherited pipe handle).
+                    let chunk = std::mem::take(&mut buf);
+                    if tx_out.send(PwshPipeFrame::Output(chunk)).is_err() {
+                        return;
+                    }
                 }
             }
         }
-        let _ = tx_out.send(PwshPipeFrame::Output(buf));
+        if !buf.is_empty() {
+            let _ = tx_out.send(PwshPipeFrame::Output(buf));
+        }
     });
     let stderr_thread = std::thread::spawn(move || {
         let mut buf = Vec::new();
@@ -185,10 +196,16 @@ pub async fn run_pwsh_command(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&tmp[..n]);
+                    let chunk = std::mem::take(&mut buf);
+                    if tx.send(PwshPipeFrame::Stderr(chunk)).is_err() {
+                        return;
+                    }
                 }
             }
         }
-        let _ = tx.send(PwshPipeFrame::Stderr(buf));
+        if !buf.is_empty() {
+            let _ = tx.send(PwshPipeFrame::Stderr(buf));
+        }
     });
 
     // Wait for child with timeout, ambient cancellation, and abort support
@@ -198,17 +215,39 @@ pub async fn run_pwsh_command(
         .ok()
         .flatten();
 
-    // Wait for I/O threads
-    stdout_thread.join().ok();
-    stderr_thread.join().ok();
-
-    // Collect both stdout and stderr
+    // Drain I/O threads with timeout (safety net: grandchild may inherit
+    // pipe handle and prevent EOF, causing pump threads to block on read()
+    // even after the child process exits).
     let mut stdout_buf = Vec::new();
     let mut stderr_buf = Vec::new();
-    while let Ok(frame) = rx.try_recv() {
-        match frame {
-            PwshPipeFrame::Output(b) => stdout_buf = b,
-            PwshPipeFrame::Stderr(b) => stderr_buf = b,
+    {
+        let drain_start = std::time::Instant::now();
+        let drain_timeout = Duration::from_secs(5);
+        loop {
+            // Collect whatever data is available so far
+            while let Ok(frame) = rx.try_recv() {
+                match frame {
+                    PwshPipeFrame::Output(b) => stdout_buf.extend(b),
+                    PwshPipeFrame::Stderr(b) => stderr_buf.extend(b),
+                }
+            }
+
+            if stdout_thread.is_finished() && stderr_thread.is_finished() {
+                // One final drain after threads have exited
+                while let Ok(frame) = rx.try_recv() {
+                    match frame {
+                        PwshPipeFrame::Output(b) => stdout_buf.extend(b),
+                        PwshPipeFrame::Stderr(b) => stderr_buf.extend(b),
+                    }
+                }
+                break;
+            }
+
+            if drain_start.elapsed() >= drain_timeout {
+                break;
+            }
+
+            sleep(wall_now(), Duration::from_millis(50)).await;
         }
     }
 
