@@ -24708,9 +24708,15 @@ async fn dispatch_hostcall_exec_ref_with_limit(
                     }
                     crate::tools::isolate_command_process_group(&mut command);
 
-                    let mut child = command.spawn().map_err(|err| err.to_string())?;
-                    let pid = child.id();
+                    // Wrap in ProcessGuard for automatic cleanup on drop (incl. process-group tree kill)
+                    let mut guard = crate::tools::ProcessGuard::spawn_managed(
+                        &mut command,
+                        crate::tools::ProcessCleanupMode::ProcessGroupTree,
+                    )
+                    .map_err(|err| err.to_string())?;
+                    let pid = guard.child.as_ref().map(std::process::Child::id);
 
+                    let child = guard.child.as_mut().ok_or("Missing child")?;
                     let stdout = child.stdout.take().ok_or("Missing stdout pipe")?;
                     let stderr = child.stderr.take().ok_or("Missing stderr pipe")?;
 
@@ -24724,23 +24730,29 @@ async fn dispatch_hostcall_exec_ref_with_limit(
                     let start = Instant::now();
                     let mut killed = false;
                     let status = loop {
-                        if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
+                        if let Some(status) =
+                            guard.try_wait_child().map_err(|err| err.to_string())?
+                        {
                             break status;
                         }
 
                         if !killed && cancel_worker.load(AtomicOrdering::SeqCst) {
                             killed = true;
-                            crate::tools::kill_process_group_tree(Some(pid));
-                            let _ = child.kill();
-                            break child.wait().map_err(|err| err.to_string())?;
+                            if let Some(mut child) = guard.child.take() {
+                                crate::tools::kill_process_group_tree(pid);
+                                let _ = child.kill();
+                                break child.wait().map_err(|err| err.to_string())?;
+                            }
                         }
 
                         if let Some(timeout_ms) = timeout_ms {
                             if !killed && start.elapsed() >= Duration::from_millis(timeout_ms) {
                                 killed = true;
-                                crate::tools::kill_process_group_tree(Some(pid));
-                                let _ = child.kill();
-                                break child.wait().map_err(|err| err.to_string())?;
+                                if let Some(mut child) = guard.child.take() {
+                                    crate::tools::kill_process_group_tree(pid);
+                                    let _ = child.kill();
+                                    break child.wait().map_err(|err| err.to_string())?;
+                                }
                             }
                         }
 
@@ -24761,7 +24773,7 @@ async fn dispatch_hostcall_exec_ref_with_limit(
 
                     // Explicitly reap to avoid leaving a zombie behind after a
                     // successful try_wait()-observed exit on isolated process groups.
-                    let _ = child.wait();
+                    let _ = guard.wait();
 
                     let code = exit_status_code(status);
                     let _ = tx.send(ExecStreamFrame::Final { code, killed });
@@ -24875,9 +24887,15 @@ async fn dispatch_hostcall_exec_ref_with_limit(
             }
             crate::tools::isolate_command_process_group(&mut command);
 
-            let mut child = command.spawn().map_err(|err| err.to_string())?;
-            let pid = child.id();
+            // Wrap in ProcessGuard for automatic cleanup on drop (incl. process-group tree kill)
+            let mut guard = crate::tools::ProcessGuard::spawn_managed(
+                &mut command,
+                crate::tools::ProcessCleanupMode::ProcessGroupTree,
+            )
+            .map_err(|err| err.to_string())?;
+            let pid = guard.child.as_ref().map(std::process::Child::id);
 
+            let child = guard.child.as_mut().ok_or("Missing child")?;
             let stdout = child.stdout.take().ok_or("Missing stdout pipe")?;
             let stderr = child.stderr.take().ok_or("Missing stderr pipe")?;
 
@@ -24907,23 +24925,27 @@ async fn dispatch_hostcall_exec_ref_with_limit(
                     ingest_frame(frame);
                 }
 
-                if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
+                if let Some(status) = guard.try_wait_child().map_err(|err| err.to_string())? {
                     break status;
                 }
 
                 if !killed && cancel_worker.load(AtomicOrdering::SeqCst) {
                     killed = true;
-                    crate::tools::kill_process_group_tree(Some(pid));
-                    let _ = child.kill();
-                    break child.wait().map_err(|err| err.to_string())?;
+                    if let Some(mut child) = guard.child.take() {
+                        crate::tools::kill_process_group_tree(pid);
+                        let _ = child.kill();
+                        break child.wait().map_err(|err| err.to_string())?;
+                    }
                 }
 
                 if let Some(timeout_ms) = timeout_ms {
                     if !killed && start.elapsed() >= Duration::from_millis(timeout_ms) {
                         killed = true;
-                        crate::tools::kill_process_group_tree(Some(pid));
-                        let _ = child.kill();
-                        break child.wait().map_err(|err| err.to_string())?;
+                        if let Some(mut child) = guard.child.take() {
+                            crate::tools::kill_process_group_tree(pid);
+                            let _ = child.kill();
+                            break child.wait().map_err(|err| err.to_string())?;
+                        }
                     }
                 }
 
@@ -24947,7 +24969,7 @@ async fn dispatch_hostcall_exec_ref_with_limit(
             }
 
             drop(rx_stream); // Unblock pump threads if they are blocked on send
-            let _ = child.wait(); // Explicitly reap
+            let _ = guard.wait(); // Explicitly reap
 
             if stdout_acc.len() as u64 >= max_capture_bytes {
                 stdout_acc.truncate(usize::try_from(max_capture_bytes).unwrap_or(usize::MAX));

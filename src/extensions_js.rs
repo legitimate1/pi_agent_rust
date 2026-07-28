@@ -48,6 +48,7 @@ use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, path::Path, path::PathBuf};
@@ -10229,7 +10230,7 @@ function __emitCloseOnce(child, code, signal = null) {
 
 function __parseSpawnOptions(raw) {
   const options = raw && typeof raw === "object" ? raw : {};
-  const allowed = new Set(["cwd", "detached", "shell", "stdio", "timeout"]);
+  const allowed = new Set(["cwd", "detached", "shell", "stdio", "timeout", "longLived"]);
   for (const key of Object.keys(options)) {
     if (!allowed.has(key)) {
       throw new Error(`node:child_process.spawn: unsupported option '${key}'`);
@@ -10282,6 +10283,7 @@ function __parseSpawnOptions(raw) {
     detached: Boolean(options.detached),
     stdio,
     timeoutMs,
+    longLived: Boolean(options.longLived),
   };
 }
 
@@ -10330,6 +10332,51 @@ export function spawn(command, args = [], options = {}) {
   child.stderr = opts.stdio[2] === "pipe" ? __makeEmitter() : null;
   child.stdin = opts.stdio[0] === "pipe" ? __makeEmitter() : null;
 
+  // ── Long-lived (spawn native) path ──
+  if (opts.longLived) {
+    const handleKey = __pi_spawn_native(
+      cmd,
+      JSON.stringify(argv),
+      opts.cwd || undefined,
+    );
+    child.__pi_spawn_handle = handleKey;
+
+    child.kill = (signal = "SIGTERM") => {
+      if (child.__pi_done) return false;
+      __pi_spawn_kill_native(handleKey);
+      child.killed = true;
+      __emitCloseOnce(child, null, String(signal || "SIGTERM"));
+      return true;
+    };
+
+    if (child.stdin) {
+      child.stdin.write = (data) => {
+        if (child.__pi_done) return false;
+        const b64 = btoa(unescape(encodeURIComponent(String(data))));
+        return __pi_stdin_write_native(handleKey, b64);
+      };
+    }
+
+    function __pi_spawn_poll() {
+      if (child.__pi_done) return;
+      const raw = __pi_spawn_read_native(handleKey);
+      const result = JSON.parse(raw || "{}");
+      if (result.stdout) child.stdout?.emit("data", String(result.stdout));
+      if (result.stderr) child.stderr?.emit("data", String(result.stderr));
+      if (result.exited) {
+        const code = typeof result.code === "number" ? result.code : 0;
+        __emitCloseOnce(child, code, null);
+        return;
+      }
+      setTimeout(__pi_spawn_poll, 50);
+    }
+    __pi_spawn_poll();
+
+    __pi_child_process_state.children.set(child.pid, child);
+    return child;
+  }
+
+  // ── Existing exec-based path ──
   child.kill = (signal = "SIGTERM") => {
     if (child.__pi_done) return false;
     if (
@@ -15949,6 +15996,8 @@ pub struct PiJsRuntime<C: SchedulerClock = WallClock> {
     module_state: Rc<RefCell<PiJsModuleState>>,
     /// Extension policy for synchronous capability checks.
     policy: Option<ExtensionPolicy>,
+    /// Registry of long-running subprocesses created by extensions.
+    subprocess_registry: Arc<Mutex<crate::subprocess_handle::SubprocessRegistry>>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -16138,6 +16187,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             repair_events,
             module_state,
             policy,
+            subprocess_registry: Arc::new(Mutex::new(
+                crate::subprocess_handle::SubprocessRegistry::new(),
+            )),
         };
 
         instance.install_pi_bridge().await?;
@@ -17050,6 +17102,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let allowed_read_roots = Arc::clone(&self.allowed_read_roots);
         let module_state = Rc::clone(&self.module_state);
         let policy = self.policy.clone();
+        let subprocess_registry = Arc::clone(&self.subprocess_registry);
 
         self.context
             .with(|ctx| {
@@ -17830,7 +17883,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 workspace_root.join(requested)
                             };
 
-                            // Canonicalize parent dir (file may not exist yet)
+                            #[allow(clippy::option_if_let_else, clippy::redundant_clone)]
                             let checked_path = if let Some(parent) = requested_abs.parent() {
                                 let canon_parent =
                                     crate::extensions::safe_canonicalize(parent);
@@ -18449,6 +18502,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 let stderr_pipe =
                                     child.stderr.take().ok_or("Missing stderr pipe")?;
 
+                                // Wrap in ProcessGuard for automatic cleanup on drop (incl. process-group tree kill)
+                                let mut guard = crate::tools::ProcessGuard::new(
+                                    child,
+                                    crate::tools::ProcessCleanupMode::ProcessGroupTree,
+                                );
+
                                 let (tx, rx) = std::sync::mpsc::sync_channel::<StreamChunk>(128);
                                 let tx_stdout = tx.clone();
                                 let _stdout_handle =
@@ -18496,21 +18555,28 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         ingest_chunk!(chunk.kind, chunk.bytes);
                                     }
 
-                                    if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+                                    // Use ProcessGuard::try_wait_child() instead of raw child.try_wait()
+                                    if let Some(st) = guard.try_wait_child().map_err(|e| e.to_string())? {
                                         break st;
                                     }
                                     if !killed && limit_exceeded {
                                         killed = true;
-                                        crate::tools::kill_process_group_tree(Some(pid));
-                                        let _ = child.kill();
-                                        break child.wait().map_err(|e| e.to_string())?;
+                                        // Take child from guard (leaves guard.child = None so Drop is no-op),
+                                        // kill process tree, then reap synchronously for exit status.
+                                        if let Some(mut child) = guard.child.take() {
+                                            crate::tools::kill_process_group_tree(Some(pid));
+                                            let _ = child.kill();
+                                            break child.wait().map_err(|e| e.to_string())?;
+                                        }
                                     }
                                     if let Some(t) = timeout {
                                         if !killed && start.elapsed() >= t {
                                             killed = true;
-                                            crate::tools::kill_process_group_tree(Some(pid));
-                                            let _ = child.kill();
-                                            break child.wait().map_err(|e| e.to_string())?;
+                                            if let Some(mut child) = guard.child.take() {
+                                                crate::tools::kill_process_group_tree(Some(pid));
+                                                let _ = child.kill();
+                                                break child.wait().map_err(|e| e.to_string())?;
+                                            }
                                         }
                                     }
                                     if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(5)) {
@@ -18533,7 +18599,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 }
 
                                 drop(rx);
-                                let _ = child.wait();
+                                // Guard's Drop reaps the child on normal exit (try_wait sees Ok(Some(_)) → no-op);
+                                // on kill paths the child was already taken and reaped above.
 
                                 let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
                                 let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
@@ -18572,6 +18639,220 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         }
                     }),
                 )?;
+
+                // __pi_spawn_native(cmd, args_json, cwd) -> handle_key
+                // Spawns a long-running subprocess (e.g. LSP server) with piped
+                // stdin/stdout/stderr.  Background pump threads buffer stdout/stderr
+                // output.  Returns a handle_key string for subsequent operations.
+                global.set(
+                    "__pi_spawn_native",
+                    Func::from({
+                        let process_cwd = process_cwd.clone();
+                        let policy = policy.clone();
+                        let subprocess_registry = Arc::clone(&subprocess_registry);
+                        move |ctx: Ctx<'_>,
+                              cmd: String,
+                              args_json: String,
+                              cwd: Opt<String>|
+                              -> rquickjs::Result<String> {
+                            // 1. Parse args
+                            let args: Vec<String> = serde_json::from_str(&args_json)
+                                .map_err(|err| rquickjs::Error::new_into_js_message(
+                                    "String",
+                                    "Array",
+                                    format!("invalid JSON args: {err}"),
+                                ))?;
+
+                            // 2. Exec mediation check
+                            if let Some(policy) = &policy {
+                                let extension_id: Option<String> = ctx
+                                    .globals()
+                                    .get::<_, Option<String>>("__pi_current_extension_id")
+                                    .ok()
+                                    .flatten()
+                                    .map(|value| value.trim().to_string())
+                                    .filter(|value| !value.is_empty());
+
+                                if !check_exec_capability(policy, extension_id.as_deref()) {
+                                    return Err(rquickjs::Error::new_into_js_message(
+                                        "spawn",
+                                        "denied",
+                                        "extension lacks 'exec' capability",
+                                    ));
+                                }
+
+                                match evaluate_exec_mediation(&policy.exec_mediation, &cmd, &args) {
+                                    ExecMediationResult::Deny { reason, .. } => {
+                                        return Err(rquickjs::Error::new_into_js_message(
+                                            "spawn",
+                                            "denied",
+                                            format!("command blocked by exec mediation: {reason}"),
+                                        ));
+                                    }
+                                    ExecMediationResult::AllowWithAudit { class, reason } => {
+                                        tracing::info!(
+                                            event = "pijs.spawn.mediation_audit",
+                                            cmd = %cmd,
+                                            class = class.label(),
+                                            reason = %reason,
+                                            "spawn command allowed with exec mediation audit"
+                                        );
+                                    }
+                                    ExecMediationResult::Allow => {}
+                                }
+                            }
+
+                            // 3. Determine working directory
+                            let working_dir = cwd
+                                .0
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| process_cwd.clone());
+
+                            // 4. Spawn subprocess
+                            let handle = match crate::subprocess_handle::SubprocessHandle::spawn(
+                                &cmd,
+                                &args,
+                                Path::new(&working_dir),
+                            ) {
+                                Ok(h) => h,
+                                Err(err) => {
+                                    return Err(rquickjs::Error::new_into_js_message(
+                                        "spawn",
+                                        "io",
+                                        format!("failed to spawn {cmd}: {err}"),
+                                    ));
+                                }
+                            };
+
+                            let pid = handle.pid();
+                            let handle_key = format!("spawn-{pid}-{}", generate_call_id());
+
+			// 5. Register in registry
+			subprocess_registry.lock().unwrap().register(handle_key.clone(), handle);
+
+                            tracing::info!(
+                                event = "pijs.spawn",
+                                cmd = %cmd,
+                                pid,
+                                handle_key = %handle_key,
+                                "subprocess spawned"
+                            );
+
+                            Ok(handle_key)
+                        }
+                    }),
+                )?;
+
+                // __pi_spawn_read_native(handle_key) -> JSON string
+                // Reads available buffered output from the subprocess.
+                // Returns {"stdout": "...", "stderr": "..."}.
+                global.set(
+                    "__pi_spawn_read_native",
+                    Func::from({
+                        let subprocess_registry = Arc::clone(&subprocess_registry);
+                        move |_ctx: Ctx<'_>,
+                              handle_key: String|
+                              -> rquickjs::Result<String> {
+					subprocess_registry.lock().unwrap().get_mut(&handle_key).map_or_else(|| {
+						Err(rquickjs::Error::new_into_js_message(
+							"spawn",
+							"not_found",
+							format!("no subprocess with key: {handle_key}"),
+						))
+					}, |handle| {
+						let output = handle.read_output();
+						if let Ok(Some(code)) = handle.try_wait() {
+							let mut result: serde_json::Value =
+								serde_json::from_str(&output)
+									.unwrap_or_else(|_| serde_json::json!({}));
+							if let Some(obj) = result.as_object_mut() {
+								obj.insert("exited".to_string(), serde_json::Value::Bool(true));
+								obj.insert("code".to_string(), serde_json::Value::Number(code.into()));
+							}
+							return Ok(result.to_string());
+						}
+						Ok(output)
+					})
+                        }
+                    }),
+                )?;
+
+                // __pi_stdin_write_native(handle_key, base64_data) -> bool
+                // Writes base64-decoded data to the subprocess's stdin.
+                global.set(
+                    "__pi_stdin_write_native",
+                    Func::from({
+                        let subprocess_registry = Arc::clone(&subprocess_registry);
+                        move |_ctx: Ctx<'_>,
+                              handle_key: String,
+                              base64_data: String|
+                              -> rquickjs::Result<bool> {
+                            let data = match BASE64_STANDARD.decode(&base64_data) {
+                                Ok(d) => d,
+                                Err(err) => {
+                                    return Err(rquickjs::Error::new_into_js_message(
+                                        "stdin_write",
+                                        "decode",
+                                        format!("invalid base64: {err}"),
+                                    ));
+                                }
+                            };
+
+                            subprocess_registry.lock().unwrap().get_mut(&handle_key).map_or_else(|| {
+                                Err(rquickjs::Error::new_into_js_message(
+                                    "stdin_write",
+                                    "not_found",
+                                    format!("no subprocess with key: {handle_key}"),
+                                ))
+                            }, |handle| {
+                                match handle.write_stdin(&data) {
+                                    Ok(()) => Ok(true),
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            event = "pijs.stdin_write.error",
+                                            handle_key = %handle_key,
+                                            error = %err,
+                                            "stdin write failed"
+                                        );
+                                        Ok(false)
+                                    }
+                                }
+                            })
+                        }
+                    }),
+                )?;
+
+// __pi_spawn_kill_native(handle_key) -> bool
+                // Kills the subprocess and removes it from the registry.
+                global.set(
+                    "__pi_spawn_kill_native",
+                    Func::from({
+                        let subprocess_registry = Arc::clone(&subprocess_registry);
+                        move |_ctx: Ctx<'_>,
+                              handle_key: String|
+                              -> rquickjs::Result<bool> {
+                        subprocess_registry.lock().unwrap().remove(&handle_key).map_or_else(|| {
+                            tracing::warn!(
+                                event = "pijs.spawn.kill.not_found",
+                                handle_key = %handle_key,
+                                "no subprocess found with key"
+                            );
+                            Ok(false)
+                        }, |mut handle| {
+                            let pid = handle.pid();
+                            handle.kill();
+                            tracing::info!(
+                                event = "pijs.spawn.kill",
+                                pid,
+                                handle_key = %handle_key,
+                                "subprocess killed"
+                            );
+                            Ok(true)
+                        })
+                    }
+                }
+                ),
+            )?;
 
                 // Register crypto hostcalls for node:crypto module
                 crate::crypto_shim::register_crypto_hostcalls(&global)?;
@@ -30970,7 +31251,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
 
             runtime
                 .eval(
-                    r#"
+                    r"
                     globalThis.spawnSyncFail = {};
                     import('node:child_process').then(({ spawnSync }) => {
                         const r = spawnSync('python3', ['-c', 'import sys; sys.exit(7)']);
@@ -30978,7 +31259,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                         globalThis.spawnSyncFail.signal = r.signal;
                         globalThis.spawnSyncFail.done = true;
                     });
-                    "#,
+                    ",
                 )
                 .await
                 .expect("eval spawnSync fail");

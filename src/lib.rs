@@ -208,6 +208,8 @@ pub mod session_store_v2;
 #[doc(hidden)]
 pub use pi_core::sse;
 #[doc(hidden)]
+pub mod subprocess_handle;
+#[doc(hidden)]
 pub mod swarm_activity_ledger;
 #[doc(hidden)]
 pub mod swarm_flight_recorder;

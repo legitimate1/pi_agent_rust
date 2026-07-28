@@ -3419,7 +3419,7 @@ pub(crate) fn emit_bash_update(
 }
 
 pub(crate) struct ProcessGuard {
-    child: Option<std::process::Child>,
+    pub(crate) child: Option<std::process::Child>,
     cleanup_mode: ProcessCleanupMode,
 }
 

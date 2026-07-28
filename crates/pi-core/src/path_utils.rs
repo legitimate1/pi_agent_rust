@@ -73,7 +73,9 @@ pub fn strip_unc_prefix(path: PathBuf) -> PathBuf {
     {
         let s = path.to_string_lossy();
         if let Some(stripped) = s.strip_prefix(r"\\?\") {
-            if let Some(unc) = stripped.strip_prefix("UNC") && unc.starts_with('\\') {
+            if let Some(unc) = stripped.strip_prefix("UNC")
+                && unc.starts_with('\\')
+            {
                 return PathBuf::from(format!(r"\{unc}"));
             }
             return PathBuf::from(stripped);
