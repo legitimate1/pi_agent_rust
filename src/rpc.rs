@@ -4649,6 +4649,7 @@ fn rpc_model_from_entry(entry: &ModelEntry) -> Value {
         "contextWindow": entry.model.context_window,
         "maxTokens": entry.model.max_tokens,
         "cost": entry.model.cost,
+        "compat": entry.compat,
     })
 }
 
