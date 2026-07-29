@@ -13,6 +13,7 @@
 | **RPC 方法 `get_tree` — 查询会话树形结构（分支/叶子）** | ✅ | `src/rpc.rs` |
 | **RPC 方法 `get_version` — 返回 pi 版本号和 Git SHA** | ✅ | `src/rpc.rs` |
 | **RPC 方法 `get_system_prompt` — 返回当前会话的 system prompt 及注册的工具定义** | ✅ | `src/rpc.rs` `src/agent.rs` |
+| **`session_state` 返回模型 `compat` 字段** — 客户端可获取 `thinkingLevelMap` 等兼容性配置 | ✅ | `src/rpc.rs` |
 | **RPC 方法 `remove_from_queue` — 按 messageId 精确取消队列消息** | ✅ | `src/rpc.rs` |
 | **RPC 方法 `clear_queue` — 一键清空 steer/follow_up 队列** | ✅ | `src/rpc.rs` |
 | **RPC 方法 `get_queue` — 查询队列当前内容（steering + follow_up）** | ✅ | `src/rpc.rs` |
@@ -94,6 +95,7 @@
 | 内置模型注册 | ✅ | `src/models.rs` |
 | `models.json` 自定义模型加载 | ✅ | `src/models.rs:698` |
 | Provider 元数据（别名 + 认证键） | ✅ | `src/provider_metadata.rs` |
+| **`supports_xhigh()` 检查 `compat.thinkingLevelMap`** — 第三方 provider 在 models.json 中声明 `thinkingLevelMap.xhigh` 即可支持 xhigh，无需硬编码 | ✅ | `src/models.rs:30` |
 
 ## 资源与配置管理
 
