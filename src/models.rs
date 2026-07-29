@@ -39,6 +39,16 @@ impl ModelEntry {
                 | "gpt-5.3-codex-spark"
         ) || self.is_deepseek_reasoning_model()
             || self.is_anthropic_xhigh_effort_model()
+            // If the model's compat config explicitly maps "xhigh" to a provider
+            // effort value, the transport can handle xhigh. This avoids clamping
+            // XHigh→High for custom/third-party providers (e.g. lucisapi's gpt-5.6-sol)
+            // that declare xhigh support via thinkingLevelMap but aren't in the
+            // hardcoded list, DeepSeek, or Anthropic.
+            || self
+                .compat
+                .as_ref()
+                .and_then(|c| c.thinking_level_map.as_ref())
+                .is_some_and(|map| map.contains_key("xhigh"))
     }
 
     /// Whether this is an Anthropic adaptive-thinking model whose modern
