@@ -407,3 +407,28 @@
 **默认值变更（2026-07-28）**：初始实现默认 `false`，经验证验证开销可忽略且能减少迭代来回，改为默认 `true`。Agent 可显式传 `verify: false` 跳过。<br>
 **何时重新考虑**：需要支持更多文件类型时，扩展映射表即可。
 
+## D23: set_model/set_thinking_level 增加 persist 参数（2026-07-29）
+
+**决策**：在 `set_model` 和 `set_thinking_level` 的请求体中增加可选的 `persist: bool` 参数（默认 `true`）。`persist=false` 时仅内存切换 provider/model/thinking，不写会话文件。
+
+**涉及改动**：
+1. `src/extensions.rs` → `ExtensionSession` trait 签名增加 `persist: bool`
+2. `src/agent.rs` → `set_provider_model() + set_thinking_level()` 条件跳过 `persist_session()`
+3. `src/rpc.rs` → RPC handler 解析 `persist` 字段；`apply_model_change`/`apply_thinking_level` 条件持久化
+4. `src/acp.rs` → `session/set_model` + `session/set_config_option` 解析 `persist` 参数
+5. `src/extension_dispatcher.rs` → dispatch handler 从 JSON payload 解析 `persist`
+6. `src/sdk.rs` → `SessionTransportHandle`/`RpcClient`/`AgentSessionHandle` 透传 `persist`
+7. `src/session.rs` → `SessionHandle` trait impl 透传 `persist`
+
+**理由**：
+- pidian（Obsidian 插件）需要切换模型/思考等级但不污染默认配置
+- 原方案走重启 pi 进程（`--model` 启动参数），体验差
+- `persist=false` 使客户端实现"临时切换"——当前对话用不同模型，下次启动恢复默认
+
+**不选 B 的原因**：
+- 不加控制全部持久化——切换模型写会话文件，客户端需额外清理
+- 全局开关持久化——粒度太粗，所有 set_model 调用都受影响
+- 仅限 RPC 路径——Extension/ACP 也需要此能力
+
+**何时重新考虑**：如果未来引入会话级配置系统，可合并到统一配置管理。
+

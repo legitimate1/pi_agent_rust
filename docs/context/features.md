@@ -18,6 +18,7 @@
 | **RPC 方法 `get_queue` — 查询队列当前内容（steering + follow_up）** | ✅ | `src/rpc.rs` |
 | **`queue_update` 事件推送 — 队列状态变更时实时同步给客户端** | ✅ | `src/rpc.rs` |
 | **队列消息携带 `messageId` — 客户端分配或服务端 UUID fallback** | ✅ | `src/rpc.rs` |
+| **set_model/set_thinking_level 支持 persist 参数** — `persist=false` 仅内存切换，不写会话文件 | ✅ | `src/rpc.rs` `src/acp.rs` `src/extension_dispatcher.rs` `src/sdk.rs` `src/session.rs` `src/agent.rs` |
 | CLI 子命令（doctor/config/list/info 等） | ✅ | `src/main.rs` |
 | **`~/.pi/agent/SYSTEM.md` 覆盖默认系统提示词** | ✅ | `src/app.rs` |
 | **`.pi/SYSTEM.md` 项目级系统提示词** — 优先级高于用户级 | ✅ | `src/app.rs` |
@@ -35,6 +36,7 @@
 | Bedrock / Vertex AI / GitHub Copilot / GitLab Duo | ✅ | `src/providers/*.rs` |
 | 扩展 stream-simple Provider 桥接 | ✅ | `src/providers/mod.rs` |
 | Provider 工厂 + 路由 | ✅ | `src/providers/mod.rs` |
+| **Provider 运行时热切换** — `set_model` 跨 provider 切换时直接在内存创建/替换 provider 实例（anthropic ↔ openai ↔ gemini 等），无需重启进程 | ✅ | `src/agent.rs` `src/providers/mod.rs` |
 | opencode-go（OpenCode Zen Go，deepseek-v4-flash 等） | ✅ | `src/provider_metadata.rs` `src/app.rs` |
 
 ## 工具系统
