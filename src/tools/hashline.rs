@@ -302,7 +302,8 @@ impl Tool for HashlineEditTool {
         "使用 read 的 hashline 模式输出的 LINE#HASH 标签进行精确文件编辑。 \
          支持 replace/prepend/append 操作，定位锚点（\"N#AB\"）和可选结束锚点用于范围替换。 \
          lines 可为字符串数组（多行）、字符串（单行）或 null（删除）。编辑从下到上顺序执行，\
-         执行前验证目标行哈希以确保文件未被修改。默认在编辑后运行语法检查（verify=true），设 false 跳过。"
+         执行前验证目标行哈希以确保文件未被修改。默认在编辑后运行语法检查（verify=true），设 false 跳过。\
+         如果要连续多次跨调用编辑同一个文件，建议改用 edit（oldText 匹配不受行号偏移影响）。"
     }
 
     fn parameters(&self) -> serde_json::Value {

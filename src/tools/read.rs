@@ -91,6 +91,7 @@ where
 }
 
 impl ReadTool {
+    #[allow(clippy::too_many_lines)]
     async fn read_single_file(
         &self,
         path: &str,
@@ -349,13 +350,10 @@ impl ReadTool {
         } else {
             input.offset
         };
-        let effective_limit: Option<i64> = if let Some(n) = input.head {
+        let effective_limit: Option<i64> = input.head.map_or(input.limit, |n| {
             #[allow(clippy::cast_possible_wrap)]
-            let v = n as i64;
-            Some(v)
-        } else {
-            input.limit
-        };
+            Some(n as i64)
+        });
 
         let (encoding_label, bom_skip) = detect_encoding(initial_bytes, None);
         let is_utf8 = encoding_label == "UTF-8" || encoding_label == "UTF-8 (BOM)";
@@ -378,16 +376,19 @@ impl ReadTool {
                 _ => 0,
             };
 
-            let selected_lines: Vec<&str> = if let Some(n) = input.tail {
-                let take = n.min(total_lines);
-                let start = total_lines.saturating_sub(take);
-                all_lines[start..].to_vec()
-            } else {
-                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                let limit = effective_limit.map_or(usize::MAX, |l| l as usize);
-                let end = start_line_idx.saturating_add(limit).min(total_lines);
-                all_lines[start_line_idx..end].to_vec()
-            };
+            let selected_lines: Vec<&str> = input.tail.map_or_else(
+                || {
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    let limit = effective_limit.map_or(usize::MAX, |l| l as usize);
+                    let end = start_line_idx.saturating_add(limit).min(total_lines);
+                    all_lines[start_line_idx..end].to_vec()
+                },
+                |n| {
+                    let take = n.min(total_lines);
+                    let start = total_lines.saturating_sub(take);
+                    all_lines[start..].to_vec()
+                },
+            );
 
             let display_start = if input.tail.is_some() {
                 total_lines.saturating_sub(selected_lines.len())
@@ -474,17 +475,15 @@ impl ReadTool {
             let mut chunk_cursor = 0;
 
             for pos in memchr::memchr_iter(b'\n', &chunk) {
-                if collecting {
-                    if newlines_seen + 1 == end_line_idx {
-                        if raw_content.len() < DEFAULT_MAX_BYTES {
-                            let remaining = DEFAULT_MAX_BYTES - raw_content.len();
-                            let slice_len = (pos + 1 - chunk_cursor).min(remaining);
-                            raw_content
-                                .extend_from_slice(&chunk[chunk_cursor..chunk_cursor + slice_len]);
-                        }
-                        collecting = false;
-                        chunk_cursor = pos + 1;
+                if collecting && newlines_seen + 1 == end_line_idx {
+                    if raw_content.len() < DEFAULT_MAX_BYTES {
+                        let remaining = DEFAULT_MAX_BYTES - raw_content.len();
+                        let slice_len = (pos + 1 - chunk_cursor).min(remaining);
+                        raw_content
+                            .extend_from_slice(&chunk[chunk_cursor..chunk_cursor + slice_len]);
                     }
+                    collecting = false;
+                    chunk_cursor = pos + 1;
                 }
 
                 newlines_seen += 1;
@@ -825,6 +824,7 @@ impl Tool for ReadTool {
         };
 
         if paths.len() == 1 {
+            #[allow(clippy::large_futures)]
             return self.read_single_file(paths[0], &input, tool_call_id).await;
         }
 
@@ -833,6 +833,7 @@ impl Tool for ReadTool {
         let mut had_error = false;
 
         for (i, p) in paths.iter().enumerate() {
+            #[allow(clippy::large_futures)]
             match self.read_single_file(p, &input, tool_call_id).await {
                 Ok(output) => {
                     if i > 0 {

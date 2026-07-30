@@ -1288,7 +1288,7 @@ pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
         "\n\n以下技能为特定任务提供专门的指令。".to_string(),
         "当任务描述与某个技能匹配时，使用 read 工具加载该技能的 SKILL.md 文件。"
             .to_string(),
-        "当技能文件引用相对路径时，请将路径解析为技能目录（SKILL.md 所在目录）的绝对路径，然后在工具命令中使用该绝对路径。".to_string(),
+        "当技能文件引用相对路径（包括 `[[wiki 链接]]`）时，请将路径解析为技能目录（SKILL.md 所在目录）的绝对路径，然后在工具命令中使用该绝对路径。".to_string(),
         String::new(),
         "<available_skills>".to_string(),
     ];

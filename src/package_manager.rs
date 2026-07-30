@@ -84,16 +84,11 @@ pub enum ResourceOrigin {
 /// ```json
 /// { "skill_mode": "project_only" }
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum SkillMode {
+    #[default]
     All,
     ProjectOnly,
-}
-
-impl Default for SkillMode {
-    fn default() -> Self {
-        Self::All
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -670,6 +665,7 @@ impl PackageManager {
         self.resolve_with_roots(&roots).await
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn resolve_with_roots(&self, roots: &ResolveRoots) -> Result<ResolvedPaths> {
         let this_for_setup = self.clone();
         let roots_for_setup = roots.clone();
@@ -1661,11 +1657,10 @@ fn read_settings_snapshot(path: &Path) -> Result<SettingsSnapshot> {
     let skill_mode = value
         .get("skill_mode")
         .and_then(Value::as_str)
-        .map(|s| match s.trim() {
+        .map_or(SkillMode::All, |s| match s.trim() {
             "project_only" => SkillMode::ProjectOnly,
             _ => SkillMode::All,
-        })
-        .unwrap_or(SkillMode::All);
+        });
 
     Ok(SettingsSnapshot {
         packages,

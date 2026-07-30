@@ -21773,7 +21773,7 @@ async fn dispatch_extension_event_batch(
     Ok(results)
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
 async fn execute_extension_tool(
     runtime: &PiJsRuntime,
     host: &JsRuntimeHost,

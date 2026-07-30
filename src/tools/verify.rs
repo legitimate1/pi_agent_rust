@@ -23,7 +23,7 @@ use crate::error::{Error, Result};
 
 /// File type classification based on extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FileType {
+pub enum FileType {
     Rust,
     Json,
     Toml,
@@ -32,7 +32,7 @@ pub(crate) enum FileType {
 
 /// Single-file verification result.
 #[derive(Debug, Clone)]
-pub(crate) struct VerifyResult {
+pub struct VerifyResult {
     pub path: PathBuf,
     pub file_type: FileType,
     pub passed: bool,
@@ -77,7 +77,7 @@ fn detect_file_type(path: &Path) -> Option<FileType> {
 /// Returns `Err` only for truly exceptional cases (file unreadable, I/O
 /// failure). Checker failures (syntax errors, formatting differences) are
 /// reported as `passed: false` in the [`VerifyResult`].
-pub(crate) async fn verify_file(path: PathBuf, abort: Option<AbortSignal>) -> Result<VerifyResult> {
+pub async fn verify_file(path: PathBuf, abort: Option<AbortSignal>) -> Result<VerifyResult> {
     let file_type = detect_file_type(&path).ok_or_else(|| {
         Error::tool(
             "verify",
@@ -94,6 +94,7 @@ pub(crate) async fn verify_file(path: PathBuf, abort: Option<AbortSignal>) -> Re
         FileType::TypeScript => verify_prettier(&path, abort).await?,
     };
 
+    #[allow(clippy::cast_possible_truncation)]
     let time_ms = start.elapsed().as_millis() as u64;
 
     Ok(VerifyResult {
@@ -143,17 +144,16 @@ async fn verify_rustfmt(
 ) -> Result<(bool, Option<String>, &'static str)> {
     let path = path.to_path_buf();
     let abort = abort.clone();
-    Ok(asupersync::runtime::spawn_blocking_io(move || {
-        verify_rustfmt_sync(&path, abort)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    asupersync::runtime::spawn_blocking_io(move || {
+        verify_rustfmt_sync(&path, abort.as_ref()).map_err(|e| std::io::Error::other(e.to_string()))
     })
     .await
-    .map_err(|e| Error::tool("verify", format!("spawn_blocking_io failed: {e}")))?)
+    .map_err(|e| Error::tool("verify", format!("spawn_blocking_io failed: {e}")))
 }
 
 fn verify_rustfmt_sync(
     path: &Path,
-    abort: Option<AbortSignal>,
+    abort: Option<&AbortSignal>,
 ) -> Result<(bool, Option<String>, &'static str)> {
     // Check file size threshold
     let metadata = std::fs::metadata(path).map_err(|e| {
@@ -209,17 +209,17 @@ async fn verify_prettier(
 ) -> Result<(bool, Option<String>, &'static str)> {
     let path = path.to_path_buf();
     let abort = abort.clone();
-    Ok(asupersync::runtime::spawn_blocking_io(move || {
-        verify_prettier_sync(&path, abort)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    asupersync::runtime::spawn_blocking_io(move || {
+        verify_prettier_sync(&path, abort.as_ref())
+            .map_err(|e| std::io::Error::other(e.to_string()))
     })
     .await
-    .map_err(|e| Error::tool("verify", format!("spawn_blocking_io failed: {e}")))?)
+    .map_err(|e| Error::tool("verify", format!("spawn_blocking_io failed: {e}")))
 }
 
 fn verify_prettier_sync(
     path: &Path,
-    abort: Option<AbortSignal>,
+    abort: Option<&AbortSignal>,
 ) -> Result<(bool, Option<String>, &'static str)> {
     // Check file size threshold
     let metadata = std::fs::metadata(path).map_err(|e| {
@@ -309,7 +309,7 @@ fn verify_prettier_sync(
 fn run_external_process(
     program: &str,
     args: &[&str],
-    abort: Option<AbortSignal>,
+    abort: Option<&AbortSignal>,
 ) -> Result<std::process::Output> {
     let mut child = std::process::Command::new(program)
         .args(args)
@@ -322,7 +322,7 @@ fn run_external_process(
     let timeout = std::time::Duration::from_secs(VERIFY_TIMEOUT_SECS);
 
     loop {
-        if let Some(ref abort) = abort {
+        if let Some(abort) = abort {
             if abort.is_aborted() {
                 let _ = child.kill();
                 return Err(Error::tool("verify", "Verification aborted by user"));
@@ -363,7 +363,7 @@ fn run_external_process(
 
 /// Serialize a [`VerifyResult`] into a JSON Value suitable for
 /// `ToolOutput.details.verify`.
-pub(crate) fn verify_result_to_json(result: &VerifyResult) -> serde_json::Value {
+pub fn verify_result_to_json(result: &VerifyResult) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     map.insert("passed".to_string(), serde_json::Value::Bool(result.passed));
     map.insert(

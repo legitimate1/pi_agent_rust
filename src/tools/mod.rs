@@ -3894,11 +3894,13 @@ pub(crate) fn find_rg_binary() -> Option<&'static str> {
     })
 }
 
-/// Try an atomic rename (`NamedTempFile::persist`).  On Windows,
-/// `MoveFileEx` fails with `ERROR_ACCESS_DENIED` when the destination
+/// Try an atomic rename with readonly-handling fallback.
+///
+/// On Windows, `MoveFileEx` fails with `ERROR_ACCESS_DENIED` when the destination
 /// file has `FILE_ATTRIBUTE_READONLY`.  If the first attempt hits
 /// `PermissionDenied` and the target has the readonly attribute, strip
 /// the attribute, retry, and restore it on the new file.
+#[allow(clippy::permissions_set_readonly_false)]
 pub fn persist_with_readonly_handling(
     temp_file: tempfile::NamedTempFile,
     target: &Path,

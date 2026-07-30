@@ -93,13 +93,19 @@ struct EventContractEntry {
 }
 ```
 
-**权威来源**：一份独立声明的静态表（`&[EventContractEntry]`），通过辅助函数 + 穷尽 match + 一致性测试验证与 `ExtensionEventName` / `ExtensionEvent` 同步。
+**权威来源**：契约在 Rust 侧声明，是**实现与文档之间的可验证投影层**。契约条目通过以下机制与实现保持一致性：
 
-> **Phase 1 决策**：契约表不从 enum 生成，enum 也不从契约表生成。不修改现有 enum 定义。一致性由辅助函数 + 穷尽 match + 测试保证。
+- **编译期约束**：穷尽 match 确保新增枚举变体必须在契约构造中显式处理——这是契约/实现一致性层的组成部分，而非真相的唯一来源。
+- **一致性测试**：CI 中运行的测试验证契约投影与实际运行时行为对齐（见「运行时探针」和「分层门禁」）。
+- **语义描述**：人维护的摘要、触发时机、稳定性等，在契约条目中与机械事实并列——运行时无法推断这些信息。
+
+> **Phase 1 决策**：契约数据不从 enum 自动生成，enum 也不从契约数据生成。不修改现有 enum 定义。编译期检查和运行时测试构成双向一致性网，而非单一的「同步」关系。
 
 **设计选择**：辅助函数 + 穷尽 match + 一致性测试。不引入过程宏或 `include!`，不修改现有 enum 定义。
 
 #### 语义（人工维护，绑定到条目）
+
+> **为什么语义必须人工维护**：Rust 契约承载的公共语义——稳定性承诺、能力要求、使用限制、精炼的人类描述——是运行时无法推断的。类型系统能表达什么是可调用的，但无法表达什么是推荐的、什么是废弃的、什么需要特定权限。这些信息必须在契约中与机械事实并列。
 
 每个事件条目附带以下信息，**不和实现代码放在一起，但紧邻契约**：
 
@@ -130,11 +136,11 @@ struct EventSemantics {
 
 1. `ExtensionEventName` 新增变体 → 穷尽匹配强制要求补充到契约表 → 否则编译失败
 2. `ExtensionEvent` 新增变体 → 同上
-3. 契约表包含 `is_registered` 标记位，使 Phase 2 接入 `pi.on()` 验证时无需修改契约结构
-4. CLI `events` 输出只从契约表投影，renderer 不手写任何事件名
-5. JSON `--json` 输出所有契约条目
+3. CLI `events` 输出只从契约表投影，renderer 不手写任何事件名
+4. JSON `--json` 输出所有契约条目
+5. 每个声明的事件必须通过运行时探针证明其 Rust dispatch 路径可观测
 
-> **Phase 1 关于 `pi.on()` 验证的决策**：暂不实现运行时验证。契约表中预留 `is_registered` 标记位，CLI 输出中包含该标记位，供后续 Phase 快速接入。避免在 Phase 1 争论 warn/error/开关问题。
+> **Phase 1 关于 `pi.on()` 验证的决策**：保持 `pi.on()` 宽松（任意字符串均可注册），不对未知事件名做运行时错误。每个声明的事件必须通过运行时探针证明：注册 handler 后触发对应的 Rust dispatch，探针能捕获到执行。文档定义的事件集以**实际可分派/可观测**的事件为准，而非 `pi.on()` 接受的字符串集合。如果当前代码中的事件计数/映射关系存在不确定之处，保守表述，不凭空声称行为。
 
 ---
 
@@ -180,9 +186,11 @@ struct RegisterToolContractEntry {
 }
 ```
 
-**权威来源**：显式定义的字段注册表。`ExtensionToolDef` 的反序列化规则和 `__pi_register_tool` 的验证规则必须**与注册表一致**，或直接从注册表生成。
+**权威来源**：字段注册表在 Rust 侧定义，与 `ExtensionToolDef` 的反序列化规则同源。`__pi_register_tool` 的 QuickJS 验证行为通过运行时探针验证：对每个字段的接受/默认/拒绝路径，测试通过 QuickJS 运行时实际调用 `__pi_register_tool`，以实际行为作为验证目标。契约元数据（字段名、类型、默认值说明）自身不能作为行为一致性的充分证据——运行时探针是关键的安全网。
 
 #### 语义（人工维护，绑定到条目）
+
+> **为什么语义必须人工维护**：字段的稳定性承诺、行为约束的含义、与其他 API 的关联——这些是 Rust 类型系统和 QuickJS 运行时都无法推断的公共语义。必须在契约中显式声明。
 
 ```rust
 struct RegisterToolSemantics {
@@ -212,7 +220,7 @@ execute(input, context?) → Promise<object>
 2. `__pi_register_tool` 新增验证规则 → 必须在注册表的 `validation` 中体现 → 否则测试失败
 3. CLI 文本输出不手写字段表，只从注册表投影
 4. JSON `--json` 输出完整字段注册表
-5. 对每个字段至少有一个有效和无效输入测试（测试数据与注册表一致）
+5. 对每个字段至少有一个有效和无效输入测试（测试通过 QuickJS 运行时探针执行，以 `__pi_register_tool` 的实际行为为验证目标）
 
 #### `execute` 字段在 ReferenceEntry 中的表示
 
@@ -475,16 +483,18 @@ src/
 
 **推荐**：Phase 1 先用方案 2（辅助函数 + 测试），根据实际体验决定是否升级为宏。
 
-### 第 1 层：运行时一致性测试
+### 第 1 层：运行时一致性测试（含运行时探针）
 
 ```rust
 // 每个注册的事件名都能在 ExtensionEventName 中找到
 // 每个 ExtensionEventName 变体都有一个契约条目
 // 每个 ExtensionEvent 变体的 event_name() 返回值在契约中
 // registerTool 的字段表与 ExtensionToolDef 字段匹配
+// 运行时探针：每个声明事件注册 handler 后 dispatch 可观测
+// 运行时探针：register-tool 字段的实际 QuickJS 行为与契约一致
 ```
 
-这些测试放置在 `src/developer_guide/` 的 `tests` 子模块或集成测试中。
+这些测试放置在 `src/developer_guide/` 的 `tests` 子模块或集成测试中。运行时探针在测试中启动最小 QuickJS 运行时，不引入生产级的 introspection API。
 
 ### 第 2 层：行为约束测试
 
@@ -494,7 +504,7 @@ src/
 // 对每个字段，至少有一个成功路径测试
 ```
 
-这些测试可以直接调用 `__pi_register_tool` 的 JS 侧或通过 QuickJS 运行时验证。
+这些测试通过 QuickJS 运行时探针直接调用 `__pi_register_tool`，验证字段级别的接受/默认/拒绝行为与契约声称一致。不依赖契约元数据作为行为充分的证据。
 
 ### 第 3 层：Renderer 输出测试
 
@@ -527,8 +537,17 @@ src/
 ### 不引入的依赖
 
 - 不引入 Rust 反射或 syn/syn 解析来提取 doc comment
-- 不引入 QuickJS 运行时启动来获取事件列表
 - 不引入生成时的构建脚本
+
+### 运行时探针边界
+
+Phase 1 **不提供公开的生产级运行时自省 API**：`pi developer-guide` 的输出来自 Rust 契约投影，而非 QuickJS 运行时枚举。
+
+但测试和 CI 中**可以使用最小 QuickJS 运行时探针**来验证契约投影的真实性：
+
+- **事件**：对每个声明的事件，测试启动运行时、注册 handler、确认对应的 Rust dispatch 路径在探针中可观测。
+- **工具注册**：对 `register-tool` 的每个字段，测试通过 QuickJS 实际调用 `__pi_register_tool`，验证接受/默认/拒绝行为与契约声称一致——契约元数据本身不能作为充分证据。
+- **门禁定位**：运行时探针是契约的"安全网"，确保投影在 CI 管道中不会与运行时事实漂移。探针不是 `pi developer-guide` 输出的数据源，而是其真实性的验证者。
 
 ### Compile time impact
 
@@ -537,7 +556,7 @@ src/
 
 ### 与现有事件 dispatch 的关系
 
-不改变 `dispatch_event` 和 `pi.on()` 的运行时行为。事件名验证留待 Phase 2 基于契约表中的 `is_registered` 标记位接入。
+不改变 `dispatch_event` 和 `pi.on()` 的运行时行为。Phase 1 的文档事件集以运行时探针验证的实际 dispatch/可观测性为准；是否收紧未知事件名的注册行为是独立的未来行为变更，不在本阶段预设。
 
 ### 与现有 registerTool 的关系
 

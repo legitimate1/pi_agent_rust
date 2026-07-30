@@ -1010,7 +1010,7 @@ impl Config {
 
 impl From<&Config> for pi_core::tool_config::ToolConfig {
     fn from(c: &Config) -> Self {
-        pi_core::tool_config::ToolConfig {
+        Self {
             shell_path: c.shell_path.clone(),
             shell_command_prefix: c.shell_command_prefix.clone(),
             image_auto_resize: c.image_auto_resize(),

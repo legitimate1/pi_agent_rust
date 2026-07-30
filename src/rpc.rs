@@ -727,8 +727,8 @@ fn build_queue_snapshot(
     follow_up: &VecDeque<QueuedMessage>,
 ) -> Value {
     json!({
-        "steering": steering.iter().map(|qm| qm.to_queue_item_json()).collect::<Vec<_>>(),
-        "follow_up": follow_up.iter().map(|qm| qm.to_queue_item_json()).collect::<Vec<_>>(),
+        "steering": steering.iter().map(QueuedMessage::to_queue_item_json).collect::<Vec<_>>(),
+        "follow_up": follow_up.iter().map(QueuedMessage::to_queue_item_json).collect::<Vec<_>>(),
     })
 }
 
@@ -1007,8 +1007,7 @@ pub async fn run(
                     let message_id = parsed
                         .get("messageId")
                         .and_then(Value::as_str)
-                        .map(String::from)
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                        .map_or_else(|| uuid::Uuid::new_v4().to_string(), String::from);
                     let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                         .await
                         .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
@@ -1125,8 +1124,7 @@ pub async fn run(
                     let message_id = parsed
                         .get("messageId")
                         .and_then(Value::as_str)
-                        .map(String::from)
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                        .map_or_else(|| uuid::Uuid::new_v4().to_string(), String::from);
                     let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                         .await
                         .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
@@ -1213,8 +1211,7 @@ pub async fn run(
                     let message_id = parsed
                         .get("messageId")
                         .and_then(Value::as_str)
-                        .map(String::from)
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                        .map_or_else(|| uuid::Uuid::new_v4().to_string(), String::from);
                     let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                         .await
                         .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
@@ -2405,6 +2402,26 @@ pub async fn run(
             }
 
             "get_tree" => {
+                fn build_tree_node<'a>(
+                    entry_id: &str,
+                    children: &HashMap<String, Vec<String>>,
+                    entries_map: &HashMap<&'a str, &'a crate::session::SessionEntry>,
+                ) -> Value {
+                    let Some(entry) = entries_map.get(entry_id) else {
+                        return json!({ "entry": null, "children": [] });
+                    };
+                    let entry_val = session_entry_to_tree_value(entry);
+                    let child_nodes: Vec<Value> = children
+                        .get(entry_id)
+                        .map(|ids| {
+                            ids.iter()
+                                .map(|cid| build_tree_node(cid, children, entries_map))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    json!({ "entry": entry_val, "children": child_nodes })
+                }
+
                 let (entries, leaf_id) = {
                     let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
                         .await
@@ -2434,26 +2451,6 @@ pub async fn run(
                     .iter()
                     .filter_map(|e| Some((e.base_id()?.as_str(), e)))
                     .collect();
-
-                fn build_tree_node<'a>(
-                    entry_id: &str,
-                    children: &HashMap<String, Vec<String>>,
-                    entries_map: &HashMap<&'a str, &'a crate::session::SessionEntry>,
-                ) -> Value {
-                    let Some(entry) = entries_map.get(entry_id) else {
-                        return json!({ "entry": null, "children": [] });
-                    };
-                    let entry_val = session_entry_to_tree_value(entry);
-                    let child_nodes: Vec<Value> = children
-                        .get(entry_id)
-                        .map(|ids| {
-                            ids.iter()
-                                .map(|cid| build_tree_node(cid, children, entries_map))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    json!({ "entry": entry_val, "children": child_nodes })
-                }
 
                 let tree: Vec<Value> = roots
                     .iter()
@@ -2501,7 +2498,7 @@ pub async fn run(
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                     (
-                        guard.agent.system_prompt().map(|s| s.to_string()),
+                        guard.agent.system_prompt().map(ToString::to_string),
                         guard.agent.tool_defs(),
                     )
                 };
@@ -2569,7 +2566,7 @@ pub async fn run(
                     };
 
                     let (response, next_request) = {
-                        let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&ui_state), &cx).await
+                        let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(ui_state), &cx).await
                         else {
                             let _ = out_tx.send(response_error(
                                 id,

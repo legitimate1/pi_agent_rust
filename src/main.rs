@@ -1019,7 +1019,7 @@ fn print_resolved_repair_policy(resolved: &pi::config::ResolvedRepairPolicy) -> 
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::future_not_send)]
 async fn run(
     mut cli: cli::Cli,
     extension_flags: Vec<cli::ExtensionCliFlag>,
@@ -6507,6 +6507,7 @@ async fn run_rpc_mode(
     }
 }
 
+#[allow(clippy::future_not_send)]
 async fn run_acp_mode(options: pi::acp::AcpOptions) -> Result<()> {
     use futures::FutureExt;
 

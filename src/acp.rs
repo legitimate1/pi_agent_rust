@@ -289,6 +289,7 @@ impl AcpPermissionClient {
 ///
 /// Reads JSON-RPC requests line-by-line from stdin, dispatches them,
 /// and writes JSON-RPC responses/notifications to stdout.
+#[allow(clippy::future_not_send)]
 pub async fn run_stdio(options: AcpOptions) -> Result<()> {
     let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(256);
     let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
@@ -345,6 +346,7 @@ pub async fn run_stdio(options: AcpOptions) -> Result<()> {
 }
 
 /// Core ACP event loop.
+#[allow(clippy::future_not_send)]
 async fn run(
     options: AcpOptions,
     mut in_rx: asupersync::channel::mpsc::Receiver<String>,
@@ -1099,6 +1101,7 @@ fn permission_response_to_decision(response: &Value) -> ToolApprovalDecision {
 /// If a sessionId is provided, validates against that specific session.
 /// Otherwise, validates against any active session's cwd.
 /// Returns `Ok(())` if valid, `Err(message)` if rejected.
+#[allow(clippy::future_not_send)]
 async fn validate_file_path(
     path_str: &str,
     session_id: Option<&str>,
@@ -1556,11 +1559,12 @@ fn parse_config_option(
 /// Returns the active `(provider, model)` on success. The agent session may be
 /// `None` if a prompt is currently in flight (it is taken out of the state
 /// during a turn); callers should surface that as a retryable error.
+#[allow(clippy::future_not_send)]
 async fn apply_set_model(
     session_state: &Arc<Mutex<AcpSessionState>>,
     provider: &str,
     model: &str,
-    _persist: bool,
+    persist: bool,
     cx: &AgentCx,
 ) -> std::result::Result<(String, String), String> {
     let Ok(mut guard) = session_state.lock(cx).await else {
@@ -1570,17 +1574,18 @@ async fn apply_set_model(
         return Err("Cannot change model while a prompt is in progress".to_string());
     };
     agent_session
-        .set_provider_model(provider, model, _persist)
+        .set_provider_model(provider, model, persist)
         .await
         .map_err(|e| e.to_string())?;
     Ok((provider.to_string(), model.to_string()))
 }
 
 /// Apply a parsed `session/set_config_option` to a live session.
+#[allow(clippy::future_not_send)]
 async fn apply_set_config_option(
     session_state: &Arc<Mutex<AcpSessionState>>,
     option: RuntimeConfigOption,
-    _persist: bool,
+    persist: bool,
     cx: &AgentCx,
 ) -> std::result::Result<(), String> {
     let Ok(mut guard) = session_state.lock(cx).await else {
@@ -1591,7 +1596,7 @@ async fn apply_set_config_option(
     };
     match option {
         RuntimeConfigOption::ThinkingLevel(level) => agent_session
-            .set_thinking_level(level, _persist)
+            .set_thinking_level(level, persist)
             .await
             .map_err(|e| e.to_string()),
     }

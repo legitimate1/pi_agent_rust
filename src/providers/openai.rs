@@ -264,23 +264,21 @@ impl OpenAIProvider {
             },
             Some(ReasoningStyle::Standard) => {
                 let level = options.thinking_level.unwrap_or_default();
-                match level {
-                    ThinkingLevel::Off => (None, None),
-                    _ => {
-                        let effort = self
-                            .compat
-                            .as_ref()
-                            .and_then(|c| c.thinking_level_map.as_ref())
-                            .and_then(|map| map.get(&level.to_string()))
-                            .cloned()
-                            .unwrap_or_else(|| match level {
-                                ThinkingLevel::Minimal | ThinkingLevel::Low => "low".to_string(),
-                                ThinkingLevel::Medium => "medium".to_string(),
-                                ThinkingLevel::High | ThinkingLevel::XHigh => "high".to_string(),
-                                _ => "medium".to_string(),
-                            });
-                        (None, Some(effort))
-                    }
+                if level == ThinkingLevel::Off {
+                    (None, None)
+                } else {
+                    let effort = self
+                        .compat
+                        .as_ref()
+                        .and_then(|c| c.thinking_level_map.as_ref())
+                        .and_then(|map| map.get(&level.to_string()))
+                        .cloned()
+                        .unwrap_or_else(|| match level {
+                            ThinkingLevel::Minimal | ThinkingLevel::Low => "low".to_string(),
+                            ThinkingLevel::High | ThinkingLevel::XHigh => "high".to_string(),
+                            ThinkingLevel::Off | ThinkingLevel::Medium => "medium".to_string(),
+                        });
+                    (None, Some(effort))
                 }
             }
             None => (None, None),

@@ -6,9 +6,34 @@
 
 核心定位：
 
-- **不追求「CLI 即文档」**，而是建立**契约驱动的开发者参考体系**
-- **CLI 是版本绑定的查询入口**，不是新的维护负担
-- **内容按「事实—语义—教学」三层边界**分层，机械事实由实现派生或共用
+- **长期模型**：Rust 公共契约声明 + 最小化 QuickJS 运行时探针 + 一致性/行为测试 → `pi developer-guide` 文本/JSON 输出。Markdown 参考文档后续从同一投影生成——手写 Markdown 不是 API 真相来源。
+- **契约包含运行时无法推断的语义**：稳定性、能力要求、限制、简洁的人工描述。运行时探针验证 QuickJS 实际暴露的内容；测试是可执行的证据，不是同等真相来源。
+- **CLI 是版本绑定的查询入口**，不是新的维护负担。
+- **内容按「事实—语义—教学」三层边界**分层，机械事实由实现派生或共用。
+
+## 冻结决策检查点（2026-07-30）
+
+本轮讨论已确定 `pi developer-guide` 的架构方向；在开始实现前，以下结论冻结，不在扩展技能重构讨论中继续展开。
+
+### 已确认
+
+- 公共扩展 API 的长期链路是：**Rust 公共契约声明 + 最小 QuickJS 运行时探针 + 一致性/行为测试**，派生 `pi developer-guide` 的 text/JSON 输出；未来 Markdown reference 也只从同一投影生成。
+- Rust 契约只声明运行时无法推断的公共语义：稳定性、能力要求、限制和简洁的人类说明。运行时探针验证 QuickJS 实际暴露面；测试是可执行证据，不是并列的事实来源。
+- Phase 1 只覆盖 `events` 和 `register-tool`，提供 text/JSON，不提供静态 Markdown renderer，也不提供面向扩展作者的生产级 runtime introspection API。
+- `pi.on()` 在 Phase 1 保持宽松，未知字符串不变成运行时错误。文档中的事件集以“Rust 实际 dispatch 且已注册 handler 可在最小 QuickJS runtime 中观察到”为准。
+- `register-tool` 的字段接受、默认和拒绝行为必须通过实际 QuickJS 注册路径验证，不能只由契约元数据声称。
+- 旧静态开发指南只保留概念、设计建议、工作流和教学内容；精确 API reference 最终由 `pi developer-guide` 提供。
+
+### 与 `pi-extension-dev` 的接口
+
+在 `pi developer-guide` 尚未实现前，扩展技能中的 API/能力文件只作为证据索引：引导读取对应 Rust 实现和测试，不重复维护完整 API 事实。`pi developer-guide` 可用后，索引改为路由到它的派生输出。
+
+### 暂缓到 B 树恢复时处理
+
+- 最小 QuickJS runtime probe 如何加载 fixture extension 并建立当前扩展上下文。
+- `events` 契约与实际 dispatch 路径的完整枚举、计数和映射校验。
+- `register-tool` 的精确事实表、契约与 `ExtensionToolDef`/JS 验证逻辑的共享或校验边界。
+- `DeveloperReference` 的最终字段与后续 `node-compat`、`hostcall` topic 的演进。
 
 ## 阶段总览
 

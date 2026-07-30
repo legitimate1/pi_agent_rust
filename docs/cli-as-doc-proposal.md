@@ -1,5 +1,7 @@
 # 议题：CLI 即文档 vs 静态 .md 文档
 
+> **📜 历史探索文档** — 本文是 CLI-as-Doc 概念的早期探索记录，保留了最初的讨论框架和备选方案。当前已收敛的设计在 [`docs/design/cli-as-doc/`](./design/cli-as-doc/) 中推进，以本文的讨论为前置背景。如需了解当前设计，请直接阅读设计文档。
+
 ## 背景
 
 pi_agent_rust 有一个面向 QuickJS 扩展开发者的开发指南（`docs/extension-developer-guide.md`，约 20KB，13 节）。

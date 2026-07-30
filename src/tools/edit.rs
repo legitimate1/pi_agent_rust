@@ -607,7 +607,8 @@ impl Tool for EditTool {
         "edit"
     }
     fn description(&self) -> &str {
-        "通过替换文本编辑现有文件。oldText 须唯一匹配文件中一处区域；替换无变化时报错。返回替换差异。文件限 100MB。默认在编辑后运行语法检查（verify=true），设 false 跳过。"
+        "通过替换文本编辑现有文件。oldText 须唯一匹配文件中一处区域；替换无变化时报错。返回替换差异。文件限 100MB。默认在编辑后运行语法检查（verify=true），设 false 跳过。\
+         内容匹配不受行号偏移影响，适合多次调用的连续编辑。如需单次调用内批量修改多处非重叠位置，建议改用 hashline_edit。"
     }
 
     fn parameters(&self) -> serde_json::Value {

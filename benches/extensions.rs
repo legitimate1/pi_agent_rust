@@ -98,7 +98,12 @@ impl pi::extensions::ExtensionSession for BenchSession {
         Ok(())
     }
 
-    async fn set_model(&self, _provider: String, _model_id: String, _persist: bool) -> pi::error::Result<()> {
+    async fn set_model(
+        &self,
+        _provider: String,
+        _model_id: String,
+        _persist: bool,
+    ) -> pi::error::Result<()> {
         Ok(())
     }
 
