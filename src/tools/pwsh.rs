@@ -132,7 +132,23 @@ pub async fn run_pwsh_command(
         "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); $PSDefaultParameterOutputEncoding = [System.Text.UTF8Encoding]::new(); {command}"
     );
 
-    let mut cmd = std::process::Command::new("pwsh");
+    // Resolve pwsh executable: prefer absolute path (avoids Rust/Windows PATH
+    // parsing bug where "C:\Program Files\..." with spaces + no extension
+    // gets truncated to "C:\Program" and fails to spawn).
+    // Fall back to PATH lookup ("pwsh") if standard locations are missing.
+    let pwsh_exe = if cfg!(windows) {
+        let pf = std::env::var("PROGRAMFILES").unwrap_or_else(|_| r"C:\Program Files".into());
+        let candidate = Path::new(&pf).join(r"PowerShell\7\pwsh.exe");
+        if candidate.exists() {
+            candidate.to_string_lossy().to_string()
+        } else {
+            "pwsh".to_string()
+        }
+    } else {
+        "pwsh".to_string()
+    };
+
+    let mut cmd = std::process::Command::new(&pwsh_exe);
     cmd.arg("-NoProfile")
         .arg("-ExecutionPolicy")
         .arg("Bypass")

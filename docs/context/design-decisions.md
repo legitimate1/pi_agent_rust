@@ -65,6 +65,14 @@
 
 **何时重新考虑**：如果 QuickJS 沙箱放开 `exec` 能力限制，可考虑回退到扩展方式。
 
+**2026-08-01 修订：pwsh 解析加绝对路径 fallback**
+
+**问题**：Rust `std::process::Command::new("pwsh")` 在 Windows 上解析 PATH 时，带空格的条目（`C:\Program Files\PowerShell\7\`）会被按空格截断成 `C:\Program`，spawn 报 `program not found`。此前能工作是因为 PATH 里曾有"无空格路径"的 pwsh 副本（系统 PATH 事故后被清掉）。
+
+**修复**：`src/tools/pwsh.rs` 的 `run_pwsh_command()` 改为优先用绝对路径 `%PROGRAMFILES%\PowerShell\7\pwsh.exe`（存在则用），否则 fallback 到 `pwsh`（PATH 查找）。绝对路径 + `.exe` 扩展名绕开 CreateProcess 的 PATH 解析缺陷。
+
+**通用结论**：Rust 在 Windows 上 spawn 程序不要依赖 `Command::new("名字")` 解析 PATH，用绝对路径 + 扩展名最稳。
+
 ## D5: `~/.pi/agent/SYSTEM.md` 覆盖默认系统提示词（2026-07-15）
 
 **决策**：当 `~/.pi/agent/SYSTEM.md` 存在时，替代 `default_system_prompt()` 作为 system prompt 的基础内容。
