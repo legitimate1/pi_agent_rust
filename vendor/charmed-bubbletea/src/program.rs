@@ -1089,9 +1089,16 @@ impl<M: Model> Program<M> {
             return Ok(());
         }
 
-        // Render first, then clear trailing lines (avoids full-screen flicker)
+        // Clear each row before writing it so shorter streaming rows cannot
+        // leave characters from the previous frame at the right edge. Clearing
+        // the whole screen first would remove the Windows Terminal flicker fix.
         execute!(writer, MoveTo(0, 0))?;
-        write!(writer, "{}", view)?;
+        for (row, line) in view.split_inclusive('\n').enumerate() {
+            let row = u16::try_from(row).unwrap_or(u16::MAX);
+            execute!(writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+            write!(writer, "{line}")?;
+        }
+        // Clear rows left over from a taller previous frame.
         execute!(writer, Clear(ClearType::FromCursorDown))?;
         writer.flush()?;
 
@@ -2048,6 +2055,35 @@ mod tests {
         fn view(&self) -> String {
             format!("Count: {}", self.count)
         }
+    }
+
+    #[test]
+    fn render_clears_each_row_before_shorter_streaming_frame() {
+        let mut program = Program::new(TestModel { count: 12345 });
+        let mut last_view = String::new();
+        let mut first_frame = Vec::new();
+        program
+            .render(&mut first_frame, &mut last_view)
+            .expect("first frame should render");
+
+        program.model.count = 1;
+        let mut second_frame = Vec::new();
+        program
+            .render(&mut second_frame, &mut last_view)
+            .expect("shorter frame should render");
+
+        assert!(
+            second_frame
+                .windows(b"\x1b[2K".len())
+                .any(|window| window == b"\x1b[2K"),
+            "shorter frame must clear the current line before writing: {second_frame:?}"
+        );
+        assert!(
+            !second_frame
+                .windows(b"\x1b[2J".len())
+                .any(|window| window == b"\x1b[2J"),
+            "render must not fall back to clearing the whole screen: {second_frame:?}"
+        );
     }
 
     #[test]
