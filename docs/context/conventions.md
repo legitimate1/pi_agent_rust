@@ -73,25 +73,40 @@ let exit_code = guard.wait_with_cancellation(timeout_secs, abort.as_ref()).await
 
 ## 扩展 abort 约定
 
-扩展工具（扩展注册的自定义工具）的 abort 传播路径不同于内置工具：
+扩展工具（扩展注册的自定义工具）的 abort 传播路径不同于内置工具，采用**两阶段**机制：
 
-1. `ExtensionToolWrapper::execute` 收到 abort 信号 → 不直接传给 JS runtime（由 command channel 异步转发）
-2. `await_js_task` 在循环中检查 `abort.is_aborted()` → 调用 `runtime.request_interrupt()` → QuickJS interrupt handler 触发 → JS 执行中断
-3. `InterruptBudget.external_trigger` 确保外部 abort 优先级高于 interrupt budget
+1. `ExtensionToolWrapper::execute` 收到 abort → 经 `execute_tool_ref` → `JsRuntimeCommand::ExecuteTool.abort` 字段（mpsc channel）转发给 runtime worker
+2. `execute_extension_tool` 将 `task_id` 传给 JS 侧 `__pi_execute_tool`，JS 侧为每次调用创建 `AbortController` 并作为第 4 参数 `signal` 传给扩展 `execute`（此前恒为 `undefined`）
+3. `await_js_task` 循环检查 `abort.is_aborted()`：
+   - **首次** → 调 JS `__pi_abort_task(task_id)` → 触发该调用的 `AbortController.abort()` → 扩展的 `signal.addEventListener('abort')` 事件生效（优雅路径）
+   - **下一轮仍 pending** → `runtime.request_interrupt()` → QuickJS interrupt handler 硬中断兜底
+4. `InterruptBudget.external_trigger` 确保外部 abort 优先级高于 interrupt budget；`with_ctx` 每次入口自动 `reset()`，外部 trigger 一次性有效
 
 ```rust
-// await_js_task 中的 abort 检查模式
+// await_js_task 中的两阶段 abort 检查模式
+let mut js_abort_notified = false;
 loop {
     if let Some(signal) = abort {
         if signal.is_aborted() {
-            runtime.request_interrupt();
-            return Err(Error::extension("aborted"));
+            if js_abort_notified {
+                runtime.request_interrupt();
+                return Err(Error::extension("Extension tool aborted by user request"));
+            }
+            js_abort_notified = true;
+            // 通知 JS 侧 AbortController（best-effort）
+            let _ = runtime.with_ctx(|ctx| {
+                let abort_fn: rquickjs::Function<'_> = ctx.globals().get("__pi_abort_task")?;
+                let _: rquickjs::Value<'_> = abort_fn.call((js_task,))?;
+                Ok::<(), rquickjs::Error>(())
+            }).await;
         }
     }
     pump_js_runtime_once(runtime, host).await?;
     // ... 检查 task 状态
 }
 ```
+
+扩展工具 execute 的 5 参签名：`(toolCallId, input, onUpdate, signal, ctx)`——第 4 位 `signal` 是真实的 AbortController signal（支持 `aborted` / `addEventListener('abort')` / `throwIfAborted()`）。
 
 ## 反模式
 

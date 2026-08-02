@@ -440,3 +440,23 @@
 
 **何时重新考虑**：如果未来引入会话级配置系统，可合并到统一配置管理。
 
+## D24: 扩展工具 abort 两阶段机制（2026-08-02）
+
+**决策**：扩展工具执行时，`await_js_task` 检测到 abort 后**先**通知 JS 侧 `AbortController`（扩展可优雅退出），**再**于下一轮循环 `request_interrupt()` 硬中断兜底；同时把真实 `signal`（AbortController.signal）作为第 4 参数传给扩展 `execute`。
+
+**涉及改动**：
+1. `src/extension_tools.rs` → `ExtensionToolWrapper::execute` 透传 `abort` 到 `execute_tool_ref`
+2. `src/extensions.rs` → `JsRuntimeCommand::ExecuteTool` 新增 `abort` 字段；`await_js_task` 新增 `js_abort_task` 参数 + 两阶段 abort 逻辑
+3. `src/extensions_js.rs` → `__pi_execute_tool` 创建 AbortController 存入 `__pi_abort_controllers` Map，`signal` 替换硬编码 `undefined`；新增 `__pi_abort_task(taskId)`
+
+**理由**：
+- 此前扩展工具 `execute` 的第 4 参数 signal 恒为 `undefined`——abort 信号在 `ExtensionToolWrapper` 处即被丢弃，`await_js_task` 拿到的 abort 恒为 `None`，中断轮询从未生效
+- 扩展生态（如 timed-confirm 示例）依赖 `signal.addEventListener('abort')` 实现可取消的长时间操作，硬中断会跳过扩展的清理逻辑
+- 先通知后中断：扩展可优雅退出并返回有意义的错误；忽略 signal 的扩展仍被硬中断兜底，行为不退化
+
+**不选 B 的原因**：
+- 仅硬中断（原状）——扩展无法感知取消，长任务清理逻辑（关闭文件、释放资源）被跳过
+- 仅 JS signal 通知不硬中断——恶意/死循环扩展永远不响应，abort 失效
+
+**何时重新考虑**：如果 QuickJS 运行时支持 Promise 级取消（如外部 promise rejection 注入），可简化为一阶段优雅取消。
+

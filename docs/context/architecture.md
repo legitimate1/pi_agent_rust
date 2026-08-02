@@ -103,7 +103,11 @@ Rust 工具   扩展工具
 bash/pwsh   execute_extension_tool
 循环检查     │
 abort +      await_js_task 循环检查
-guard.kill() abort + runtime.request_interrupt()
+guard.kill() │
+            ├─ 首次 abort → __pi_abort_task(task_id)
+            │   → JS AbortController.abort()
+            │   → 扩展 signal 事件触发（优雅退出）
+            │   → 仍 pending → request_interrupt() 硬中断
             │
             QuickJS interrupt hook
             强制停止 JS 执行
@@ -114,5 +118,6 @@ guard.kill() abort + runtime.request_interrupt()
 | 路径 | 机制 | 延迟 |
 |:-----|:-----|:-----|
 | bash/pwsh 工具 | 循环中 `signal.is_aborted()` → `guard.kill()` → `taskkill /F /T` | ≤100ms (轮询间隔) |
-| 扩展 JS 工具 | `await_js_task` 循环检查 → `runtime.request_interrupt()` → JS 中断 | ≤1ms (下一个 QuickJS interrupt) |
+| 扩展 JS 工具（优雅路径） | `await_js_task` 检测 abort → `__pi_abort_task(task_id)` → JS `AbortController.abort()` → 扩展 signal abort 事件 | ≤1 pump 周期 |
+| 扩展 JS 工具（硬中断兜底） | 通知后下一轮仍 pending → `request_interrupt()` → QuickJS 中断 | 1 轮 pump + ≤1ms interrupt |
 | agent_end 发送 | 工具返回后 run_loop 检测 abort 标记，立即发送 TurnEnd + AgentEnd | 立即 |

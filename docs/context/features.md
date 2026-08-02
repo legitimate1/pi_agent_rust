@@ -70,7 +70,7 @@
 |:-----|:----:|:---------|
 | JS/TS 扩展加载（QuickJS） | ✅ | `src/extensions_js.rs` |
 | **JS Runtime 中断机制** — `InterruptBudget.external_trigger` 外部中断 + QuickJS interrupt hook 停止死循环 | ✅ | `src/extensions_js.rs:4616` |
-| **扩展工具 abort 传播** — `await_js_task` 循环检查 abort 信号，触发 runtime 中断 + 返回错误 | ✅ | `src/extensions.rs` `src/extensions_js.rs` |
+| **扩展工具 abort 信号桥接** — agent 的 `AbortSignal` 经 `ExtensionToolWrapper → JsRuntimeCommand → await_js_task` 全链路透传：首次检测到 abort 时调 JS `__pi_abort_task(task_id)` 触发扩展的 `AbortController`（扩展可用 `signal.aborted` / `addEventListener('abort')` 优雅退出），下一轮仍 pending 则 `request_interrupt()` 硬中断兜底 | ✅ | `src/extension_tools.rs` `src/extensions.rs` `src/extensions_js.rs` |
 | Native Rust 扩展（`*.native.json`） | ✅ | `src/extensions.rs` |
 | WASM 扩展 | ✅ | `src/extensions.rs` |
 | 能力策略模型（Strict/Prompt/Permissive） | ✅ | `src/extensions.rs:1139` |
