@@ -635,6 +635,7 @@ fn execute_tool(
                     Arc::clone(&ctx),
                     10_000,
                     None,
+                    None,
                 )
                 .await
                 .map_err(|e| format!("{e}"))

@@ -232,6 +232,7 @@ fn run_shape_test(shape: ExtensionShape, fixture_name: &str) -> ShapeTestResult 
                             std::sync::Arc::new(serde_json::json!({})),
                             20_000,
                             None,
+                            None,
                         )
                         .await
                         .map_err(|e| format!("execute_tool: {e}"))

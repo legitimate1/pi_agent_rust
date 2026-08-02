@@ -19116,6 +19116,10 @@ const __pi_extensions = new Map();
 
 // Fast indexes
 const __pi_tool_index = new Map();      // tool_name -> { extensionId, spec, execute }
+// task_id -> AbortController for in-flight tool executions. The controller's
+// signal is passed to the extension's `execute` handler as the 4th argument
+// so it can observe user aborts (e.g. via signal.addEventListener('abort')).
+const __pi_abort_controllers = new Map();
 const __pi_command_index = new Map();   // command_name -> { extensionId, name, description, handler }
 const __pi_hook_index = new Map();      // event_name -> [{ extensionId, handler }, ...]
 const __pi_event_bus_index = new Map(); // event_name -> [{ extensionId, handler }, ...] (pi.events.on)
@@ -19231,6 +19235,7 @@ function __pi_reset_extension_runtime_state() {
     __pi_current_extension_id = null;
     __pi_extensions.clear();
     __pi_tool_index.clear();
+    __pi_abort_controllers.clear();
     __pi_command_index.clear();
     __pi_hook_index.clear();
     __pi_event_bus_index.clear();
@@ -20762,7 +20767,7 @@ function __pi_validate_tool_input(schema, input) {
     }
 }
 
-async function __pi_execute_tool(tool_name, tool_call_id, input, ctx_payload, onUpdateJs) {
+async function __pi_execute_tool(tool_name, tool_call_id, input, ctx_payload, onUpdateJs, taskId) {
     const name = String(tool_name || '').trim();
     const record = __pi_tool_index.get(name);
     if (!record) {
@@ -20779,9 +20784,29 @@ async function __pi_execute_tool(tool_name, tool_call_id, input, ctx_payload, on
             } catch (_) {}
           }
         : undefined;
-    return __pi_with_extension_async(record.extensionId, () =>
-        record.execute(tool_call_id, input, onUpdate, undefined, ctx)
-    );
+    const controller = new AbortController();
+    if (taskId !== undefined && taskId !== null) {
+        __pi_abort_controllers.set(String(taskId), controller);
+    }
+    try {
+        return await __pi_with_extension_async(record.extensionId, () =>
+            record.execute(tool_call_id, input, onUpdate, controller.signal, ctx)
+        );
+    } finally {
+        if (taskId !== undefined && taskId !== null) {
+            __pi_abort_controllers.delete(String(taskId));
+        }
+    }
+}
+
+// Abort an in-flight tool execution from the host side. Fires the
+// AbortController's signal so the extension can observe the abort; if the
+// extension ignores the signal the host falls back to a hard interrupt.
+function __pi_abort_task(taskId) {
+    const controller = __pi_abort_controllers.get(String(taskId));
+    if (controller && !controller.signal.aborted) {
+        controller.abort(new Error('Extension tool aborted by user request'));
+    }
 }
 
 async function __pi_execute_command(command_name, args, ctx_payload) {

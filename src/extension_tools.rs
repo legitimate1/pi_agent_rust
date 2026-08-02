@@ -190,7 +190,7 @@ impl Tool for ExtensionToolWrapper {
         tool_call_id: &str,
         input: Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-        _abort: Option<AbortSignal>,
+        abort: Option<AbortSignal>,
     ) -> Result<ToolOutput> {
         let result = self
             .runtime
@@ -201,6 +201,7 @@ impl Tool for ExtensionToolWrapper {
                 Arc::clone(&self.ctx_payload),
                 self.timeout_ms,
                 on_update,
+                abort,
             )
             .await
             .map_err(|err| Error::tool(self.name(), err.to_string()))?;
@@ -1087,6 +1088,120 @@ mod tests {
                 }
                 other => panic!(),
             }
+        });
+    }
+
+    #[test]
+    fn extension_tool_signal_argument_is_defined() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let source = r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "signal_tool",
+                    description: "reports whether the abort signal was bridged",
+                    parameters: { type: "object" },
+                    execute: async (_callId, _input, _onUpdate, signal, _ctx) => ({
+                      content: [{ type: "text", text: String(signal !== undefined && signal !== null) }],
+                      isError: false
+                    })
+                  });
+                }
+            "#;
+            let (_temp_dir, _manager, js_runtime, def) = setup_js_tool(source, "signal_tool").await;
+
+            let wrapper = ExtensionToolWrapper::new(def, js_runtime);
+            let output = wrapper
+                .execute("call-1", json!({}), None, None)
+                .await
+                .expect("execute tool");
+
+            assert!(!output.is_error);
+            match output.content.as_slice() {
+                [ContentBlock::Text(text)] => assert_eq!(text.text, "true"),
+                other => panic!("expected single text block, got: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn extension_tool_abort_signal_bridged_to_js() {
+        use asupersync::sync::Notify;
+        use asupersync::time::{timeout, wall_now};
+        use std::time::Duration;
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let source = r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "abort_tool",
+                    description: "waits for the abort signal",
+                    parameters: { type: "object" },
+                    execute: async (_callId, _input, onUpdate, signal, _ctx) => {
+                      if (signal === undefined || signal === null) {
+                        return { content: [{ type: "text", text: "no signal" }], isError: true };
+                      }
+                      return await new Promise((_resolve, reject) => {
+                        signal.addEventListener("abort", () => {
+                          reject(new Error("aborted by signal"));
+                        });
+                        // Signal the host that the abort listener is armed.
+                        if (typeof onUpdate === "function") {
+                          onUpdate({ content: [], details: { ready: true } });
+                        }
+                      });
+                    }
+                  });
+                }
+            "#;
+            let (_temp_dir, _manager, js_runtime, def) = setup_js_tool(source, "abort_tool").await;
+
+            let (abort_handle, abort_signal) = crate::abort::AbortHandle::new();
+            let wrapper = ExtensionToolWrapper::new(def, js_runtime);
+            let handle = runtime.handle();
+
+            // The JS handler signals readiness via on_update once its abort
+            // listener is armed — avoids a fixed-duration sleep race.
+            let ready = Arc::new(Notify::new());
+            let ready_for_cb = Arc::clone(&ready);
+            let on_update: Box<dyn Fn(ToolUpdate) + Send + Sync> = Box::new(move |update| {
+                if update
+                    .details
+                    .as_ref()
+                    .and_then(|d| d.get("ready"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                {
+                    ready_for_cb.notify_one();
+                }
+            });
+
+            let ready_wait = ready.notified();
+            let exec_join = handle.spawn(async move {
+                wrapper
+                    .execute("call-1", json!({}), Some(on_update), Some(abort_signal))
+                    .await
+            });
+
+            timeout(wall_now(), Duration::from_millis(5000), ready_wait)
+                .await
+                .expect("JS tool should signal readiness");
+
+            abort_handle.abort();
+
+            let result = exec_join.await;
+            let err = result.expect_err("aborted tool should fail");
+            assert!(
+                err.to_string().contains("aborted by signal"),
+                "expected graceful abort via bridged signal, got: {err}"
+            );
         });
     }
 }

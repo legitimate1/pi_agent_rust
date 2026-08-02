@@ -701,6 +701,7 @@ fn execute_tool_scenario(
                     Arc::new(ctx),
                     DEFAULT_TIMEOUT_MS,
                     None,
+                    None,
                 )
                 .await
                 .map_err(|e| format!("execute_tool: {e}"))
@@ -2282,6 +2283,7 @@ fn execute_tool_scenario_with_mocks(
                     Arc::new(ctx),
                     DEFAULT_TIMEOUT_MS,
                     None,
+                    None,
                 )
                 .await
                 .map_err(|e| format!("execute_tool: {e}"))
@@ -2487,6 +2489,7 @@ fn execute_multi_step_scenario(
                                 input,
                                 Arc::new(ctx),
                                 DEFAULT_TIMEOUT_MS,
+                                None,
                                 None,
                             )
                             .await

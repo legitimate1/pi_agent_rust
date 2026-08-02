@@ -1035,6 +1035,7 @@ fn extension_tool_execution_returns_result() {
                     std::sync::Arc::new(json!({})),
                     5000,
                     None,
+                    None,
                 )
                 .await
                 .expect("execute tool")

@@ -359,6 +359,7 @@ fn run_tool_roundtrip_native_runtime(runtime: &ExtensionRuntimeHandle) -> Result
                 Arc::new(json!({})),
                 60_000,
                 None,
+                None,
             )
             .await?;
         if output.get("is_error").and_then(serde_json::Value::as_bool) == Some(false) {

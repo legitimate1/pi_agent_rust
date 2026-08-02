@@ -630,6 +630,7 @@ fn execute_nonexistent_tool() {
                 std::sync::Arc::new(serde_json::json!({})),
                 20_000,
                 None,
+                None,
             )
             .await
             .map_err(|e| format!("{e}"))
@@ -676,6 +677,7 @@ fn execute_tool_that_throws() {
                 serde_json::json!({}),
                 std::sync::Arc::new(serde_json::json!({})),
                 20_000,
+                None,
                 None,
             )
             .await

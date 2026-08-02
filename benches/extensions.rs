@@ -556,6 +556,7 @@ fn bench_extension_tool_call_roundtrip(c: &mut Criterion) {
                     black_box(ctx_payload.clone()),
                     5_000,
                     None,
+                    None,
                 ))
                 .expect("execute hello tool");
                 black_box(result);

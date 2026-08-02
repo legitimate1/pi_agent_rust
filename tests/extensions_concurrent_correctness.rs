@@ -349,6 +349,7 @@ fn stateful_extensions_maintain_isolated_call_counts() {
             std::sync::Arc::new(ctx.clone()),
             5_000,
             None,
+            None,
         ));
     }
 
@@ -359,6 +360,7 @@ fn stateful_extensions_maintain_isolated_call_counts() {
         std::sync::Arc::new(ctx.clone()),
         5_000,
         None,
+        None,
     ));
 
     for _ in 0..2 {
@@ -368,6 +370,7 @@ fn stateful_extensions_maintain_isolated_call_counts() {
             json!({}),
             std::sync::Arc::new(ctx.clone()),
             5_000,
+            None,
             None,
         ));
     }
@@ -380,6 +383,7 @@ fn stateful_extensions_maintain_isolated_call_counts() {
         std::sync::Arc::new(ctx.clone()),
         5_000,
         None,
+        None,
     ));
     let result_b = futures::executor::block_on(runtime.execute_tool(
         "probe_iso_b".to_string(),
@@ -388,6 +392,7 @@ fn stateful_extensions_maintain_isolated_call_counts() {
         std::sync::Arc::new(ctx.clone()),
         5_000,
         None,
+        None,
     ));
     let result_c = futures::executor::block_on(runtime.execute_tool(
         "probe_iso_c".to_string(),
@@ -395,6 +400,7 @@ fn stateful_extensions_maintain_isolated_call_counts() {
         json!({}),
         std::sync::Arc::new(ctx.clone()),
         5_000,
+        None,
         None,
     ));
 

@@ -18554,6 +18554,7 @@ enum JsRuntimeCommand {
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
         on_update: Option<ToolUpdateCallback>,
+        abort: Option<AbortSignal>,
         reply: oneshot::Sender<Result<Value>>,
     },
     ExecuteCommand {
@@ -19116,6 +19117,7 @@ impl JsExtensionRuntimeHandle {
                             ctx_payload,
                             timeout_ms,
                             on_update,
+                            abort,
                             reply,
                         } => {
                             let result = execute_extension_tool(
@@ -19127,7 +19129,7 @@ impl JsExtensionRuntimeHandle {
                                 ctx_payload.as_ref(),
                                 timeout_ms,
                                 on_update.map(|cb| cb.0),
-                                None,
+                                abort.as_ref(),
                             )
                             .await;
                             let _ = reply.send(&cx, result);
@@ -19492,6 +19494,7 @@ impl JsExtensionRuntimeHandle {
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_tool(
         &self,
         tool_name: String,
@@ -19500,6 +19503,7 @@ impl JsExtensionRuntimeHandle {
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        abort: Option<AbortSignal>,
     ) -> Result<Value> {
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, mut reply_rx) = oneshot::channel();
@@ -19510,6 +19514,7 @@ impl JsExtensionRuntimeHandle {
             ctx_payload,
             timeout_ms,
             on_update: on_update.map(ToolUpdateCallback),
+            abort,
             reply: reply_tx,
         };
         let fut = async move {
@@ -20585,6 +20590,7 @@ mod native_runtime_duplicate_scaffold {
             }
         }
 
+        #[allow(clippy::too_many_arguments)]
         pub async fn execute_tool(
             &self,
             tool_name: String,
@@ -20593,6 +20599,7 @@ mod native_runtime_duplicate_scaffold {
             ctx_payload: Arc<Value>,
             timeout_ms: u64,
             on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+            abort: Option<AbortSignal>,
         ) -> Result<Value> {
             self.execute_tool_ref(
                 &tool_name,
@@ -20601,10 +20608,12 @@ mod native_runtime_duplicate_scaffold {
                 ctx_payload,
                 timeout_ms,
                 on_update,
+                abort,
             )
             .await
         }
 
+        #[allow(clippy::too_many_arguments)]
         pub async fn execute_tool_ref(
             &self,
             tool_name: &str,
@@ -20613,6 +20622,7 @@ mod native_runtime_duplicate_scaffold {
             ctx_payload: Arc<Value>,
             timeout_ms: u64,
             on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+            abort: Option<AbortSignal>,
         ) -> Result<Value> {
             match self {
                 Self::Js(runtime) => {
@@ -20624,10 +20634,12 @@ mod native_runtime_duplicate_scaffold {
                             ctx_payload,
                             timeout_ms,
                             on_update,
+                            abort,
                         )
                         .await
                 }
                 Self::NativeRust(runtime) => {
+                    let _ = abort;
                     let _ = (ctx_payload, on_update);
                     runtime
                         .execute_tool_ref(tool_name, tool_call_id, input, timeout_ms)
@@ -21618,7 +21630,7 @@ async fn load_one_extension(
             })
             .await;
         let load_result = match bootstrap_result {
-            Ok(()) => await_js_task(runtime, host, &task_id, Duration::from_secs(10), None)
+            Ok(()) => await_js_task(runtime, host, &task_id, Duration::from_secs(10), None, None)
                 .await
                 .map(|_| ()),
             Err(err) => Err(err),
@@ -21687,6 +21699,7 @@ async fn dispatch_extension_event(
         &task_id,
         Duration::from_millis(timeout_ms),
         None,
+        None,
     )
     .await
 }
@@ -21746,6 +21759,7 @@ async fn dispatch_extension_event_batch(
         host,
         &task_id,
         Duration::from_millis(timeout_ms),
+        None,
         None,
     )
     .await?;
@@ -21815,8 +21829,14 @@ async fn execute_extension_tool(
                 .into_value(),
                 None => json_to_js(&ctx, &serde_json::Value::Null)?,
             };
-            let promise: rquickjs::Value<'_> =
-                exec_fn.call((tool_name, tool_call_id, input_js, ctx_js, on_update_fn))?;
+            let promise: rquickjs::Value<'_> = exec_fn.call((
+                tool_name,
+                tool_call_id,
+                input_js,
+                ctx_js,
+                on_update_fn,
+                task_id.as_str(),
+            ))?;
             let _task: String = task_start.call((task_id.as_str(), promise))?;
             Ok(())
         })
@@ -21828,6 +21848,7 @@ async fn execute_extension_tool(
         &task_id,
         Duration::from_millis(timeout_ms),
         abort,
+        Some(task_id.as_str()),
     )
     .await;
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -21879,6 +21900,7 @@ async fn execute_extension_command(
         &task_id,
         Duration::from_millis(timeout_ms),
         abort,
+        None,
     )
     .await;
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -21926,6 +21948,7 @@ async fn execute_extension_shortcut(
         host,
         &task_id,
         Duration::from_millis(timeout_ms),
+        None,
         None,
     )
     .await;
@@ -21981,6 +22004,7 @@ async fn start_extension_provider_stream_simple(
         &task_id,
         Duration::from_millis(timeout_ms),
         None,
+        None,
     )
     .await?;
     value
@@ -22013,6 +22037,7 @@ async fn next_extension_provider_stream_simple(
         host,
         &task_id,
         Duration::from_millis(timeout_ms),
+        None,
         None,
     )
     .await?;
@@ -22054,6 +22079,7 @@ async fn cancel_extension_provider_stream_simple(
         host,
         &task_id,
         Duration::from_millis(timeout_ms),
+        None,
         None,
     )
     .await?;
@@ -26013,6 +26039,7 @@ async fn await_js_task(
     task_id: &str,
     timeout: Duration,
     abort: Option<&AbortSignal>,
+    js_abort_task: Option<&str>,
 ) -> Result<Value> {
     enum TaskTakeResult {
         Missing,
@@ -26028,6 +26055,10 @@ async fn await_js_task(
 
     let start = extension_wait_now();
     let start_instant = Instant::now();
+    // Whether the JS-side AbortController for this task has been notified.
+    // The first abort observation notifies the extension (graceful path); if
+    // the task is still pending on the next loop pass, we hard-interrupt.
+    let mut js_abort_notified = false;
 
     loop {
         let now = extension_wait_now();
@@ -26043,8 +26074,29 @@ async fn await_js_task(
         // Check for external abort signal
         if let Some(signal) = abort {
             if signal.is_aborted() {
-                runtime.request_interrupt();
-                return Err(Error::extension("Extension tool aborted by user request"));
+                if js_abort_notified {
+                    // Already notified the JS side but the task is still
+                    // pending — hard-interrupt as the fallback.
+                    runtime.request_interrupt();
+                    return Err(Error::extension("Extension tool aborted by user request"));
+                }
+                js_abort_notified = true;
+                if let Some(js_task) = js_abort_task {
+                    // Notify the JS side so the extension's
+                    // `signal` (AbortController) fires its abort event.
+                    // Best-effort: ignore failures so the hard interrupt
+                    // below remains the fallback.
+                    let _ = runtime
+                        .with_ctx(|ctx| {
+                            let global = ctx.globals();
+                            let abort_fn: rquickjs::Function<'_> = global.get("__pi_abort_task")?;
+                            let _: rquickjs::Value<'_> = abort_fn.call((js_task,))?;
+                            Ok::<(), rquickjs::Error>(())
+                        })
+                        .await;
+                }
+                // Give the extension one pump cycle to respond to the
+                // signal before falling back to a hard interrupt.
             }
         }
 
