@@ -4,7 +4,7 @@
 //! for files edited by Pi Agent. Used by edit, hashline_edit, and write
 //! tools when their `verify` parameter is set to true.
 //!
-//! # Supported file types (MVP)
+//! # Supported file types
 //!
 //! | Extension | Checker | Method | Threshold |
 //! |-----------|---------|--------|-----------|
@@ -13,6 +13,20 @@
 //! | `.toml`   | `toml::from_str` | process-internal | unlimited |
 //! | `.ts`     | `npx --no-install prettier --check` | external process | ≤1MB |
 //!
+//! # Architecture
+//!
+//! - **Process-internal checkers** (`json`/`toml`): parse in-process; errors
+//!   already carry line/column info. No process, no diff.
+//! - **External-process checkers** (`rustfmt`/`prettier`): declared as
+//!   [`ExternalChecker`] table entries and executed through one shared
+//!   runner ([`run_external_checker`]). Adding a checker means adding a
+//!   `FileType` variant + extension mapping + one table entry — no new
+//!   boilerplate.
+//!
+//! Failure messages are normalized: ANSI codes stripped, an optional unified
+//! diff appended (via `similar`, when the checker can emit normalized text),
+//! and a fix hint added. Messages are capped to avoid flooding tool output.
+//!
 //! External program names are resolved via [`resolve_program`]: on Windows
 //! `npx.cmd`/`prettier.cmd` shims are located because `CreateProcess` cannot
 //! spawn bare `.cmd` names; other platforms pass names through unchanged.
@@ -20,7 +34,10 @@
 //! All checkers report only — no automatic correction.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
+
+use regex::Regex;
 
 use crate::abort::AbortSignal;
 use crate::error::{Error, Result};
@@ -102,6 +119,132 @@ fn resolve_program_in_dirs(name: &str, dirs: &[PathBuf]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// External-process checker table (declarative)
+// ---------------------------------------------------------------------------
+
+/// Declarative definition of an external-process checker.
+///
+/// All shared behavior (size threshold, availability probe, process run,
+/// timeout, failure normalization) lives in [`run_external_checker`]; each
+/// checker only declares its own differences here.
+struct ExternalChecker {
+    /// Checker display name (surfaced in `VerifyResult.checker`).
+    name: &'static str,
+    /// Bare program name (resolved via [`resolve_program`] for Windows
+    /// `.exe`/`.cmd` shims).
+    program: &'static str,
+    /// Availability probe args (e.g. `--version`).
+    version_args: &'static [&'static str],
+    /// Message shown when the program is not found in PATH.
+    not_found_hint: &'static str,
+    /// Check args; the file path is appended by the runner.
+    check_args: &'static [&'static str],
+    /// Optional fix hint template (`<file>` is substituted with the path).
+    fix_hint: &'static str,
+    /// Optional formatter args: running `<program> <format_args> <path>`
+    /// must print normalized text on stdout. When set, failures append a
+    /// unified diff between the original and the formatted text.
+    format_args: Option<&'static [&'static str]>,
+    /// Optional failure classifier: `Some(warning)` means "soft failure"
+    /// (report as passed with a warning, e.g. prettier module not cached);
+    /// `None` means every non-zero exit is a hard failure.
+    classify_failure: Option<fn(i32, &str) -> Option<String>>,
+}
+
+/// rustfmt --check. Its stderr already contains the diff (with ANSI codes),
+/// so no separate formatter command is needed.
+static RUSTFMT_CHECKER: ExternalChecker = ExternalChecker {
+    name: "rustfmt",
+    program: "rustfmt",
+    version_args: &["--version"],
+    not_found_hint: "rustfmt not found in PATH. Run `rustup component add rustfmt` to install.",
+    check_args: &["--check", "--edition", "2024"],
+    fix_hint: "Run `rustfmt <file>` to fix.",
+    format_args: None,
+    classify_failure: None,
+};
+
+/// npx --no-install prettier --check. `--check` prints no diff, so the
+/// formatter command (`prettier <path>` → stdout) supplies it on failure.
+static PRETTIER_CHECKER: ExternalChecker = ExternalChecker {
+    name: "prettier",
+    program: "npx",
+    version_args: &["--version"],
+    not_found_hint: "npx not found in PATH. Skipping prettier check. \
+                     Install Node.js to enable TypeScript formatting verification \
+                     (Windows: ensure `npx.cmd` is on PATH).",
+    check_args: &["--no-install", "prettier", "--check"],
+    fix_hint: "Run `npx prettier --write <file>` to fix.",
+    format_args: Some(&["--no-install", "prettier"]),
+    classify_failure: Some(prettier_classify_failure),
+};
+
+/// prettier failure classification: exit code 2 with a module-not-found
+/// message means the module is not cached locally (soft failure, not a
+/// formatting problem).
+fn prettier_classify_failure(code: i32, stderr: &str) -> Option<String> {
+    if code == 2 && (stderr.contains("Cannot find module") || stderr.contains("not found")) {
+        Some(
+            "prettier not cached locally. \
+             Run `npx prettier --check <file>` once to cache it."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Failure message normalization (shared by all external checkers)
+// ---------------------------------------------------------------------------
+
+/// Maximum message length; anything longer is truncated with a marker.
+const MAX_VERIFY_MESSAGE_CHARS: usize = 8192;
+
+/// Maximum diff length embedded in a failure message.
+const MAX_DIFF_CHARS: usize = 6000;
+
+/// Lazily-initialized ANSI escape sequence matcher (same pattern as
+/// `conformance.rs`).
+static ANSI_REGEX: OnceLock<Regex> = OnceLock::new();
+
+/// Strip ANSI escape sequences (e.g. rustfmt's colored diff) from text.
+fn strip_ansi(text: &str) -> String {
+    ANSI_REGEX
+        .get_or_init(|| Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").expect("ansi regex"))
+        .replace_all(text, "")
+        .into_owned()
+}
+
+/// Generate a unified diff between original and formatted text, capped at
+/// [`MAX_DIFF_CHARS`] with a truncation marker.
+fn format_diff(original: &str, formatted: &str) -> String {
+    let diff = similar::TextDiff::from_lines(original, formatted)
+        .unified_diff()
+        .context_radius(3)
+        .to_string();
+    truncate_at(diff, MAX_DIFF_CHARS, "\n… (diff truncated)")
+}
+
+/// Truncate `text` to `max` chars at a UTF-8 boundary, appending `marker`.
+fn truncate_at(mut text: String, max: usize, marker: &str) -> String {
+    if text.len() > max {
+        let mut boundary = max;
+        while !text.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        text.truncate(boundary);
+        text.push_str(marker);
+    }
+    text
+}
+
+/// Cap a full failure message at [`MAX_VERIFY_MESSAGE_CHARS`].
+fn truncate_message(msg: String) -> String {
+    truncate_at(msg, MAX_VERIFY_MESSAGE_CHARS, "\n… (message truncated)")
+}
+
+// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
@@ -130,8 +273,8 @@ pub async fn verify_file(path: PathBuf, abort: Option<AbortSignal>) -> Result<Ve
     let (passed, message, checker) = match file_type {
         FileType::Json => verify_json(&path)?,
         FileType::Toml => verify_toml(&path)?,
-        FileType::Rust => verify_rustfmt(&path, abort).await?,
-        FileType::TypeScript => verify_prettier(&path, abort).await?,
+        FileType::Rust => verify_external(&RUSTFMT_CHECKER, &path, abort).await?,
+        FileType::TypeScript => verify_external(&PRETTIER_CHECKER, &path, abort).await?,
     };
 
     #[allow(clippy::cast_possible_truncation)]
@@ -177,88 +320,27 @@ fn verify_toml(path: &Path) -> Result<(bool, Option<String>, &'static str)> {
 // External process checkers (wrapped in spawn_blocking_io)
 // ---------------------------------------------------------------------------
 
-/// Check Rust formatting by running rustfmt --check.
-async fn verify_rustfmt(
+/// Run an external-process checker declared in the checker table.
+async fn verify_external(
+    checker: &'static ExternalChecker,
     path: &Path,
     abort: Option<AbortSignal>,
 ) -> Result<(bool, Option<String>, &'static str)> {
     let path = path.to_path_buf();
     let abort = abort.clone();
     asupersync::runtime::spawn_blocking_io(move || {
-        verify_rustfmt_sync(&path, abort.as_ref()).map_err(|e| std::io::Error::other(e.to_string()))
-    })
-    .await
-    .map_err(|e| Error::tool("verify", format!("spawn_blocking_io failed: {e}")))
-}
-
-fn verify_rustfmt_sync(
-    path: &Path,
-    abort: Option<&AbortSignal>,
-) -> Result<(bool, Option<String>, &'static str)> {
-    // Check file size threshold
-    let metadata = std::fs::metadata(path).map_err(|e| {
-        Error::tool(
-            "verify",
-            format!("Cannot read metadata for {}: {e}", path.display()),
-        )
-    })?;
-
-    if metadata.len() > VERIFY_MAX_EXTERNAL_BYTES {
-        return Ok((
-            true,
-            Some(format!("Skipped: file > 1MB ({} bytes)", metadata.len())),
-            "rustfmt",
-        ));
-    }
-
-    // Check if rustfmt is available (resolve .exe/.cmd shims on Windows)
-    let rustfmt = resolve_program("rustfmt");
-    if std::process::Command::new(&rustfmt)
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        return Ok((
-            false,
-            Some(
-                "rustfmt not found in PATH. Run `rustup component add rustfmt` to install."
-                    .to_string(),
-            ),
-            "rustfmt",
-        ));
-    }
-
-    // Run rustfmt --check
-    let output = run_external_process(
-        &rustfmt,
-        &["--check", "--edition", "2024", &path.to_string_lossy()],
-        abort,
-    )?;
-
-    if output.status.success() {
-        Ok((true, None, "rustfmt"))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        Ok((false, Some(stderr), "rustfmt"))
-    }
-}
-
-/// Check TypeScript formatting by running npx --no-install prettier --check.
-async fn verify_prettier(
-    path: &Path,
-    abort: Option<AbortSignal>,
-) -> Result<(bool, Option<String>, &'static str)> {
-    let path = path.to_path_buf();
-    let abort = abort.clone();
-    asupersync::runtime::spawn_blocking_io(move || {
-        verify_prettier_sync(&path, abort.as_ref())
+        run_external_checker(checker, &path, abort.as_ref())
             .map_err(|e| std::io::Error::other(e.to_string()))
     })
     .await
     .map_err(|e| Error::tool("verify", format!("spawn_blocking_io failed: {e}")))
 }
 
-fn verify_prettier_sync(
+/// Shared execution path for all external-process checkers:
+/// size threshold → program resolve/probe → check run → failure
+/// normalization (soft classification, ANSI strip, diff, fix hint, cap).
+fn run_external_checker(
+    checker: &ExternalChecker,
     path: &Path,
     abort: Option<&AbortSignal>,
 ) -> Result<(bool, Option<String>, &'static str)> {
@@ -274,71 +356,107 @@ fn verify_prettier_sync(
         return Ok((
             true,
             Some(format!("Skipped: file > 1MB ({} bytes)", metadata.len())),
-            "prettier",
+            checker.name,
         ));
     }
 
-    // Check if npx is available (resolve npx.cmd shim on Windows, where
-    // npm ships no npx.exe)
-    let npx = resolve_program("npx");
-    if std::process::Command::new(&npx)
-        .arg("--version")
+    // Resolve program (Windows .exe/.cmd shims) and probe availability
+    let program = resolve_program(checker.program);
+    if std::process::Command::new(&program)
+        .args(checker.version_args)
         .output()
         .is_err()
     {
         return Ok((
             false,
-            Some(
-                "npx not found in PATH. Skipping prettier check. \
-                 Install Node.js to enable TypeScript formatting verification \
-                 (Windows: ensure `npx.cmd` is on PATH)."
-                    .to_string(),
-            ),
-            "prettier",
+            Some(checker.not_found_hint.to_string()),
+            checker.name,
         ));
     }
 
-    // Run npx --no-install prettier --check
-    let output = run_external_process(
-        &npx,
-        &[
-            "--no-install",
-            "prettier",
-            "--check",
-            &path.to_string_lossy(),
-        ],
-        abort,
-    )?;
+    // Run the check: <program> <check_args> <path>
+    let path_str = path.to_string_lossy().into_owned();
+    let mut check_args: Vec<&str> = checker.check_args.to_vec();
+    check_args.push(&path_str);
+    let output = run_external_process(&program, &check_args, abort)?;
 
     if output.status.success() {
-        Ok((true, None, "prettier"))
-    } else if let Some(code) = output.status.code() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Ok((true, None, checker.name));
+    }
 
-        if code == 2 {
-            if stderr.contains("Cannot find module") || stderr.contains("not found") {
-                Ok((
+    // Failure handling: rustfmt emits its diff on stdout, prettier emits
+    // warnings on stderr — merge both, keeping only diff-looking stdout.
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    if let Some(code) = output.status.code() {
+        // Soft failure classification (e.g. prettier module not cached)
+        if let Some(classify) = checker.classify_failure {
+            if let Some(warning) = classify(code, &stderr) {
+                return Ok((
                     true,
-                    Some(
-                        "prettier not cached locally. \
-                         Run `npx prettier --check <file>` once to cache it."
-                            .to_string(),
-                    ),
-                    "prettier",
-                ))
-            } else {
-                Ok((false, Some(stderr), "prettier"))
+                    Some(warning.replace("<file>", &path_str)),
+                    checker.name,
+                ));
             }
-        } else {
-            Ok((false, Some(stderr), "prettier"))
         }
+
+        // Hard failure: normalize stderr, append diff if available, add hint
+        let mut message = strip_ansi(&stderr);
+        if looks_like_diff(&stdout) {
+            if !message.trim().is_empty() {
+                message.push('\n');
+            }
+            message.push_str(&strip_ansi(&stdout));
+        }
+        if let Some(format_args) = checker.format_args {
+            if let Some(formatted) = run_formatter(&program, format_args, path, abort) {
+                if let Ok(original) = std::fs::read_to_string(path) {
+                    message.push_str("\n\n");
+                    message.push_str(&format_diff(&original, &formatted));
+                }
+            }
+        }
+        message.push_str("\n\n");
+        message.push_str(&checker.fix_hint.replace("<file>", &path_str));
+        message = truncate_message(message);
+
+        Ok((false, Some(message), checker.name))
     } else {
         Ok((
             false,
-            Some("prettier terminated by signal".to_string()),
-            "prettier",
+            Some(format!("{} terminated by signal", checker.name)),
+            checker.name,
         ))
     }
+}
+
+/// Heuristic: does this stdout text look like a formatter diff (rustfmt
+/// prints `Diff in <path>:` + `-`/`+` lines, unified diffs contain `@@`)?
+fn looks_like_diff(text: &str) -> bool {
+    text.contains("Diff in")
+        || text.contains("@@")
+        || text
+            .lines()
+            .any(|l| l.starts_with('-') || l.starts_with('+'))
+}
+
+/// Run `<program> <format_args> <path>` and return stdout (normalized text).
+/// Failures are swallowed: diff generation is best-effort only.
+fn run_formatter(
+    program: &str,
+    format_args: &[&str],
+    path: &Path,
+    abort: Option<&AbortSignal>,
+) -> Option<String> {
+    let path_str = path.to_string_lossy().into_owned();
+    let mut args: Vec<&str> = format_args.to_vec();
+    args.push(&path_str);
+    let output = run_external_process(program, &args, abort).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -582,5 +700,102 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).contains("fake-tool-ok"),
             "resolved .cmd should actually execute"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Failure message normalization (strip_ansi / format_diff / truncation)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_ansi_removes_color_codes() {
+        let input = "Diff in file.rs:1:\n\x1b[31m-old line\x1b[0m\n\x1b[32m+new line\x1b[0m\n";
+        let out = strip_ansi(input);
+        assert!(
+            !out.contains("\x1b["),
+            "ANSI codes should be stripped: {out:?}"
+        );
+        assert!(out.contains("-old line"), "diff content preserved");
+        assert!(out.contains("+new line"), "diff content preserved");
+    }
+
+    #[test]
+    fn test_strip_ansi_plain_text_unchanged() {
+        assert_eq!(strip_ansi("no codes here"), "no codes here");
+        assert_eq!(strip_ansi(""), "");
+    }
+
+    #[test]
+    fn test_format_diff_shows_added_removed_lines() {
+        let original = "fn main() {\nprintln!(\"hi\");\n}\n";
+        let formatted = "fn main() {\n    println!(\"hi\");\n}\n";
+        let diff = format_diff(original, formatted);
+        assert!(diff.contains("-println!(\"hi\");"), "removed line: {diff}");
+        assert!(
+            diff.contains("+    println!(\"hi\");"),
+            "added line: {diff}"
+        );
+        assert!(!diff.contains("\x1b["), "no ANSI in generated diff");
+    }
+
+    #[test]
+    fn test_format_diff_no_changes_empty() {
+        let text = "a\nb\nc\n";
+        let diff = format_diff(text, text);
+        // identical text still yields a diff header but no +/- lines
+        assert!(!diff.contains("+a"), "no added lines for identical input");
+        assert!(!diff.contains("-a"), "no removed lines for identical input");
+    }
+
+    #[test]
+    fn test_truncate_message_marks_overflow() {
+        let msg = "x".repeat(10_000);
+        let out = truncate_message(msg);
+        assert!(out.len() < 10_000, "should be truncated");
+        assert!(out.ends_with("(message truncated)"), "marker appended");
+    }
+
+    #[test]
+    fn test_truncate_message_short_unchanged() {
+        let msg = "short message".to_string();
+        assert_eq!(truncate_message(msg), "short message");
+    }
+
+    #[test]
+    fn test_truncate_at_respects_utf8_boundary() {
+        // "é" is 2 bytes; truncating at an odd boundary must not panic
+        let msg = "é".repeat(5_000); // 10_000 bytes
+        let out = truncate_at(msg, 8_001, "…");
+        assert!(out.is_char_boundary(out.len()));
+    }
+
+    #[test]
+    fn test_prettier_classify_failure() {
+        // Soft failure: module not cached locally
+        let soft = prettier_classify_failure(2, "Cannot find module 'prettier'").unwrap();
+        assert!(soft.contains("not cached"), "soft warning text: {soft}");
+        assert!(prettier_classify_failure(2, "Error: prettier not found").is_some());
+
+        // Hard failures: other exit codes / messages
+        assert_eq!(
+            prettier_classify_failure(1, "Code style issues found"),
+            None
+        );
+        assert_eq!(prettier_classify_failure(2, "Some other error"), None);
+    }
+
+    #[test]
+    fn test_looks_like_diff() {
+        // rustfmt-style diff (stdout)
+        assert!(looks_like_diff(
+            "Diff in file.rs:1:\n fn main() {\n-x\n+x\n }"
+        ));
+        // unified diff hunk header
+        assert!(looks_like_diff("@@ -1,2 +1,2 @@\n-x\n+x"));
+        // plain output (prettier "Checking formatting...") is not a diff
+        assert!(!looks_like_diff(
+            "Checking formatting...\nAll matched files use Prettier code style!"
+        ));
+        assert!(!looks_like_diff(""));
+        assert!(!looks_like_diff("error: something happened"));
     }
 }
