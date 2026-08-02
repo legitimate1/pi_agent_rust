@@ -20,7 +20,7 @@ verify_file(path, abort)
 ├── detect_file_type(path)       扩展名 → FileType
 ├── FileType::Json/Toml          → verify_json/verify_toml    进程内解析（serde_json/toml）
 └── FileType::Rust/TypeScript    → verify_external(&CHECKER)  spawn_blocking_io 包装
-                                     └── run_external_checker(共享执行器)
+                                     └── run_external_checker(共享执行器, 失败时走 checker.fallback 链)
 ```
 
 ### 两类 checker
@@ -28,7 +28,7 @@ verify_file(path, abort)
 | 类别 | 例子 | 特点 |
 |:-----|:-----|:-----|
 | **进程内**（internal） | `.json` → serde_json、`.toml` → toml | 无子进程、无超时、错误自带行列号、无限大小 |
-| **外部进程**（external） | `.rs` → rustfmt、`.ts` → prettier | 1MB 阈值、10s 超时、程序名经 `resolve_program` 解析、失败消息规范化（ANSI 剥离 + diff + fix hint + 截断） |
+| **外部进程**（external） | `.rs` → rustfmt、`.ts` → prettier（全局直调，npx 回退） | 1MB 阈值、10s 超时、程序名经 `resolve_program` 解析、失败消息规范化（ANSI 剥离 + diff + fix hint + 截断） |
 
 ### 外部进程 checker 是表驱动声明式的
 
@@ -44,10 +44,11 @@ struct ExternalChecker {
     fix_hint: &'static str,                // 失败修复提示（<file> 占位符自动替换）
     format_args: Option<&'static [&'static str]>, // 能输出规范化文本→失败自动生成 diff
     classify_failure: Option<fn(i32, &str) -> Option<String>>, // 软失败分类
+    fallback: Option<&'static ExternalChecker>, // 主程序缺失时回退的 checker（如 prettier → npx）
 }
 ```
 
-现有两个实例：`RUSTFMT_CHECKER`、`PRETTIER_CHECKER`（`src/tools/verify.rs` 静态区）。
+现有实例：`RUSTFMT_CHECKER`（无回退）、`PRETTIER_CHECKER`（**直调全局 prettier**，`fallback: NPX_PRETTIER_CHECKER`）、`NPX_PRETTIER_CHECKER`（npx 包装，仅作回退）— 均在 `src/tools/verify.rs` 静态区。
 
 ### 失败消息规范化（`run_external_checker` 硬失败路径）
 
@@ -72,6 +73,7 @@ struct ExternalChecker {
    - `format_args`：能输出规范化文本就设 `Some(...)` → **免费获得失败 diff**
    - `classify_failure`：有"非格式问题退出码"（如模块未缓存）时提供软失败分类函数
    - `fix_hint`：给 Agent 的修复命令（用 `<file>` 占位）
+   - `fallback`：主程序缺失时回退的 checker（如 `PRETTIER_CHECKER → NPX_PRETTIER_CHECKER`）；无回退设 `None`
 5. **补测试** — `src/tools/verify.rs` tests：
    - `detect_file_type` 新扩展名断言
    - 有差异逻辑（classify / diff）时补纯函数单测
@@ -98,6 +100,7 @@ struct ExternalChecker {
 | 坑 | 症状 | 原因/处理 |
 |:---|:-----|:---------|
 | Windows 上 prettier/rustfmt verify 恒失败 | `[verify:FAILED\|prettier\|0ms]`，message "npx not found" | npm 只装 `npx.cmd` 无 `npx.exe`，CreateProcess 不解析裸 `.cmd`。已由 `resolve_program` 修复（PATH 扫 `name.exe`→`name.cmd`→`name.bat`） |
+| prettier verify 偶发 10s 超时（Windows） | `[verify:ERROR\|...npx.cmd timed out after 10s]` | **npx 包装触网**（npm registry 探测，`fetch-timeout=300s` + retries=2 → 一次网络挂起即超 10s）。已改**直调全局 prettier.cmd**（纯本地 ~270ms，无网络依赖），无全局安装时自动回退 npx。超时/abort 杀进程树（taskkill /T），避免 node 孤儿 |
 | prettier 对某文件恒返回 exit 0（"All matched files use Prettier code style!"） | verify 误通过 | **prettier 3.x 无 `.prettierignore` 时回退用 `.gitignore`**，gitignored 路径（如 `target/`）下的文件被静默跳过。验证时文件要放在非 gitignore 路径 |
 | rustfmt 失败但 message 只有 fix hint 没有 diff | 旧版行为 | 已修复：rustfmt diff 在 stdout，`looks_like_diff` 合并 |
 | message 超长 | 工具输出刷屏 | `truncate_message` 8192 字符上限，UTF-8 边界安全 |

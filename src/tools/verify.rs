@@ -11,7 +11,7 @@
 //! | `.rs`     | `rustfmt --check` | external process | ≤1MB |
 //! | `.json`   | `serde_json::from_str` | process-internal | unlimited |
 //! | `.toml`   | `toml::from_str` | process-internal | unlimited |
-//! | `.ts`     | `npx --no-install prettier --check` | external process | ≤1MB |
+//! | `.ts`     | `prettier --check` (global install; `npx --no-install` fallback) | external process | ≤1MB |
 //!
 //! # Architecture
 //!
@@ -149,6 +149,10 @@ struct ExternalChecker {
     /// (report as passed with a warning, e.g. prettier module not cached);
     /// `None` means every non-zero exit is a hard failure.
     classify_failure: Option<fn(i32, &str) -> Option<String>>,
+    /// Fallback checker used when this checker's program cannot be resolved
+    /// or spawned (e.g. no global prettier → npx wrapper). `None` = report
+    /// not-found. Chains are at most one level deep in practice.
+    fallback: Option<&'static Self>,
 }
 
 /// rustfmt --check. Its stderr already contains the diff (with ANSI codes),
@@ -162,12 +166,35 @@ static RUSTFMT_CHECKER: ExternalChecker = ExternalChecker {
     fix_hint: "Run `rustfmt <file>` to fix.",
     format_args: None,
     classify_failure: None,
+    fallback: None,
 };
 
-/// npx --no-install prettier --check. `--check` prints no diff, so the
-/// formatter command (`prettier <path>` → stdout) supplies it on failure.
+/// prettier --check via the global install (resolved to `prettier.cmd` on
+/// Windows). The global shim is self-contained and network-free (it runs
+/// `node %dp0%\node_modules\prettier\bin\prettier.cjs`), which is ~4x faster
+/// than the npx wrapper (~270ms vs ~1.2s) and immune to npm registry stalls
+/// that intermittently blew the 10s verify timeout. Falls back to
+/// [`NPX_PRETTIER_CHECKER`] when no global prettier is on PATH.
 static PRETTIER_CHECKER: ExternalChecker = ExternalChecker {
     name: "prettier",
+    program: "prettier",
+    version_args: &["--version"],
+    not_found_hint: "prettier not found in PATH. Skipping prettier check. \
+                     Install prettier globally (`npm i -g prettier`) to enable \
+                     TypeScript formatting verification. Falls back to npx when absent.",
+    check_args: &["--check"],
+    fix_hint: "Run `prettier --write <file>` to fix.",
+    format_args: Some(&[]),
+    classify_failure: Some(prettier_classify_failure),
+    fallback: Some(&NPX_PRETTIER_CHECKER),
+};
+
+/// npx --no-install prettier --check — fallback when no global prettier is
+/// on PATH. Slower (cmd + node + npx resolution) and can stall on network
+/// hiccups (npx probes the npm registry), hence secondary to
+/// [`PRETTIER_CHECKER`]. Kept for environments without a global prettier.
+static NPX_PRETTIER_CHECKER: ExternalChecker = ExternalChecker {
+    name: "npx-prettier",
     program: "npx",
     version_args: &["--version"],
     not_found_hint: "npx not found in PATH. Skipping prettier check. \
@@ -177,6 +204,7 @@ static PRETTIER_CHECKER: ExternalChecker = ExternalChecker {
     fix_hint: "Run `npx prettier --write <file>` to fix.",
     format_args: Some(&["--no-install", "prettier"]),
     classify_failure: Some(prettier_classify_failure),
+    fallback: None,
 };
 
 /// prettier failure classification: exit code 2 with a module-not-found
@@ -340,9 +368,22 @@ async fn verify_external(
 /// size threshold → program resolve/probe → check run → failure
 /// normalization (soft classification, ANSI strip, diff, fix hint, cap).
 fn run_external_checker(
-    checker: &ExternalChecker,
+    checker: &'static ExternalChecker,
     path: &Path,
     abort: Option<&AbortSignal>,
+) -> Result<(bool, Option<String>, &'static str)> {
+    run_external_checker_resolved(checker, path, abort, &resolve_program)
+}
+
+/// Core of [`run_external_checker`] with an injectable resolver, so tests
+/// can simulate missing/available programs without touching the real PATH.
+/// When the primary program cannot be spawned, the checker's `fallback`
+/// chain is tried before reporting not-found.
+fn run_external_checker_resolved(
+    checker: &'static ExternalChecker,
+    path: &Path,
+    abort: Option<&AbortSignal>,
+    resolve: &dyn Fn(&str) -> String,
 ) -> Result<(bool, Option<String>, &'static str)> {
     // Check file size threshold
     let metadata = std::fs::metadata(path).map_err(|e| {
@@ -361,12 +402,18 @@ fn run_external_checker(
     }
 
     // Resolve program (Windows .exe/.cmd shims) and probe availability
-    let program = resolve_program(checker.program);
+    let program = resolve(checker.program);
     if std::process::Command::new(&program)
         .args(checker.version_args)
         .output()
         .is_err()
     {
+        // Primary program unavailable: try the fallback chain (e.g. npx when
+        // no global prettier), then report not-found only if every level
+        // failed.
+        if let Some(fallback) = checker.fallback {
+            return run_external_checker_resolved(fallback, path, abort, resolve);
+        }
         return Ok((
             false,
             Some(checker.not_found_hint.to_string()),
@@ -467,7 +514,9 @@ fn run_formatter(
 ///
 /// Polls the child process at 50ms intervals, checking both the abort signal
 /// and the wall-clock timeout.  Returns the captured stdout/stderr on success,
-/// or an error on timeout/abort.
+/// or an error on timeout/abort. On timeout/abort the whole process tree is
+/// terminated (see [`terminate_process_tree`]) so wrapper shells do not leak
+/// orphaned grandchildren (e.g. `cmd.exe` → `node.exe`).
 fn run_external_process(
     program: &str,
     args: &[&str],
@@ -486,13 +535,13 @@ fn run_external_process(
     loop {
         if let Some(abort) = abort {
             if abort.is_aborted() {
-                let _ = child.kill();
+                terminate_process_tree(&mut child);
                 return Err(Error::tool("verify", "Verification aborted by user"));
             }
         }
 
         if start.elapsed() >= timeout {
-            let _ = child.kill();
+            terminate_process_tree(&mut child);
             return Err(Error::tool(
                 "verify",
                 format!("{program} timed out after {VERIFY_TIMEOUT_SECS}s"),
@@ -517,6 +566,30 @@ fn run_external_process(
             }
         }
     }
+}
+
+/// Terminate a child process and its descendants.
+///
+/// On Windows `Child::kill()` only terminates the direct child — for `.cmd`
+/// shims that is the `cmd.exe` wrapper, leaving the real worker (e.g.
+/// `node.exe` running prettier) orphaned with inherited pipe handles.
+/// `taskkill /T` kills the whole tree; the plain kill below remains as a
+/// best-effort fallback (and is the only path on non-Windows, where
+/// process-group kill would require libc).
+fn terminate_process_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .arg("/PID")
+            .arg(child.id().to_string())
+            .arg("/T")
+            .arg("/F")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
 }
 
 // ---------------------------------------------------------------------------
@@ -781,6 +854,108 @@ mod tests {
             None
         );
         assert_eq!(prettier_classify_failure(2, "Some other error"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fallback chain (primary program missing → npx wrapper)
+    // -----------------------------------------------------------------------
+
+    /// Resolver that reports every program as missing (nonexistent path).
+    fn resolver_all_missing(name: &str) -> String {
+        format!(r"C:\nonexistent\{}", name)
+    }
+
+    #[test]
+    fn test_prettier_fallback_reports_npx_hint_when_both_missing() {
+        // Global prettier missing and npx missing too: the reported checker
+        // and hint must come from the fallback (NPX), proving the chain ran.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let (passed, msg, checker) = run_external_checker_resolved(
+            &PRETTIER_CHECKER,
+            file.path(),
+            None,
+            &resolver_all_missing,
+        )
+        .unwrap();
+        assert!(!passed, "no checker available → not passed");
+        assert_eq!(checker, "npx-prettier", "fallback checker name surfaced");
+        let msg = msg.unwrap();
+        assert!(
+            msg.contains("npx not found"),
+            "fallback not-found hint expected: {msg}"
+        );
+        assert!(
+            !msg.contains("npm i -g prettier"),
+            "primary hint must not leak when fallback also missing"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_prettier_direct_check_via_cmd_shim() {
+        // Global prettier.cmd on PATH: the check runs directly through it,
+        // no npx involved (the regression scenario of #32).
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("prettier.cmd");
+        std::fs::write(&shim, "@echo off\r\necho fake prettier ok\r\n").unwrap();
+        let shim_path = shim.to_string_lossy().into_owned();
+        let file = dir.path().join("foo.ts");
+        std::fs::write(&file, "const x: number = 1;\n").unwrap();
+
+        let resolve = move |name: &str| -> String {
+            if name == "prettier" {
+                shim_path.clone()
+            } else {
+                resolver_all_missing(name)
+            }
+        };
+
+        let (passed, msg, checker) =
+            run_external_checker_resolved(&PRETTIER_CHECKER, &file, None, &resolve).unwrap();
+        assert!(passed, "direct check should pass: {:?}", msg);
+        assert_eq!(checker, "prettier");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_prettier_falls_back_to_npx_when_global_missing() {
+        // No global prettier but npx.cmd present: verify must run through
+        // the npx fallback and pass (zero-regression path).
+        let dir = tempfile::tempdir().unwrap();
+        let npx_shim = dir.path().join("npx.cmd");
+        std::fs::write(&npx_shim, "@echo off\r\necho fake npx ok\r\n").unwrap();
+        let npx_path = npx_shim.to_string_lossy().into_owned();
+        let file = dir.path().join("foo.ts");
+        std::fs::write(&file, "const x: number = 1;\n").unwrap();
+
+        let resolve = move |name: &str| -> String {
+            if name == "npx" {
+                npx_path.clone()
+            } else {
+                resolver_all_missing(name)
+            }
+        };
+
+        let (passed, msg, checker) =
+            run_external_checker_resolved(&PRETTIER_CHECKER, &file, None, &resolve).unwrap();
+        assert!(passed, "npx fallback should pass: {:?}", msg);
+        assert_eq!(checker, "npx-prettier");
+    }
+
+    #[test]
+    fn test_prettier_not_found_no_fallback_checker() {
+        // A checker without fallback still reports its own not-found hint.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let (passed, msg, checker) = run_external_checker_resolved(
+            &NPX_PRETTIER_CHECKER,
+            file.path(),
+            None,
+            &resolver_all_missing,
+        )
+        .unwrap();
+        assert!(!passed);
+        assert_eq!(checker, "npx-prettier");
+        assert!(msg.unwrap().contains("npx not found"));
     }
 
     #[test]
