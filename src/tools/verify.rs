@@ -13,6 +13,10 @@
 //! | `.toml`   | `toml::from_str` | process-internal | unlimited |
 //! | `.ts`     | `npx --no-install prettier --check` | external process | ≤1MB |
 //!
+//! External program names are resolved via [`resolve_program`]: on Windows
+//! `npx.cmd`/`prettier.cmd` shims are located because `CreateProcess` cannot
+//! spawn bare `.cmd` names; other platforms pass names through unchanged.
+//!
 //! All checkers report only — no automatic correction.
 
 use std::path::{Path, PathBuf};
@@ -58,6 +62,42 @@ fn detect_file_type(path: &Path) -> Option<FileType> {
         "toml" => Some(FileType::Toml),
         "ts" | "tsx" => Some(FileType::TypeScript),
         _ => None,
+    }
+}
+
+/// Resolve a bare program name to a spawnable command on this platform.
+///
+/// Windows `CreateProcess` cannot spawn extension-less shims or `.cmd`/`.bat`
+/// files by bare name (e.g. npm ships `npx` only as `npx.cmd`). We scan PATH
+/// for `name.exe` first (directly spawnable), then `name.cmd` / `name.bat`
+/// (Rust's `Command` wires those up via the shell shim). Non-Windows builds
+/// return the name unchanged, so behavior there is untouched.
+fn resolve_program(name: &str) -> String {
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    resolve_program_in_dirs(name, &dirs)
+}
+
+/// PATH-scanning core of [`resolve_program`], parameterized for testability
+/// (avoids `std::env::set_var`, which is unsafe in Rust 2024).
+fn resolve_program_in_dirs(name: &str, dirs: &[PathBuf]) -> String {
+    #[cfg(windows)]
+    {
+        for dir in dirs {
+            for ext in ["exe", "cmd", "bat"] {
+                let candidate = dir.join(format!("{name}.{ext}"));
+                if candidate.is_file() {
+                    return candidate.to_string_lossy().into_owned();
+                }
+            }
+        }
+        name.to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (name, dirs);
+        name.to_string()
     }
 }
 
@@ -171,8 +211,9 @@ fn verify_rustfmt_sync(
         ));
     }
 
-    // Check if rustfmt is available
-    if std::process::Command::new("rustfmt")
+    // Check if rustfmt is available (resolve .exe/.cmd shims on Windows)
+    let rustfmt = resolve_program("rustfmt");
+    if std::process::Command::new(&rustfmt)
         .arg("--version")
         .output()
         .is_err()
@@ -189,7 +230,7 @@ fn verify_rustfmt_sync(
 
     // Run rustfmt --check
     let output = run_external_process(
-        "rustfmt",
+        &rustfmt,
         &["--check", "--edition", "2024", &path.to_string_lossy()],
         abort,
     )?;
@@ -237,8 +278,10 @@ fn verify_prettier_sync(
         ));
     }
 
-    // Check if npx is available
-    if std::process::Command::new("npx")
+    // Check if npx is available (resolve npx.cmd shim on Windows, where
+    // npm ships no npx.exe)
+    let npx = resolve_program("npx");
+    if std::process::Command::new(&npx)
         .arg("--version")
         .output()
         .is_err()
@@ -246,8 +289,9 @@ fn verify_prettier_sync(
         return Ok((
             false,
             Some(
-                "npx not found. Skipping prettier check. \
-                 Install Node.js to enable TypeScript formatting verification."
+                "npx not found in PATH. Skipping prettier check. \
+                 Install Node.js to enable TypeScript formatting verification \
+                 (Windows: ensure `npx.cmd` is on PATH)."
                     .to_string(),
             ),
             "prettier",
@@ -256,7 +300,7 @@ fn verify_prettier_sync(
 
     // Run npx --no-install prettier --check
     let output = run_external_process(
-        "npx",
+        &npx,
         &[
             "--no-install",
             "prettier",
@@ -462,5 +506,81 @@ mod tests {
         assert!(!passed, "invalid TOML should fail");
         assert!(msg.unwrap().contains("TOML parse error"));
         assert_eq!(checker, "toml");
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_program (Windows .cmd shim resolution)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_program_missing_returns_name() {
+        // No match anywhere on any platform: name is returned unchanged,
+        // letting the caller surface the original "not found" error path.
+        assert_eq!(resolve_program_in_dirs("npx", &[]), "npx");
+        assert_eq!(
+            resolve_program_in_dirs("rustfmt", &[PathBuf::from("/nonexistent")]),
+            "rustfmt"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_resolve_program_windows_prefers_exe_then_cmd() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Only a .cmd shim exists (npm's npx on Windows).
+        std::fs::write(dir.path().join("npx.cmd"), "@echo off\necho fake npx\n").unwrap();
+        // An .exe exists too; it must win over the .cmd.
+        std::fs::write(dir.path().join("rustfmt.exe"), b"fake exe").unwrap();
+        std::fs::write(
+            dir.path().join("rustfmt.cmd"),
+            "@echo off\necho fake rustfmt\n",
+        )
+        .unwrap();
+        // Extension-less shim must NOT match (CreateProcess cannot run it).
+        std::fs::write(dir.path().join("prettier"), b"#!node\n").unwrap();
+
+        let dirs = vec![dir.path().to_path_buf()];
+
+        assert_eq!(
+            resolve_program_in_dirs("npx", &dirs),
+            dir.path().join("npx.cmd").to_string_lossy().into_owned(),
+            ".cmd shim should be resolved when no .exe exists"
+        );
+        assert_eq!(
+            resolve_program_in_dirs("rustfmt", &dirs),
+            dir.path()
+                .join("rustfmt.exe")
+                .to_string_lossy()
+                .into_owned(),
+            ".exe should take precedence over .cmd"
+        );
+        assert_eq!(
+            resolve_program_in_dirs("prettier", &dirs),
+            "prettier",
+            "extension-less shim must not be resolved"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_resolve_program_cmd_is_spawnable() {
+        // Core regression: the resolved .cmd path must actually be spawnable
+        // by std::process::Command (this is the Windows failure mode of #30).
+        let dir = tempfile::tempdir().unwrap();
+        let cmd_path = dir.path().join("fake_tool.cmd");
+        std::fs::write(&cmd_path, "@echo off\necho fake-tool-ok\n").unwrap();
+
+        let resolved = resolve_program_in_dirs("fake_tool", &[dir.path().to_path_buf()]);
+        assert_eq!(Path::new(&resolved), cmd_path);
+
+        let out = std::process::Command::new(&resolved)
+            .output()
+            .expect("resolved .cmd path should spawn");
+        assert!(out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("fake-tool-ok"),
+            "resolved .cmd should actually execute"
+        );
     }
 }
