@@ -128,6 +128,11 @@ pub struct ToolCallEventResult {
 
     /// Reason for blocking (shown to user).
     pub reason: Option<String>,
+
+    /// Replacement input used when the tool executes. Honored only when
+    /// `block` is false; `None` keeps the original `tool_call.arguments`.
+    #[serde(default)]
+    pub replace_input: Option<Value>,
 }
 
 /// Result from a tool_result event handler.
@@ -701,7 +706,8 @@ mod tests {
             result,
             ToolCallEventResult {
                 block: false,
-                reason: Some("nope".to_string())
+                reason: Some("nope".to_string()),
+                replace_input: None,
             }
         );
     }
@@ -712,6 +718,7 @@ mod tests {
             serde_json::from_value(json!({ "block": true })).expect("deserialize tool_call");
         assert!(tool_call.block);
         assert_eq!(tool_call.reason, None);
+        assert_eq!(tool_call.replace_input, None);
 
         let tool_result: ToolResultEventResult = serde_json::from_value(json!({
             "content": [{ "type": "text", "text": "hello" }],
@@ -726,6 +733,34 @@ mod tests {
         assert_eq!(input.content.as_deref(), Some("hi"));
         assert!(!input.block);
         assert_eq!(input.reason, None);
+    }
+
+    #[test]
+    fn tool_call_result_deserializes_replace_input() {
+        let result: ToolCallEventResult = serde_json::from_value(json!({
+            "replaceInput": { "command": "rtk git status" }
+        }))
+        .expect("deserialize replaceInput");
+        assert!(!result.block);
+        assert_eq!(result.reason, None);
+        assert_eq!(
+            result.replace_input,
+            Some(json!({ "command": "rtk git status" }))
+        );
+    }
+
+    #[test]
+    fn tool_call_result_block_ignores_replace_input() {
+        let result: ToolCallEventResult = serde_json::from_value(json!({
+            "block": true,
+            "replaceInput": { "command": "echo replaced" }
+        }))
+        .expect("deserialize block + replaceInput");
+        assert!(result.block);
+        assert_eq!(
+            result.replace_input,
+            Some(json!({ "command": "echo replaced" }))
+        );
     }
 
     #[test]

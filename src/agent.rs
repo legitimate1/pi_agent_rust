@@ -2970,7 +2970,7 @@ impl Agent {
 
     async fn execute_tool(
         &self,
-        tool_call: ToolCall,
+        mut tool_call: ToolCall,
         on_event: AgentEventHandler,
         latency: SharedTurnLatencyAccumulator,
         abort: Option<AbortSignal>,
@@ -2993,15 +2993,33 @@ impl Agent {
             .await;
             record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
 
-            if let Some(blocked_output) = hook_outcome {
-                (blocked_output, true)
-            } else {
-                let tool_started_at = Instant::now();
-                let outcome = self
-                    .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event), abort.clone())
-                    .await;
-                record_local_tool_latency(&latency, tool_started_at.elapsed());
-                outcome
+            match hook_outcome {
+                ToolCallHookOutcome::Blocked(blocked_output) => (blocked_output, true),
+                ToolCallHookOutcome::Replaced(replace_input) => {
+                    tool_call.arguments = replace_input;
+                    let tool_started_at = Instant::now();
+                    let outcome = self
+                        .execute_tool_without_hooks(
+                            &tool_call,
+                            Arc::clone(&on_event),
+                            abort.clone(),
+                        )
+                        .await;
+                    record_local_tool_latency(&latency, tool_started_at.elapsed());
+                    outcome
+                }
+                ToolCallHookOutcome::Continue => {
+                    let tool_started_at = Instant::now();
+                    let outcome = self
+                        .execute_tool_without_hooks(
+                            &tool_call,
+                            Arc::clone(&on_event),
+                            abort.clone(),
+                        )
+                        .await;
+                    record_local_tool_latency(&latency, tool_started_at.elapsed());
+                    outcome
+                }
             }
         } else {
             let tool_started_at = Instant::now();
@@ -3155,27 +3173,30 @@ impl Agent {
         extensions: &ExtensionManager,
         tool_call: &ToolCall,
         fail_closed_hooks: bool,
-    ) -> Option<ToolOutput> {
+    ) -> ToolCallHookOutcome {
         match extensions
             .dispatch_tool_call(tool_call, EXTENSION_EVENT_TIMEOUT_MS)
             .await
         {
-            Ok(Some(result)) if result.block => {
-                Some(Self::tool_call_blocked_output(result.reason.as_deref()))
-            }
-            Ok(_) => None,
+            Ok(Some(result)) if result.block => ToolCallHookOutcome::Blocked(
+                Self::tool_call_blocked_output(result.reason.as_deref()),
+            ),
+            Ok(Some(result)) => result
+                .replace_input
+                .map_or(ToolCallHookOutcome::Continue, ToolCallHookOutcome::Replaced),
+            Ok(None) => ToolCallHookOutcome::Continue,
             Err(err) => {
                 if fail_closed_hooks {
                     tracing::warn!(
                         error = ?err,
                         "tool_call extension hook failed (fail-closed)"
                     );
-                    Some(Self::tool_call_blocked_output(Some(
+                    ToolCallHookOutcome::Blocked(Self::tool_call_blocked_output(Some(
                         "extension hook failed",
                     )))
                 } else {
                     tracing::warn!("tool_call extension hook failed (fail-open): {err}");
-                    None
+                    ToolCallHookOutcome::Continue
                 }
             }
         }
@@ -3288,6 +3309,16 @@ impl Agent {
 
         tool_result
     }
+}
+
+/// Outcome of a `tool_call` extension hook dispatch.
+enum ToolCallHookOutcome {
+    /// No hook action: execute the tool with its original arguments.
+    Continue,
+    /// Hook blocked execution; return the provided output instead.
+    Blocked(ToolOutput),
+    /// Hook rewrote the tool arguments; execute with the replacement input.
+    Replaced(Value),
 }
 
 // ============================================================================
@@ -6247,6 +6278,145 @@ mod extensions_integration_tests {
             );
             if let [ContentBlock::Text(text)] = output.content.as_slice() {
                 assert_eq!(text.text, "Tool execution blocked: blocked bash in test");
+            }
+        });
+    }
+
+    #[test]
+    fn tool_call_hook_can_rewrite_bash_command_via_replace_input() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.on("tool_call", (event) => {
+                    const name = event && event.toolName ? String(event.toolName) : "";
+                    if (name === "bash") {
+                      return { replaceInput: { command: "echo replaced" } };
+                    }
+                    return undefined;
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let provider = Arc::new(NoopProvider);
+            let tools = ToolRegistry::new(&["bash"], temp_dir.path(), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+
+            agent_session
+                .enable_extensions(&["bash"], temp_dir.path(), None, &[entry_path])
+                .await
+                .expect("enable extensions");
+
+            let tool_call = ToolCall {
+                id: "call-1".to_string(),
+                name: "bash".to_string(),
+                arguments: json!({ "command": "printf 'original' > original.txt" }),
+                thought_signature: None,
+            };
+
+            let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
+            let (output, is_error) = agent_session
+                .agent
+                .execute_tool(tool_call, on_event, test_turn_latency(), None)
+                .await;
+
+            assert!(!is_error, "rewritten command should execute cleanly");
+            assert!(!output.is_error);
+            assert!(
+                !temp_dir.path().join("original.txt").exists(),
+                "original command should not run when replaceInput is applied"
+            );
+            let text = output
+                .content
+                .iter()
+                .find_map(|block| match block {
+                    ContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            assert!(
+                text.contains("replaced"),
+                "expected rewritten command output, got {text:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn tool_call_hook_block_takes_priority_over_replace_input() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.on("tool_call", (event) => {
+                    const name = event && event.toolName ? String(event.toolName) : "";
+                    if (name === "bash") {
+                      return {
+                        block: true,
+                        reason: "blocked bash in test",
+                        replaceInput: { command: "echo should-not-run" },
+                      };
+                    }
+                    return {};
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let provider = Arc::new(NoopProvider);
+            let tools = ToolRegistry::new(&["bash"], temp_dir.path(), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+
+            agent_session
+                .enable_extensions(&["bash"], temp_dir.path(), None, &[entry_path])
+                .await
+                .expect("enable extensions");
+
+            let tool_call = ToolCall {
+                id: "call-1".to_string(),
+                name: "bash".to_string(),
+                arguments: json!({ "command": "printf 'hi' > blocked.txt" }),
+                thought_signature: None,
+            };
+
+            let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
+            let (output, is_error) = agent_session
+                .agent
+                .execute_tool(tool_call, on_event, test_turn_latency(), None)
+                .await;
+
+            assert!(is_error);
+            assert!(output.is_error);
+            assert!(
+                !temp_dir.path().join("blocked.txt").exists(),
+                "expected bash command not to run when blocked"
+            );
+            if let [ContentBlock::Text(text)] = output.content.as_slice() {
+                assert_eq!(text.text, "Tool execution blocked: blocked bash in test");
+            } else {
+                panic!("expected blocked text output, got {:?}", output.content);
             }
         });
     }
