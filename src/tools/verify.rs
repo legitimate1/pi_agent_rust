@@ -32,6 +32,11 @@
 //! `npx.cmd`/`prettier.cmd` shims are located because `CreateProcess` cannot
 //! spawn bare `.cmd` names; other platforms pass names through unchanged.
 //!
+//! Checker processes are spawned with stdin set to null: verification is
+//! read-only and never consumes input. Inheriting the host's stdin (e.g. the
+//! JSONL pipe in Obsidian-hosted mode) makes `cmd.exe`-wrapped shims hang
+//! waiting on the pipe's write end, which the host keeps open (#34).
+//!
 //! All checkers report only — no automatic correction.
 
 use std::path::{Path, PathBuf};
@@ -527,8 +532,16 @@ fn run_external_process(
     args: &[&str],
     abort: Option<&AbortSignal>,
 ) -> Result<std::process::Output> {
+    // stdin=null is required (#34): verification is read-only and never
+    // consumes input. Inheriting the host's stdin (e.g. the JSONL pipe in
+    // Obsidian-hosted mode) makes cmd.exe-wrapped shims (`prettier.cmd`,
+    // `npx.cmd`) hang waiting on a pipe whose write end stays open in the
+    // host, blowing the 10s timeout. The availability probe below uses
+    // `.output()` (which defaults to null stdin) — that asymmetry is why
+    // probes never hung while checks did.
     let mut child = std::process::Command::new(program)
         .args(args)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -926,6 +939,39 @@ mod tests {
         let (passed, msg, checker) =
             run_external_checker_resolved(&PRETTIER_CHECKER, &file, None, &resolve).unwrap();
         assert!(passed, "direct check should pass: {:?}", msg);
+        assert_eq!(checker, "prettier");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_verify_spawn_uses_null_stdin() {
+        // #34 regression: checker subprocesses must get stdin=null, not the
+        // inherited host pipe. The fake .cmd reads one line from stdin:
+        // with null stdin, `set /p` hits EOF immediately (NO_INPUT, exit 0);
+        // if stdin were inherited from an open pipe/console it would block
+        // until the verify timeout kills the process tree.
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("stdin_probe.cmd");
+        std::fs::write(
+            &shim,
+            "@echo off\r\nset \"line=\"\r\nset /p line=\r\nif not defined line (echo NO_INPUT) else (echo GOT:%line%)\r\nexit /b 0\r\n",
+        )
+        .unwrap();
+        let shim_path = shim.to_string_lossy().into_owned();
+        let file = dir.path().join("foo.md");
+        std::fs::write(&file, "probe\n").unwrap();
+
+        let resolve = move |name: &str| -> String {
+            if name == "prettier" {
+                shim_path.clone()
+            } else {
+                resolver_all_missing(name)
+            }
+        };
+
+        let (passed, msg, checker) =
+            run_external_checker_resolved(&PRETTIER_CHECKER, &file, None, &resolve).unwrap();
+        assert!(passed, "stdin probe shim must see EOF: {:?}", msg);
         assert_eq!(checker, "prettier");
     }
 
