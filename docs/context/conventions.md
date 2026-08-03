@@ -48,6 +48,8 @@ guard.wait_with_cancellation(timeout_secs, abort.as_ref()).await?;
 
 > `ChildOnly` 模式已废弃。新增 spawn 子进程的工具必须使用 `ProcessGroupTree` + `isolate_command_process_group`。
 
+> **例外：verify 引擎**（`src/tools/verify.rs`）不使用 ProcessGuard — 它在 `spawn_blocking_io` 同步上下文中运行自己的轮询循环（`run_external_process`），50ms 轮询 + 10s wall-clock 超时 + abort 检查。超时/abort 时用 `terminate_process_tree`（Windows `taskkill /T /F` 杀整棵进程树，防 cmd 外壳泄漏 node 孤儿）而非 ProcessGuard 的 cleanup。新增 verify 子进程逻辑时沿用此模式，不要强行套 ProcessGuard（异步上下文不兼容）。
+
 ### 标准化 wait 方法
 
 优先使用 `guard.wait_with_cancellation(timeout_secs, abort.as_ref())`，它内置：

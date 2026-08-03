@@ -460,3 +460,18 @@
 
 **何时重新考虑**：如果 QuickJS 运行时支持 Promise 级取消（如外部 promise rejection 注入），可简化为一阶段优雅取消。
 
+## D25: verify 的 .ts 检查直调全局 prettier，回退 npx（2026-08-03）
+
+**决策**：verify 的 TypeScript 检查器从 `npx --no-install prettier --check` 改为**直调全局 `prettier --check`**（Windows 解析为 `prettier.cmd`），无全局安装时通过 `ExternalChecker.fallback` 链回退到 npx 包装。超时/abort 改为 `taskkill /T /F` 杀整棵进程树（`terminate_process_tree`）。
+
+**理由**：
+- npx 包装层触网（registry 探测，`fetch-timeout=300s` + retries=2），一次网络挂起即触发 verify 10s 超时（#32 偶发复现）；直调全局 prettier 是纯本地（`node %dp0%\node_modules\prettier\bin\prettier.cjs`），实测 ~270ms vs npx ~1.2s
+- 全局 prettier 是常见环境（`npm i -g prettier`），fallback 保留 npx 保证无全局环境零回归
+
+**不选 B 的原因**：
+- 放宽超时（如 30s）— 只把偶发超时延后，不改根因；verify 阻塞编辑流程的等待上限应保持低
+- 项目内安装 prettier 走本地依赖 — 需要改每个目标项目（pidian 等），verify 是宿主侧能力，不应要求项目侧安装
+- 缓存 npx 解析结果 — npx 仍可能触网（缓存失效/registry 变更），只缓解不根治
+
+**何时重新考虑**：如果目标环境普遍无全局 prettier 且 npx 不再触网（如 npx 增加纯离线解析模式），可重新评估以 npx 为主。`terminate_process_tree` 若需覆盖非 Windows（当前非 Windows 仅 `child.kill()` 单进程），可在支持进程组 kill 时扩展。
+

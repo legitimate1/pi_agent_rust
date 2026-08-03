@@ -59,7 +59,7 @@
 | **内置 pwsh 工具**（PowerShell 命令执行、尾部截断 2000 行/1MB、exit 0 时自动过滤 stderr、绝对路径 fallback 解决带空格 PATH 解析 bug） | ✅ | `src/tools/pwsh.rs` |
 | **运行时禁用内置工具**（`disabledTools` 配置） | ✅ | `src/config.rs` `src/main.rs` |
 | **工具描述外部覆盖**（`toolDescriptions` 配置，免编译修改工具描述） | ✅ | `src/config.rs` `src/tools/mod.rs` `src/agent.rs` |
-| **编辑后轻量验证（verify 参数）** — edit/hashline_edit/write 支持可选 verify 参数，编辑后自动运行语法/格式检查（.rs→rustfmt, .json/.toml→进程内解析, .ts→prettier）。结果附在 details.verify，不阻断流程。**扩展 checker 见 `verify-tool.md`** | ✅ | `src/tools/verify.rs` `src/tools/edit.rs` `src/tools/hashline.rs` `src/tools/write.rs` |
+| **编辑后轻量验证（verify 参数）** — edit/hashline_edit/write 支持可选 verify 参数，编辑后自动运行语法/格式检查（.rs→rustfmt, .json/.toml→进程内解析, .ts→prettier 全局直调、无全局安装时 npx 回退）。结果附在 details.verify，不阻断流程。**扩展 checker 见 `verify-tool.md`** | ✅ | `src/tools/verify.rs` `src/tools/edit.rs` `src/tools/hashline.rs` `src/tools/write.rs` |
 | **ProcessGuard 子进程生命周期管理** — 统一管理 spawn 子进程的清理：ambient cancellation、超时 kill、abort 信号检查、Drop 自动回收 | ✅ | `src/tools/mod.rs:3337` |
 | Tool trait + JSON Schema 定义 | ✅ | `src/tools/mod.rs` |
 | **Abort 信号原语** — 共享 `AbortHandle`/`AbortSignal`，打破 agent.rs ↔ tools/mod.rs 循环依赖 | ✅ | `src/abort.rs` |
