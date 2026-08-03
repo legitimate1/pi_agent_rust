@@ -119,4 +119,7 @@ loop {
 | 使用不安全的 `unsafe` 代码 | 纯 safe Rust | 项目 `forbid(unsafe_code)` |
 | 放任 `target/` 无限膨胀 | 定期 `cargo sweep --file` 清理旧产物 | Cargo 永不删除旧文件，debug .pdb 和增量缓存可累积到数百 GB |
 | 用裸 `std::process::Child` | 用 `ProcessGuard` 封装 | Drop 时不 kill 子进程，abort 后变孤儿 |
+| 用 `Path::is_absolute()` 判断"绝对形式路径" | 同时检查 `components()` 是否含 `RootDir`/`Prefix` | **Windows 上 `/tmp/x` 这类 root-relative 路径（无盘符）`is_absolute()` 返回 false**，会漏判导致路径逃逸校验失效（#33 及同类问题的根因，已在 conformance/mod.rs、logging.rs 修复） |
+| 测试 fixture 用 `format!("cwd:\"{}\"", path.display())` 拼 JSON | 用 `serde_json::to_string(&path.to_string_lossy())` | Windows 路径反斜杠未转义会生成非法 JSON（migrations 测试根因） |
+| 用 `PathBuf::push` 拼接 `C:` 盘符与相对段 | 显式 `format!("{drive}\\{path}")` | Windows 上 `PathBuf::from("C:").push("Users")` 得到 `C:Users`（丢分隔符，auth home_dir 根因） |
 | `cargo test <模块名>` 定位单元测试 | `cargo test --lib <模块名>` | 不加 `--lib` 会编译所有集成测试 target（e2e 等），大幅延长等待时间 |

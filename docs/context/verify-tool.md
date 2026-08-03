@@ -19,7 +19,7 @@
 verify_file(path, abort)
 ├── detect_file_type(path)       扩展名 → FileType
 ├── FileType::Json/Toml          → verify_json/verify_toml    进程内解析（serde_json/toml）
-└── FileType::Rust/TypeScript    → verify_external(&CHECKER)  spawn_blocking_io 包装
+└── FileType::Rust/TypeScript/Markdown → verify_external(&CHECKER)  spawn_blocking_io 包装
                                      └── run_external_checker(共享执行器, 失败时走 checker.fallback 链)
 ```
 
@@ -28,7 +28,7 @@ verify_file(path, abort)
 | 类别 | 例子 | 特点 |
 |:-----|:-----|:-----|
 | **进程内**（internal） | `.json` → serde_json、`.toml` → toml | 无子进程、无超时、错误自带行列号、无限大小 |
-| **外部进程**（external） | `.rs` → rustfmt、`.ts` → prettier（全局直调，npx 回退） | 1MB 阈值、10s 超时、程序名经 `resolve_program` 解析、失败消息规范化（ANSI 剥离 + diff + fix hint + 截断） |
+| **外部进程**（external） | `.rs` → rustfmt、`.ts`/`.md` → prettier（全局直调，npx 回退） | 1MB 阈值、10s 超时、程序名经 `resolve_program` 解析、失败消息规范化（ANSI 剥离 + diff + fix hint + 截断） |
 
 ### 外部进程 checker 是表驱动声明式的
 

@@ -68,7 +68,7 @@ Session persistence + index (JSONL, optional SQLite)
 | `abort.rs` | 共享 AbortHandle/AbortSignal 原语，打破 agent ↔ tools 循环依赖 |
 | `app.rs` | 系统提示词构建（SYSTEM.md 加载、default_system_prompt、project context files） |
 | `tools/` 模块目录 | ToolRegistry + 9 内置工具模块 + verify 内部验证引擎 |
-| `tools/verify.rs` | 编辑后轻量验证引擎：文件类型检测→检查器映射（.rs/.json/.toml/.ts）→进程内/外部进程执行 |
+| `tools/verify.rs` | 编辑后轻量验证引擎：文件类型检测→检查器映射（.rs/.json/.toml/.ts/.md）→进程内/外部进程执行 |
 | `agent.rs` | Agent 循环（工具迭代、扩展合并、ToolDef 构建） |
 | `extensions.rs` | 扩展管理器、能力策略、生命周期 |
 | `extensions_js.rs` | QuickJS 运行时、虚拟模块、HostcallKind |

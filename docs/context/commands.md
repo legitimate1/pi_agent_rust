@@ -36,7 +36,7 @@ cargo sweep --file
 cargo sweep --time 30
 ```
 
-部署脚本 `deploy-release.ps1` 已在末尾自动执行 `cargo sweep --stamp`，每次部署后跑一次 `cargo sweep --file` 即可清理旧产物。
+部署脚本 `deploy-release.ps1` 末尾自动执行 **`cargo sweep --file` → `cargo sweep --stamp`**（先清理上次部署前的旧产物，再更新基线），无需手动清理。首次部署（无 stamp）自动跳过清理只打标记。
 
 ### 构建优化配置（`.cargo/config.toml`）
 
