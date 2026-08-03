@@ -475,3 +475,19 @@
 
 **何时重新考虑**：如果目标环境普遍无全局 prettier 且 npx 不再触网（如 npx 增加纯离线解析模式），可重新评估以 npx 为主。`terminate_process_tree` 若需覆盖非 Windows（当前非 Windows 仅 `child.kill()` 单进程），可在支持进程组 kill 时扩展。
 
+## D26: verify 子进程 stdin 置 null，防宿主管道挂起（2026-08-03）
+
+**决策**：`run_external_process`（`src/tools/verify.rs`）spawn 检查器子进程时显式 `stdin(Stdio::null())`，与全库其他 20+ 处 spawn 一致。
+
+**理由**：
+- verify 只读不消费输入；继承宿主 stdin（Obsidian 宿主 = 活跃 JSONL 管道，写端常开）时，`cmd.exe` 包装的 shim（`prettier.cmd`/`npx.cmd`）等待该管道不退出 → 10s 超时（#34，宿主内 .ts/.md 稳定复现；rustfmt 是 .exe 直连无 cmd 层，不受影响）
+- probe（`--version`，`.output()` 默认 stdin=null）从不超时，check（stdin 未设）恒超时——同一程序仅差 stdin 处理，定位根因
+
+**不选 B 的原因**：
+- 放宽超时（如 30s）— 不改根因，verify 兜底仍丢失；阻塞编辑流程的等待上限应保持低
+- 手动包装 stdin 管道并主动 EOF — verify 永不读 stdin，无收益且复杂化
+
+**修正 D25**：#32 的 npx 超时根因实为同一 stdin 继承问题（cmd shim 挂起），网络只是放大因素；D25 直调 prettier 保留了 cmd 层，故 #34 中 .ts/.md 超时复现。D25 的直调决策本身仍成立（性能 ~4x 提升 + 无网络依赖）。
+
+**何时重新考虑**：若未来 verify 需要读取 stdin 输入（当前无此需求），需重新设计管道生命周期。
+

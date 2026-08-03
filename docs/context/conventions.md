@@ -48,7 +48,7 @@ guard.wait_with_cancellation(timeout_secs, abort.as_ref()).await?;
 
 > `ChildOnly` 模式已废弃。新增 spawn 子进程的工具必须使用 `ProcessGroupTree` + `isolate_command_process_group`。
 
-> **例外：verify 引擎**（`src/tools/verify.rs`）不使用 ProcessGuard — 它在 `spawn_blocking_io` 同步上下文中运行自己的轮询循环（`run_external_process`），50ms 轮询 + 10s wall-clock 超时 + abort 检查。超时/abort 时用 `terminate_process_tree`（Windows `taskkill /T /F` 杀整棵进程树，防 cmd 外壳泄漏 node 孤儿）而非 ProcessGuard 的 cleanup。新增 verify 子进程逻辑时沿用此模式，不要强行套 ProcessGuard（异步上下文不兼容）。
+> **例外：verify 引擎**（`src/tools/verify.rs`）不使用 ProcessGuard — 它在 `spawn_blocking_io` 同步上下文中运行自己的轮询循环（`run_external_process`），50ms 轮询 + 10s wall-clock 超时 + abort 检查。超时/abort 时用 `terminate_process_tree`（Windows `taskkill /T /F` 杀整棵进程树，防 cmd 外壳泄漏 node 孤儿）而非 ProcessGuard 的 cleanup。新增 verify 子进程逻辑时沿用此模式，不要强行套 ProcessGuard（异步上下文不兼容）。子进程 spawn 必须显式 `stdin(Stdio::null())`（#34：继承宿主 JSONL 管道会让 cmd 包装的 shim 挂起）。
 
 ### 标准化 wait 方法
 
@@ -119,6 +119,7 @@ loop {
 | 使用不安全的 `unsafe` 代码 | 纯 safe Rust | 项目 `forbid(unsafe_code)` |
 | 放任 `target/` 无限膨胀 | 定期 `cargo sweep --file` 清理旧产物 | Cargo 永不删除旧文件，debug .pdb 和增量缓存可累积到数百 GB |
 | 用裸 `std::process::Child` | 用 `ProcessGuard` 封装 | Drop 时不 kill 子进程，abort 后变孤儿 |
+| spawn 子进程不显式设置 stdin（依赖默认继承） | 显式 `.stdin(Stdio::null())` 或 `Stdio::piped()` | 默认继承父进程 stdin；GUI 宿主（Obsidian/Electron）下父进程 stdin 是活跃 JSONL 管道，cmd 包装的 shim（`prettier.cmd`/`npx.cmd`）等待该管道挂起，verify 10s 超时（#34）。全库 20+ 处 spawn 均显式 null，唯 verify 遗漏 |
 | 用 `Path::is_absolute()` 判断"绝对形式路径" | 同时检查 `components()` 是否含 `RootDir`/`Prefix` | **Windows 上 `/tmp/x` 这类 root-relative 路径（无盘符）`is_absolute()` 返回 false**，会漏判导致路径逃逸校验失效（#33 及同类问题的根因，已在 conformance/mod.rs、logging.rs 修复） |
 | 测试 fixture 用 `format!("cwd:\"{}\"", path.display())` 拼 JSON | 用 `serde_json::to_string(&path.to_string_lossy())` | Windows 路径反斜杠未转义会生成非法 JSON（migrations 测试根因） |
 | 用 `PathBuf::push` 拼接 `C:` 盘符与相对段 | 显式 `format!("{drive}\\{path}")` | Windows 上 `PathBuf::from("C:").push("Users")` 得到 `C:Users`（丢分隔符，auth home_dir 根因） |
