@@ -48,11 +48,15 @@
 
 ## 静态检查（质量门禁）
 
-改代码后必须跑：
-
-```pwsh
-cargo clippy --all-targets -- -D warnings && cargo fmt --check
-```
+- **日常改动**（轻量，快速反馈）：
+  ```pwsh
+  cargo clippy --lib -- -D warnings && cargo fmt --check
+  ```
+- **收尾**（全部改动完成后，与全量测试一起跑）：
+  ```pwsh
+  cargo clippy --all-targets -- -D warnings && cargo fmt --check
+  ```
+  `--all-targets` 会编译全部集成测试二进制（Windows 下单个 ~64MB，全套 ~30GB），只允许在收尾时跑。
 
 ## 构建与部署
 
@@ -68,13 +72,24 @@ cargo clippy --all-targets -- -D warnings && cargo fmt --check
 用户说「部署」→ .\scripts\deploy-release.ps1
 ```
 
+> 构建前**不**重复跑全量测试 — 收尾门禁已验证过。若用户中途要求构建（改动未收尾），先跑针对性测试确认无误再构建。部署脚本自动执行 `cargo sweep --file` + `--stamp` 清理旧产物，无需手动清理。
+
 ## 测试
 
+- **日常改动**：只跑针对性测试（`cargo test <模块>` / `cargo test --test <文件>`），
+  外加轻量静态检查 `cargo clippy --lib -- -D warnings && cargo fmt --check`。
+  禁止日常跑全量 `cargo test`（全量编译 ~30GB debug 产物，见「静态检查」）。
+- **全部改动完成（收尾）**：跑一次全量 `cargo test` + `cargo clippy --all-targets -- -D warnings`
+  + `cargo fmt --check`，通过后**提醒用户构建**（不自动构建）。
+- 创建/修改测试文件时：必须运行该测试文件直到通过。
+
+常用针对性命令：
+
 ```pwsh
-cargo test                    # 全部
-cargo test -- --nocapture     # 带输出
-cargo test conformance        # 一致性测试
-cargo test sse::tests         # 特定模块
+cargo test --test conformance_fixtures   # 特定集成测试文件
+cargo test conformance                   # 一致性测试
+cargo test sse::tests                    # 特定模块
+cargo test -- --nocapture                # 带输出
 ```
 
 ### 一致性测试
@@ -124,7 +139,7 @@ cargo test sse::tests         # 特定模块
 ## 会话结束
 
 1. 为未完成的工作创建问题
-2. 跑测试、静态检查、构建
+2. 跑收尾质量门禁（全量测试 + clippy --all-targets + fmt，通过后提醒用户构建）
 3. 更新问题状态
 4. **推送到远程（强制）：**
    ```bash

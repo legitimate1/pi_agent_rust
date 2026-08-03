@@ -416,6 +416,7 @@ fn validate_coverage_path(path: &str, field_name: &str, index: usize) -> Result<
     let parsed = Path::new(&normalized);
     if parsed.is_absolute()
         || looks_like_windows_absolute_path(&normalized)
+        || normalized.starts_with('/')
         || candidate.starts_with("\\\\")
         || normalized.starts_with("//")
     {

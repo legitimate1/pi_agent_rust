@@ -183,7 +183,13 @@ fn conformance_golden_root() -> PathBuf {
 
 fn resolve_golden_path(relative: &str) -> Result<PathBuf, String> {
     let relative_path = Path::new(relative);
-    if relative_path.is_absolute() {
+
+    // Windows 上 root-relative 路径（如 /tmp/x，无盘符）is_absolute() 为 false，
+    // 但仍是绝对形式，必须显式检查 RootDir/Prefix 组件，跨平台一致拒绝。
+    let has_root_component = relative_path
+        .components()
+        .any(|c| matches!(c, Component::RootDir | Component::Prefix(_)));
+    if relative_path.is_absolute() || has_root_component {
         return Err(format!(
             "Golden path must be relative to tests/conformance/goldens: {relative}"
         ));

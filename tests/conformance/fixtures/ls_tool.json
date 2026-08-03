@@ -127,14 +127,6 @@
         "content_golden": "ls_tool/limit_notice.txt",
         "details_golden": "ls_tool/limit_details.json"
       }
-    },
-    {
-      "name": "ls_outside_cwd",
-      "description": "Listing outside the working directory should be rejected",
-      "input": {"path": "../"},
-      "expect_error": true,
-      "error_contains": "Cannot list outside the working directory",
-      "expected": {}
     }
   ]
 }

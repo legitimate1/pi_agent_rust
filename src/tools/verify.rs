@@ -12,6 +12,7 @@
 //! | `.json`   | `serde_json::from_str` | process-internal | unlimited |
 //! | `.toml`   | `toml::from_str` | process-internal | unlimited |
 //! | `.ts`     | `prettier --check` (global install; `npx --no-install` fallback) | external process | ≤1MB |
+//! | `.md`     | `prettier --check` (same checker as `.ts`) | external process | ≤1MB |
 //!
 //! # Architecture
 //!
@@ -49,6 +50,7 @@ pub enum FileType {
     Json,
     Toml,
     TypeScript,
+    Markdown,
 }
 
 /// Single-file verification result.
@@ -78,6 +80,7 @@ fn detect_file_type(path: &Path) -> Option<FileType> {
         "json" => Some(FileType::Json),
         "toml" => Some(FileType::Toml),
         "ts" | "tsx" => Some(FileType::TypeScript),
+        "md" | "markdown" => Some(FileType::Markdown),
         _ => None,
     }
 }
@@ -302,7 +305,9 @@ pub async fn verify_file(path: PathBuf, abort: Option<AbortSignal>) -> Result<Ve
         FileType::Json => verify_json(&path)?,
         FileType::Toml => verify_toml(&path)?,
         FileType::Rust => verify_external(&RUSTFMT_CHECKER, &path, abort).await?,
-        FileType::TypeScript => verify_external(&PRETTIER_CHECKER, &path, abort).await?,
+        FileType::TypeScript | FileType::Markdown => {
+            verify_external(&PRETTIER_CHECKER, &path, abort).await?
+        }
     };
 
     #[allow(clippy::cast_possible_truncation)]
@@ -645,6 +650,14 @@ mod tests {
         assert_eq!(
             detect_file_type(Path::new("foo.tsx")),
             Some(FileType::TypeScript)
+        );
+        assert_eq!(
+            detect_file_type(Path::new("foo.md")),
+            Some(FileType::Markdown)
+        );
+        assert_eq!(
+            detect_file_type(Path::new("foo.markdown")),
+            Some(FileType::Markdown)
         );
         assert_eq!(detect_file_type(Path::new("foo.py")), None);
         assert_eq!(detect_file_type(Path::new("foo")), None);

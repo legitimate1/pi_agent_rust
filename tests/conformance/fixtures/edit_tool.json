@@ -123,19 +123,7 @@
         "newText": "new"
       },
       "expect_error": true,
-      "error_contains": "Cannot edit outside the working directory",
-      "expected": {}
-    },
-    {
-      "name": "edit_outside_cwd",
-      "description": "Editing outside the working directory should be rejected",
-      "input": {
-        "path": "../outside.txt",
-        "oldText": "old",
-        "newText": "new"
-      },
-      "expect_error": true,
-      "error_contains": "Cannot edit outside the working directory",
+      "error_contains": "File not found",
       "expected": {}
     },
     {

@@ -1,1 +1,5 @@
 legacy_pi_mono_code/pi-mono/** -whitespace
+
+# Conformance golden files must stay LF: CRLF conversion breaks content
+# comparison against tool output, which normalizes to LF.
+tests/conformance/goldens/** text eol=lf

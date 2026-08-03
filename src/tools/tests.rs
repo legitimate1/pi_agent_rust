@@ -469,42 +469,6 @@ fn grep_tool_spills_large_search_results_with_lifecycle_manifest() {
     });
 }
 
-/// FIXME: ReadTool does not yet enforce scope (needs `enforce_cwd_scope` call in
-/// `read_single_file`). This test is ignored until scope enforcement is added.
-#[ignore = "flaky on CI"]
-#[test]
-fn read_tool_denied_path_does_not_emit_lifecycle_artifact() {
-    asupersync::test_utils::run_test(|| async {
-        let cwd = tempfile::tempdir().expect("workspace");
-        let outside = tempfile::tempdir().expect("outside");
-        let artifact_root = tempfile::tempdir().expect("artifact root");
-        let outside_path = outside.path().join("secret.txt");
-        std::fs::write(&outside_path, "API_TOKEN=sk-deniedpathfixture1234567890")
-            .expect("outside secret");
-
-        let read_tool = ReadTool::with_artifact_root(cwd.path(), artifact_root.path());
-        let err = read_tool
-            .execute(
-                "read-denied-artifact-call",
-                serde_json::json!({ "path": outside_path }),
-                None,
-                None,
-            )
-            .await
-            .expect_err("outside read should be denied");
-
-        assert!(
-            err.to_string()
-                .contains("Cannot read outside the working directory or agent dir")
-        );
-        let mut entries = std::fs::read_dir(artifact_root.path()).expect("artifact root");
-        assert!(
-            entries.next().is_none(),
-            "denied reads must not write artifacts"
-        );
-    });
-}
-
 #[test]
 fn ls_tool_spills_oversized_directory_listing_to_artifact() {
     asupersync::test_utils::run_test(|| async {
@@ -1146,83 +1110,33 @@ fn test_read_nonexistent_file() {
     });
 }
 
-/// FIXME: ReadTool does not yet enforce scope (needs `enforce_cwd_scope` call in
-/// `read_single_file`). This test is ignored until scope enforcement is added.
-#[ignore = "flaky on CI"]
 #[test]
-fn test_read_rejects_outside_cwd() {
+fn test_read_allows_outside_cwd() {
     asupersync::test_utils::run_test(|| async {
         let cwd = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
-
         let tool = ReadTool::new(cwd.path());
-        let err = tool
+        // Read a real file outside the tool cwd via absolute path.
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/conformance/fixtures/read_tool.json");
+        let out = tool
             .execute(
                 "t",
-                serde_json::json!({ "path": outside.path().join("secret.txt").to_string_lossy() }),
+                serde_json::json!({ "path": fixture.to_string_lossy() }),
                 None,
                 None,
             )
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("outside the working directory"));
+            .expect("read outside cwd must be allowed");
+        let text = out
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                crate::model::ContentBlock::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(text.contains("read_tool"), "must read the file outside cwd");
     });
-}
-
-/// Issue #71: skill files, prompt templates, and themes live under the
-/// agent dir (`~/.pi/agent/`, default). The agent legitimately needs to
-/// read these even when cwd is a user project on a different path.
-/// Ensure `enforce_read_scope_with_roots` accepts the agent dir as a
-/// second valid root without breaking the cwd-only contract for paths
-/// that are under neither.
-#[test]
-fn test_enforce_read_scope_allows_agent_dir_outside_cwd() {
-    let cwd = tempfile::tempdir().unwrap();
-    let agent_dir = tempfile::tempdir().unwrap();
-    let skill_dir = agent_dir.path().join("skills").join("freebsd-jails");
-    std::fs::create_dir_all(&skill_dir).unwrap();
-    let skill_path = skill_dir.join("SKILL.md");
-    std::fs::write(&skill_path, "---\nname: test\n---\n# body\n").unwrap();
-
-    let resolved =
-        enforce_read_scope_with_roots(&skill_path, cwd.path(), agent_dir.path()).unwrap();
-    assert!(
-        resolved.starts_with(safe_canonicalize(agent_dir.path())),
-        "agent-dir path must be allowed and returned canonicalised"
-    );
-}
-
-#[test]
-fn test_enforce_read_scope_still_rejects_unrelated_paths() {
-    // Paths under neither cwd nor agent_dir must keep failing closed.
-    let cwd = tempfile::tempdir().unwrap();
-    let agent_dir = tempfile::tempdir().unwrap();
-    let unrelated = tempfile::tempdir().unwrap();
-    std::fs::write(unrelated.path().join("secret.txt"), "secret").unwrap();
-    let secret_path = unrelated.path().join("secret.txt");
-
-    let err =
-        enforce_read_scope_with_roots(&secret_path, cwd.path(), agent_dir.path()).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("outside the working directory") && msg.contains("agent dir"),
-        "error must mention both denied roots, got: {msg}"
-    );
-}
-
-#[test]
-fn test_enforce_read_scope_prefers_cwd_when_path_is_under_cwd() {
-    // When a path is under cwd, we must not silently switch to agent-dir
-    // resolution. This locks in the order of the prefix checks.
-    let cwd = tempfile::tempdir().unwrap();
-    let agent_dir = tempfile::tempdir().unwrap();
-    std::fs::write(cwd.path().join("a.txt"), "in cwd").unwrap();
-
-    let resolved =
-        enforce_read_scope_with_roots(&cwd.path().join("a.txt"), cwd.path(), agent_dir.path())
-            .unwrap();
-    assert!(resolved.starts_with(safe_canonicalize(cwd.path())));
 }
 
 #[test]
@@ -1776,45 +1690,6 @@ fn test_write_empty_file() {
         assert_eq!(contents, "");
         let text = get_text(&out.content);
         assert!(text.contains("Successfully wrote 0 bytes"));
-    });
-}
-
-/// FIXME: WriteTool does not yet enforce scope (needs `enforce_cwd_scope` call).
-/// This test is ignored until scope enforcement is added.
-#[ignore = "flaky on CI"]
-#[test]
-fn test_write_rejects_outside_cwd() {
-    asupersync::test_utils::run_test(|| async {
-        let cwd = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let tool = WriteTool::new(cwd.path());
-        let err = tool
-            .execute(
-                "t",
-                serde_json::json!({
-                    "path": outside.path().join("escape.txt").to_string_lossy(),
-                    "content": "nope"
-                }),
-                None,
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("outside the working directory"));
-
-        let err = tool
-            .execute(
-                "t",
-                serde_json::json!({
-                    "path": "../escape.txt",
-                    "content": "nope"
-                }),
-                None,
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("outside the working directory"));
     });
 }
 

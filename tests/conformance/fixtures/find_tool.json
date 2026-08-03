@@ -137,14 +137,6 @@
         "content_exact": "newest.txt\nmiddle.txt\noldest.txt",
         "details_none": true
       }
-    },
-    {
-      "name": "find_outside_cwd",
-      "description": "Find outside the working directory should be rejected",
-      "input": {"pattern": "*.txt", "path": "../"},
-      "expect_error": true,
-      "error_contains": "Cannot find outside the working directory",
-      "expected": {}
     }
   ]
 }

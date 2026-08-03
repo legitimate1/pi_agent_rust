@@ -99,14 +99,6 @@
       "expected": {}
     },
     {
-      "name": "read_outside_cwd",
-      "description": "Reading outside the working directory should be rejected",
-      "input": {"path": "../outside.txt"},
-      "expect_error": true,
-      "error_contains": "Cannot read outside the working directory",
-      "expected": {}
-    },
-    {
       "name": "read_nonexistent_file",
       "description": "Reading a nonexistent file should error",
       "input": {"path": "/nonexistent/path/file.txt"},

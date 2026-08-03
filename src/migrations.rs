@@ -646,8 +646,8 @@ mod tests {
         write(
             &agent_dir.join("legacy-session.jsonl"),
             &format!(
-                "{{\"type\":\"session\",\"cwd\":\"{}\",\"id\":\"abc\"}}\n{{\"type\":\"message\"}}\n",
-                cwd.display()
+                "{{\"type\":\"session\",\"cwd\":{},\"id\":\"abc\"}}\n{{\"type\":\"message\"}}\n",
+                serde_json::to_string(&cwd.to_string_lossy()).expect("serialize cwd")
             ),
         );
 
@@ -742,7 +742,10 @@ mod tests {
         );
         write(
             &agent_dir.join("legacy.jsonl"),
-            &format!("{{\"type\":\"session\",\"cwd\":\"{}\"}}\n", cwd.display()),
+            &format!(
+                "{{\"type\":\"session\",\"cwd\":{}}}\n",
+                serde_json::to_string(&cwd.to_string_lossy()).expect("serialize cwd")
+            ),
         );
         write(&agent_dir.join("commands/hello.md"), "# hello");
         write(&agent_dir.join("tools/fd"), "fd-binary");

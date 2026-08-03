@@ -630,7 +630,7 @@ impl Tool for EditTool {
                 },
                 "verify": {
                     "type": "boolean",
-                    "description": "若为 true，编辑后自动运行语法检查（.rs → rustfmt --check, .json/.toml → 进程内解析, .ts → prettier --check）。依赖工具需在 PATH 中可用。默认 true。",
+                    "description": "若为 true，编辑后自动运行语法检查（.rs → rustfmt --check, .json/.toml → 进程内解析, .ts/.md → prettier --check）。依赖工具需在 PATH 中可用。默认 true。",
                     "default": true
                 }
             },

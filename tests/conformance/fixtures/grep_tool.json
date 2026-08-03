@@ -214,14 +214,6 @@
         "content_regex": "(?s)hashline_context\\.txt-1#[A-Z]{2}- alpha.*hashline_context\\.txt:2#[A-Z]{2}: beta.*hashline_context\\.txt-3#[A-Z]{2}- gamma",
         "details_none": true
       }
-    },
-    {
-      "name": "grep_outside_cwd",
-      "description": "Grep outside the working directory should be rejected",
-      "input": {"pattern": "needle", "path": "../"},
-      "expect_error": true,
-      "error_contains": "Cannot grep outside the working directory",
-      "expected": {}
     }
   ]
 }

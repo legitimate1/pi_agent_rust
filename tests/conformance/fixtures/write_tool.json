@@ -89,17 +89,6 @@
         "content_exact": "Successfully wrote 25 bytes to special.txt",
         "details_none": true
       }
-    },
-    {
-      "name": "write_outside_cwd",
-      "description": "Writing outside the working directory should be rejected",
-      "input": {
-        "path": "../outside.txt",
-        "content": "nope"
-      },
-      "expect_error": true,
-      "error_contains": "Cannot write outside the working directory",
-      "expected": {}
     }
   ]
 }

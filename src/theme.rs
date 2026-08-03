@@ -1029,8 +1029,8 @@ mod tests {
     #[test]
     fn load_by_name_invalid_project_override_does_not_fall_back_to_global() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let global_themes = dir.path().join("global/themes");
-        let project_themes = dir.path().join("project/themes");
+        let global_themes = dir.path().join("global").join("themes");
+        let project_themes = dir.path().join("project").join("themes");
         fs::create_dir_all(&global_themes).unwrap();
         fs::create_dir_all(&project_themes).unwrap();
 
@@ -1050,8 +1050,10 @@ mod tests {
             message.contains("Failed to load theme 'shared'"),
             "unexpected error: {message}"
         );
+        let expected_path = project_themes.join("shared.json");
+        let expected_path_str = expected_path.to_string_lossy().to_string();
         assert!(
-            message.contains("project/themes/shared.json"),
+            message.contains(&expected_path_str),
             "unexpected error: {message}"
         );
     }

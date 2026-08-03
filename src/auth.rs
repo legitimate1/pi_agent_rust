@@ -1649,9 +1649,10 @@ where
             if path.starts_with('\\') || path.starts_with('/') {
                 Some(PathBuf::from(format!("{drive}{path}")))
             } else {
-                let mut combined = PathBuf::from(drive);
-                combined.push(path);
-                Some(combined)
+                // HOMEPATH without a leading separator (e.g. `Users\foo`):
+                // join with an explicit separator — PathBuf::push on a drive
+                // root (`C:`) does not insert one.
+                Some(PathBuf::from(format!("{drive}\\{path}")))
             }
         })
 }
@@ -3078,9 +3079,10 @@ where
             if path.starts_with('\\') || path.starts_with('/') {
                 Some(PathBuf::from(format!("{drive}{path}")))
             } else {
-                let mut combined = PathBuf::from(drive);
-                combined.push(path);
-                Some(combined)
+                // HOMEPATH without a leading separator (e.g. `Users\foo`):
+                // join with an explicit separator — PathBuf::push on a drive
+                // root (`C:`) does not insert one.
+                Some(PathBuf::from(format!("{drive}\\{path}")))
             }
         })
 }
