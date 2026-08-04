@@ -577,3 +577,19 @@
 - 仅放宽多入口加载的容错（失败入口忽略）— 掩盖误判根因，多扩展仍会被合并加载产生副作用（root 注册扩散、同名命令冲突）
 
 **何时重新考虑**：若未来引入真正的「extensions 根下多目录 bundle」合法场景（如显式 manifest 声明），应改为按 manifest 判 bundle，而非目录结构启发式；届时两个 guard 需同步调整。
+
+## D28: manifest-aware 扩展加载——有 extension.json 时禁用 sibling 发现（2026-08-04）
+
+**决策**：`discover_related_extension_entries`（`src/extensions.rs`）在 primary 所在目录存在 `extension.json`（或 package.json 的 `pi.ext.manifest.v1` schema）时，只返回 manifest 声明的 entrypoint，跳过全部 sibling 启发式发现（`discover_sibling_extension_entries` / `discover_sibling_index_entries`）。
+
+**理由**：
+
+- `extension.json` 明确声明 entrypoint，是唯一权威入口；启发式发现会把目录内模块文件（`commands.ts` 调 `pi.registerCommand`）和子目录门面（`fusion/index.ts`）误判为额外入口，逐个加载耗尽 hostcall budget（实测 3 入口超 10s 超时）
+- 误判的子目录会被 `load_one_extension` 注册为 extension root，导致扩展内合法相对 import（如 `fusion/orchestrator.ts` 的 `../config`）被 `detect_monorepo_escape` 误判为逃逸、生成空 stub——问题 2 是问题 1 的连带，无需单独修
+
+**不选 B 的原因**：
+
+- 收紧 `is_likely_flat_extension_entry` 启发式 — 启发式永远有盲区，无法可靠区分「模块文件」与「真入口」；manifest 是权威声明，应直接信任
+- 放宽 `detect_monorepo_escape` 判定（任一 root 下即合法）— 破坏 monorepo 不跨包引用的安全语义（现有测试 `detect_monorepo_escape_uses_nearest_base_root` 明确该语义）
+
+**何时重新考虑**：若未来支持「manifest 多入口」（extension.json 声明多个 entrypoint），本 guard 应改为信任 manifest 的完整入口列表，而不是回退启发式。
