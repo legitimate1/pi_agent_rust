@@ -21487,6 +21487,24 @@ fn discover_related_extension_entries(primary: &Path) -> Result<Vec<PathBuf>> {
     let mut seen = BTreeSet::new();
     let _ = seen.insert(canonical_primary.clone());
 
+    // Manifest-aware: when the extension declares an entrypoint via
+    // `extension.json` (or `package.json` with a `pi.ext.manifest.v1`
+    // schema), trust the manifest and load ONLY the declared entrypoint.
+    // Skipping heuristic sibling discovery here is important because:
+    // - module files inside the extension (e.g. `commands.ts` calling
+    //   `pi.registerCommand`) look like flat extension entries
+    // - subdirectory facades (e.g. `fusion/index.ts`) look like dir entries
+    // Both would be wrongly loaded as extra entrypoints, each paying a
+    // multi-second hostcall budget, and the subdirectory would be registered
+    // as an extension root (breaking relative imports that stay inside the
+    // extension). Bundles declared via `package.json` `pi.extensions` arrays
+    // (no schema) do NOT hit this guard and keep heuristic discovery.
+    if let Some(parent_dir) = primary.parent()
+        && load_extension_manifest(parent_dir)?.is_some()
+    {
+        return Ok(out);
+    }
+
     let mut selected_package_dir: Option<PathBuf> = None;
     let mut selected_package_entries_len = 0usize;
     let mut selected_resolved: Vec<PathBuf> = Vec::new();
@@ -32494,6 +32512,53 @@ mod tests {
         let discovered = discover_related_extension_entries(&index)
             .expect("manifest should keep internal helper indexes private");
         assert_eq!(discovered, vec![safe_canonicalize(&index)]);
+    }
+
+    #[test]
+    fn discover_related_extension_entries_trusts_extension_json_manifest_entrypoint_only() {
+        // Regression for #35 follow-up: an extension.json manifest declares
+        // THE entrypoint. Internal module files (commands.ts calling
+        // pi.registerCommand) and subdirectory facades (fusion/index.ts) must
+        // NOT be discovered as extra entrypoints, otherwise they each pay a
+        // multi-second hostcall budget and the subdirectory gets registered
+        // as an extension root (breaking relative imports that stay inside
+        // the extension).
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("manifest-ext");
+        let fusion = root.join("fusion");
+        std::fs::create_dir_all(&fusion).expect("mkdir fusion");
+
+        let index = root.join("index.ts");
+        let commands = root.join("commands.ts");
+        let fusion_index = fusion.join("index.ts");
+        std::fs::write(
+            root.join("extension.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": "pi.ext.manifest.v1",
+                "extension_id": "manifest-ext",
+                "name": "Manifest Ext",
+                "version": "0.1.0",
+                "api_version": "1.0",
+                "runtime": "js",
+                "entrypoint": "index.ts",
+                "capabilities": []
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write extension.json");
+        std::fs::write(&index, "export default function init(_pi) {}\n").expect("write index");
+        std::fs::write(&commands, "pi.registerCommand('x', { run: () => {} });\n")
+            .expect("write commands");
+        std::fs::write(&fusion_index, "export function runFusion(_pi) {}\n")
+            .expect("write fusion index");
+
+        let discovered = discover_related_extension_entries(&index)
+            .expect("extension.json manifest should keep module files private");
+        assert_eq!(
+            discovered,
+            vec![safe_canonicalize(&index)],
+            "manifest-declared entrypoint must be the only discovered entry"
+        );
     }
 
     #[test]

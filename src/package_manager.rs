@@ -2195,6 +2195,20 @@ impl PackageManager {
             }
         }
 
+        // Also collect extension entrypoints at the package root itself.
+        // A package can mix resource subdirectories (prompts/, themes/, ...)
+        // with a root-level extension entry (index.ts / extension.json /
+        // package.json#pi.extensions). Without this, the extension part is
+        // silently dropped when `has_any_dir` is true (the caller only falls
+        // back to adding the root as an extension when NOTHING was collected).
+        if let Some(root_entries) = resolve_extension_entries(package_root) {
+            let target = accumulator.target_mut(ResourceType::Extensions);
+            for entry in root_entries {
+                target.add(entry, metadata, true);
+            }
+            has_any_dir = true;
+        }
+
         Ok(has_any_dir)
     }
 
@@ -6728,6 +6742,84 @@ mod tests {
         let entries = resolve_extension_entries(&ext_dir).expect("entries");
         // Manifest presence should return the directory itself, not index.ts
         assert_eq!(entries, vec![ext_dir]);
+    }
+
+    #[test]
+    fn collect_package_resources_collects_root_extension_alongside_resource_dirs() {
+        // Regression: a package mixing resource subdirectories (prompts/) with
+        // a root-level extension entrypoint (index.ts) used to silently drop
+        // the extension when has_any_dir was true. Now the root extension
+        // entry is collected alongside the resource dirs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let package_root = dir.path().join("pkg");
+        fs::create_dir_all(package_root.join("prompts")).expect("create prompts");
+        fs::write(package_root.join("prompts").join("welcome.md"), "# Welcome")
+            .expect("write prompt");
+        fs::write(package_root.join("index.ts"), "export default {}").expect("write index");
+
+        let mut accumulator = ResourceAccumulator::new();
+        let metadata = PathMetadata {
+            source: "test".to_string(),
+            scope: PackageScope::User,
+            origin: ResourceOrigin::Package,
+            base_dir: None,
+        };
+        let had_any = PackageManager::collect_package_resources(
+            &package_root,
+            &mut accumulator,
+            None,
+            &metadata,
+        )
+        .expect("collect package resources");
+        assert!(had_any, "resource dirs should set has_any_dir");
+
+        let ext_paths = accumulator
+            .extensions
+            .items
+            .iter()
+            .map(|item| item.path.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            ext_paths.contains(&package_root.join("index.ts")),
+            "root extension entrypoint must be collected, got {ext_paths:?}"
+        );
+    }
+
+    #[test]
+    fn collect_package_resources_keeps_extension_only_package_when_no_resource_dirs() {
+        // A package with only a root extension entrypoint (no resource dirs)
+        // must still be collected via the fallback path.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let package_root = dir.path().join("pkg");
+        fs::create_dir_all(&package_root).expect("create pkg");
+        fs::write(package_root.join("index.ts"), "export default {}").expect("write index");
+
+        let mut accumulator = ResourceAccumulator::new();
+        let metadata = PathMetadata {
+            source: "test".to_string(),
+            scope: PackageScope::User,
+            origin: ResourceOrigin::Package,
+            base_dir: None,
+        };
+        let had_any = PackageManager::collect_package_resources(
+            &package_root,
+            &mut accumulator,
+            None,
+            &metadata,
+        )
+        .expect("collect package resources");
+        assert!(had_any, "extension entry should set has_any_dir");
+
+        let ext_paths = accumulator
+            .extensions
+            .items
+            .iter()
+            .map(|item| item.path.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            ext_paths.contains(&package_root.join("index.ts")),
+            "extension entrypoint must be collected, got {ext_paths:?}"
+        );
     }
 
     #[test]
