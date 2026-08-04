@@ -169,3 +169,4 @@ cargo test -- --nocapture                # 带输出
 | 做架构级改动、理解历史决策背景 | `docs/context/design-decisions.md` |
 | 更新构建/测试/部署流程（日常开发看 AGENTS.md 的「构建」+「测试」+「会话结束」即可） | `docs/context/commands.md` |
 | 新增静态检查工具 / 优化 verify 检查逻辑 | `docs/context/verify-tool.md` |
+| 症状排查 / 回归调试（provider/session/extension/安装器改动后测试失败；含症状路由表、调试 playbook、安装器补丁模式） | `docs/context/debugging.md` |

@@ -21350,9 +21350,36 @@ fn discover_sibling_index_entries(primary: &Path) -> Vec<PathBuf> {
     let Some(parent_dir) = primary.parent() else {
         return Vec::new();
     };
+
+    // Skip sibling discovery when the parent is a known auto-discovery root
+    // (e.g., ~/.pi/agent/extensions/ or .pi/extensions/). Files directly in
+    // these roots are independent extensions, not siblings of a single package.
+    if parent_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("extensions"))
+    {
+        return Vec::new();
+    }
+
     let Some(cluster_root) = parent_dir.parent() else {
         return Vec::new();
     };
+
+    // Skip sibling discovery when the cluster root itself is an
+    // auto-discovery root. A primary entry like
+    // `<root>/extensions/web-tool/index.ts` sits one level below such a root;
+    // its parent (`web-tool`) is the extension directory, while the cluster
+    // root is `extensions`. Directories under the root are independent
+    // extensions, so merging their `index.*` entrypoints into one bundle
+    // would break relative imports inside multi-file extensions.
+    if cluster_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("extensions"))
+    {
+        return Vec::new();
+    }
 
     let mut candidate_dirs = Vec::new();
     if let Ok(entries) = fs::read_dir(cluster_root) {
@@ -32103,6 +32130,80 @@ mod tests {
         assert!(
             discovered.is_empty(),
             "large clusters should not trigger sibling index expansion"
+        );
+    }
+
+    #[test]
+    fn discover_sibling_index_entries_ignores_extensions_auto_discovery_root() {
+        // Regression for #35: extensions auto-discovery roots (e.g.
+        // ~/.pi/agent/extensions/ or .pi/extensions/) contain independent
+        // extensions. Sibling discovery must not merge their index entrypoints
+        // into a single bundle, which would break relative imports inside
+        // multi-file extensions.
+        let temp = tempdir().expect("tempdir");
+        let extensions_dir = temp.path().join("extensions");
+        let ext_a = extensions_dir.join("alpha");
+        let ext_b = extensions_dir.join("beta");
+        std::fs::create_dir_all(&ext_a).expect("mkdir alpha");
+        std::fs::create_dir_all(&ext_b).expect("mkdir beta");
+
+        let a_index = ext_a.join("index.ts");
+        let b_index = ext_b.join("index.ts");
+        std::fs::write(&a_index, "export default {};\n").expect("write alpha index");
+        std::fs::write(&b_index, "export default {};\n").expect("write beta index");
+
+        let discovered = discover_sibling_index_entries(&b_index);
+        assert!(
+            discovered.is_empty(),
+            "extensions root siblings must not be merged into a bundle, got {discovered:?}"
+        );
+    }
+
+    #[test]
+    fn discover_sibling_index_entries_still_merges_bundles_under_other_roots() {
+        // The extensions-root guard must not disable legitimate bundle
+        // merging under cluster roots that are not auto-discovery roots.
+        let temp = tempdir().expect("tempdir");
+        let bundle_root = temp.path().join("plugins");
+        let ext_a = bundle_root.join("alpha");
+        let ext_b = bundle_root.join("beta");
+        std::fs::create_dir_all(&ext_a).expect("mkdir alpha");
+        std::fs::create_dir_all(&ext_b).expect("mkdir beta");
+
+        let a_index = ext_a.join("index.ts");
+        let b_index = ext_b.join("index.ts");
+        std::fs::write(&a_index, "export default {};\n").expect("write alpha index");
+        std::fs::write(&b_index, "export default {};\n").expect("write beta index");
+
+        let discovered = discover_sibling_index_entries(&b_index);
+        assert_eq!(discovered.len(), 2);
+        assert!(discovered.contains(&safe_canonicalize(&a_index)));
+        assert!(discovered.contains(&safe_canonicalize(&b_index)));
+    }
+
+    #[test]
+    fn discover_related_extension_entries_keeps_multi_file_extension_alone_under_extensions_root() {
+        // Regression for #35 end-to-end: a multi-file extension under an
+        // extensions root must resolve to only its own entrypoint; sibling
+        // extensions must not be pulled in as bundle entrypoints.
+        let temp = tempdir().expect("tempdir");
+        let extensions_dir = temp.path().join("extensions");
+        let multi = extensions_dir.join("multi-ext");
+        let other = extensions_dir.join("other-ext");
+        std::fs::create_dir_all(&multi).expect("mkdir multi-ext");
+        std::fs::create_dir_all(&other).expect("mkdir other-ext");
+
+        let multi_index = multi.join("index.ts");
+        let other_index = other.join("index.ts");
+        std::fs::write(&multi_index, "export default {};\n").expect("write multi index");
+        std::fs::write(&other_index, "export default {};\n").expect("write other index");
+
+        let discovered = discover_related_extension_entries(&multi_index)
+            .expect("discover should not error for extensions root multi-file extension");
+        assert_eq!(
+            discovered,
+            vec![safe_canonicalize(&multi_index)],
+            "multi-file extension must stay independent under extensions root"
         );
     }
 
