@@ -877,7 +877,7 @@ Provider-count rule: Pi has 12 native provider implementation modules, counted a
 2. **Streaming-first**: Custom SSE parser, no blocking on responses
 3. **Process tree management**: `sysinfo` crate ensures no orphaned processes
 4. **Structured errors**: `thiserror` with specific error types per component
-5. **Size-budgeted release profile**: LTO + strip + `opt-level = "z"` for budget-compliant shipping artifacts
+5. **Balanced release profile**: `opt-level = 3` + thin LTO for speed, `panic = "abort"` + `strip = true` for lean artifacts
 
 ### asupersync Context vs TypeScript Pi (pi-mono)
 
@@ -1824,7 +1824,7 @@ Concrete engineering work in this codebase includes:
 | Provider/message memory path | Zero-copy request context migration (`Cow`), `Arc`-based message/result sharing, clone elimination in stream end paths | Removes hot-path cloning and allocation churn in core agent/provider loops |
 | TUI rendering path | Message render cache, conversation-prefix cache, reusable render buffers, viewport/render-path refactors, Criterion perf gates | Reduces redraw cost and jitter while streaming long outputs |
 | Startup/resource loading | Parallelized skill/prompt/theme loading plus precomputed tool definitions/command names | Moves heavy initialization off the critical path to improve time-to-interaction |
-| Allocator/build profile | Size-budgeted default release profile, opt-in jemalloc benchmark variants, strict artifact validation for perf claims | Keeps shipping artifacts within budget and prevents benchmark/reporting drift |
+| Allocator/build profile | Balanced release profile (opt-level 3 + thin LTO), opt-in jemalloc benchmark variants, strict artifact validation for perf claims | Ships fast binaries with quick builds while preventing benchmark/reporting drift |
 | Perf governance | Scenario matrix, claim-integrity gates, strict no-data fail behavior, variance/confidence artifacts, reproducible orchestration bundles | Makes performance claims auditable and regression detection automatic |
 | Hostcall marshalling planner | `HostcallRewriteEngine` uses a small cost model to pick fast opcode fusion only when it is clearly cheaper and unambiguous; otherwise it stays on the canonical path and records fallback reason | Gains speed on hot marshalling shapes without risking silent semantic drift from ambiguous rewrites |
 | Tool text-processing hot path | `truncate_head`/`truncate_tail` use lazy line traversal and `memchr` line counting; normalization switched to a single-pass transform instead of chained string rewrites | Large file/tool outputs avoid unnecessary intermediate allocations and stay responsive |
@@ -1837,24 +1837,23 @@ Optimization spans algorithms, execution lanes, memory movement, queue disciplin
 
 ### Release Profile and Binary Size Gate
 
-The shipping release profile is tuned to keep release artifacts inside the
-binary-size budget while preserving cross-crate optimization:
+The shipping release profile is tuned for runtime speed and fast incremental
+developer builds while keeping artifacts lean:
 
 ```toml
 [profile.release]
-opt-level = "z"      # Optimize generated code for size
-lto = true           # Link-time optimization across all crates
-codegen-units = 1    # Single codegen unit (slower compile, better optimization)
-panic = "abort"      # No unwinding machinery
-strip = true         # Remove symbol tables
+opt-level = 3      # Full speed optimization
+lto = "thin"       # Thin link-time optimization (fast, good codegen)
+panic = "abort"    # No unwinding machinery
+strip = true       # Remove symbol tables
 ```
 
-Binary size is explicitly budgeted in CI via `binary_size_release`, with a target
-threshold of `22.0 MiB` (the harness computes bytes / 1024 / 1024). Default
-release builds keep heavyweight extras opt-in and currently measure `21.12 MiB`
-for `pi` with the standard Cargo `release` profile. Use `--features full` when
-you need the image, clipboard, wasm, jemalloc, and syntax-highlighting extras in
-one build.
+Binary size is tracked in CI via `binary_size_release` with the
+`BINARY_SIZE_RELEASE_BUDGET_MB` threshold (the harness computes bytes / 1024 /
+1024). Default release builds keep heavyweight extras opt-in and currently
+measure `~34 MiB` for `pi` with the balanced profile. Use `--features full`
+when you need the image, clipboard, wasm, jemalloc, and syntax-highlighting
+extras in one build.
 
 ### Benchmark Evidence vs Shipping Artifacts
 

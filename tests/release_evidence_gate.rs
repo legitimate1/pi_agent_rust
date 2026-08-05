@@ -558,25 +558,30 @@ fn agent_release_profile_guidance_matches_cargo_and_readme() {
         return;
     };
 
-    let opt_level = release
+    // `opt-level = 3` parses as an integer in TOML (the old `"z"` was a
+    // string); accept either representation of the same value.
+    let opt_level_str = release
         .get("opt-level")
         .and_then(toml::Value::as_str)
         .unwrap_or("");
-    assert_eq!(
-        opt_level, "z",
-        "shipping release profile must stay size-budgeted"
+    let opt_level_int = release
+        .get("opt-level")
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(0);
+    assert!(
+        opt_level_str == "3" || opt_level_int == 3,
+        "shipping release profile must use opt-level = 3 (balanced: speed, not size)"
     );
     assert_eq!(
-        release.get("lto").and_then(toml::Value::as_bool),
-        Some(true),
-        "release profile must keep LTO enabled"
+        release.get("lto").and_then(toml::Value::as_str),
+        Some("thin"),
+        "release profile must keep thin LTO"
     );
-    assert_eq!(
-        release
-            .get("codegen-units")
-            .and_then(toml::Value::as_integer),
-        Some(1),
-        "release profile must keep single-codegen-unit optimization"
+    // codegen-units intentionally unset: default multi-threaded codegen
+    // keeps incremental developer builds fast.
+    assert!(
+        release.get("codegen-units").is_none(),
+        "release profile must not pin codegen-units (keep default parallelism)"
     );
     assert_eq!(
         release.get("panic").and_then(toml::Value::as_str),
@@ -593,9 +598,8 @@ fn agent_release_profile_guidance_matches_cargo_and_readme() {
     let readme = require_text("README.md");
     let release_profile_tokens = [
         "[profile.release]",
-        "opt-level = \"z\"",
-        "lto = true",
-        "codegen-units = 1",
+        "opt-level = 3",
+        "lto = \"thin\"",
         "panic = \"abort\"",
         "strip = true",
     ];
@@ -624,8 +628,9 @@ fn agent_release_profile_guidance_matches_cargo_and_readme() {
         "AGENTS.md must not describe jemalloc as enabled by default"
     );
     assert!(
-        agents.contains("<22 MiB") && readme.contains("22.0 MiB"),
-        "AGENTS.md and README.md must agree on the release binary size budget"
+        agents.contains("BINARY_SIZE_RELEASE_BUDGET_MB")
+            && readme.contains("BINARY_SIZE_RELEASE_BUDGET_MB"),
+        "AGENTS.md and README.md must agree on the release binary size budget constant"
     );
 }
 

@@ -65,20 +65,19 @@
 2. 构建和部署分离 — 构建后等用户指令再部署
 3. 不得私自构建或部署
 
-### Release profile（size-budgeted，契约）
+### Release profile（均衡配置，契约）
 
-发布产物有 <22 MiB 大小预算（`BINARY_SIZE_RELEASE_BUDGET_MB`），`Cargo.toml` 的 `[profile.release]` 必须保持 size-budgeted 配置，`tests/release_evidence_gate.rs` 会校验：
+`Cargo.toml` 的 `[profile.release]` 使用均衡配置——以运行时速度与启动性能优先（`opt-level = 3` + thin LTO + 默认多线程 codegen），同时保留 `panic = "abort"` 与 `strip = true`。`tests/release_evidence_gate.rs` 会校验：
 
 ```toml
 [profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
+opt-level = 3
+lto = "thin"
 panic = "abort"
 strip = true
 ```
 
-不要改回 `opt-level = 3` / `lto = "thin"` / 添加 `incremental = true`——那会把产物推出大小预算并破坏发布闸门。jemalloc is opt-in via `--features jemalloc`（README 描述为 opt-in jemalloc benchmark variants），不要默认启用。
+不要改回 `opt-level = "z"` / `lto = true` / `codegen-units = 1`——那是纯压体积的激进配置（编译极慢、代码运行慢），已明确弃用。二进制大小预算由 `BINARY_SIZE_RELEASE_BUDGET_MB` 定义并经 `binary_size_release` 预算门禁校验（见 `src/perf_build.rs`、`tests/perf_budgets.rs`、`tests/perf_regression.rs`）。jemalloc is opt-in via `--features jemalloc`（README 描述为 opt-in jemalloc benchmark variants），不要默认启用。
 
 ### 流程
 
