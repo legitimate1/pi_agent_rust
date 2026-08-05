@@ -40,7 +40,7 @@
               "close_reason": "Completed deterministic effect-aware parallel tool batch evidence",
               "code_paths": [
                 "src/agent.rs",
-                "src/tools.rs"
+                "src/tools/mod.rs"
               ],
               "commit": "156cd358121c07dbc60ec919b0bac546a1632604",
               "docs_or_evidence_paths": [
@@ -229,7 +229,7 @@
           "path": "src/agent.rs"
         },
         {
-          "path": "src/tools.rs"
+          "path": "src/tools/mod.rs"
         }
       ],
       "id": "effect_aware_tool_batch_evidence",
@@ -494,7 +494,7 @@
       "close_reason": "Completed deterministic effect-aware parallel tool batch evidence",
       "code_paths": [
         "src/agent.rs",
-        "src/tools.rs"
+        "src/tools/mod.rs"
       ],
       "commit": "156cd358121c07dbc60ec919b0bac546a1632604",
       "docs_or_evidence_paths": [

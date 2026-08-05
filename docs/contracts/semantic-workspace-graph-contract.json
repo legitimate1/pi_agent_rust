@@ -84,7 +84,7 @@
         "src/agent.rs",
         "src/provider.rs",
         "src/providers/*.rs",
-        "src/tools.rs",
+        "src/tools/mod.rs",
         "src/extensions.rs",
         "src/extensions_js.rs",
         "src/resources.rs",

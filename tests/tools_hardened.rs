@@ -754,9 +754,22 @@ mod bash_hardened {
             h.log().info("verify", format!("pwd={text}"));
             // The pwd output should match or be within the temp dir
             let temp_dir_str = h.temp_dir().to_string_lossy();
+            let mut actual = text.trim().to_string();
+            // On Windows the bash tool runs under MSYS, where `pwd` prints a
+            // POSIX-style path (e.g. /tmp/xyz); convert it back to the
+            // Windows form so it is comparable with the canonicalized cwd.
+            #[cfg(windows)]
+            if let Ok(out) = std::process::Command::new("cygpath")
+                .args(["-w", &actual])
+                .output()
+            {
+                if out.status.success() {
+                    actual = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                }
+            }
             assert!(
-                text.contains(&*temp_dir_str),
-                "pwd should match temp dir: got {text}, expected to contain {temp_dir_str}"
+                actual.contains(&*temp_dir_str),
+                "pwd should match temp dir: got {actual}, expected to contain {temp_dir_str}"
             );
         });
     }

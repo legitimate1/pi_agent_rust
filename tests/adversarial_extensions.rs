@@ -612,7 +612,11 @@ export default function activate(pi) {
 #[test]
 fn t1_fs_write_outside_workspace() {
     // Attempt to write files outside workspace.
-    // writeFileSync must enforce workspace confinement, just like readFileSync.
+    // Since c1a923e0, `/tmp/...` writes are *virtualized* into the
+    // extension's scoped VFS temp namespace instead of being blocked: the
+    // write succeeds inside the extension's view but never touches the real
+    // filesystem. The old "BLOCKED" contract was replaced by the scoped
+    // virtual namespace (see security_fs_escape::vfs_mkdir_absolute_tmp_is_scoped_virtual).
     let result = eval_adversarial(
         r#"
 import fs from "node:fs";
@@ -634,8 +638,26 @@ export default function activate(pi) {
 "#,
     );
     assert!(
-        result.starts_with("BLOCKED:"),
-        "Write outside workspace must be blocked, got: {result}"
+        result.contains("ESCAPED_GAP_G2"),
+        "absolute /tmp writes are virtualized into the extension VFS (not blocked), got: {result}"
+    );
+    // The real filesystem must be untouched by the virtualized write.
+    let real_hits: Vec<_> = std::fs::read_dir("/tmp")
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("adversarial_escape_test_")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        real_hits.is_empty(),
+        "virtualized /tmp write leaked to real filesystem: {real_hits:?}"
     );
 }
 

@@ -28,13 +28,30 @@
       "ok_count": 63,
       "sigsegv_count": 44,
       "sigsegv_files": [
-        "src/agent.rs", "src/bin/*.rs", "src/buffer_shim.rs", "src/connectors/http.rs",
-        "src/extension_dispatcher.rs", "src/extension_tools.rs", "src/http/*.rs",
-        "src/http_shim.rs", "src/interactive/ext_session.rs", "src/lib.rs", "src/main.rs",
-        "src/providers/anthropic.rs", "src/providers/azure.rs", "src/providers/bedrock.rs",
-        "src/providers/cohere.rs", "src/providers/gemini.rs", "src/providers/gitlab.rs",
-        "src/providers/openai.rs", "src/providers/openai_responses.rs", "src/providers/vertex.rs",
-        "src/rpc.rs", "src/session.rs", "src/session_sqlite.rs", "src/tools.rs"
+        "src/agent.rs",
+        "src/bin/*.rs",
+        "src/buffer_shim.rs",
+        "src/connectors/http.rs",
+        "src/extension_dispatcher.rs",
+        "src/extension_tools.rs",
+        "src/http/*.rs",
+        "src/http_shim.rs",
+        "src/interactive/ext_session.rs",
+        "src/lib.rs",
+        "src/main.rs",
+        "src/providers/anthropic.rs",
+        "src/providers/azure.rs",
+        "src/providers/bedrock.rs",
+        "src/providers/cohere.rs",
+        "src/providers/gemini.rs",
+        "src/providers/gitlab.rs",
+        "src/providers/openai.rs",
+        "src/providers/openai_responses.rs",
+        "src/providers/vertex.rs",
+        "src/rpc.rs",
+        "src/session.rs",
+        "src/session_sqlite.rs",
+        "src/tools/mod.rs"
       ]
     }
   },
@@ -80,12 +97,12 @@
     {
       "area": "tools",
       "paths": [
-        "src/tools.rs"
+        "src/tools/mod.rs"
       ],
       "coverage": {
         "line_pct": 78.99,
         "branch_pct": 0.0,
-        "function_pct": 76.90,
+        "function_pct": 76.9,
         "line_count": 3032,
         "covered_line_count": 2395,
         "uncovered_line_count": 637,
@@ -127,7 +144,7 @@
         "src/session.rs"
       ],
       "coverage": {
-        "line_pct": 80.50,
+        "line_pct": 80.5,
         "branch_pct": 0.0,
         "function_pct": 77.88,
         "line_count": 2882,
@@ -212,7 +229,7 @@
         "function_pct": 88.0
       },
       "delta_to_target": {
-        "line_pct": 3.6551570007822096,
+        "line_pct": 3.6551570007822094,
         "function_pct": 4.688567674113001
       },
       "blocker": "Provider routing and adapter coverage still misses key normalization/auth permutations across provider families.",

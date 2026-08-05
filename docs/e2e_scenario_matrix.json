@@ -1,7 +1,7 @@
 {
   "schema": "pi.e2e.scenario_matrix.v2",
   "bead_id": "bd-1f42.8.5.1",
-  "updated_at": "2026-05-10",
+  "updated_at": "2026-08-05T00:00:00Z",
   "source_inputs": [
     "tests/suite_classification.toml",
     "scripts/e2e/run_all.sh",
@@ -38,7 +38,7 @@
     "min_e2e_suite_matrix_coverage_pct": 100,
     "live_budget_policy": {
       "max_live_api_calls_per_suite": 50,
-      "max_live_cost_usd_per_suite": 1.00,
+      "max_live_cost_usd_per_suite": 1.0,
       "rate_limit_delay_ms": 500,
       "credential_env_prefix": "PI_E2E_",
       "skip_env_var": "PI_SKIP_LIVE_E2E"
@@ -370,7 +370,7 @@
         ],
         "budget_controls": {
           "max_api_calls": 50,
-          "max_cost_usd": 1.00,
+          "max_cost_usd": 1.0,
           "rate_limit_delay_ms": 500,
           "timeout_per_test_secs": 60
         },
@@ -447,7 +447,7 @@
     {
       "workflow_id": "wf-interruption-resume-replay-pack",
       "workflow_class": "interruption_resume",
-      "workflow_title": "Interrupt/resume/replay continuity scenarios with deterministic rerun pointers",
+      "workflow_title": "Interrupt/resume/replay continuity scenarios with deterministic rerun pointers (incl. transient retry/resume)",
       "status": "covered",
       "vcr_mode": "dual-mode",
       "vcr_mode_rationale": "Interruption/resume tests use in-process deterministic providers for CI. Dual-mode allows periodic live validation of signal handling and session recovery.",
@@ -462,10 +462,12 @@
         "all"
       ],
       "suite_ids": [
-        "e2e_interruption_resume_replay"
+        "e2e_interruption_resume_replay",
+        "e2e_transient_retry_resume"
       ],
       "test_paths": [
-        "tests/e2e_interruption_resume_replay.rs"
+        "tests/e2e_interruption_resume_replay.rs",
+        "tests/e2e_transient_retry_resume.rs"
       ],
       "sli_ids": [
         "sli.resume.replay_integrity_pct",
@@ -480,7 +482,7 @@
         "environment.json",
         "evidence_contract.json"
       ],
-      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_interruption_resume_replay"
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_interruption_resume_replay --suite e2e_transient_retry_resume"
     },
     {
       "workflow_id": "wf-doctor-and-golden-corpus-governance",

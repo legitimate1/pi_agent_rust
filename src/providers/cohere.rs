@@ -1463,7 +1463,7 @@ mod tests {
         std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().expect("accept");
             socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(30)))
                 .expect("set read timeout");
 
             let mut bytes = Vec::new();

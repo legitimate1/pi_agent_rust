@@ -350,7 +350,7 @@ fn native_provider_module_inventory_matches_provider_docs() {
     );
     assert_eq!(
         on_disk.len(),
-        10,
+        12,
         "native provider module count changed; update docs/providers.md and this expectation"
     );
 }

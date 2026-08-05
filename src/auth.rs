@@ -4893,6 +4893,55 @@ mod tests {
         );
     }
 
+    /// Drain the full HTTP request body on a test mock-server socket before
+    /// writing the response.
+    ///
+    /// A single `read` may only consume part of a body-bearing request. Closing
+    /// the socket while unread data still sits in the kernel receive buffer
+    /// makes Windows send a TCP RST (os error 10054) instead of a clean FIN,
+    /// which the http client surfaces as a spurious `ConnectionReset`.
+    ///
+    /// The request is parsed for its `Content-Length` so the drain returns as
+    /// soon as the whole body has arrived — waiting for EOF would stall every
+    /// test for the full socket read timeout because the http client keeps its
+    /// write side open until the response is read.
+    fn drain_to_eof<S: std::io::Read>(stream: &mut S) {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                }
+            }
+        };
+
+        let header_text = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = header_text
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        let mut received = bytes.len().saturating_sub(header_end);
+        while received < content_length {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => received += n,
+            }
+        }
+    }
+
     fn spawn_json_server(status_code: u16, body: &str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().expect("local addr");
@@ -4900,12 +4949,20 @@ mod tests {
 
         std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().expect("accept");
+            // Generous timeout: under parallel full-suite load the client
+            // may be delayed by scheduling, and a short timeout turns that
+            // into spurious 10053/10054 connection failures.
             socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(30)))
                 .expect("set read timeout");
 
-            let mut chunk = [0_u8; 4096];
-            let _ = socket.read(&mut chunk);
+            // Drain the full request (including any POST body). A single
+            // `read` may only consume part of a body-bearing request, and
+            // closing the socket while unread data remains in the kernel
+            // buffer makes Windows send a TCP RST (os error 10054) instead
+            // of a clean FIN, which surfaces as flaky ConnectionReset in
+            // the http client. Draining to EOF avoids that entirely.
+            drain_to_eof(&mut socket);
 
             let reason = match status_code {
                 401 => "Unauthorized",
@@ -4932,12 +4989,20 @@ mod tests {
 
         std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().expect("accept");
+            // Generous timeout: under parallel full-suite load the client
+            // may be delayed by scheduling, and a short timeout turns that
+            // into spurious 10053/10054 connection failures.
             socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(30)))
                 .expect("set read timeout");
 
-            let mut chunk = [0_u8; 4096];
-            let _ = socket.read(&mut chunk);
+            // Drain the full request (including any POST body). A single
+            // `read` may only consume part of a body-bearing request, and
+            // closing the socket while unread data remains in the kernel
+            // buffer makes Windows send a TCP RST (os error 10054) instead
+            // of a clean FIN, which surfaces as flaky ConnectionReset in
+            // the http client. Draining to EOF avoids that entirely.
+            drain_to_eof(&mut socket);
 
             let reason = match status_code {
                 400 => "Bad Request",

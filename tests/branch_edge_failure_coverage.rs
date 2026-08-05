@@ -262,7 +262,10 @@ fn process_file_arguments_empty_file_skipped() {
 }
 
 #[test]
-fn process_file_arguments_rejects_outside_cwd() {
+fn process_file_arguments_allows_outside_cwd() {
+    // @file processing is intentionally unrestricted since c71b7d6e
+    // ("tools unrestricted"): the model may read files outside the working
+    // directory via absolute paths. Writes remain cwd-scoped.
     let dir = TempDir::new().unwrap();
     let outside = TempDir::new().unwrap();
     let outside_file = outside.path().join("secret.txt");
@@ -272,9 +275,9 @@ fn process_file_arguments_rejects_outside_cwd() {
         dir.path(),
         false,
     );
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
-    assert!(err.contains("Cannot read outside the working directory"));
+    assert!(result.is_ok(), "outside-cwd @file read should be allowed");
+    let processed = result.unwrap();
+    assert!(processed.text.contains("secret"));
 }
 
 #[test]

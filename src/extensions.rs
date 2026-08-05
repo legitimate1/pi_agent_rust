@@ -9913,18 +9913,20 @@ const fn mode_strictness(m: ExtensionPolicyMode) -> u8 {
 //
 //   1. **Per-extension deny** — if the capability is in the extension
 //      override's `deny` list → Deny ("extension_deny").
-//   2. **Per-extension allow** — if the capability is in the extension
-//      override's `allow` list → Allow ("extension_allow").
-//   3. **Global deny_caps** — if the capability is in the global `deny_caps`
-//      list → Deny ("deny_caps").
+//   2. **Global deny_caps** — if the capability is in the global `deny_caps`
+//      list → Deny ("deny_caps"). This layer is deliberately *above* the
+//      per-extension allow: a global deny must never be bypassable by an
+//      individual extension's `allow` list. The only sanctioned way to grant
+//      a dangerous capability is `allow_dangerous`, which removes the
+//      capability from `deny_caps` first (then `default_caps`/per-extension
+//      allow can admit it).
+//   3. **Per-extension allow** — if the capability is in the extension
+//      override's `allow` list → Allow ("extension_allow"). Only reachable
+//      for capabilities that are not globally denied.
 //   4. **Global default_caps** — if the capability is in `default_caps`
 //      → Allow ("default_caps").
 //   5. **Mode fallback** — Strict → Deny, Prompt → Prompt, Permissive →
 //      Allow.
-//
-// Per-extension allow comes before global deny_caps so that trusted
-// extensions can be granted dangerous capabilities on an individual basis
-// without loosening the global security posture.
 
 impl ExtensionPolicy {
     /// Evaluate policy for a capability without extension context.
@@ -9965,7 +9967,23 @@ impl ExtensionPolicy {
             }
         }
 
-        // Layer 2: per-extension allow.
+        // Layer 2: global deny_caps — takes precedence over per-extension
+        // allow so a global deny can never be bypassed by an extension's own
+        // `allow` list (see precedence chain documentation above).
+        if self
+            .deny_caps
+            .iter()
+            .any(|cap| cap.eq_ignore_ascii_case(&normalized))
+        {
+            return PolicyCheck {
+                decision: PolicyDecision::Deny,
+                capability: normalized,
+                reason: "deny_caps".to_string(),
+            };
+        }
+
+        // Layer 3: per-extension allow (only reachable for capabilities that
+        // are not globally denied).
         if let Some(ovr) = ext_override {
             if ovr
                 .allow
@@ -9978,19 +9996,6 @@ impl ExtensionPolicy {
                     reason: "extension_allow".to_string(),
                 };
             }
-        }
-
-        // Layer 3: global deny_caps.
-        if self
-            .deny_caps
-            .iter()
-            .any(|cap| cap.eq_ignore_ascii_case(&normalized))
-        {
-            return PolicyCheck {
-                decision: PolicyDecision::Deny,
-                capability: normalized,
-                reason: "deny_caps".to_string(),
-            };
         }
 
         // Layer 4: global default_caps.
@@ -10357,7 +10362,7 @@ mod policy_snapshot_tests {
     }
 
     #[test]
-    fn snapshot_per_extension_allow_overrides_global_deny() {
+    fn snapshot_deny_caps_overrides_per_extension_allow() {
         let policy = make_policy_with_per_extension();
         let snapshot = PolicySnapshot::compile(&policy);
 
@@ -10365,9 +10370,12 @@ mod policy_snapshot_tests {
         let global = snapshot.lookup("exec", None);
         assert_eq!(global.decision, PolicyDecision::Deny);
 
-        // ext.special allows "exec" — per-extension allow now overrides.
+        // ext.special allows "exec", but global deny_caps (layer 2) takes
+        // precedence over per-extension allow (layer 3) — a per-extension
+        // allow can never bypass a global deny.
         let ext = snapshot.lookup("exec", Some("ext.special"));
-        assert_eq!(ext.decision, PolicyDecision::Allow);
+        assert_eq!(ext.decision, PolicyDecision::Deny);
+        assert_eq!(ext.reason, "deny_caps");
     }
 }
 
@@ -42389,11 +42397,11 @@ mod tests {
     }
 
     #[test]
-    fn shared_dispatch_per_extension_allow_overrides_global_deny() {
-        // Global policy denies "exec" (in deny_caps), but ext.trusted has a
-        // per-extension allow for "exec". The dispatch boundary should allow it.
-        // (It will fail downstream because no actual tool, but we check it's
-        // not denied by policy.)
+    fn shared_dispatch_deny_caps_overrides_per_extension_allow() {
+        // Global policy denies "exec" (in deny_caps); ext.trusted has a
+        // per-extension allow for "exec" but a global deny (layer 2) always
+        // beats per-extension allow (layer 3). The dispatch boundary must
+        // deny the call.
         let dir = tempdir().expect("tempdir");
         let tools = ToolRegistry::new(&[], dir.path(), None);
         let http = HttpConnector::with_defaults();
@@ -42427,7 +42435,7 @@ mod tests {
             call_id: "call-ext-allow".to_string(),
             capability: "exec".to_string(),
             method: "tool".to_string(),
-            params: json!({ "name": "exec", "input": { "command": "echo hi" } }),
+            params: json!({ "name": "bash", "input": { "command": "echo hi" } }),
             timeout_ms: None,
             cancel_token: None,
             context: None,
@@ -42435,17 +42443,17 @@ mod tests {
 
         run_async(async {
             let result = dispatch_host_call_shared(&ctx, call).await;
-            // Not denied by policy — may fail downstream (no tool registered),
-            // but the error code should NOT be Denied.
-            if result.is_error {
-                let err = result.error.as_ref().expect("expected error payload");
-                assert_ne!(
-                    err.code,
-                    HostCallErrorCode::Denied,
-                    "per-extension allow should override global deny, got: {}",
-                    err.message
-                );
-            }
+            assert!(
+                result.is_error,
+                "global deny_caps must win over per-extension allow"
+            );
+            let err = result.error.expect("expected error payload");
+            assert_eq!(
+                err.code,
+                HostCallErrorCode::Denied,
+                "expected policy denial, got: {}",
+                err.message
+            );
         });
     }
 
@@ -52651,11 +52659,18 @@ mod tests {
         let explanation = policy.explain_effective_policy(None);
         assert!(explanation.dangerous_denied.contains(&"exec".to_string()));
 
-        // With extension context: exec should still be denied because
+        // With extension context: exec is still denied because global
         // deny_caps (layer 2) takes precedence over per-extension allow
-        // (layer 3).
+        // (layer 3) — a per-extension allow can never bypass a global deny.
         let explanation = policy.explain_effective_policy(Some("my-ext"));
-        assert!(explanation.dangerous_denied.contains(&"exec".to_string()));
+        assert!(
+            explanation.dangerous_denied.contains(&"exec".to_string()),
+            "exec should still be denied for my-ext via deny_caps"
+        );
+        assert!(
+            explanation.dangerous_allowed.is_empty(),
+            "dangerous capabilities must not be allowed via per-extension allow while globally denied"
+        );
         assert_eq!(explanation.extension_id.as_deref(), Some("my-ext"));
     }
 

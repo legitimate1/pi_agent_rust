@@ -538,6 +538,8 @@ mod write_tool {
 
             let text = get_text_content(&result.content);
             assert!(text.contains("Successfully wrote 20 bytes"));
+            // `.txt` files are not syntax-checkable, so verification is
+            // skipped and details stay empty.
             assert!(result.details.is_none());
         });
     }
@@ -2097,6 +2099,11 @@ fn normalize_tool_diagnostic_value(value: &mut serde_json::Value, workspace_root
             if !workspace_root.is_empty() && text.contains(workspace_root) {
                 *text = text.replace(workspace_root, "<WORKSPACE_ROOT>");
             }
+            // Windows: normalize path separators so snapshots stay
+            // platform-independent (golden files are recorded with '/').
+            if cfg!(windows) {
+                *text = text.replace('\\', "/");
+            }
         }
         serde_json::Value::Array(items) => {
             for item in items {
@@ -3220,13 +3227,16 @@ fn e2e_all_tools_roundtrip() {
 // ============================================================================
 // These tests document the security boundary of the tool layer.
 // Tools intentionally rely on agent-level trust (the LLM) rather than
-// tool-level sandboxing.  These tests verify current behaviour so that
-// any future tightening is deliberate, not accidental.
+// tool-level sandboxing. Since c71b7d6e the tools are *unrestricted*:
+// absolute paths and `..` traversal outside the working directory are
+// allowed (the @file processor and the read/write/edit tools no longer
+// enforce a cwd scope). These tests document the current behaviour so
+// that any future tightening is deliberate, not accidental.
 
 mod security_path_traversal {
     use super::*;
 
-    /// Read tool rejects parent-directory traversal (`../`).
+    /// Read tool allows parent-directory traversal (`../`).
     #[test]
     fn read_parent_dir_traversal() {
         asupersync::test_utils::run_test(|| async {
@@ -3240,21 +3250,21 @@ mod security_path_traversal {
             let input = serde_json::json!({
                 "path": "../outside.txt"
             });
-            let err = tool
+            let output = tool
                 .execute("sec-read-01", input, None, None)
                 .await
-                .expect_err("read with ../ should be rejected");
-            let text = err.to_string();
+                .expect("read with ../ is allowed (tools unrestricted)");
+            let text = get_text_content(&output.content);
             assert!(
-                text.contains("Cannot read outside the working directory"),
-                "expected outside-cwd rejection: {text}"
+                text.contains("OUTSIDE_DATA"),
+                "expected outside file content: {text}"
             );
         });
     }
 
-    /// Read tool rejects dot-dot escape even when path variants match on disk.
+    /// Read tool allows dot-dot escape even when path variants match on disk.
     #[test]
-    fn read_path_variant_outside_cwd_is_rejected() {
+    fn read_path_variant_outside_cwd_is_allowed() {
         asupersync::test_utils::run_test(|| async {
             let parent = tempfile::tempdir().unwrap();
             let child_dir = parent.path().join("child");
@@ -3266,19 +3276,16 @@ mod security_path_traversal {
             let input = serde_json::json!({
                 "path": "subdir/../../outside.txt"
             });
-            let err = tool
+            let output = tool
                 .execute("sec-read-04", input, None, None)
                 .await
-                .expect_err("dot-dot escape should be rejected");
-            let text = err.to_string();
-            assert!(
-                text.contains("Cannot read outside the working directory"),
-                "expected outside-cwd rejection: {text}"
-            );
+                .expect("dot-dot escape is allowed (tools unrestricted)");
+            let text = get_text_content(&output.content);
+            assert!(text.contains("OUTSIDE"), "expected content: {text}");
         });
     }
 
-    /// Write tool rejects parent-directory traversal (`../`).
+    /// Write tool allows parent-directory traversal (`../`).
     #[test]
     fn write_parent_dir_traversal() {
         asupersync::test_utils::run_test(|| async {
@@ -3292,25 +3299,19 @@ mod security_path_traversal {
                 "path": escaped_path.to_string_lossy(),
                 "content": "ESCAPED_CONTENT"
             });
-            let err = tool
-                .execute("sec-write-01", input, None, None)
+            tool.execute("sec-write-01", input, None, None)
                 .await
-                .expect_err("write with ../ should be rejected");
-            let text = err.to_string();
-            assert!(
-                text.contains("Cannot write outside the working directory"),
-                "expected outside-cwd rejection: {text}"
-            );
-            assert!(
-                !parent.path().join("escaped.txt").exists(),
-                "write should not escape cwd"
+                .expect("write with ../ is allowed (tools unrestricted)");
+            assert_eq!(
+                std::fs::read_to_string(parent.path().join("escaped.txt")).unwrap(),
+                "ESCAPED_CONTENT"
             );
         });
     }
 
-    /// Write tool rejects dot-dot escape paths that resolve outside CWD.
+    /// Write tool allows dot-dot escape paths that resolve outside CWD.
     #[test]
-    fn write_path_variant_outside_cwd_is_rejected() {
+    fn write_path_variant_outside_cwd_is_allowed() {
         asupersync::test_utils::run_test(|| async {
             let parent = tempfile::tempdir().unwrap();
             let child_dir = parent.path().join("child");
@@ -3322,23 +3323,17 @@ mod security_path_traversal {
                 "path": escaped_path.to_string_lossy(),
                 "content": "ESCAPED_CONTENT"
             });
-            let err = tool
-                .execute("sec-write-03", input, None, None)
+            tool.execute("sec-write-03", input, None, None)
                 .await
-                .expect_err("dot-dot escape should be rejected");
-            let text = err.to_string();
-            assert!(
-                text.contains("Cannot write outside the working directory"),
-                "expected outside-cwd rejection: {text}"
-            );
-            assert!(
-                !parent.path().join("escaped.txt").exists(),
-                "write should not escape cwd"
+                .expect("dot-dot escape is allowed (tools unrestricted)");
+            assert_eq!(
+                std::fs::read_to_string(parent.path().join("escaped.txt")).unwrap(),
+                "ESCAPED_CONTENT"
             );
         });
     }
 
-    /// Edit tool rejects parent-directory traversal (`../`).
+    /// Edit tool allows parent-directory traversal (`../`).
     #[test]
     fn edit_parent_dir_traversal() {
         asupersync::test_utils::run_test(|| async {
@@ -3355,23 +3350,17 @@ mod security_path_traversal {
                 "oldText": "ORIGINAL_CONTENT",
                 "newText": "MODIFIED_CONTENT"
             });
-            let err = tool
-                .execute("sec-edit-01", input, None, None)
+            tool.execute("sec-edit-01", input, None, None)
                 .await
-                .expect_err("edit with ../ should be rejected");
-            let text = err.to_string();
-            assert!(
-                text.contains("Cannot edit outside the working directory"),
-                "expected outside-cwd rejection: {text}"
-            );
+                .expect("edit with ../ is allowed (tools unrestricted)");
             let content = std::fs::read_to_string(&target).unwrap();
-            assert_eq!(content, "ORIGINAL_CONTENT");
+            assert_eq!(content, "MODIFIED_CONTENT");
         });
     }
 
-    /// Edit tool rejects dot-dot escape paths that resolve outside CWD.
+    /// Edit tool allows dot-dot escape paths that resolve outside CWD.
     #[test]
-    fn edit_path_variant_outside_cwd_is_rejected() {
+    fn edit_path_variant_outside_cwd_is_allowed() {
         asupersync::test_utils::run_test(|| async {
             let parent = tempfile::tempdir().unwrap();
             let child_dir = parent.path().join("child");
@@ -3386,21 +3375,15 @@ mod security_path_traversal {
                 "oldText": "ORIGINAL_CONTENT",
                 "newText": "MODIFIED_CONTENT"
             });
-            let err = tool
-                .execute("sec-edit-02", input, None, None)
+            tool.execute("sec-edit-02", input, None, None)
                 .await
-                .expect_err("dot-dot escape should be rejected");
-            let text = err.to_string();
-            assert!(
-                text.contains("Cannot edit outside the working directory"),
-                "expected outside-cwd rejection: {text}"
-            );
+                .expect("dot-dot escape is allowed (tools unrestricted)");
             let content = std::fs::read_to_string(&target).unwrap();
-            assert_eq!(content, "ORIGINAL_CONTENT");
+            assert_eq!(content, "MODIFIED_CONTENT");
         });
     }
 
-    /// Read tool rejects absolute paths outside CWD.
+    /// Read tool allows absolute paths outside CWD.
     #[test]
     fn read_absolute_path_outside_cwd() {
         asupersync::test_utils::run_test(|| async {
@@ -3413,16 +3396,16 @@ mod security_path_traversal {
             let input = serde_json::json!({
                 "path": outside_file.to_string_lossy()
             });
-            let err = tool
+            let output = tool
                 .execute("sec-read-02", input, None, None)
                 .await
-                .expect_err("absolute path outside CWD should be rejected");
-            let text = err.to_string();
-            assert!(text.contains("Cannot read outside the working directory"));
+                .expect("absolute path outside CWD is allowed (tools unrestricted)");
+            let text = get_text_content(&output.content);
+            assert!(text.contains("OUTSIDE_DATA"));
         });
     }
 
-    /// Write tool rejects absolute paths outside CWD.
+    /// Write tool allows absolute paths outside CWD.
     #[test]
     fn write_absolute_path_outside_cwd() {
         asupersync::test_utils::run_test(|| async {
@@ -3433,25 +3416,19 @@ mod security_path_traversal {
             let tool = pi::tools::WriteTool::new(cwd.path());
             let input = serde_json::json!({
                 "path": outside_file.to_string_lossy(),
-                "content": "NOPE"
+                "content": "WROTE_OUTSIDE"
             });
-            let err = tool
-                .execute("sec-write-04", input, None, None)
+            tool.execute("sec-write-04", input, None, None)
                 .await
-                .expect_err("absolute path outside CWD should be rejected");
-            let text = err.to_string();
-            assert!(
-                text.contains("Cannot write outside the working directory"),
-                "expected outside-cwd rejection: {text}"
-            );
-            assert!(
-                !outside_file.exists(),
-                "write should not touch outside path"
+                .expect("absolute path outside CWD is allowed (tools unrestricted)");
+            assert_eq!(
+                std::fs::read_to_string(&outside_file).unwrap(),
+                "WROTE_OUTSIDE"
             );
         });
     }
 
-    /// Edit tool rejects absolute paths outside CWD.
+    /// Edit tool allows absolute paths outside CWD.
     #[test]
     fn edit_absolute_path_outside_cwd() {
         asupersync::test_utils::run_test(|| async {
@@ -3466,17 +3443,10 @@ mod security_path_traversal {
                 "oldText": "ORIGINAL",
                 "newText": "MODIFIED"
             });
-            let err = tool
-                .execute("sec-edit-03", input, None, None)
+            tool.execute("sec-edit-03", input, None, None)
                 .await
-                .expect_err("absolute path outside CWD should be rejected");
-            let text = err.to_string();
-            assert!(
-                text.contains("Cannot edit outside the working directory"),
-                "expected outside-cwd rejection: {text}"
-            );
-            let content = std::fs::read_to_string(&outside_file).unwrap();
-            assert_eq!(content, "ORIGINAL");
+                .expect("absolute path outside CWD is allowed (tools unrestricted)");
+            assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "MODIFIED");
         });
     }
 
@@ -3723,7 +3693,19 @@ mod security_environment {
                 .unwrap()
                 .to_string_lossy()
                 .to_string();
-            let actual = text.trim().to_string();
+            let mut actual = text.trim().to_string();
+            // On Windows the bash tool runs under MSYS, where `pwd` prints a
+            // POSIX-style path (e.g. /tmp/xyz). Convert it back to the
+            // Windows form so it is comparable with the canonicalized cwd.
+            #[cfg(windows)]
+            if let Ok(out) = std::process::Command::new("cygpath")
+                .args(["-w", &actual])
+                .output()
+            {
+                if out.status.success() {
+                    actual = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                }
+            }
             assert!(
                 actual.contains(&expected) || expected.contains(&actual),
                 "CWD should match configured dir: actual={actual}, expected={expected}"

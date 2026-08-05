@@ -11734,8 +11734,17 @@ export function appendFileSync(path, data, opts) {
   merged.set(next, current.byteLength);
   __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
   __pi_vfs.files.set(resolved, merged);
-  // Persist to real filesystem via host function (base64-encoded)
-  if (typeof globalThis.__pi_host_write_file_sync === "function") {
+  // Persist to real filesystem via host function (base64-encoded).
+  // VFS-mapped extension-temp paths (`/__pi_extension_tmp/...`, e.g. from
+  // `/tmp/...` inputs) are virtual-only: they must not be written to the
+  // real filesystem, and the host would (correctly) deny them as outside
+  // the extension root. All other paths are passed through unchanged so the
+  // host's workspace/extension-root confinement check sees the original
+  // request path.
+  if (
+    typeof globalThis.__pi_host_write_file_sync === "function" &&
+    !__pi_vfs.isCurrentExtensionTempPath(resolved)
+  ) {
     globalThis.__pi_host_write_file_sync(path, __pi_vfs.bytesToBase64(merged));
   }
 }
@@ -11746,8 +11755,17 @@ export function writeFileSync(path, data, opts) {
   __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
   const bytes = __pi_vfs.toBytes(data, opts);
   __pi_vfs.files.set(resolved, bytes);
-  // Persist to real filesystem via host function (base64-encoded)
-  if (typeof globalThis.__pi_host_write_file_sync === "function") {
+  // Persist to real filesystem via host function (base64-encoded).
+  // VFS-mapped extension-temp paths (`/__pi_extension_tmp/...`, e.g. from
+  // `/tmp/...` inputs) are virtual-only: they must not be written to the
+  // real filesystem, and the host would (correctly) deny them as outside
+  // the extension root. All other paths are passed through unchanged so the
+  // host's workspace/extension-root confinement check sees the original
+  // request path.
+  if (
+    typeof globalThis.__pi_host_write_file_sync === "function" &&
+    !__pi_vfs.isCurrentExtensionTempPath(resolved)
+  ) {
     globalThis.__pi_host_write_file_sync(path, __pi_vfs.bytesToBase64(bytes));
   }
 }

@@ -65,6 +65,21 @@
 2. 构建和部署分离 — 构建后等用户指令再部署
 3. 不得私自构建或部署
 
+### Release profile（size-budgeted，契约）
+
+发布产物有 <22 MiB 大小预算（`BINARY_SIZE_RELEASE_BUDGET_MB`），`Cargo.toml` 的 `[profile.release]` 必须保持 size-budgeted 配置，`tests/release_evidence_gate.rs` 会校验：
+
+```toml
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+```
+
+不要改回 `opt-level = 3` / `lto = "thin"` / 添加 `incremental = true`——那会把产物推出大小预算并破坏发布闸门。jemalloc is opt-in via `--features jemalloc`（README 描述为 opt-in jemalloc benchmark variants），不要默认启用。
+
 ### 流程
 
 ```

@@ -2215,7 +2215,10 @@ fn pijs_workload_reader_prefers_profile_labeled_artifact_path() {
 
     let (latency, source) = read_pijs_workload_latency(tmp.path());
     assert_eq!(latency, Some(50.0));
-    assert_eq!(source, "target/perf/perf/pijs_workload_perf.jsonl");
+    assert_eq!(
+        source.replace('\\', "/"),
+        "target/perf/perf/pijs_workload_perf.jsonl"
+    );
 }
 
 #[test]
@@ -2689,7 +2692,7 @@ fn context_intelligence_budget_reader_prefers_machine_artifact() {
 
     assert_eq!(actual, Some(42.0));
     assert_eq!(
-        source,
+        source.replace('\\', "/"),
         "target/perf/context_intelligence_planner_budget.json"
     );
 }

@@ -58,15 +58,15 @@
               "claim_boundary_text": "Tool artifact lifecycle evidence does not delete user files or authorize cleanup without operator confirmation.",
               "close_reason": "Completed tool artifact lifecycle quota and redaction gate",
               "code_paths": [
-                "src/tools.rs"
+                "src/tools/mod.rs"
               ],
               "commit": "8341d6873e425e147ad3ff00c085fbaa13b8b05e",
               "docs_or_evidence_paths": [
-                "src/tools.rs"
+                "src/tools/mod.rs"
               ],
               "status": "closed",
               "test_paths": [
-                "src/tools.rs"
+                "src/tools/mod.rs"
               ],
               "title": "Gate tool artifact lifecycle quotas and redaction",
               "validation_commands": [
@@ -177,7 +177,7 @@
     {
       "evidence": [
         {
-          "path": "src/tools.rs"
+          "path": "src/tools/mod.rs"
         }
       ],
       "id": "tool_artifact_lifecycle",
@@ -403,15 +403,15 @@
       "claim_boundary_text": "Tool artifact lifecycle evidence does not delete user files or authorize cleanup without operator confirmation.",
       "close_reason": "Completed tool artifact lifecycle quota and redaction gate",
       "code_paths": [
-        "src/tools.rs"
+        "src/tools/mod.rs"
       ],
       "commit": "8341d6873e425e147ad3ff00c085fbaa13b8b05e",
       "docs_or_evidence_paths": [
-        "src/tools.rs"
+        "src/tools/mod.rs"
       ],
       "status": "closed",
       "test_paths": [
-        "src/tools.rs"
+        "src/tools/mod.rs"
       ],
       "title": "Gate tool artifact lifecycle quotas and redaction",
       "validation_commands": [

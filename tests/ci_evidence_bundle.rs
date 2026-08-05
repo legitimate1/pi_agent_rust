@@ -1743,8 +1743,14 @@ fn collect_section_parameter_sweeps_uses_discovered_artifact_path() {
 
     let section = collect_section(&root, source);
     assert_eq!(section.status, "present");
+    // Windows builds join paths with `\` while fixture paths use `/`;
+    // normalize separators before comparing.
+    let artifact_path = section
+        .artifact_path
+        .as_deref()
+        .map(|p| p.replace('\\', "/"));
     assert_eq!(
-        section.artifact_path.as_deref(),
+        artifact_path.as_deref(),
         Some("tests/e2e_results/run-42/results/parameter_sweeps.json")
     );
     assert_eq!(section.file_count, 1);

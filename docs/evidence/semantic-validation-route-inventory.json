@@ -203,7 +203,7 @@
       {
         "bucket": "tools",
         "patterns": [
-          "src/tools.rs",
+          "src/tools/mod.rs",
           "tests/conformance*",
           "tests/fixtures/**"
         ],

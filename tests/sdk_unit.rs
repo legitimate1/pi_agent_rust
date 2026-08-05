@@ -1299,6 +1299,15 @@ fn tool_definitions_have_required_schema_fields() {
 fn session_options_default_values() {
     let harness = TestHarness::new("session_options_default_values");
 
+    // `SessionOptions::default()` honors a `PI_MAX_TOOL_ITERATIONS` env
+    // override, which makes the asserted default non-deterministic when the
+    // variable is set. Skip rather than mutate the process environment
+    // (set_var is unsafe in Rust 2024 and this crate forbids unsafe).
+    if std::env::var_os("PI_MAX_TOOL_ITERATIONS").is_some() {
+        eprintln!("skipping: PI_MAX_TOOL_ITERATIONS set in environment");
+        return;
+    }
+
     let opts = SessionOptions::default();
     assert!(opts.provider.is_none());
     assert!(opts.model.is_none());

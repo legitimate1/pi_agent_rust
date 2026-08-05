@@ -1021,7 +1021,17 @@ impl<'a> SemanticContextBundlePlanner<'a> {
                 };
                 let exclusion = candidate.to_exclusion(exclusion_reason);
                 if suppression_reason == "suppressed_stale_or_unsafe_evidence" {
-                    stale_evidence_suppressions.push(exclusion.clone());
+                    // The same evidence file can surface through multiple
+                    // candidate nodes (different node types/routes); keep the
+                    // suppression list deduplicated by (path, reason).
+                    if !stale_evidence_suppressions.iter().any(
+                        |existing: &ContextBundleExclusion| {
+                            existing.source_path == exclusion.source_path
+                                && existing.reason == exclusion.reason
+                        },
+                    ) {
+                        stale_evidence_suppressions.push(exclusion.clone());
+                    }
                 }
                 excluded_items.push(exclusion);
                 continue;
@@ -2546,7 +2556,12 @@ pub fn normalize_context_artifact_path(raw_path: &str) -> ContextPathNormalizati
     }
 
     let path = Path::new(raw_path);
-    if path.is_absolute() {
+    // On Windows, POSIX-style root paths (`/etc/passwd`) are root-relative
+    // rather than absolute (`Path::is_absolute` returns false), which would
+    // otherwise be classified as `root_or_prefix_rejected` instead of the
+    // platform-independent `absolute_path_rejected`. Normalize the check so
+    // the classifier is identical across platforms.
+    if path.is_absolute() || raw_path.starts_with('/') {
         return ContextPathNormalization {
             raw_path: raw_path.to_string(),
             normalized_path: None,

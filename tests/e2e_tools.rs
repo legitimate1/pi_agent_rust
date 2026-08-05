@@ -1156,8 +1156,22 @@ fn bash_cwd_propagation() {
     let text = first_text(&result.content);
     h.log().info("result", format!("cwd output: {text}"));
 
+    // MSYS bash prints POSIX-style paths on Windows; convert pwd output back
+    // to the Windows form before comparing with the expected temp dir.
+    let mut normalized = text.trim().to_string();
+    #[cfg(windows)]
+    if let Ok(converted) = std::process::Command::new("cygpath")
+        .args(["-w", &normalized])
+        .output()
+    {
+        if converted.status.success() {
+            normalized = String::from_utf8_lossy(&converted.stdout)
+                .trim()
+                .to_string();
+        }
+    }
     assert!(
-        text.contains(&expected_dir.display().to_string()),
+        normalized.contains(&expected_dir.display().to_string()),
         "pwd should show temp dir, got: {text}"
     );
     assert!(

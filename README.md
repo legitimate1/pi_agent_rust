@@ -869,7 +869,7 @@ When multiple resources share the same name, the first occurrence wins. Collisio
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-Provider-count rule: Pi has 10 native provider implementation modules, counted as the Rust files under `src/providers/` excluding `mod.rs`. Those modules are `anthropic`, `openai`, `openai_responses`, `gemini`, `cohere`, `azure`, `bedrock`, `vertex`, `copilot`, and `gitlab`. User-visible provider IDs, aliases, OpenAI-compatible presets, and extension-provided `streamSimple` providers are counted separately because several native modules expose multiple routes.
+Provider-count rule: Pi has 12 native provider implementation modules, counted as the Rust files under `src/providers/` excluding `mod.rs`. Those modules are `anthropic`, `openai`, `openai_responses`, `gemini`, `cohere`, `azure`, `bedrock`, `vertex`, `copilot`, `gitlab`, `cursor`, and `model_fetch`. User-visible provider IDs, aliases, OpenAI-compatible presets, and extension-provided `streamSimple` providers are counted separately because several native modules expose multiple routes.
 
 ### Key Design Decisions
 
@@ -2392,7 +2392,7 @@ Pi is honest about what it doesn't do:
 
 | Limitation | Workaround |
 |------------|------------|
-| **Not all provider APIs** | Built-in support is backed by 10 native provider implementation modules: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini, Cohere, Azure OpenAI, Bedrock, Vertex AI, GitHub Copilot, and GitLab Duo; some ecosystem-specific APIs are still TBD |
+| **Not all provider APIs** | Built-in support is backed by 12 native provider implementation modules: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini, Cohere, Azure OpenAI, Bedrock, Vertex AI, GitHub Copilot, GitLab Duo, Cursor, and model catalog fetch; some ecosystem-specific APIs are still TBD |
 | **No web browsing** | Use bash with curl |
 | **No GUI** | Terminal-only by design |
 | **Some extensions need npm stubs** | Common stubs are provided; unlisted npm packages still require a stub. See docs/planning/EXTENSIONS.md §8.1 |
@@ -2561,7 +2561,7 @@ A: This is an authorized Rust port of [Pi Agent](https://github.com/badlogic/pi)
 A: Startup time matters when you're in a terminal all day. Rust gives us <100ms startup vs 500ms+ for Node.js. Plus, no runtime dependencies to manage.
 
 **Q: Can I use providers beyond Anthropic (OpenAI/Gemini/Cohere/Azure/Bedrock/Vertex/Copilot/GitLab/Codex)?**
-A: Yes. Pi has 10 native provider implementation modules: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini (native + Gemini CLI + Antigravity routes), Cohere, Azure OpenAI, Amazon Bedrock, Vertex AI, GitHub Copilot, and GitLab Duo. Pi also supports many OpenAI-compatible presets (for example Groq, OpenRouter, Mistral, Together, DeepSeek, Cerebras, DeepInfra, Alibaba/Qwen, and Moonshot/Kimi). Provider IDs and aliases are case-insensitive. Set credentials and choose via `--provider`/`--model`; run `pi --list-providers` to see canonical IDs, aliases, and env keys.
+A: Yes. Pi has 12 native provider implementation modules: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini (native + Gemini CLI + Antigravity routes), Cohere, Azure OpenAI, Amazon Bedrock, Vertex AI, GitHub Copilot, GitLab Duo, Cursor, and model catalog fetch. Pi also supports many OpenAI-compatible presets (for example Groq, OpenRouter, Mistral, Together, DeepSeek, Cerebras, DeepInfra, Alibaba/Qwen, and Moonshot/Kimi). Provider IDs and aliases are case-insensitive. Set credentials and choose via `--provider`/`--model`; run `pi --list-providers` to see canonical IDs, aliases, and env keys.
 
 **Q: How do sessions work?**
 A: By default, each session is a JSONL v3 file with message entries, parent references for branching, and compaction metadata. Builds include `sqlite-sessions` support by default, so configured deployments can use SQLite-backed session storage too; JSONL remains the default store unless configuration selects SQLite.
@@ -2599,7 +2599,7 @@ A: Yes. Point any provider at a custom base URL via `models.json`. Pi normalizes
 | **Language** | Rust | TypeScript | Python | Electron |
 | **Startup** | <100ms | ~1s | ~2s | ~5s |
 | **Memory** | <50MB | ~200MB | ~150MB | ~500MB |
-| **Providers** | 10 native provider implementation modules + OpenAI-compatible presets | Anthropic | Many | Many |
+| **Providers** | 12 native provider implementation modules + OpenAI-compatible presets | Anthropic | Many | Many |
 | **Tools** | 8 built-in | Many | File-focused | IDE-integrated |
 | **Sessions** | JSONL tree | Proprietary | Git-based | Proprietary |
 | **Open source** | Yes | Yes | Yes | No |

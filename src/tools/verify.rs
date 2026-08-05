@@ -90,6 +90,16 @@ fn detect_file_type(path: &Path) -> Option<FileType> {
     }
 }
 
+/// Whether a file has a known, verifiable type.
+///
+/// Tools call this before running verification so that writing/editing
+/// plain files (`.txt`, no extension, …) does not surface a spurious
+/// `verify: ERROR Unsupported file type` — verification only applies to
+/// syntax/format-checkable types.
+pub fn is_supported_file_type(path: &Path) -> bool {
+    detect_file_type(path).is_some()
+}
+
 /// Resolve a bare program name to a spawnable command on this platform.
 ///
 /// Windows `CreateProcess` cannot spawn extension-less shims or `.cmd`/`.bat`

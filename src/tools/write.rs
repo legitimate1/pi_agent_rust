@@ -164,8 +164,11 @@ impl Tool for WriteTool {
             bytes_written, input.path
         );
 
-        // Optional: run file verification after successful write
-        if input.verify {
+        // Optional: run file verification after successful write.
+        // Verification only applies to known syntax/format-checkable types;
+        // plain files (`.txt`, no extension, …) are skipped so the output
+        // stays free of spurious "unsupported type" errors.
+        if input.verify && crate::tools::verify::is_supported_file_type(&path) {
             let verify_path = path.clone();
             match crate::tools::verify::verify_file(verify_path, abort).await {
                 Ok(result) => {

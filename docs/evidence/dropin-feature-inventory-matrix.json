@@ -75,7 +75,7 @@
         "legacy_pi_mono_code/pi-mono/packages/coding-agent/src/cli/args.ts"
       ],
       "rust_evidence": [
-        "src/tools.rs",
+        "src/tools/mod.rs",
         "src/cli.rs"
       ],
       "status": "provisional_present_both",
@@ -590,7 +590,7 @@
       ],
       "rust_evidence": [
         "src/config.rs",
-        "src/tools.rs",
+        "src/tools/mod.rs",
         "docs/settings.md"
       ],
       "status": "provisional_present_both",

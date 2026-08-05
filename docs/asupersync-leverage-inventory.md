@@ -122,7 +122,7 @@ This is not a rewrite wishlist. Pi already gets real value from `asupersync` in 
 - Recommendation: `keep` for now, with a narrow `defer` for measurement-based follow-up
 - Why it matters: these threads are tied to blocking OS pipes and short-lived child-process cleanup. Replacing them preemptively with generic runtime blocking lanes is not obviously better, and several of these surfaces already combine timeouts with explicit kill/cleanup logic correctly.
 - Exact modules and functions:
-  - `src/tools.rs`
+  - `src/tools/mod.rs`
     - `BashTool::execute`
     - `GrepTool::execute`
     - `FindTool::execute`
@@ -132,7 +132,7 @@ This is not a rewrite wishlist. Pi already gets real value from `asupersync` in 
   - `src/extension_dispatcher.rs`
     - extension exec/command child-process pump paths
 - Keep unchanged:
-  - `src/tools.rs::{EditTool::execute,WriteTool::execute,HashlineEditTool::execute}` using `spawn_blocking_io` for atomic writes
+  - `src/tools/mod.rs::{EditTool::execute,WriteTool::execute,HashlineEditTool::execute}` using `spawn_blocking_io` for atomic writes
   - `AgentCx::for_current_or_request()` timer usage in tool polling loops
   - Current `TERM -> grace -> KILL` and process-tree cleanup semantics
 - Defer only if evidence appears:
@@ -151,14 +151,14 @@ This is not a rewrite wishlist. Pi already gets real value from `asupersync` in 
     - `run_prompt_with_retry` retry backoff loop
     - `maybe_auto_compact`
     - `rpc_emit_extension_ui_request`
-  - `src/tools.rs`
+  - `src/tools/mod.rs`
     - `BashTool::execute`
     - `GrepTool::execute`
     - `FindTool::execute`
   - `src/compaction_worker.rs`
     - `CompactionWorkerState::try_recv`
 - Keep unchanged right now:
-  - timer-driver-aware `now` lookups in `src/tools.rs` and `src/http/client.rs`
+  - timer-driver-aware `now` lookups in `src/tools/mod.rs` and `src/http/client.rs`
   - extension manager timeout clamping via `ExtensionManager::effective_timeout`
 - Downstream beads:
   - `bd-xdcrh.3`
@@ -174,7 +174,7 @@ tool-output, or UI-delivery state in a way that would leave a partial effect beh
 
 ### 1. Shell/process polling loops
 
-- `src/tools.rs::run_bash_command`
+- `src/tools/mod.rs::run_bash_command`
   - Why it matters: this is a long-lived poll/drain loop that can run for minutes while a child
     process is alive and streaming output.
   - Safe checkpoint location: after the current `rx.try_recv()` drain finishes and after the
@@ -202,7 +202,7 @@ tool-output, or UI-delivery state in a way that would leave a partial effect beh
   - Expected behavior after insertion: cancelled RPC shell work stops polling quickly, but tail-file
     spill state and process-tree cleanup remain internally consistent.
 
-- `src/tools.rs::GrepTool::execute`
+- `src/tools/mod.rs::GrepTool::execute`
   - Why it matters: the main loop repeatedly drains bounded stdout/stderr channels from ripgrep and
     waits for process exit; the post-exit join loop can also run for a while under backpressure.
   - Safe checkpoint location: after `drain_rg_stdout(...)` / `drain_rg_stderr(...)` finish for the
@@ -216,7 +216,7 @@ tool-output, or UI-delivery state in a way that would leave a partial effect beh
   - Expected behavior after insertion: cancellation stops waiting for more ripgrep output, but does
     not leave the match accumulator or explicit process termination in a half-applied state.
 
-- `src/tools.rs::FindTool::execute`
+- `src/tools/mod.rs::FindTool::execute`
   - Why it matters: the fd-backed search loop mirrors grep/bashtool polling, just with bulk stdout
     readers instead of per-line JSON parsing.
   - Safe checkpoint location: after the current child-status check and before `sleep(now, tick)`.
@@ -321,9 +321,9 @@ tool-output, or UI-delivery state in a way that would leave a partial effect beh
 
 ### Recommended implementation order for `bd-xdcrh.3.2`
 
-1. `src/tools.rs::run_bash_command`
+1. `src/tools/mod.rs::run_bash_command`
 2. `src/rpc.rs::run_bash_rpc`
-3. `src/tools.rs::GrepTool::execute`
+3. `src/tools/mod.rs::GrepTool::execute`
 4. `src/rpc.rs::run_prompt_with_retry`
 5. `src/agent.rs::stream_assistant_response`
 6. `src/rpc.rs` extension UI request bridge
@@ -335,14 +335,14 @@ tool-output, or UI-delivery state in a way that would leave a partial effect beh
 
 The current implementation landed the four highest-confidence sites from this map:
 
-- `src/tools.rs::run_bash_command`
+- `src/tools/mod.rs::run_bash_command`
 - `src/rpc.rs::run_bash_rpc`
 - `src/rpc.rs::run_prompt_with_retry`
 - `src/agent.rs::stream_assistant_response`
 
 Two remaining candidates were deferred deliberately rather than forgotten:
 
-- `src/tools.rs::GrepTool::execute` and `src/tools.rs::FindTool::execute`
+- `src/tools/mod.rs::GrepTool::execute` and `src/tools/mod.rs::FindTool::execute`
   - The poll boundaries are mechanically safe, but these tool APIs do not currently expose an
     explicit cancelled result shape. Adding checkpoints there would force a separate contract
     decision about whether cancellation returns partial search results or a new tool error.
@@ -363,7 +363,7 @@ These are the places where Pi is already using `asupersync` in the right way and
 - `src/extensions.rs`
   - `cx_with_deadline`
   - `ExtensionManager::{with_budget,set_budget,extension_cx,effective_timeout,dispatch_event*,execute_command,execute_shortcut}`
-- `src/tools.rs`
+- `src/tools/mod.rs`
   - `EditTool::execute`
   - `WriteTool::execute`
   - `HashlineEditTool::execute`
@@ -377,7 +377,7 @@ Existing strong examples:
 
 - `src/extensions.rs` budget/timeout tests
 - `src/http/client.rs` deterministic timeout/stream tests
-- `src/tools.rs` broad `asupersync::test_utils::run_test` coverage
+- `src/tools/mod.rs` broad `asupersync::test_utils::run_test` coverage
 
 Coverage gaps worth filling as code lands:
 

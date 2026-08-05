@@ -219,7 +219,7 @@
         "current_anchor": [
           "src/sdk.rs Tool/ToolRegistry exports",
           "src/agent.rs::enable_extensions_with_policy",
-          "src/tools.rs"
+          "src/tools/mod.rs"
         ],
         "status": "partial",
         "owner_beads": [

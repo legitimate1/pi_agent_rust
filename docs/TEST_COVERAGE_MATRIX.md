@@ -36,6 +36,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | Source file | Area | Coverage evidence / status |
 |---|---|---|
 | `src/acp.rs` | ACP protocol | Unit; `tests/sdk_api.rs`, `tests/sdk_integration.rs`, `tests/sdk_unit.rs`. |
+| `src/abort.rs` | Abort signal primitive | Unit. |
 | `src/agent.rs` | Agent loop | Unit; `tests/agent_loop_vcr.rs`, `tests/agent_loop_reliability.rs`, `tests/e2e_agent_loop.rs`, `tests/rpc_mode.rs`. |
 | `src/agent_cx.rs` | Agent context | Unit; covered through agent/RPC suites. |
 | `src/app.rs` | App orchestration | Unit; `tests/e2e_cli.rs`, `tests/e2e_rpc.rs`, `tests/main_cli_selection.rs`. |
@@ -70,6 +71,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/extensions.rs` | Extension protocol/runtime | Unit; `tests/extensions_*.rs`, `tests/ext_conformance*.rs`, `tests/e2e_extension_registration.rs`. |
 | `src/extensions_js.rs` | QuickJS bridge | Unit; `tests/event_loop_conformance.rs`, `tests/js_runtime_ordering.rs`, `tests/node_*_shim.rs`, `tests/e2e_ts_extension_loading.rs`. |
 | `src/flake_classifier.rs` | Flake classifier | Unit; patterns are mirrored by `scripts/ci_conformance_retry.sh`. |
+| `src/file_lock.rs` | DirLock directory-protocol lock | Unit. |
 | `src/hostcall_amac.rs` | Hostcall AMAC | Unit; `tests/streaming_hostcall.rs`. |
 | `src/hostcall_io_uring_lane.rs` | Hostcall io_uring lane | Unit; `tests/streaming_hostcall.rs`. |
 | `src/hostcall_queue.rs` | Hostcall queue | Unit; `tests/hostcall_queue_ebr.rs`, `tests/hostcall_queue_loom.rs`; loom opt-in owner `bd-8t27h.6`. |
@@ -105,10 +107,15 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/main.rs` | CLI entry | Unit; `tests/e2e_cli.rs`, `tests/e2e_rpc.rs`, `tests/main_cli_selection.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/migrations.rs` | Migrations | Unit; SQLite/session migration coverage through `tests/session_sqlite.rs`. |
 | `src/model.rs` | Message/content model | Unit; `tests/model_serialization.rs`. |
+| `src/model_routing.rs` | Model routing helpers | Unit. |
 | `src/model_selector.rs` | Model selector | Unit; `tests/model_selector_cycling.rs`. |
 | `src/models.rs` | Model registry | Unit; `tests/model_registry.rs`. |
 | `src/package_manager.rs` | Package manager | Unit; `tests/package_manager.rs`, `tests/e2e_cli.rs`. |
 | `src/perf_build.rs` | Perf build metadata | Unit; `tests/perf_bench_harness.rs`, `tests/perf_budgets.rs`, `tests/perf_regression.rs`. |
+| `src/semantic_workspace_graph.rs` | Semantic workspace graph | Unit; `tests/semantic_workspace_graph_builder.rs`. |
+| `src/subprocess_handle.rs` | Subprocess handle | Unit. |
+| `src/swarm_progress_slo.rs` | Swarm progress SLO | Unit; `tests/swarm_progress_cli.rs`. |
+| `src/swarm_replay.rs` | Swarm replay ingest/preview | Unit; `tests/swarm_replay_ingestor.rs`, `tests/swarm_replay_preview_cli.rs`. |
 | `src/permissions.rs` | Capability permissions | Unit; `tests/capability_policy_model.rs`, `tests/capability_policy_scoped.rs`, `tests/capability_denial_matrix.rs`. |
 | `src/pi_wasm.rs` | PiWasm runtime | Unit; `tests/lab_runtime_extensions.rs`; unsupported imports fail closed, with bounded Emscripten compatibility stubs covered by source tests. |
 | `src/platform.rs` | Platform helpers | Unit. |
@@ -119,8 +126,10 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/providers/bedrock.rs` | Bedrock provider | Unit; provider native/contract suites. |
 | `src/providers/cohere.rs` | Cohere provider | Unit; `tests/provider_streaming/cohere.rs`, provider error/path suites. |
 | `src/providers/copilot.rs` | Copilot provider | Unit; provider native/contract suites. |
+| `src/providers/cursor.rs` | Cursor provider | Unit; provider native/contract suites. |
 | `src/providers/gemini.rs` | Gemini provider | Unit; `tests/provider_streaming/gemini.rs`, provider error/path suites. |
 | `src/providers/gitlab.rs` | GitLab Duo provider | Unit; provider native/contract suites. |
+| `src/providers/model_fetch.rs` | Dynamic model catalog fetch | Unit. |
 | `src/providers/mod.rs` | Provider factory | Unit; `tests/provider_factory.rs`, `tests/provider_native_verify.rs`; branch export baseline marks this family partly branch-SIGSEGV fallback. |
 | `src/providers/openai.rs` | OpenAI chat provider | Unit; `tests/provider_streaming/openai.rs`, provider error/path suites. |
 | `src/providers/openai_responses.rs` | OpenAI Responses provider | Unit; `tests/provider_streaming/openai_responses.rs`, provider error/path suites. |
@@ -142,7 +151,19 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/swarm_flight_recorder.rs` | Swarm flight recorder | Unit and E2E; `tests/e2e_swarm_flight_recorder.rs` covers deterministic multi-agent replay artifacts. |
 | `src/terminal_images.rs` | Terminal images | Unit; interactive/TUI rendering tests. |
 | `src/theme.rs` | Theme loading | Unit; `tests/tui_snapshot.rs`, interactive UI tests. |
-| `src/tools.rs` | Built-in tools | Unit; `tests/tools_conformance.rs`, `tests/e2e_tools.rs`, `tests/tools_hardened.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
+| `src/tools/bash.rs` | Bash tool | Unit; `tests/tools_conformance.rs`, `tests/tools_hardened.rs`. |
+| `src/tools/edit.rs` | Edit tool | Unit; `tests/tools_conformance.rs`, `tests/tools_hardened.rs`. |
+| `src/tools/find.rs` | Find tool | Unit; `tests/tools_conformance.rs`, `tests/tools_hardened.rs`. |
+| `src/tools/grep.rs` | Grep tool | Unit; `tests/tools_conformance.rs`, `tests/tools_hardened.rs`. |
+| `src/tools/hashline.rs` | Hashline edit tool | Unit; `tests/tools_conformance.rs`, `tests/tools_hardened.rs`. |
+| `src/tools/ls.rs` | LS tool | Unit; `tests/tools_conformance.rs`, `tests/tools_hardened.rs`. |
+| `src/tools/mod.rs` | Tool registry and helpers | Unit; `tests/tools_conformance.rs`, `tests/e2e_tools.rs`, `tests/tools_hardened.rs`. |
+| `src/tools/pwsh.rs` | PowerShell tool | Unit; `tests/tools_conformance.rs`. |
+| `src/tools/read.rs` | Read tool | Unit; `tests/tools_conformance.rs`, `tests/tools_hardened.rs`. |
+| `src/tools/tests.rs` | Tool test utilities | Waived test-support module. |
+| `src/tools/verify.rs` | Syntax/format verify | Unit; `tests/tools_conformance.rs`, `tests/tools_hardened.rs`. |
+| `src/tools/write.rs` | Write tool | Unit; `tests/tools_conformance.rs`, `tests/tools_hardened.rs`. |
+| `src/validation_broker.rs` | Validation broker | Unit; `tests/validation_broker_cli.rs`, `tests/validation_broker_e2e.rs`. |
 | `src/tui.rs` | Terminal renderer | Unit; `tests/tui_snapshot.rs`, `tests/tui_state.rs`, `tests/e2e_tui.rs`. |
 | `src/vcr.rs` | VCR playback/record | Unit; `tests/vcr_parity_validation.rs`, `tests/vcr_redaction_scan.rs`, provider/RPC VCR suites. |
 | `src/version_check.rs` | Version checks | Unit; cross-platform and release-readiness tests exercise the surrounding behavior. |

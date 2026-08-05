@@ -923,6 +923,19 @@ fn generate_conformance_report_impl() {
         },
     });
     let summary_path = reports.join("conformance_summary.json");
+    // Fail-closed guard: if no scenario/smoke/parity reports were ingested,
+    // the summary would claim every extension is N/A (pass rate 0%),
+    // clobbering a healthy committed report and tripping the release gate
+    // (`release_evidence_gate::conformance_pass_rate_meets_release_threshold`).
+    // Only regenerate when at least one extension actually ran. (Negative
+    // policy triage is tracked separately and does not satisfy this.)
+    if statuses.is_empty() {
+        eprintln!(
+            "[conformance_report] No extension conformance data ingested; keeping existing \
+             summary/report files instead of overwriting with all-N/A."
+        );
+        return;
+    }
     std::fs::write(
         &summary_path,
         serde_json::to_string_pretty(&summary).unwrap_or_default(),

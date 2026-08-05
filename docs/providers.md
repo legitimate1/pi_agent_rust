@@ -12,7 +12,7 @@ Snapshot basis:
 - Original snapshot timestamp: 2026-02-10
 - Last source cross-check: 2026-05-10 (`bd-8t27h.7`)
 
-Provider-count rule: Pi has 10 native provider implementation modules, counted as the Rust files under `src/providers/` excluding `mod.rs`: `anthropic`, `openai`, `openai_responses`, `gemini`, `cohere`, `azure`, `bedrock`, `vertex`, `copilot`, and `gitlab`. User-visible canonical IDs, aliases, OpenAI-compatible presets, VCR coverage families, and extension-provided providers are separate counts.
+Provider-count rule: Pi has 12 native provider implementation modules, counted as the Rust files under `src/providers/` excluding `mod.rs`: `anthropic`, `openai`, `openai_responses`, `gemini`, `cohere`, `azure`, `bedrock`, `vertex`, `copilot`, `gitlab`, `cursor`, and `model_fetch`. User-visible canonical IDs, aliases, OpenAI-compatible presets, VCR coverage families, and extension-provided providers are separate counts.
 
 This rule is guarded by `tests/traceability_staleness.rs::native_provider_module_inventory_matches_provider_docs`, which compares this list against the live `src/providers/*.rs` inventory.
 

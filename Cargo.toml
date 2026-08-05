@@ -375,11 +375,11 @@ path = "tests/hostcall_queue_loom.rs"
 required-features = ["loom-tests"]
 
 [profile.release]
-opt-level = 3
-lto = "thin"
+opt-level = "z"
+lto = true
+codegen-units = 1
 panic = "abort"
 strip = true
-incremental = true
 
 [profile.dev]
 opt-level = 0

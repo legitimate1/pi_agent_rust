@@ -2,7 +2,7 @@
   "schema_version": "1.0.0",
   "program_issue_id": "bd-k5q5.7",
   "program_title": "Comprehensive Verification Program: unit tests, end-to-end scripts, and detailed diagnostics logging",
-  "updated_at": "2026-05-10",
+  "updated_at": "2026-08-05T00:00:00Z",
   "ci_policy": {
     "required_categories": [
       "unit_tests",
@@ -966,6 +966,10 @@
         {
           "path": "tests/provider_live_verify.rs",
           "justification": "Classified e2e suite included in the bd-8t27h.3 traceability backfill so CI governance covers all registered tests."
+        },
+        {
+          "path": "tests/e2e_transient_retry_resume.rs",
+          "justification": "Classified e2e suite included so CI governance covers transient retry/resume continuity."
         }
       ],
       "evidence_logs": [
@@ -1542,7 +1546,7 @@
     },
     {
       "id": "bd-f0huc",
-      "title": "SEC-2.1: Extension manifest v2 \u2014 explicit capabilities, behavioral intents, and trust metadata",
+      "title": "SEC-2.1: Extension manifest v2 — explicit capabilities, behavioral intents, and trust metadata",
       "acceptance_criteria": "Manifest v2 parsing, validation, and metadata extraction covered by unit tests.",
       "unit_tests": [
         {
@@ -1777,7 +1781,7 @@
     },
     {
       "id": "bd-3tb30",
-      "title": "SEC-3.4: Enforcement state machine \u2014 allow/harden/prompt/deny/terminate with hysteresis",
+      "title": "SEC-3.4: Enforcement state machine — allow/harden/prompt/deny/terminate with hysteresis",
       "acceptance_criteria": "State transitions, hysteresis logic, and edge cases covered by deterministic tests.",
       "unit_tests": [
         {

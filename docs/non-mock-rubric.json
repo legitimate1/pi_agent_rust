@@ -41,7 +41,7 @@
       },
       {
         "name": "tools",
-        "paths": ["src/tools.rs"],
+        "paths": ["src/tools/mod.rs", "src/tools/*.rs"],
         "criticality": "critical",
         "line_floor_pct": 75.0,
         "function_floor_pct": 72.0,

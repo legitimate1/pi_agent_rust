@@ -30,7 +30,7 @@
       "description": "List nonexistent directory errors",
       "input": {"path": "/nonexistent/directory"},
       "expect_error": true,
-      "error_contains": "Cannot list outside the working directory",
+      "error_contains": "Path not found",
       "expected": {}
     },
     {
