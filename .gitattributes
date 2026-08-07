@@ -1,5 +1,28 @@
-legacy_pi_mono_code/pi-mono/** -whitespace
+# ── Line-ending policy ─────────────────────────────────────────────
+# Project text files: force LF end-of-line everywhere (Windows/macOS/Linux
+# unified). Overrides core.autocrlf; prevents CRLF/LF churn between git,
+# prettier, editors, and agents.
+* text=auto eol=lf
+
+# Vendored third-party corpora: keep byte-for-byte as shipped (no line-ending
+# conversion, no whitespace rewriting). Do not renormalize these.
+legacy_pi_mono_code/** -text
+tests/ext_conformance/artifacts/** -text
 
 # Conformance golden files must stay LF: CRLF conversion breaks content
 # comparison against tool output, which normalizes to LF.
 tests/conformance/goldens/** text eol=lf
+
+# Binary assets: never treat as text (guards against text=auto heuristic
+# misfiring on NUL-free binary data).
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.wasm binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
