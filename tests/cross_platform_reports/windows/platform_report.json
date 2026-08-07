@@ -1,0 +1,177 @@
+{
+  "schema": "pi.ci.cross_platform_matrix.v1",
+  "generated_at": "2026-08-07T11:41:06.407Z",
+  "platform": "windows",
+  "platform_details": {
+    "arch": "x86_64",
+    "ci": "",
+    "family": "windows",
+    "github_actions": "",
+    "os": "windows"
+  },
+  "merge_policy": {
+    "description": "Cross-platform merge policy for pi_agent_rust CI",
+    "required_platforms": [
+      "linux"
+    ],
+    "informational_platforms": [
+      "macos",
+      "windows"
+    ],
+    "rules": [
+      {
+        "blocking": true,
+        "description": "All required checks on Linux must pass to merge",
+        "rule": "linux_required"
+      },
+      {
+        "blocking": false,
+        "description": "macOS failures are logged but do not block merge",
+        "rule": "macos_informational"
+      },
+      {
+        "blocking": false,
+        "description": "Windows failures are logged but do not block merge",
+        "rule": "windows_informational"
+      },
+      {
+        "blocking": false,
+        "description": "Platform-specific failures are tagged with platform-unsupported or platform-skip for triage grouping",
+        "rule": "platform_tag_grouping"
+      },
+      {
+        "blocking": false,
+        "description": "Each platform publishes structured logs (JSON/JSONL) for cross-platform diff triage",
+        "rule": "artifact_parity"
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "name": "unix_signals",
+      "available": false,
+      "notes": "POSIX signal handling (SIGTERM, SIGINT)"
+    },
+    {
+      "name": "tmux",
+      "available": false,
+      "notes": "Terminal multiplexer for E2E TUI tests"
+    },
+    {
+      "name": "symlinks",
+      "available": true,
+      "notes": "Filesystem symlink support"
+    },
+    {
+      "name": "file_permissions",
+      "available": false,
+      "notes": "POSIX file permission bits (chmod)"
+    },
+    {
+      "name": "dev_null",
+      "available": true,
+      "notes": "Null device for output redirection"
+    },
+    {
+      "name": "temp_dir",
+      "available": true,
+      "notes": "System temp directory accessible"
+    },
+    {
+      "name": "git",
+      "available": true,
+      "notes": "Git CLI available in PATH"
+    },
+    {
+      "name": "node",
+      "available": true,
+      "notes": "Node.js runtime for extension execution"
+    }
+  ],
+  "checks": [
+    {
+      "id": "cargo_check",
+      "name": "Cargo check compiles",
+      "platform": "windows",
+      "policy": "required",
+      "status": "pass"
+    },
+    {
+      "id": "test_infra",
+      "name": "Test infrastructure functional",
+      "platform": "windows",
+      "policy": "required",
+      "status": "pass"
+    },
+    {
+      "id": "temp_writable",
+      "name": "Temp directory writable",
+      "platform": "windows",
+      "policy": "required",
+      "status": "pass"
+    },
+    {
+      "id": "git_available",
+      "name": "Git CLI available",
+      "platform": "windows",
+      "policy": "required",
+      "status": "pass"
+    },
+    {
+      "id": "conformance_artifacts",
+      "name": "Conformance artifacts present",
+      "platform": "windows",
+      "policy": "informational",
+      "status": "pass"
+    },
+    {
+      "id": "e2e_tui_support",
+      "name": "E2E TUI test support (tmux)",
+      "platform": "windows",
+      "policy": "informational",
+      "status": "unsupported",
+      "reason": "tmux not available on Windows",
+      "platform_tag": "platform-unsupported"
+    },
+    {
+      "id": "file_permissions",
+      "name": "POSIX file permission support",
+      "platform": "windows",
+      "policy": "informational",
+      "status": "unsupported",
+      "reason": "POSIX permissions not available on Windows",
+      "platform_tag": "platform-unsupported"
+    },
+    {
+      "id": "extension_artifacts",
+      "name": "Extension test artifacts present",
+      "platform": "windows",
+      "policy": "informational",
+      "status": "pass"
+    },
+    {
+      "id": "evidence_bundle",
+      "name": "Evidence bundle index present",
+      "platform": "windows",
+      "policy": "informational",
+      "status": "pass"
+    },
+    {
+      "id": "suite_classification",
+      "name": "Suite classification file present and valid",
+      "platform": "windows",
+      "policy": "required",
+      "status": "pass"
+    }
+  ],
+  "summary": {
+    "total_checks": 10,
+    "passed": 8,
+    "failed": 0,
+    "skipped": 0,
+    "unsupported": 2,
+    "required_pass": 5,
+    "required_total": 5,
+    "all_required_pass": true
+  }
+}

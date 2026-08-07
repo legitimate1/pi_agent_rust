@@ -1,0 +1,10 @@
+{"check_id":"cargo_check","platform":"windows","platform_tag":null,"policy":"required","schema":"pi.ci.platform_check_event.v1","status":"pass","ts":"2026-08-07T11:41:06.408Z"}
+{"check_id":"test_infra","platform":"windows","platform_tag":null,"policy":"required","schema":"pi.ci.platform_check_event.v1","status":"pass","ts":"2026-08-07T11:41:06.408Z"}
+{"check_id":"temp_writable","platform":"windows","platform_tag":null,"policy":"required","schema":"pi.ci.platform_check_event.v1","status":"pass","ts":"2026-08-07T11:41:06.408Z"}
+{"check_id":"git_available","platform":"windows","platform_tag":null,"policy":"required","schema":"pi.ci.platform_check_event.v1","status":"pass","ts":"2026-08-07T11:41:06.408Z"}
+{"check_id":"conformance_artifacts","platform":"windows","platform_tag":null,"policy":"informational","schema":"pi.ci.platform_check_event.v1","status":"pass","ts":"2026-08-07T11:41:06.408Z"}
+{"check_id":"e2e_tui_support","platform":"windows","platform_tag":"platform-unsupported","policy":"informational","schema":"pi.ci.platform_check_event.v1","status":"unsupported","ts":"2026-08-07T11:41:06.408Z"}
+{"check_id":"file_permissions","platform":"windows","platform_tag":"platform-unsupported","policy":"informational","schema":"pi.ci.platform_check_event.v1","status":"unsupported","ts":"2026-08-07T11:41:06.408Z"}
+{"check_id":"extension_artifacts","platform":"windows","platform_tag":null,"policy":"informational","schema":"pi.ci.platform_check_event.v1","status":"pass","ts":"2026-08-07T11:41:06.408Z"}
+{"check_id":"evidence_bundle","platform":"windows","platform_tag":null,"policy":"informational","schema":"pi.ci.platform_check_event.v1","status":"pass","ts":"2026-08-07T11:41:06.408Z"}
+{"check_id":"suite_classification","platform":"windows","platform_tag":null,"policy":"required","schema":"pi.ci.platform_check_event.v1","status":"pass","ts":"2026-08-07T11:41:06.408Z"}

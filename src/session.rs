@@ -112,6 +112,22 @@ fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Maximum retry budget for a transient Windows file-contention error
+/// during session file replace/append. Another process (Defender scan, an
+/// editor, a parallel pi instance) may briefly hold the file open without
+/// the sharing modes our rename/open needs; the retry covers that window.
+const SESSION_PERSIST_RETRY_BUDGET: u32 = 6;
+const SESSION_APPEND_RETRY_BUDGET: u32 = 6;
+
+/// True for the two Windows file-contention errors that are transient in
+/// nature: `ERROR_ACCESS_DENIED` (5) — a holder without `FILE_SHARE_DELETE`
+/// blocks `MoveFileExW` (rename/persist) — and `ERROR_SHARING_VIOLATION`
+/// (32) — a holder without the share mode our open needs blocks
+/// `CreateFileW`. Both clear once the other process releases its handle.
+fn is_transient_file_contention(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::PermissionDenied || err.raw_os_error() == Some(32)
+}
+
 fn save_jsonl_full_rewrite_blocking(
     path: &Path,
     sessions_root: &Path,
@@ -146,9 +162,30 @@ fn save_jsonl_full_rewrite_blocking(
             .set_permissions(perms)
             .map_err(|e| crate::Error::Io(Box::new(e)))?;
     }
-    temp_file
-        .persist(path)
-        .map_err(|e| crate::Error::Io(Box::new(e.error)))?;
+    // persist() on Windows maps to MoveFileExW, which fails with
+    // ERROR_ACCESS_DENIED when another process holds the target open
+    // without FILE_SHARE_DELETE (Defender real-time scan, an editor, a
+    // parallel pi instance). The failure is transient and the temp file is
+    // intact across retries, so a short backoff-and-retry covers the window;
+    // genuine errors still propagate after the retry budget is exhausted.
+    let mut persist_attempts: u32 = 0;
+    loop {
+        match temp_file.persist(path) {
+            Ok(_) => break,
+            Err(e) => {
+                let is_transient_denial = is_transient_file_contention(&e.error)
+                    && persist_attempts < SESSION_PERSIST_RETRY_BUDGET;
+                if !is_transient_denial {
+                    return Err(crate::Error::Io(Box::new(e.error)));
+                }
+                persist_attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(
+                    40 * u64::from(persist_attempts),
+                ));
+                temp_file = e.file;
+            }
+        }
+    }
     sync_parent_dir(path).map_err(|e| crate::Error::Io(Box::new(e)))?;
     let mut entries_for_stats = entries_to_write.clone();
     let finalized = finalize_loaded_entries(&mut entries_for_stats);
@@ -173,12 +210,42 @@ fn append_jsonl_entries_blocking(
     session_name: Option<String>,
 ) -> Result<()> {
     let _lock = lock_session_persistence(path)?;
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(|e| crate::Error::Io(Box::new(e)))?;
+    // Opening for append can also hit a transient Windows access-denied
+    // window (another process holding the file without FILE_SHARE_WRITE).
+    // Retry briefly; genuine errors still propagate.
+    let mut open_attempts: u32 = 0;
+    let mut file = loop {
+        match std::fs::OpenOptions::new().append(true).open(path) {
+            Ok(f) => break f,
+            Err(e)
+                if is_transient_file_contention(&e)
+                    && open_attempts < SESSION_APPEND_RETRY_BUDGET =>
+            {
+                open_attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(
+                    40 * u64::from(open_attempts),
+                ));
+            }
+            Err(e) => return Err(crate::Error::Io(Box::new(e))),
+        }
+    };
     file.write_all(serialized_entries)?;
-    file.sync_all().map_err(|e| crate::Error::Io(Box::new(e)))?;
+    // FlushFileBuffers can be refused (os error 5) if the handle's share
+    // mode was invalidated by another process. The bytes were already
+    // handed to the kernel by write_all, so a refused durability barrier
+    // is downgraded to a warning — same trade-off as the RPC persister's
+    // best-effort flush. Genuine I/O failures still propagate.
+    if let Err(e) = file.sync_all() {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "session append fsync refused (access denied); data already written"
+            );
+        } else {
+            return Err(crate::Error::Io(Box::new(e)));
+        }
+    }
 
     enqueue_session_index_snapshot_update(sessions_root, path, header, message_count, session_name);
     Ok(())
@@ -11310,6 +11377,103 @@ mod tests {
             "full rewrite should preserve entries appended after this session was opened"
         );
         assert_eq!(loaded.header.provider.as_deref(), Some("new-provider"));
+    }
+
+    /// Windows: a transient handle held without FILE_SHARE_DELETE makes the
+    /// atomic persist (MoveFileExW) fail with os error 5. The retry budget
+    /// must cover that window and complete the save once the handle is gone.
+    #[test]
+    #[cfg(windows)]
+    fn full_rewrite_retries_past_transient_handle_contention() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::sync::mpsc;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("session.jsonl");
+        let header = SessionHeader::new();
+        // Pre-create the target as a valid session file so the "old" session
+        // exists (prepare_jsonl_full_rewrite parses it before replacing).
+        let old_header = SessionHeader::new();
+        std::fs::write(&path, serde_json::to_string(&old_header).unwrap() + "\n").unwrap();
+
+        // Hold the target with READ|WRITE but NO DELETE — the exact Windows
+        // condition that blocks rename/replace. Release after 300ms so the
+        // retry (40ms..240ms backoff) succeeds.
+        let holder = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(0x1 | 0x2)
+            .open(&path)
+            .unwrap();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_thread = std::thread::spawn(move || {
+            let _ = release_rx.recv_timeout(std::time::Duration::from_millis(300));
+            drop(holder);
+        });
+
+        let result =
+            save_jsonl_full_rewrite_blocking(&path, temp_dir.path(), &header, &[], 0, true);
+
+        let _ = release_tx.send(());
+        release_thread.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "full rewrite should succeed after transient handle release, got: {result:?}"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains(&header.id),
+            "rewritten file should contain the new header id"
+        );
+    }
+
+    /// Windows: opening for append needs GENERIC_WRITE; a holder without
+    /// FILE_SHARE_WRITE blocks it with os error 5. The open retry must cover
+    /// that transient window.
+    #[test]
+    #[cfg(windows)]
+    fn append_retries_past_transient_handle_contention() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::sync::mpsc;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("session.jsonl");
+        std::fs::write(&path, "header line\n").unwrap();
+
+        // Hold with READ only (no FILE_SHARE_WRITE) → append-open is denied
+        // until the holder releases (300ms later).
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1)
+            .open(&path)
+            .unwrap();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_thread = std::thread::spawn(move || {
+            let _ = release_rx.recv_timeout(std::time::Duration::from_millis(300));
+            drop(holder);
+        });
+
+        let result = append_jsonl_entries_blocking(
+            &path,
+            temp_dir.path(),
+            &SessionHeader::new(),
+            b"{\"type\":\"message\"}\n",
+            1,
+            None,
+        );
+
+        let _ = release_tx.send(());
+        release_thread.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "append should succeed after transient handle release, got: {result:?}"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("message"),
+            "appended entry should be present"
+        );
     }
 
     #[test]

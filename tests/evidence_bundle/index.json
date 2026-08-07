@@ -1,8 +1,8 @@
 {
   "schema": "pi.ci.evidence_bundle.v1",
-  "generated_at": "2026-05-12T19:26:21.441Z",
-  "git_ref": "80edf7ef9",
-  "ci_run_id": "local-20260512T192621Z",
+  "generated_at": "2026-08-07T11:41:06.488Z",
+  "git_ref": "1d686c39",
+  "ci_run_id": "local-20260807T114106Z",
   "sections": [
     {
       "id": "conformance_summary",
@@ -13,13 +13,13 @@
       "schema": "pi.ext.conformance_summary.v2",
       "summary": {
         "fail": 0,
-        "generated_at": "2026-05-10T23:08:55Z",
+        "generated_at": "2026-05-12T19:26:24Z",
         "pass": 60,
         "pass_rate_pct": 100.0,
         "total": 224
       },
       "file_count": 1,
-      "total_bytes": 1058
+      "total_bytes": 1114
     },
     {
       "id": "conformance_baseline",
@@ -36,7 +36,7 @@
         "tested": 223
       },
       "file_count": 1,
-      "total_bytes": 16247
+      "total_bytes": 16659
     },
     {
       "id": "conformance_events",
@@ -45,7 +45,7 @@
       "status": "present",
       "artifact_path": "tests/ext_conformance/reports/conformance_events.jsonl",
       "file_count": 1,
-      "total_bytes": 223532
+      "total_bytes": 221685
     },
     {
       "id": "conformance_report_md",
@@ -54,30 +54,27 @@
       "status": "present",
       "artifact_path": "tests/ext_conformance/reports/CONFORMANCE_REPORT.md",
       "file_count": 1,
-      "total_bytes": 48168
+      "total_bytes": 48652
     },
     {
       "id": "regression_verdict",
       "label": "Regression gate verdict",
       "category": "conformance",
-      "status": "present",
+      "status": "missing",
       "artifact_path": "tests/ext_conformance/reports/regression_verdict.json",
-      "schema": "pi.conformance.regression_gate.v1",
-      "summary": {
-        "effective_pass_rate_pct": null,
-        "status": "pass"
-      },
-      "file_count": 1,
-      "total_bytes": 1658
+      "diagnostics": "File not found",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
       "id": "conformance_trend",
       "label": "Conformance trend data",
       "category": "conformance",
-      "status": "present",
+      "status": "missing",
       "artifact_path": "tests/ext_conformance/reports/conformance_trend.jsonl",
-      "file_count": 1,
-      "total_bytes": 3075
+      "diagnostics": "File not found",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
       "id": "must_pass_gate",
@@ -87,18 +84,18 @@
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
       "schema": "pi.ext.must_pass_gate.v1",
       "summary": {
-        "correlation_id": "local-20260501T0316",
-        "generated_at": "2026-05-01T03:20:54.460Z",
+        "correlation_id": "must-pass-gate-local-20260515T170218075Z",
+        "generated_at": "2026-05-15T17:03:02.000Z",
         "must_pass_failed": 0,
         "must_pass_pass_rate_pct": 100.0,
         "must_pass_passed": 123,
         "must_pass_skipped": 0,
         "must_pass_total": 123,
-        "run_id": "local-20260501T0316",
+        "run_id": "local-20260515T170218075Z",
         "status": "pass"
       },
       "file_count": 1,
-      "total_bytes": 1206
+      "total_bytes": 1286
     },
     {
       "id": "must_pass_gate_events",
@@ -107,20 +104,17 @@
       "status": "present",
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_events.jsonl",
       "file_count": 1,
-      "total_bytes": 56814
+      "total_bytes": 62186
     },
     {
       "id": "failure_dossiers",
       "label": "Per-extension failure dossiers",
       "category": "diagnostics",
-      "status": "present",
+      "status": "missing",
       "artifact_path": "tests/ext_conformance/reports/dossiers",
-      "summary": {
-        "file_count": 34,
-        "total_bytes": 140366
-      },
-      "file_count": 34,
-      "total_bytes": 140366
+      "diagnostics": "Directory not found",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
       "id": "health_delta",
@@ -130,36 +124,30 @@
       "artifact_path": "tests/ext_conformance/reports/health_delta",
       "summary": {
         "file_count": 3,
-        "total_bytes": 88320
+        "total_bytes": 82184
       },
       "file_count": 3,
-      "total_bytes": 88320
+      "total_bytes": 82184
     },
     {
       "id": "provider_compat",
       "label": "Provider compatibility matrix",
       "category": "diagnostics",
-      "status": "present",
+      "status": "missing",
       "artifact_path": "tests/ext_conformance/reports/provider_compat",
-      "summary": {
-        "file_count": 753,
-        "total_bytes": 375207
-      },
-      "file_count": 753,
-      "total_bytes": 375207
+      "diagnostics": "Directory not found",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
       "id": "sharded_reports",
       "label": "Sharded extension matrix reports",
       "category": "diagnostics",
-      "status": "present",
+      "status": "missing",
       "artifact_path": "tests/ext_conformance/reports/sharded",
-      "summary": {
-        "file_count": 12,
-        "total_bytes": 280518
-      },
-      "file_count": 12,
-      "total_bytes": 280518
+      "diagnostics": "Directory not found",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
       "id": "journey_report",
@@ -169,7 +157,7 @@
       "artifact_path": "tests/ext_conformance/reports/journeys/journey_report.json",
       "schema": "pi.ext.journey_report.v1",
       "file_count": 1,
-      "total_bytes": 14742
+      "total_bytes": 820
     },
     {
       "id": "auto_repair_summary",
@@ -179,7 +167,7 @@
       "artifact_path": "tests/ext_conformance/reports/auto_repair_summary.json",
       "schema": "pi.ext.auto_repair_summary.v1",
       "file_count": 1,
-      "total_bytes": 56700
+      "total_bytes": 38722
     },
     {
       "id": "e2e_results",
@@ -188,11 +176,11 @@
       "status": "present",
       "artifact_path": "tests/e2e_results",
       "summary": {
-        "file_count": 1176,
-        "total_bytes": 183247322
+        "file_count": 74,
+        "total_bytes": 257962
       },
-      "file_count": 1176,
-      "total_bytes": 183247322
+      "file_count": 74,
+      "total_bytes": 257962
     },
     {
       "id": "quarantine_report",
@@ -206,7 +194,7 @@
         "expired_count": 0
       },
       "file_count": 1,
-      "total_bytes": 499
+      "total_bytes": 518
     },
     {
       "id": "quarantine_audit",
@@ -225,7 +213,7 @@
       "artifact_path": "tests/perf/reports/budget_summary.json",
       "schema": "pi.perf.budget_summary.v1",
       "file_count": 1,
-      "total_bytes": 4082
+      "total_bytes": 4216
     },
     {
       "id": "perf_comparison",
@@ -242,7 +230,7 @@
         "slower_count": 6
       },
       "file_count": 1,
-      "total_bytes": 6350
+      "total_bytes": 6524
     },
     {
       "id": "parameter_sweeps",
@@ -259,7 +247,7 @@
         "source_artifact": "phase1_matrix_validation"
       },
       "file_count": 1,
-      "total_bytes": 1076
+      "total_bytes": 1116
     },
     {
       "id": "stress_triage",
@@ -273,17 +261,17 @@
         "pass": true
       },
       "file_count": 1,
-      "total_bytes": 4829
+      "total_bytes": 5063
     },
     {
       "id": "load_time_benchmark",
       "label": "Extension load-time benchmark",
       "category": "performance",
-      "status": "present",
+      "status": "missing",
       "artifact_path": "tests/ext_conformance/reports/load_time_benchmark.json",
-      "schema": "pi.ext.load_time_benchmark.v1",
-      "file_count": 1,
-      "total_bytes": 17566
+      "diagnostics": "File not found",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
       "id": "risk_review",
@@ -293,7 +281,7 @@
       "artifact_path": "tests/ext_conformance/artifacts/RISK_REVIEW.json",
       "schema": "pi.ext.risk_review.v1",
       "file_count": 1,
-      "total_bytes": 86687
+      "total_bytes": 89657
     },
     {
       "id": "provenance_verification",
@@ -303,7 +291,7 @@
       "artifact_path": "tests/ext_conformance/artifacts/PROVENANCE_VERIFICATION.json",
       "schema": "pi.ext.provenance_verification.v1",
       "file_count": 1,
-      "total_bytes": 143396
+      "total_bytes": 146944
     },
     {
       "id": "traceability_matrix",
@@ -312,7 +300,7 @@
       "status": "present",
       "artifact_path": "docs/traceability_matrix.json",
       "file_count": 1,
-      "total_bytes": 89373
+      "total_bytes": 96776
     },
     {
       "id": "high_value_suite_artifact_inventory",
@@ -322,20 +310,17 @@
       "artifact_path": "docs/evidence/high-value-suite-artifact-inventory.json",
       "schema": "pi.traceability.high_value_suite_artifact_inventory.v1",
       "file_count": 1,
-      "total_bytes": 11209
+      "total_bytes": 11541
     },
     {
       "id": "extension_inventory",
       "label": "Extension inventory",
       "category": "inventory",
-      "status": "present",
+      "status": "missing",
       "artifact_path": "tests/ext_conformance/reports/inventory.json",
-      "schema": "pi.ext.inventory.v1",
-      "summary": {
-        "total_extensions": null
-      },
-      "file_count": 1,
-      "total_bytes": 89349
+      "diagnostics": "File not found",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
       "id": "inclusion_manifest",
@@ -345,10 +330,10 @@
       "artifact_path": "tests/ext_conformance/reports/inclusion_manifest",
       "summary": {
         "file_count": 4,
-        "total_bytes": 406062
+        "total_bytes": 411062
       },
       "file_count": 4,
-      "total_bytes": 406062
+      "total_bytes": 411062
     },
     {
       "id": "perf3x_lineage_contract",
@@ -358,12 +343,12 @@
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json | tests/ext_conformance/reports/conformance_summary.json | tests/perf/reports/stress_triage.json",
       "schema": "pi.perf3x.lineage_contract.v1",
       "summary": {
-        "artifact_span_minutes": 14148,
-        "conformance_generated_at": "2026-05-10T23:08:55+00:00",
-        "correlation_id": "local-20260501T0316",
+        "artifact_span_minutes": 8140,
+        "conformance_generated_at": "2026-05-12T19:26:24+00:00",
+        "correlation_id": "must-pass-gate-local-20260515T170218075Z",
         "max_allowed_span_days": 14,
-        "must_pass_generated_at": "2026-05-01T03:20:54.460+00:00",
-        "run_id": "local-20260501T0316",
+        "must_pass_generated_at": "2026-05-15T17:03:02+00:00",
+        "run_id": "local-20260515T170218075Z",
         "stress_generated_at": "2026-05-10T01:22:30+00:00"
       },
       "file_count": 0,
@@ -372,11 +357,11 @@
   ],
   "summary": {
     "total_sections": 29,
-    "present_sections": 29,
-    "missing_sections": 0,
+    "present_sections": 22,
+    "missing_sections": 7,
     "invalid_sections": 0,
-    "total_artifacts": 2004,
-    "total_bytes": 185415411,
+    "total_artifacts": 99,
+    "total_bytes": 1504687,
     "verdict": "complete"
   }
 }

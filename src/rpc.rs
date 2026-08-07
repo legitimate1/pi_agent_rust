@@ -276,13 +276,20 @@ impl RpcSessionPersister {
         if let Ok(file) = std::fs::File::open(&path) {
             let reader = std::io::BufReader::new(file);
             let mut lines = reader.lines();
-            // Skip the session header (line 1).
-            let _ = lines.next();
             while let Some(Ok(line)) = lines.next() {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
-                    entry_count += 1;
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                        // The session header (type="session") carries the chain
+                        // root id but is not a message entry: record it as the
+                        // parent of the first persisted message without counting
+                        // it toward the rp_* sequence. Previously the header was
+                        // skipped, so the first entry had no parentId and the
+                        // leaf-backtracking chain was cut at the root.
+                        let is_header = val.get("type").and_then(|v| v.as_str()) == Some("session");
+                        if !is_header {
+                            entry_count += 1;
+                        }
                         if let Some(id) = val.get("id").and_then(|v| v.as_str()) {
                             last_entry_id = Some(id.to_string());
                         }
@@ -368,6 +375,17 @@ fn rpc_agent_event_handler(
         // === RPC session persister: write completed messages in real-time ===
         if let Some(ref persister) = session_persister {
             match &event {
+                AgentEvent::MessageStart { message } => {
+                    // Persist user messages as they are submitted, not only at
+                    // TurnEnd (which carries assistant + tool results). The main
+                    // session.save path also writes users; writing them here too
+                    // is harmless (user entries carry no usage and the leaf
+                    // backtracking chain stays unique per id) and guarantees the
+                    // user is on disk even if session.save is disabled.
+                    if matches!(message, Message::User(_)) {
+                        persister.persist_messages(vec![message.clone()]);
+                    }
+                }
                 AgentEvent::TurnEnd {
                     message,
                     tool_results,
@@ -1833,6 +1851,61 @@ pub async fn run(
                     Err(err) => {
                         let _ =
                             out_tx.send(response_error_with_hints(id, "set_session_name", &err));
+                    }
+                }
+            }
+
+            "append_custom_entry" => {
+                let Some(custom_type) = parsed.get("customType").and_then(Value::as_str) else {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "append_custom_entry",
+                        "Missing customType".to_string(),
+                    ));
+                    continue;
+                };
+                if custom_type.trim().is_empty() {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "append_custom_entry",
+                        "customType must not be empty".to_string(),
+                    ));
+                    continue;
+                }
+                let data = parsed.get("data").cloned();
+                let result: Result<String> = async {
+                    // Append the custom entry to the in-memory session first
+                    // (it joins the autosave queue), then persist so the entry
+                    // lands on disk before we acknowledge. Mirrors
+                    // set_session_name's lock-drop-reacquire pattern.
+                    let entry_id = {
+                        let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                            .await
+                            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                        let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
+                            Error::session(format!("inner session lock failed: {err}"))
+                        })?;
+                        inner_session.append_custom_entry(custom_type.to_string(), data)
+                    };
+                    let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    guard.persist_session().await?;
+                    Ok(entry_id)
+                }
+                .await;
+
+                match result {
+                    Ok(entry_id) => {
+                        let _ = out_tx.send(response_ok(
+                            id,
+                            "append_custom_entry",
+                            Some(json!({ "entryId": entry_id })),
+                        ));
+                    }
+                    Err(err) => {
+                        let _ =
+                            out_tx.send(response_error_with_hints(id, "append_custom_entry", &err));
                     }
                 }
             }
@@ -9201,5 +9274,131 @@ export default function init(pi) {
         let val_b = json!({"type": "extension_ui_response", "requestId": "req-1", "value": "Beta"});
         let resp = rpc_parse_extension_ui_response(&val_b, &active).unwrap();
         assert_eq!(resp.value, Some(json!("Beta")));
+    }
+
+    /// The RPC persister must (1) link its first entry to the session header
+    /// id — previously the header was skipped during startup scanning, leaving
+    /// rp_000001 with no parentId and cutting the leaf-backtracking chain —
+    /// and (2) persist user messages from MessageStart so the chain contains
+    /// the user prompt even when session.save is disabled.
+    #[test]
+    fn persister_links_first_entry_to_header_and_persists_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let header_id = "test-header-0001";
+        std::fs::write(
+            &path,
+            format!("{{\"type\":\"session\",\"id\":\"{header_id}\"}}\n"),
+        )
+        .unwrap();
+
+        let (out_tx, _out_rx) = std::sync::mpsc::sync_channel::<String>(8);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let persister = RpcSessionPersister::new(path.clone()).expect("persister");
+        let handler = rpc_agent_event_handler(out_tx, runtime.handle(), None, Some(persister));
+
+        let user = Message::User(UserMessage {
+            content: UserContent::Text("hello".to_string()),
+            timestamp: 1,
+        });
+        handler(AgentEvent::MessageStart { message: user });
+        handler(AgentEvent::AgentEnd {
+            session_id: Arc::from("test-session"),
+            messages: vec![],
+            error: None,
+        });
+
+        // The writer thread consumes asynchronously; poll until the user line lands.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let content = loop {
+            let current = std::fs::read_to_string(&path).unwrap_or_default();
+            if current.lines().count() >= 2 || Instant::now() > deadline {
+                break current;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        let lines: Vec<serde_json::Value> = content
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        assert_eq!(lines.len(), 2, "header + user entry, got: {content}");
+        let user_entry = &lines[1];
+        assert_eq!(user_entry["type"], "message");
+        assert_eq!(user_entry["id"], "rp_000001");
+        assert_eq!(
+            user_entry["parentId"], header_id,
+            "first persisted entry must link to the session header id (chain root)"
+        );
+        assert_eq!(user_entry["message"]["role"], "user");
+        assert_eq!(user_entry["message"]["content"], "hello");
+    }
+
+    /// The `append_custom_entry` RPC endpoint appends a Custom entry and
+    /// persists it. Verify the on-disk JSONL shape stays compatible with the
+    /// session schema (so pidian/SocraticManager messages survive pi's own
+    /// full rewrites, which merge unknown-id entries).
+    #[test]
+    fn append_custom_entry_endpoint_persists_compatible_jsonl() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let mut session = Session::create();
+            session.session_dir = Some(temp_dir.path().to_path_buf());
+            session
+                .save()
+                .await
+                .expect("initial save (creates path + header)");
+            let path = session.path.clone().expect("session path");
+
+            // Mimic the endpoint body: append custom entry, then persist.
+            let entry_id = session.append_custom_entry(
+                "socratic".to_string(),
+                Some(json!({ "kind": "challenge", "text": "⚔️ 质询启动" })),
+            );
+            assert!(!entry_id.is_empty());
+            session.save().await.expect("save with custom entry");
+
+            // On-disk shape: type=custom with camelCase base + camelCase customType.
+            let disk = std::fs::read_to_string(&path).expect("read jsonl");
+            let raw: serde_json::Value = disk
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .find(|v: &serde_json::Value| v["type"] == "custom")
+                .expect("custom entry on disk");
+            assert_eq!(raw["customType"], "socratic");
+            assert_eq!(raw["data"]["kind"], "challenge");
+            assert!(raw.get("id").is_some(), "custom entry must carry an id");
+            assert!(
+                raw.get("parentId").is_some() || raw.get("id").is_some(),
+                "custom entry must link into the chain (parentId or be the root id)"
+            );
+
+            // Reload round-trip: pi itself must parse the file back.
+            let loaded = Session::open(path.to_string_lossy().as_ref())
+                .await
+                .expect("reload");
+            let custom = loaded
+                .entries
+                .iter()
+                .find_map(|e| match e {
+                    crate::session::SessionEntry::Custom(c) => Some(c),
+                    _ => None,
+                })
+                .expect("custom entry survives reload");
+            assert_eq!(custom.custom_type, "socratic");
+            assert_eq!(
+                custom
+                    .data
+                    .as_ref()
+                    .and_then(|v| v.get("kind"))
+                    .and_then(Value::as_str),
+                Some("challenge")
+            );
+        });
     }
 }

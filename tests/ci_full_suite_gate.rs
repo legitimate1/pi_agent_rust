@@ -881,7 +881,7 @@ fn normalize_repo_relative_evidence_path(
             }
             Component::RootDir | Component::Prefix(_) => {
                 return Err(format!(
-                    "coverage_rows[{row_idx}] field '{field_name}[{path_idx}]' must be repo-relative: {raw_path}"
+                    "coverage_rows[{row_idx}] field '{field_name}[{path_idx}]' must be repo-relative, got absolute path: {raw_path}"
                 ));
             }
         }
