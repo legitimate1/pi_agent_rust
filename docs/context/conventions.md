@@ -19,6 +19,8 @@
 - `@mariozechner/pi-coding-agent` 等 npm 包为虚拟模块
 - **扩展自动发现根（`~/.pi/agent/extensions/`、`.pi/extensions/`）下的每个目录/文件是独立扩展，不是 bundle 入口** — sibling 扩展发现逻辑（`discover_sibling_extension_entries` / `discover_sibling_index_entries`）必须排除该根，否则多个独立扩展会被误判为同一包的多入口（#35）
 - **Cargo 不自动清理旧编译产物** — 每次 `cargo build`/`cargo test` 生成新 hash 的文件（.exe/.pdb/.rlib），旧文件永久保留。Windows 上 .pdb 文件尤为庞大。需用 `cargo-sweep` 主动管理。
+- **Windows 文件竞争是瞬态错误** — `MoveFileExW`（rename/persist）遇无 `FILE_SHARE_DELETE` 持有者返回 os error 5（`PermissionDenied`）；`CreateFileW` 遇无对应共享模式持有者返回 os error 32（`ERROR_SHARING_VIOLATION`）。两者都是「其他进程短暂持有句柄」，**应重试而非失败**（会话保存已实现重试，见 `is_transient_file_contention`）。Defender 实时扫描、编辑器、并行 pi 实例是常见持有者。
+- **RPC 会话持久化链以 session header 为根** — persister 启动扫描时 header 行的 id 计入 `last_entry_id`（作为首条 entry 的 parentId）但不计入 `rp_` 序列号。跳过 header 会导致首条 entry 无 parentId、leaf 回溯链截断。
 
 ## 子进程管理约定
 

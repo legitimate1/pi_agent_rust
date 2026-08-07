@@ -1570,7 +1570,10 @@ The RPC mode (`pi --mode rpc`) exposes a line-delimited JSON protocol over stdin
 {"type": "abort"}
 {"type": "get_state"}
 {"type": "compact", "reserveTokens": 8192, "keepRecentTokens": 20000}
+{"type": "append_custom_entry", "customType": "socratic", "data": {"kind": "challenge"}, "id": "req-002"}
 ```
+
+> `append_custom_entry` 让客户端（如 pidian 的苏格拉底）把注入消息经 pi 会话管理落盘为 `type: custom` entry——不进入 LLM API 消息链路，只作为会话元数据（JSONL + `get_messages` 可见）。
 
 **Pi → Client (stdout):**
 

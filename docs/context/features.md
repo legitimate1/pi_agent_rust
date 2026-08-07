@@ -88,6 +88,10 @@
 | 分支 / 树结构 | ✅ | `src/session.rs` |
 | SQLite 会话后端 | ✅ | `src/session.rs` |
 | 会话索引元数据 | ✅ | `src/session_index.rs` |
+| **会话保存 Windows 文件竞争重试** — persist/append 遇 PermissionDenied（os error 5）或 sharing violation（os error 32）退避重试；append fsync 拒绝降级警告（数据已入页缓存） | ✅ | `src/session.rs` |
+| **RPC 会话持久化链根修复** — persister 启动扫描计入 session header id，首条 entry parentId 链接链根 | ✅ | `src/rpc.rs` |
+| **RPC 持久化补写 user 消息** — MessageStart(User) 实时落盘（防 session.save 关闭时 user 丢失） | ✅ | `src/rpc.rs` |
+| **RPC 方法 `append_custom_entry`** — 客户端（如 pidian 苏格拉底）注入自定义 entry 经 pi 会话管理落盘（CustomEntry，不影响 API 消息链路） | ✅ | `src/rpc.rs` `src/session.rs` |
 
 ## 模型注册表
 

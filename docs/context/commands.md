@@ -108,6 +108,24 @@ pi --provider <PROVIDER>     # 指定 Provider
 pi --tools read,write,edit,grep,find,ls,hashline_edit,pwsh
 ```
 
+## RPC 协议
+
+### `append_custom_entry`（会话注入）
+
+客户端注入自定义 entry（如 pidian 苏格拉底消息）经 pi 会话管理落盘：
+
+```
+请求: { "type": "request", "id": "req_1", "command": "append_custom_entry",
+        "customType": "socratic", "data": { "kind": "challenge", ... } }
+响应: { "type": "response", "id": "req_1", "command": "append_custom_entry",
+        "success": true, "data": { "entryId": "<8-hex>" } }
+```
+
+- `customType` 必填且非空；`data` 可选任意 JSON
+- 落盘格式：`{"type":"custom","id":...,"parentId":...,"timestamp":...,"customType":...,"data":...}`（camelCase）
+- CustomEntry **不进入 API 消息链路**（`append_model_message_for_entry` 忽略），不影响 LLM 请求
+- 完整 RPC 方法清单见 `features.md`「会话管理」域
+
 ## 版本迁移注意事项
 
 - `asupersync` 和 `rich_rust` 为外部依赖（sibling 项目）

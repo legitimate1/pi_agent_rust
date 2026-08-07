@@ -593,3 +593,21 @@
 - 放宽 `detect_monorepo_escape` 判定（任一 root 下即合法）— 破坏 monorepo 不跨包引用的安全语义（现有测试 `detect_monorepo_escape_uses_nearest_base_root` 明确该语义）
 
 **何时重新考虑**：若未来支持「manifest 多入口」（extension.json 声明多个 entrypoint），本 guard 应改为信任 manifest 的完整入口列表，而不是回退启发式。
+
+## D29: 会话保存 Windows 文件竞争重试 + RPC 持久化补全（2026-08-07）
+
+**决策**：会话 JSONL 保存的 `persist()`/append-open 遇 Windows 文件竞争错误（os error 5 PermissionDenied / os error 32 sharing violation）退避重试；append 后 fsync 的 PermissionDenied 降级为警告。同时修复 RPC persister 链根（header id 作首条 entry parentId）并补写 user 消息，新增 `append_custom_entry` RPC 端点。
+
+**理由**：
+
+- 实测复现：`rename` 遇无 `FILE_SHARE_DELETE` 持有者 → 报「拒绝访问 (os error 5)」，与用户高频报错一字不差；持有者为 Defender 实时扫描/编辑器/并行 pi 实例，毫秒级瞬态
+- 加 fsync 后报错频率上升（落盘窗口拉长，撞句柄概率增大）；RPC persister 是防 Obsidian 崩溃设计，数据到页缓存已够，无需每次 fsync
+- `append_custom_entry` 使客户端（pidian 苏格拉底）注入消息经 pi 会话管理落盘，消除双写；CustomEntry 不进 API 消息链路（`append_model_message_for_entry` 忽略），不污染 LLM 请求
+
+**不选 B 的原因**：
+
+- 移除 fsync 完全放弃崩溃安全 — checkpoint/关闭仍 fsync，保留断电保护
+- pidian 侧继续直接写 JSONL — 双写导致热力图 token 虚高、链交错断裂（实测 919,100 虚高）
+- 加 `session/save` RPC 让 pidian 请求 pi 保存 — pi 本就在自动保存，多一层往返无收益
+
+**何时重新考虑**：若 pi 迁移 SQLite 会话后端（`sqlite-sessions`），JSONL 重试与 persister 均随格式废弃；若未来支持 Windows 独占打开语义变更，需重新评估重试预算。
