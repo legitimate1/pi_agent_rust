@@ -27,14 +27,14 @@
 
 ### 关键依赖
 
-| Crate | 用途 |
-|-------|------|
-| `asupersync` | 结构化并发异步运行时 |
-| `rich_rust` | 终端 UI 渲染（标记语法）|
-| `serde` + `serde_json` | JSON 序列化 |
-| `clap` | CLI 参数解析 |
-| `crossterm` | 底层终端控制 |
-| `thiserror` | 错误类型定义 |
+| Crate                  | 用途                     |
+| ---------------------- | ------------------------ |
+| `asupersync`           | 结构化并发异步运行时     |
+| `rich_rust`            | 终端 UI 渲染（标记语法） |
+| `serde` + `serde_json` | JSON 序列化              |
+| `clap`                 | CLI 参数解析             |
+| `crossterm`            | 底层终端控制             |
+| `thiserror`            | 错误类型定义             |
 
 ## 代码编辑规范
 
@@ -61,6 +61,7 @@
 ## 构建与部署
 
 ### 规则
+
 1. 每次构建前升版本号：`cargo set-version --bump patch -p pi_agent_rust`（`-p pi_agent_rust` 限仅升主 crate，避免 workspace 成员全部跳版本）
 2. 构建和部署分离 — 构建后等用户指令再部署
 3. 不得私自构建或部署
@@ -94,7 +95,7 @@ strip = true
   外加轻量静态检查 `cargo clippy --lib -- -D warnings && cargo fmt --check`。
   禁止日常跑全量 `cargo test`（全量编译 ~30GB debug 产物，见「静态检查」）。
 - **全部改动完成（收尾）**：跑一次全量 `cargo test` + `cargo clippy --all-targets -- -D warnings`
-  + `cargo fmt --check`，通过后**提醒用户构建**（不自动构建）。
+  - `cargo fmt --check`，通过后**提醒用户构建**（不自动构建）。
 - 创建/修改测试文件时：必须运行该测试文件直到通过。
 
 常用针对性命令：
@@ -117,12 +118,12 @@ cargo test -- --nocapture                # 带输出
   "cases": [
     {
       "name": "test_name",
-      "setup": [{"type": "create_file", "path": "...", "content": "..."}],
-      "input": {"param": "value"},
+      "setup": [{ "type": "create_file", "path": "...", "content": "..." }],
+      "input": { "param": "value" },
       "expected": {
         "content_contains": ["..."],
         "content_regex": "...",
-        "details_exact": {"key": "value"}
+        "details_exact": { "key": "value" }
       }
     }
   ]
@@ -135,20 +136,20 @@ cargo test -- --nocapture                # 带输出
 
 ## 功能域→文件快速定位
 
-| 功能域 | 入口文件 |
-|:-------|:---------|
-| CLI 入口 + 子命令 | `src/main.rs` |
-| Agent 主循环 | `src/agent.rs` |
-| Abort 信号原语 | `src/abort.rs` |
-| Provider 层（10 个实现模块） | `src/providers/` |
-| 内置工具（9 个） | `src/tools/` |
-| 交互式 TUI | `src/interactive.rs` + `src/tui.rs` |
-| RPC/stdin 模式 | `src/rpc.rs` |
+| 功能域                          | 入口文件                                     |
+| :------------------------------ | :------------------------------------------- |
+| CLI 入口 + 子命令               | `src/main.rs`                                |
+| Agent 主循环                    | `src/agent.rs`                               |
+| Abort 信号原语                  | `src/abort.rs`                               |
+| Provider 层（12 个实现模块）    | `src/providers/`                             |
+| 内置工具（9 个）                | `src/tools/`                                 |
+| 交互式 TUI                      | `src/interactive.rs` + `src/tui.rs`          |
+| RPC/stdin 模式                  | `src/rpc.rs`                                 |
 | 扩展体系（协议 + QuickJS 桥接） | `src/extensions.rs` + `src/extensions_js.rs` |
-| 会话持久化 | `src/session.rs` + `src/session_index.rs` |
-| 配置加载 | `src/config.rs` |
-| 模型注册表 | `src/models.rs` |
-| 系统提示词构建 | `src/app.rs` |
+| 会话持久化                      | `src/session.rs` + `src/session_index.rs`    |
+| 配置加载                        | `src/config.rs`                              |
+| 模型注册表                      | `src/models.rs`                              |
+| 系统提示词构建                  | `src/app.rs`                                 |
 
 ## 会话结束
 
@@ -170,17 +171,17 @@ cargo test -- --nocapture                # 带输出
 
 ### 核心必读（每次接手先读这 3 个）
 
-| 内容 | 文档 |
-|:-----|:-----|
-| 完整功能清单（每条功能→文件映射） | `docs/context/features.md` |
+| 内容                                         | 文档                           |
+| :------------------------------------------- | :----------------------------- |
+| 完整功能清单（每条功能→文件映射）            | `docs/context/features.md`     |
 | 详细架构（工具系统、扩展加载流程、模块关系） | `docs/context/architecture.md` |
-| 命名规范、隐含假设、反模式 | `docs/context/conventions.md` |
+| 命名规范、隐含假设、反模式                   | `docs/context/conventions.md`  |
 
 ### 按需查阅（仅特定场景需要）
 
-| 需要什么时读 | 文档 |
-|:------------|:-----|
-| 做架构级改动、理解历史决策背景 | `docs/context/design-decisions.md` |
-| 更新构建/测试/部署流程（日常开发看 AGENTS.md 的「构建」+「测试」+「会话结束」即可） | `docs/context/commands.md` |
-| 新增静态检查工具 / 优化 verify 检查逻辑 | `docs/context/verify-tool.md` |
-| 症状排查 / 回归调试（provider/session/extension/安装器改动后测试失败；含症状路由表、调试 playbook、安装器补丁模式） | `docs/context/debugging.md` |
+| 需要什么时读                                                                                                        | 文档                               |
+| :------------------------------------------------------------------------------------------------------------------ | :--------------------------------- |
+| 做架构级改动、理解历史决策背景                                                                                      | `docs/context/design-decisions.md` |
+| 更新构建/测试/部署流程（日常开发看 AGENTS.md 的「构建」+「测试」+「会话结束」即可）                                 | `docs/context/commands.md`         |
+| 新增静态检查工具 / 优化 verify 检查逻辑                                                                             | `docs/context/verify-tool.md`      |
+| 症状排查 / 回归调试（provider/session/extension/安装器改动后测试失败；含症状路由表、调试 playbook、安装器补丁模式） | `docs/context/debugging.md`        |

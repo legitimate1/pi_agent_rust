@@ -611,3 +611,53 @@
 - 加 `session/save` RPC 让 pidian 请求 pi 保存 — pi 本就在自动保存，多一层往返无收益
 
 **何时重新考虑**：若 pi 迁移 SQLite 会话后端（`sqlite-sessions`），JSONL 重试与 persister 均随格式废弃；若未来支持 Windows 独占打开语义变更，需重新评估重试预算。
+
+## D30: Specification-First 移植方法论（2026-08-07）
+
+**决策**：从 TypeScript 原版移植时按「提取行为 → 文档化 spec → 按 spec 实现 → 一致性测试」流程，而非逐行翻译。
+
+**理由**：TS 习语（回调/Promise/类层次）不能直接映射到 Rust（所有权/trait/enum）；按 spec 实现产出更符合 Rust 习语的代码，且 fixture 一致性测试可在不耦合实现细节的前提下对照原版验证。
+
+**不选 B 的原因**：逐行翻译产出「穿着 Rust 外衣的 JS」，对抗语言特性。
+
+**何时重新考虑**：无。新功能开发沿用同一流程。
+
+## D31: 单二进制分发 + 内置 QuickJS（2026-08-07）
+
+**决策**：分发模型为单个 Rust 静态二进制（`pi`），扩展用嵌入 QuickJS 运行（无 Node/Bun 依赖），而非 npm 包 + Node 运行时。
+
+**理由**：消除 Node 运行时启动开销（<100ms vs 500ms+）与运行时依赖管理；扩展经 `node:` 垫片保持生态兼容。
+
+**不选 B 的原因**：Node 嵌入式运行时引入 100MB+ 体积与 JIT 启动延迟；放弃扩展兼容则破坏既有生态。
+
+**何时重新考虑**：若 QuickJS 沙箱无法覆盖未来扩展 API 需求，可评估渐进式外部运行时桥接。
+
+## D32: asupersync 结构化并发运行时替换 Node event loop（2026-08-07）
+
+**决策**：异步基座用 asupersync（结构化并发 + 内置 HTTP/TLS/SQLite），`AgentCx` 包装 `asupersync::Cx` 在 agent/tools/session/rpc 边界显式传递能力作用域。
+
+**理由**：取消语义显式化（父任务取消 → 子任务干净取消，无孤儿 future）；I/O 能力经 `Cx` 作用域化，测试确定性；HTTP/TLS 内置避免 OpenSSL 依赖地狱。
+
+**不选 B 的原因**：tokio 生态虽大但取消靠约定不靠结构；Node 事件循环 + Promise 约定无法提供能力作用域。
+
+**何时重新考虑**：若 asupersync 生态停滞或出现结构性缺陷，可评估迁移 tokio（代价高，需重写取消边界）。
+
+## D33: 自研 SSE 解析器（2026-08-07）
+
+**决策**：流式响应用自研 SSE 状态机（`src/sse.rs`），不用现成 crate。
+
+**理由**：需处理 Anthropic/OpenAI/Gemini 多 provider 的分块差异（CR/LF、多行 data:、UTF-8 部分尾部、TCP 分块跨界）；状态机可按字节增量处理、零拷贝、错误不崩流。
+
+**不选 B 的原因**：现成 SSE crate 面向通用场景，无法按需内联事件类型、控制缓冲策略，且多 provider 适配成本更高。
+
+**何时重新考虑**：若协议复杂度超出维护成本，可评估基于成熟 crate 的封装。
+
+## D34: 能力门控扩展安全模型（2026-08-07）
+
+**决策**：扩展无 ambient 系统访问权；所有 hostcall（tool/exec/http/session/ui/env/log）经能力策略门控 + 审计日志，exec 再加命令级调解。
+
+**理由**：原版扩展模型文档化为全系统访问，安全风险不可审计；门控后策略可解释、确定性、fail-closed，支持 trust 生命周期与 kill switch。
+
+**不选 B 的原因**：维持全系统访问 + 事后审计 — 无法在 spawn 前拦截危险命令；OS 级沙箱（容器/VM）— 部署复杂、牺牲性能。
+
+**何时重新考虑**：若扩展生态出现合法需要 ambient 能力的工作负载，可评估按扩展细粒度授权（仍保留审计）。
