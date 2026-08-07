@@ -25,17 +25,6 @@
 - Rust 2024 nightly（见 `rust-toolchain.toml`）
 - 不安全代码禁止（`#![forbid(unsafe_code)]`）
 
-### 关键依赖
-
-| Crate                  | 用途                     |
-| ---------------------- | ------------------------ |
-| `asupersync`           | 结构化并发异步运行时     |
-| `rich_rust`            | 终端 UI 渲染（标记语法） |
-| `serde` + `serde_json` | JSON 序列化              |
-| `clap`                 | CLI 参数解析             |
-| `crossterm`            | 底层终端控制             |
-| `thiserror`            | 错误类型定义             |
-
 ## 代码编辑规范
 
 - **不要用脚本批量改代码** — 手动逐处改。批量简单修改用并行 subagent。
@@ -44,7 +33,7 @@
 
 ## Drop-In 声明
 
-除非 `docs/contracts/dropin-certification-contract.json` 的硬性条件满足，否则不要将 Pi Rust 描述为严格的 drop-in 替代品。`docs/evidence/dropin-certification-verdict.json` 的 `overall_verdict = CERTIFIED` 才是发布闸门。
+除非 `docs/contracts/dropin-certification-contract.json` 硬性条件满足，否则不要把 Pi Rust 描述为严格的 drop-in 替代品；发布闸门是 `docs/evidence/dropin-certification-verdict.json` 的 `overall_verdict = CERTIFIED`。
 
 ## 静态检查（质量门禁）
 
@@ -66,20 +55,6 @@
 2. 构建和部署分离 — 构建后等用户指令再部署
 3. 不得私自构建或部署
 
-### Release profile（均衡配置，契约）
-
-`Cargo.toml` 的 `[profile.release]` 使用均衡配置——以运行时速度与启动性能优先（`opt-level = 3` + thin LTO + 默认多线程 codegen），同时保留 `panic = "abort"` 与 `strip = true`。`tests/release_evidence_gate.rs` 会校验：
-
-```toml
-[profile.release]
-opt-level = 3
-lto = "thin"
-panic = "abort"
-strip = true
-```
-
-不要改回 `opt-level = "z"` / `lto = true` / `codegen-units = 1`——那是纯压体积的激进配置（编译极慢、代码运行慢），已明确弃用。二进制大小预算由 `BINARY_SIZE_RELEASE_BUDGET_MB` 定义并经 `binary_size_release` 预算门禁校验（见 `src/perf_build.rs`、`tests/perf_budgets.rs`、`tests/perf_regression.rs`）。jemalloc is opt-in via `--features jemalloc`（README 描述为 opt-in jemalloc benchmark variants），不要默认启用。
-
 ### 流程
 
 ```
@@ -88,14 +63,15 @@ strip = true
 ```
 
 > 构建前**不**重复跑全量测试 — 收尾门禁已验证过。若用户中途要求构建（改动未收尾），先跑针对性测试确认无误再构建。部署脚本自动执行 `cargo sweep --file` + `--stamp` 清理旧产物，无需手动清理。
+>
+> Release profile 契约（opt-level/thin LTO/panic/strip + 校验 + 预算门禁）见 `docs/context/commands.md`「构建与部署配置」。
 
 ## 测试
 
 - **日常改动**：只跑针对性测试（`cargo test <模块>` / `cargo test --test <文件>`），
   外加轻量静态检查 `cargo clippy --lib -- -D warnings && cargo fmt --check`。
   禁止日常跑全量 `cargo test`（全量编译 ~30GB debug 产物，见「静态检查」）。
-- **全部改动完成（收尾）**：跑一次全量 `cargo test` + `cargo clippy --all-targets -- -D warnings`
-  - `cargo fmt --check`，通过后**提醒用户构建**（不自动构建）。
+- **全部改动完成（收尾）**：跑一次全量 `cargo test` + `cargo clippy --all-targets -- -D warnings` + `cargo fmt --check`，通过后**提醒用户构建**（不自动构建）。
 - 创建/修改测试文件时：必须运行该测试文件直到通过。
 
 常用针对性命令：
@@ -107,49 +83,11 @@ cargo test sse::tests                    # 特定模块
 cargo test -- --nocapture                # 带输出
 ```
 
-### 一致性测试
-
-基于 JSON 测试夹具，验证内置工具行为符合预期：
-
-```json
-{
-  "version": "1.0",
-  "tool": "tool_name",
-  "cases": [
-    {
-      "name": "test_name",
-      "setup": [{ "type": "create_file", "path": "...", "content": "..." }],
-      "input": { "param": "value" },
-      "expected": {
-        "content_contains": ["..."],
-        "content_regex": "...",
-        "details_exact": { "key": "value" }
-      }
-    }
-  ]
-}
-```
+> 一致性测试夹具格式（JSON schema）见 `docs/context/commands.md`「测试与验证」。
 
 ## 第三方库使用
 
 如果你不是 100% 确定如何使用某个第三方库，上网搜索最新的文档和最佳实践，不要猜。
-
-## 功能域→文件快速定位
-
-| 功能域                          | 入口文件                                     |
-| :------------------------------ | :------------------------------------------- |
-| CLI 入口 + 子命令               | `src/main.rs`                                |
-| Agent 主循环                    | `src/agent.rs`                               |
-| Abort 信号原语                  | `src/abort.rs`                               |
-| Provider 层（12 个实现模块）    | `src/providers/`                             |
-| 内置工具（9 个）                | `src/tools/`                                 |
-| 交互式 TUI                      | `src/interactive.rs` + `src/tui.rs`          |
-| RPC/stdin 模式                  | `src/rpc.rs`                                 |
-| 扩展体系（协议 + QuickJS 桥接） | `src/extensions.rs` + `src/extensions_js.rs` |
-| 会话持久化                      | `src/session.rs` + `src/session_index.rs`    |
-| 配置加载                        | `src/config.rs`                              |
-| 模型注册表                      | `src/models.rs`                              |
-| 系统提示词构建                  | `src/app.rs`                                 |
 
 ## 会话结束
 
@@ -182,6 +120,6 @@ cargo test -- --nocapture                # 带输出
 | 需要什么时读                                                                                                        | 文档                               |
 | :------------------------------------------------------------------------------------------------------------------ | :--------------------------------- |
 | 做架构级改动、理解历史决策背景                                                                                      | `docs/context/design-decisions.md` |
-| 更新构建/测试/部署流程（日常开发看 AGENTS.md 的「构建」+「测试」+「会话结束」即可）                                 | `docs/context/commands.md`         |
+| 修改运行配置/机制（profile 契约、部署机制、RPC 协议、CLI 参考、低频验证命令）                                       | `docs/context/commands.md`         |
 | 新增静态检查工具 / 优化 verify 检查逻辑                                                                             | `docs/context/verify-tool.md`      |
 | 症状排查 / 回归调试（provider/session/extension/安装器改动后测试失败；含症状路由表、调试 playbook、安装器补丁模式） | `docs/context/debugging.md`        |

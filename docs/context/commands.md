@@ -1,20 +1,33 @@
-# 开发命令
+# 开发命令（权威档案）
 
-## 构建
+> 按需阅读的档案：修改运行配置/机制、跑低频命令、发布流程时用。高频照做命令（构建流程、日常测试、静态检查）见 `AGENTS.md`。
 
-```bash
-cargo check              # 快速检查编译错误
-cargo build              # Debug 构建（LLD 链接器 + sccache 缓存）
-cargo build --release    # 发布构建（opt-level=3 + thin LTO + panic=abort）
+## 构建与部署配置
+
+### Release profile（均衡配置，契约）
+
+`Cargo.toml` 的 `[profile.release]` 使用均衡配置——以运行时速度与启动性能优先（`opt-level = 3` + thin LTO + 默认多线程 codegen），同时保留 `panic = "abort"` 与 `strip = true`。`tests/release_evidence_gate.rs` 会校验：
+
+```toml
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"
+strip = true
 ```
 
-### 部署
+不要改回 `opt-level = "z"` / `lto = true` / `codegen-units = 1`——那是纯压体积的激进配置（编译极慢、代码运行慢），已明确弃用。二进制大小预算由 `BINARY_SIZE_RELEASE_BUDGET_MB` 定义并经 `binary_size_release` 预算门禁校验（见 `src/perf_build.rs`、`tests/perf_budgets.rs`、`tests/perf_regression.rs`）。jemalloc is opt-in via `--features jemalloc`（README 描述为 opt-in jemalloc benchmark variants），不要默认启用。
 
-构建完成后，用脚本一键停进程+覆盖（脚本还会自动更新 cargo-sweep 时间戳，为下次清理做准备）：
+### 构建优化配置（`.cargo/config.toml`）
 
-```powershell
-.\scripts\deploy-release.ps1
-```
+- **LLD 链接器**：`lld-link.exe` 替代 MSVC `link.exe`，链接速度快 3-5x
+- **sccache**：编译器缓存，`cargo clean` / 切换分支后大幅加速冷启动
+- **Dev profile**：`debug = "line-tables-only"`，减少 debug 信息量以加速编译
+- **Defender 排除**：项目 `target/` 已加入 Windows Defender 排除列表
+
+### 部署脚本机制（`deploy-release.ps1`）
+
+一键停进程+覆盖；脚本末尾自动执行 **`cargo sweep --file` → `cargo sweep --stamp`**（先清理上次部署前的旧产物，再更新基线），无需手动清理。首次部署（无 stamp）自动跳过清理只打标记。
 
 ### target/ 磁盘空间管理
 
@@ -34,24 +47,7 @@ cargo sweep --file
 cargo sweep --time 30
 ```
 
-部署脚本 `deploy-release.ps1` 末尾自动执行 **`cargo sweep --file` → `cargo sweep --stamp`**（先清理上次部署前的旧产物，再更新基线），无需手动清理。首次部署（无 stamp）自动跳过清理只打标记。
-
-### 构建优化配置（`.cargo/config.toml`）
-
-- **LLD 链接器**：`lld-link.exe` 替代 MSVC `link.exe`，链接速度快 3-5x
-- **sccache**：编译器缓存，`cargo clean` / 切换分支后大幅加速冷启动
-- **Dev profile**：`debug = "line-tables-only"`，减少 debug 信息量以加速编译
-- **Defender 排除**：项目 `target/` 已加入 Windows Defender 排除列表
-
-## 测试
-
-```bash
-cargo test               # 全部测试
-cargo test -- --nocapture  # 带输出
-cargo test conformance   # 一致性测试
-cargo test --lib sse::tests    # 特定 lib 模块单元测试
-cargo test --lib tools::verify::tests  # 特定内部模块（非集成测试 target）
-```
+## 测试与验证（低频命令）
 
 ### 统一验证运行器（含证据产物）
 
@@ -118,14 +114,7 @@ rch exec -- cargo run --example ext_runtime_risk_ledger -- calibrate --input pat
 bash tests/installer_regression.sh
 ```
 
-## Release & Publishing
-
-- Tag 格式：`vX.Y.Z`（`vX.Y.Z-rc.N` 预发布允许但跳过 crates.io publish）
-- Tag 版本**必须**等于 `Cargo.toml` 的 `package.version`
-- 依赖发布顺序：`asupersync` → `rich_rust` → `charmed-*`（lipgloss/bubbletea/bubbles/glamour）→ `pi_agent_rust`
-- `.github/workflows/publish.yml` 在 `CARGO_REGISTRY_TOKEN` 设置时处理 crates.io 发布
-
-## Coverage
+### Coverage
 
 ```bash
 cargo install cargo-llvm-cov --locked   # 一次性安装
@@ -136,6 +125,36 @@ CI=true VCR_MODE=playback VCR_CASSETTE_DIR=tests/fixtures/vcr \
   cargo llvm-cov --all-targets --workspace --lcov --output-path lcov.info  # LCOV（CI/产物）
 cargo llvm-cov --all-targets --workspace --html  # HTML 报告
 ```
+
+### 一致性测试夹具格式
+
+基于 JSON 测试夹具，验证内置工具行为符合预期：
+
+```json
+{
+  "version": "1.0",
+  "tool": "tool_name",
+  "cases": [
+    {
+      "name": "test_name",
+      "setup": [{ "type": "create_file", "path": "...", "content": "..." }],
+      "input": { "param": "value" },
+      "expected": {
+        "content_contains": ["..."],
+        "content_regex": "...",
+        "details_exact": { "key": "value" }
+      }
+    }
+  ]
+}
+```
+
+## Release & Publishing
+
+- Tag 格式：`vX.Y.Z`（`vX.Y.Z-rc.N` 预发布允许但跳过 crates.io publish）
+- Tag 版本**必须**等于 `Cargo.toml` 的 `package.version`
+- 依赖发布顺序：`asupersync` → `rich_rust` → `charmed-*`（lipgloss/bubbletea/bubbles/glamour）→ `pi_agent_rust`
+- `.github/workflows/publish.yml` 在 `CARGO_REGISTRY_TOKEN` 设置时处理 crates.io 发布
 
 ## Cargo features
 
@@ -148,38 +167,9 @@ full    = [image-resize, jemalloc, clipboard, wasm-host, sqlite-sessions, syntax
 - `--no-default-features --features clipboard`：无 SQLite 会话后端的最小子集
 - jemalloc 仅 benchmark 变体使用（`BENCH_ALLOCATORS_CSV=system,jemalloc ./scripts/bench_extension_workloads.sh`），默认不启用
 
-## 静态检查
+## CLI 参考
 
-```bash
-cargo clippy --all-targets -- -D warnings && cargo fmt --check
-```
-
-> `cargo clippy` 已内含编译检查，无需单独跑 `cargo check`。详情见 AGENTS.md 的「静态检查」节。
-
-## Release 构建
-
-默认 profile：
-
-```toml
-opt-level = 3       # 速度优化
-lto = "thin"        # 薄 LTO，兼顾编译速度与代码质量
-panic = "abort"
-strip = true
-```
-
-## CLI 用法
-
-```bash
-pi [OPTIONS] [ARGS]...
-pi --print "message"         # 非交互模式
-pi --model <MODEL> "..."     # 指定模型
-pi --thinking <LEVEL>        # 思考级别
-pi --no-tools                # 禁用全部内置工具
-pi --tools read,write,edit   # 仅启用指定工具
-pi --provider <PROVIDER>     # 指定 Provider
-```
-
-### CLI 子命令
+### 子命令
 
 ```bash
 # 包管理
@@ -210,31 +200,29 @@ pi migrate ~/.pi/agent/sessions --dry-run
 pi migrate ~/.pi/agent/sessions
 ```
 
-### 其他常用选项
+### 常用选项
 
-| 选项                         | 说明                                 |
-| :--------------------------- | :----------------------------------- |
-| `-c, --continue`             | 继续最近会话                         |
-| `-r, --resume`               | 打开会话选择器 UI                    |
-| `--session <PATH>`           | 打开指定会话文件                     |
-| `--session-dir <DIR>`        | 覆盖会话存储目录                     |
-| `--no-session`               | 不持久化会话                         |
-| `-p, --print`                | 单次响应，无交互                     |
-| `--mode text                 | json                                 | rpc`        | 输出/协议模式    |
-| `--extension-policy safe     | balanced                             | permissive` | 扩展能力配置文件 |
-| `--repair-policy off         | suggest                              | auto-safe   | auto-strict`     | 扩展自动修复策略 |
-| `--list-models [PATTERN]`    | 列出可用模型（可选模糊过滤）         |
-| `--list-providers`           | 列出 provider ID、别名、认证 env key |
-| `--export <PATH>`            | 导出会话为 HTML                      |
-| `--no-migrations`            | 跳过启动迁移检查                     |
-| `--explain-extension-policy` | 打印生效的能力决策并退出             |
-| `--explain-repair-policy`    | 打印生效的修复策略解析并退出         |
+| 选项                                                   | 说明                                 |
+| :----------------------------------------------------- | :----------------------------------- |
+| `-c, --continue`                                       | 继续最近会话                         |
+| `-r, --resume`                                         | 打开会话选择器 UI                    |
+| `--session <PATH>`                                     | 打开指定会话文件                     |
+| `--session-dir <DIR>`                                  | 覆盖会话存储目录                     |
+| `--no-session`                                         | 不持久化会话                         |
+| `-p, --print`                                          | 单次响应，无交互                     |
+| `--mode text\|json\|rpc`                               | 输出/协议模式                        |
+| `--extension-policy safe\|balanced\|permissive`        | 扩展能力配置文件                     |
+| `--repair-policy off\|suggest\|auto-safe\|auto-strict` | 扩展自动修复策略                     |
+| `--list-models [PATTERN]`                              | 列出可用模型（可选模糊过滤）         |
+| `--list-providers`                                     | 列出 provider ID、别名、认证 env key |
+| `--export <PATH>`                                      | 导出会话为 HTML                      |
+| `--no-migrations`                                      | 跳过启动迁移检查                     |
+| `--explain-extension-policy`                           | 打印生效的能力决策并退出             |
+| `--explain-repair-policy`                              | 打印生效的修复策略解析并退出         |
 
-## 工具配置
+### 工具配置
 
-### 运行时禁用工具
-
-在 `settings.json` 中设置 `disabledTools` 数组，启动时自动过滤：
+运行时禁用工具：`settings.json` 设置 `disabledTools` 数组，启动时自动过滤（支持 `camelCase` 和 `snake_case` 两种格式）：
 
 ```json
 {
@@ -242,11 +230,7 @@ pi migrate ~/.pi/agent/sessions
 }
 ```
 
-支持 `camelCase`（`disabledTools`）和 `snake_case`（`disabled_tools`）两种格式。
-
-### `--tools` CLI 参数
-
-覆盖启用的工具列表（逗号分隔）：
+`--tools` CLI 参数覆盖启用的工具列表（逗号分隔）：
 
 ```bash
 pi --tools read,write,edit,grep,find,ls,hashline_edit,pwsh
