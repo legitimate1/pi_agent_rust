@@ -797,8 +797,24 @@ where
     }
 
     fn process_event(&mut self, data: &str) -> Result<()> {
-        let chunk: OpenAIStreamChunk = serde_json::from_str(data)
-            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
+        let chunk: OpenAIStreamChunk = match serde_json::from_str(data) {
+            Ok(chunk) => chunk,
+            // Truncated SSE data: the upstream closed the stream mid-event (EOF
+            // inside a JSON string/value). That is a transport-level cut, not a
+            // protocol violation — surface it as a transient UnexpectedEof so
+            // `Error::sse` stamps it retryable and the retry loop re-issues the
+            // request instead of failing the whole turn. Genuine malformed JSON
+            // (syntax/type errors) still fails as before.
+            Err(e) if e.classify() == serde_json::error::Category::Eof => {
+                return Err(Error::sse(&std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("JSON parse error: {e}\nData: {data}"),
+                )));
+            }
+            Err(e) => {
+                return Err(Error::api(format!("JSON parse error: {e}\nData: {data}")));
+            }
+        };
 
         // Handle usage in final chunk
         if let Some(usage) = chunk.usage {
@@ -1961,6 +1977,58 @@ mod tests {
         assert_eq!(
             done.1.error_message.as_deref(),
             Some("upstream provider timeout")
+        );
+    }
+
+    #[test]
+    fn test_truncated_chunk_is_classified_transient_and_retryable() {
+        // Upstream closed the stream mid-event: the JSON cuts off inside a
+        // string (the deepseek-v4-flash / opencode-go failure mode). The
+        // resulting parse error must be classified transient so the retry
+        // loop re-issues the request instead of failing the whole turn.
+        let truncated = r#"{"id":"c8f36b75-24b6-4e9f-aa82-7156cbb95afb","object":"chat.completion.chunk","choices":[{"index":0,"finish_reason":null,"lo"#;
+        let mut state = StreamState::new(
+            crate::sse::SseStream::new(Box::pin(futures::stream::iter(std::iter::empty::<
+                std::io::Result<Vec<u8>>,
+            >()))),
+            "gpt-test".to_string(),
+            "openai".to_string(),
+            "openai".to_string(),
+        );
+        let err = state
+            .process_event(truncated)
+            .expect_err("truncated chunk must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("EOF while parsing"), "message: {msg}");
+        assert!(msg.contains("transient connection drop"), "message: {msg}");
+        assert!(
+            crate::error::is_retryable_error(&msg, None, None),
+            "truncated chunk must be retryable: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_malformed_chunk_is_not_classified_transient() {
+        // A genuine protocol violation (type mismatch) must NOT be retried:
+        // the same bad chunk would fail identically on every attempt.
+        let malformed = r#"{"choices": "not-an-array"}"#;
+        let mut state = StreamState::new(
+            crate::sse::SseStream::new(Box::pin(futures::stream::iter(std::iter::empty::<
+                std::io::Result<Vec<u8>>,
+            >()))),
+            "gpt-test".to_string(),
+            "openai".to_string(),
+            "openai".to_string(),
+        );
+        let err = state
+            .process_event(malformed)
+            .expect_err("malformed chunk must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("JSON parse error"), "message: {msg}");
+        assert!(!msg.contains("transient connection drop"), "message: {msg}");
+        assert!(
+            !crate::error::is_retryable_error(&msg, None, None),
+            "malformed chunk must not be retryable: {msg}"
         );
     }
 

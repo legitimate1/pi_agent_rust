@@ -3696,8 +3696,98 @@ mod retry_tests {
     }
 
     #[derive(Debug)]
-    struct AlwaysErrorProvider;
+    struct TruncatedStreamProvider {
+        calls: AtomicUsize,
+    }
 
+    impl TruncatedStreamProvider {
+        const fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for TruncatedStreamProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+
+            let mut partial = AssistantMessage {
+                content: Vec::new(),
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            };
+
+            if call == 0 {
+                // First call fails with the truncated-SSE error exactly as it
+                // reaches the retry loop after `Error::sse` stamps it transient
+                // (the opencode-go / deepseek-v4-flash failure mode).
+                partial.stop_reason = StopReason::Error;
+                partial.error_message = Some(
+                    "API error: SSE error: JSON parse error: EOF while parsing a string at \
+                     line 1 column 173\nData: {\"id\":\"c8f36b75\",\"object\":\"chat.completion.\
+                     chunk\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"lo (transient \
+                     connection drop)"
+                        .to_string(),
+                );
+                let events = vec![
+                    Ok(crate::model::StreamEvent::Start {
+                        partial: partial.clone(),
+                    }),
+                    Ok(crate::model::StreamEvent::Error {
+                        reason: StopReason::Error,
+                        error: partial,
+                    }),
+                ];
+                Ok(Box::pin(stream::iter(events)))
+            } else {
+                // Second call succeeds.
+                let events = vec![
+                    Ok(crate::model::StreamEvent::Start {
+                        partial: partial.clone(),
+                    }),
+                    Ok(crate::model::StreamEvent::Done {
+                        reason: StopReason::Stop,
+                        message: partial,
+                    }),
+                ];
+                Ok(Box::pin(stream::iter(events)))
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct AlwaysErrorProvider;
     #[async_trait]
     #[allow(clippy::unnecessary_literal_bound)]
     impl Provider for AlwaysErrorProvider {
@@ -3858,6 +3948,111 @@ mod retry_tests {
             assert!(
                 retry_end_value.get("finalError").is_none(),
                 "successful auto_retry_end must omit absent finalError: {retry_end_value}"
+            );
+        });
+    }
+
+    #[test]
+    fn rpc_truncated_stream_error_retries_then_succeeds() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let provider = Arc::new(TruncatedStreamProvider::new());
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let inner_session = Arc::new(Mutex::new(Session::in_memory()));
+            let agent_session = AgentSession::new(
+                agent,
+                inner_session,
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+
+            let session = Arc::new(Mutex::new(agent_session));
+
+            let mut config = Config::default();
+            config.retry = Some(crate::config::RetrySettings {
+                enabled: Some(true),
+                max_retries: Some(1),
+                base_delay_ms: Some(1),
+                max_delay_ms: Some(1),
+            });
+
+            let mut shared = RpcSharedState::new(&config);
+            shared.auto_compaction_enabled = false;
+            let shared_state = Arc::new(Mutex::new(shared));
+
+            let is_streaming = Arc::new(AtomicBool::new(false));
+            let is_compacting = Arc::new(AtomicBool::new(false));
+            let abort_handle_slot: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
+            let retry_abort = Arc::new(AtomicBool::new(false));
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+
+            let auth_path = tempfile::tempdir()
+                .expect("tempdir")
+                .path()
+                .join("auth.json");
+            let auth = AuthStorage::load(auth_path).expect("auth load");
+
+            let options = RpcOptions {
+                config,
+                resources: ResourceLoader::empty(false),
+                available_models: Vec::new(),
+                scoped_models: Vec::new(),
+                cli_api_key: None,
+                auth,
+                runtime_handle,
+            };
+
+            run_prompt_with_retry(
+                session,
+                shared_state,
+                is_streaming,
+                is_compacting,
+                abort_handle_slot,
+                out_tx,
+                retry_abort,
+                options,
+                "hello".to_string(),
+                Vec::new(),
+                AgentCx::for_request(),
+            )
+            .await;
+
+            let mut saw_retry_start = false;
+            let mut saw_retry_end_success = false;
+
+            for line in out_rx.try_iter() {
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let Some(kind) = value.get("type").and_then(Value::as_str) else {
+                    continue;
+                };
+                match kind {
+                    "auto_retry_start" => {
+                        saw_retry_start = true;
+                    }
+                    "auto_retry_end"
+                        if value.get("success").and_then(Value::as_bool) == Some(true) =>
+                    {
+                        saw_retry_end_success = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            assert!(
+                saw_retry_start,
+                "truncated stream error must trigger auto_retry_start"
+            );
+            assert!(
+                saw_retry_end_success,
+                "retry after truncated stream error must succeed"
             );
         });
     }
