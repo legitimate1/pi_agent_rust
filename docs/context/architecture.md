@@ -63,28 +63,26 @@ Session persistence + index (JSONL, optional SQLite)
 
 ## 模块关系
 
-| 模块                      | 职责                                                                                                                               |
-| :------------------------ | :--------------------------------------------------------------------------------------------------------------------------------- |
-| `abort.rs`                | 共享 AbortHandle/AbortSignal 原语，打破 agent ↔ tools 循环依赖                                                                     |
-| `app.rs`                  | 系统提示词构建（SYSTEM.md 加载、default_system_prompt、project context files）                                                     |
-| `tools/` 模块目录         | ToolRegistry + 9 内置工具模块 + verify 内部验证引擎                                                                                |
-| `tools/verify.rs`         | 编辑后轻量验证引擎：文件类型检测→检查器映射（.rs/.json/.toml/.ts/.md）→进程内/外部进程执行                                         |
-| `agent.rs`                | Agent 循环（工具迭代、扩展合并、ToolDef 构建）                                                                                     |
-| `extensions.rs`           | 扩展管理器、能力策略、生命周期                                                                                                     |
-| `extensions_js.rs`        | QuickJS 运行时、虚拟模块、HostcallKind                                                                                             |
-| `extension_tools.rs`      | 扩展工具包装器 + 收集函数                                                                                                          |
-| `rpc.rs`                  | RPC/stdin 服务器模式、RPC 方法分发（get_commands/get_tree/get_version 等）、RpcSessionPersister（进程侧主动会话持久化）            |
-| `providers/mod.rs`        | Provider 工厂 + 扩展 stream-simple 桥接                                                                                            |
-| `providers/`（12 个模块） | 12 个 native provider 实现：anthropic/openai/openai_responses/gemini/cohere/azure/bedrock/vertex/copilot/gitlab/cursor/model_fetch |
-| `provider_metadata.rs`    | Provider 元数据：别名、认证键、本地 provider（ollama/llamacpp/mistralrs/lmstudio）                                                 |
-| `auth.rs`                 | 凭据管理：API Key / OAuth / AWS / Bearer，auth.json 文件锁                                                                         |
-| `models.rs`               | 内置 + models.json 模型注册表                                                                                                      |
-| `session.rs`              | JSONL 会话持久化                                                                                                                   |
-| `session_store_v2.rs`     | V2 sidecar：分段日志 + 偏移索引 + 检查点回滚                                                                                       |
-| `autocomplete.rs`         | `@` 文件引用 + `/` 命令补全索引（WalkBuilder + 30s 后台刷新）                                                                      |
-| `resources.rs`            | Skills / prompt templates / themes / extensions 资源加载                                                                           |
-| `package_manager.rs`      | 包安装/移除/更新（pi install 等）                                                                                                  |
-| `doctor.rs`               | 环境诊断（config/dirs/auth/sessions/swarm preflight）                                                                              |
+- **`abort.rs`** → 共享 AbortHandle/AbortSignal 原语，打破 agent ↔ tools 循环依赖
+- **`app.rs`** → 系统提示词构建（SYSTEM.md 加载、default_system_prompt、project context files）
+- **`tools/` 模块目录** → ToolRegistry + 9 内置工具模块 + verify 内部验证引擎
+- **`tools/verify.rs`** → 编辑后轻量验证引擎：文件类型检测→检查器映射（.rs/.json/.toml/.ts/.md）→进程内/外部进程执行
+- **`agent.rs`** → Agent 循环（工具迭代、扩展合并、ToolDef 构建）
+- **`extensions.rs`** → 扩展管理器、能力策略、生命周期
+- **`extensions_js.rs`** → QuickJS 运行时、虚拟模块、HostcallKind
+- **`extension_tools.rs`** → 扩展工具包装器 + 收集函数
+- **`rpc.rs`** → RPC/stdin 服务器模式、RPC 方法分发（get_commands/get_tree/get_version 等）、RpcSessionPersister（进程侧主动会话持久化）
+- **`providers/mod.rs`** → Provider 工厂 + 扩展 stream-simple 桥接
+- **`providers/`（12 个模块）** → 12 个 native provider 实现：anthropic/openai/openai_responses/gemini/cohere/azure/bedrock/vertex/copilot/gitlab/cursor/model_fetch
+- **`provider_metadata.rs`** → Provider 元数据：别名、认证键、本地 provider（ollama/llamacpp/mistralrs/lmstudio）
+- **`auth.rs`** → 凭据管理：API Key / OAuth / AWS / Bearer，auth.json 文件锁
+- **`models.rs`** → 内置 + models.json 模型注册表
+- **`session.rs`** → JSONL 会话持久化
+- **`session_store_v2.rs`** → V2 sidecar：分段日志 + 偏移索引 + 检查点回滚
+- **`autocomplete.rs`** → `@` 文件引用 + `/` 命令补全索引（WalkBuilder + 30s 后台刷新）
+- **`resources.rs`** → Skills / prompt templates / themes / extensions 资源加载
+- **`package_manager.rs`** → 包安装/移除/更新（pi install 等）
+- **`doctor.rs`** → 环境诊断（config/dirs/auth/sessions/swarm preflight）
 
 ## Agent 循环中的 abort 传播
 
@@ -123,12 +121,10 @@ guard.kill() │
 工具执行返回后 → run_loop 立即发送 TurnEnd + AgentEnd(error:"Aborted")
 ```
 
-| 路径                       | 机制                                                                                                            | 延迟                       |
-| :------------------------- | :-------------------------------------------------------------------------------------------------------------- | :------------------------- |
-| bash/pwsh 工具             | 循环中 `signal.is_aborted()` → `guard.kill()` → `taskkill /F /T`                                                | ≤100ms (轮询间隔)          |
-| 扩展 JS 工具（优雅路径）   | `await_js_task` 检测 abort → `__pi_abort_task(task_id)` → JS `AbortController.abort()` → 扩展 signal abort 事件 | ≤1 pump 周期               |
-| 扩展 JS 工具（硬中断兜底） | 通知后下一轮仍 pending → `request_interrupt()` → QuickJS 中断                                                   | 1 轮 pump + ≤1ms interrupt |
-| agent_end 发送             | 工具返回后 run_loop 检测 abort 标记，立即发送 TurnEnd + AgentEnd                                                | 立即                       |
+- **bash/pwsh 工具**：循环中 `signal.is_aborted()` → `guard.kill()` → `taskkill /F /T`；≤100ms (轮询间隔)
+- **扩展 JS 工具（优雅路径）**：`await_js_task` 检测 abort → `__pi_abort_task(task_id)` → JS `AbortController.abort()` → 扩展 signal abort 事件；≤1 pump 周期
+- **扩展 JS 工具（硬中断兜底）**：通知后下一轮仍 pending → `request_interrupt()` → QuickJS 中断；1 轮 pump + ≤1ms interrupt
+- **agent_end 发送**：工具返回后 run_loop 检测 abort 标记，立即发送 TurnEnd + AgentEnd；立即
 
 ## 运行时不变量
 
@@ -143,15 +139,13 @@ guard.kill() │
 
 扩展（QuickJS 沙箱）通过 hostcall 请求与宿主通信，`ExtensionDispatcher` 检查能力策略后分派到 ToolRegistry / HTTP / session 等：
 
-| Hostcall              | 所需能力                 |         危险?          |
-| :-------------------- | :----------------------- | :--------------------: |
-| `pi.tool(...)`        | `read`/`write`/`exec` 等 | read/write 否，exec 是 |
-| `pi.http(request)`    | `http`                   |           否           |
-| `pi.exec(cmd, args)`  | `exec`                   |           是           |
-| `pi.env(key)`         | `env`                    |           是           |
-| `pi.session(op, ...)` | `session`                |           否           |
-| `pi.ui(op, ...)`      | `ui`                     |           否           |
-| `pi.log(entry)`       | `log`                    |     否（始终允许）     |
+- **`pi.tool(...)`**：`read`/`write`/`exec` 等；read/write 否，exec 是
+- **`pi.http(request)`**：`http`；否
+- **`pi.exec(cmd, args)`**：`exec`；是
+- **`pi.env(key)`**：`env`；是
+- **`pi.session(op, ...)`**：`session`；否
+- **`pi.ui(op, ...)`**：`ui`；否
+- **`pi.log(entry)`**：`log`；否（始终允许）
 
 关键机制：
 
@@ -211,12 +205,10 @@ Agent Async Task（asupersync 运行时，流式 provider 响应 + 执行工具�
 
 凭据存 `~/.pi/agent/auth.json`（文件锁防并发损坏）。存储值可为字面量、`$ENV:VAR` 引用、`$CMD:shell command`（请求时解析 trimmed stdout）。
 
-| 机制         | Provider                                                                   | 细节                                     |
-| :----------- | :------------------------------------------------------------------------- | :--------------------------------------- |
-| API Key      | Anthropic/OpenAI/Gemini/Cohere 等                                          | 环境变量或 settings                      |
-| OAuth        | Anthropic/OpenAI Codex/Gemini CLI/Antigravity/Kimi/Copilot/GitLab/扩展定义 | PKCE + 自动刷新；Kimi 用 device flow     |
-| AWS 凭据     | Bedrock                                                                    | access key + secret + 可选 session token |
-| Service Key  | SAP AI Core                                                                | client id/secret 换 bearer               |
-| Bearer Token | 自定义 provider                                                            | 静态 token                               |
+- **API Key**：Anthropic/OpenAI/Gemini/Cohere 等；环境变量或 settings
+- **OAuth**：Anthropic/OpenAI Codex/Gemini CLI/Antigravity/Kimi/Copilot/GitLab/扩展定义；PKCE + 自动刷新；Kimi 用 device flow
+- **AWS 凭据**：Bedrock；access key + secret + 可选 session token
+- **Service Key**：SAP AI Core；client id/secret 换 bearer
+- **Bearer Token**：自定义 provider；静态 token
 
 `pi config` 报告各 provider 凭据状态：`Missing` / `ApiKey` / `OAuthValid`（含过期倒计时）/ `OAuthExpired` / `AwsCredentials` / `BearerToken`。认证失败返回机器可读诊断码（MissingApiKey/InvalidApiKey/QuotaExceeded/OAuthTokenRefreshFailed 等）。

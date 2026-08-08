@@ -109,17 +109,13 @@ cargo test -- --nocapture                # 带输出
 
 ### 核心必读（每次接手先读这 3 个）
 
-| 内容                                         | 文档                           |
-| :------------------------------------------- | :----------------------------- |
-| 完整功能清单（每条功能→文件映射）            | `docs/context/features.md`     |
-| 详细架构（工具系统、扩展加载流程、模块关系） | `docs/context/architecture.md` |
-| 命名规范、隐含假设、反模式                   | `docs/context/conventions.md`  |
+- **完整功能清单（每条功能→文件映射）** → `docs/context/features.md`
+- **详细架构（工具系统、扩展加载流程、模块关系）** → `docs/context/architecture.md`
+- **命名规范、隐含假设、反模式** → `docs/context/conventions.md`
 
 ### 按需查阅（仅特定场景需要）
 
-| 需要什么时读                                                                                                        | 文档                               |
-| :------------------------------------------------------------------------------------------------------------------ | :--------------------------------- |
-| 做架构级改动、理解历史决策背景                                                                                      | `docs/context/design-decisions.md` |
-| 修改运行配置/机制（profile 契约、部署机制、RPC 协议、CLI 参考、低频验证命令）                                       | `docs/context/commands.md`         |
-| 新增静态检查工具 / 优化 verify 检查逻辑                                                                             | `docs/context/verify-tool.md`      |
-| 症状排查 / 回归调试（provider/session/extension/安装器改动后测试失败；含症状路由表、调试 playbook、安装器补丁模式） | `docs/context/debugging.md`        |
+- **做架构级改动、理解历史决策背景** → `docs/context/design-decisions.md`
+- **修改运行配置/机制（profile 契约、部署机制、RPC 协议、CLI 参考、低频验证命令）** → `docs/context/commands.md`
+- **新增静态检查工具 / 优化 verify 检查逻辑** → `docs/context/verify-tool.md`
+- **症状排查 / 回归调试（provider/session/extension/安装器改动后测试失败；含症状路由表、调试 playbook、安装器补丁模式）** → `docs/context/debugging.md`

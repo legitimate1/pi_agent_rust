@@ -202,23 +202,21 @@ pi migrate ~/.pi/agent/sessions
 
 ### 常用选项
 
-| 选项                                                   | 说明                                 |
-| :----------------------------------------------------- | :----------------------------------- |
-| `-c, --continue`                                       | 继续最近会话                         |
-| `-r, --resume`                                         | 打开会话选择器 UI                    |
-| `--session <PATH>`                                     | 打开指定会话文件                     |
-| `--session-dir <DIR>`                                  | 覆盖会话存储目录                     |
-| `--no-session`                                         | 不持久化会话                         |
-| `-p, --print`                                          | 单次响应，无交互                     |
-| `--mode text\|json\|rpc`                               | 输出/协议模式                        |
-| `--extension-policy safe\|balanced\|permissive`        | 扩展能力配置文件                     |
-| `--repair-policy off\|suggest\|auto-safe\|auto-strict` | 扩展自动修复策略                     |
-| `--list-models [PATTERN]`                              | 列出可用模型（可选模糊过滤）         |
-| `--list-providers`                                     | 列出 provider ID、别名、认证 env key |
-| `--export <PATH>`                                      | 导出会话为 HTML                      |
-| `--no-migrations`                                      | 跳过启动迁移检查                     |
-| `--explain-extension-policy`                           | 打印生效的能力决策并退出             |
-| `--explain-repair-policy`                              | 打印生效的修复策略解析并退出         |
+- `-c, --continue` → 继续最近会话
+- `-r, --resume` → 打开会话选择器 UI
+- `--session <PATH>` → 打开指定会话文件
+- `--session-dir <DIR>` → 覆盖会话存储目录
+- `--no-session` → 不持久化会话
+- `-p, --print` → 单次响应，无交互
+- `--mode text|json|rpc` → 输出/协议模式
+- `--extension-policy safe|balanced|permissive` → 扩展能力配置文件
+- `--repair-policy off|suggest|auto-safe|auto-strict` → 扩展自动修复策略
+- `--list-models [PATTERN]` → 列出可用模型（可选模糊过滤）
+- `--list-providers` → 列出 provider ID、别名、认证 env key
+- `--export <PATH>` → 导出会话为 HTML
+- `--no-migrations` → 跳过启动迁移检查
+- `--explain-extension-policy` → 打印生效的能力决策并退出
+- `--explain-repair-policy` → 打印生效的修复策略解析并退出
 
 ### 工具配置
 

@@ -5,13 +5,11 @@
 
 ## 症状路由表
 
-| 症状                       | 前 3 条命令                                                                                                                                                                                                             |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Provider 流式/工具调用回归 | `cargo test provider_streaming -- --nocapture` ; `rg -n "stream\|tool\|delta\|event\|SSE" src/providers src/sse.rs src/provider.rs` ; `cargo test conformance`                                                          |
-| 会话重放/索引漂移          | `cargo test session -- --nocapture` ; `rg -n "Session\|save\|open\|index\|jsonl\|sqlite" src/session.rs src/session_index.rs src/session_sqlite.rs` ; `cargo test conformance`                                          |
-| 扩展策略/运行时故障        | `cargo test extension -- --nocapture` ; `rg -n "policy\|hostcall\|capability\|quickjs\|deny\|allow" src/extensions.rs src/extensions_js.rs src/extension_*.rs` ; `cargo test conformance`                               |
-| 安装器/卸载器/技能问题     | `bash tests/installer_regression.sh` ; `rg -n "AGENT_SKILL_STATUS\|CHECKSUM_STATUS\|SIGSTORE_STATUS\|COMPLETIONS_STATUS" install.sh` ; `rg -n "managed skill\|expected skill directory\|PIAR_AGENT_SKILL" uninstall.sh` |
-| 交互式与 RPC 行为分歧      | `cargo test e2e_rpc -- --nocapture` ; `rg -n "interactive\|rpc\|stdin\|event\|session" src/main.rs src/interactive.rs src/rpc.rs` ; `cargo test conformance`                                                            |
+- **Provider 流式/工具调用回归** → `cargo test provider_streaming -- --nocapture`；`rg -n "stream|tool|delta|event|SSE" src/providers src/sse.rs src/provider.rs`；`cargo test conformance`
+- **会话重放/索引漂移** → `cargo test session -- --nocapture`；`rg -n "Session|save|open|index|jsonl|sqlite" src/session.rs src/session_index.rs src/session_sqlite.rs`；`cargo test conformance`
+- **扩展策略/运行时故障** → `cargo test extension -- --nocapture`；`rg -n "policy|hostcall|capability|quickjs|deny|allow" src/extensions.rs src/extensions_js.rs src/extension_*.rs`；`cargo test conformance`
+- **安装器/卸载器/技能问题** → `bash tests/installer_regression.sh`；`rg -n "AGENT_SKILL_STATUS|CHECKSUM_STATUS|SIGSTORE_STATUS|COMPLETIONS_STATUS" install.sh`；`rg -n "managed skill|expected skill directory|PIAR_AGENT_SKILL" uninstall.sh`
+- **交互式与 RPC 行为分歧** → `cargo test e2e_rpc -- --nocapture`；`rg -n "interactive|rpc|stdin|event|session" src/main.rs src/interactive.rs src/rpc.rs`；`cargo test conformance`
 
 > `cargo test <词>` 是子串匹配，`session` 会覆盖 session_index_tests / session_sqlite / session_store_v2 等，`extension` 会覆盖 ext_conformance 等，命中面比字面更宽，属预期。
 

@@ -2,13 +2,11 @@
 
 ## 命名规范
 
-| 类别        | 规范         | 示例                         |
-| :---------- | :----------- | :--------------------------- |
-| 内置工具名  | 小写         | `read` `write` `edit` `bash` |
-| Provider 名 | 小写         | `anthropic` `openai`         |
-| 扩展 ID     | `ext.*` 前缀 | `ext.tools_fs`               |
-| Rust 源码   | `snake_case` | `extension_tools.rs`         |
-| 测试函数    | `snake_case` | `test_tool_override`         |
+- **内置工具名** → 小写（示例：`read` `write` `edit` `bash`）
+- **Provider 名** → 小写（示例：`anthropic` `openai`）
+- **扩展 ID** → `ext.*` 前缀（示例：`ext.tools_fs`）
+- **Rust 源码** → `snake_case`（示例：`extension_tools.rs`）
+- **测试函数** → `snake_case`（示例：`test_tool_override`）
 
 ## 隐含假设
 
@@ -42,12 +40,10 @@ guard.wait_with_cancellation(timeout_secs, abort.as_ref()).await?;
 
 所有 spawn 子进程的工具（bash/pwsh/grep/find）统一使用 `ProcessGroupTree`：
 
-| 工具 | 清理模式                                             | 说明                                             |
-| :--- | :--------------------------------------------------- | :----------------------------------------------- |
-| bash | `ProcessGroupTree` + `isolate_command_process_group` | shell 启动的后台进程一律被 `taskkill /F /T` 终止 |
-| pwsh | `ProcessGroupTree` + `isolate_command_process_group` | PowerShell 命令的子进程树被完整清理              |
-| grep | `ProcessGroupTree` + `isolate_command_process_group` | ripgrep 及其子进程被清理                         |
-| find | `ProcessGroupTree` + `isolate_command_process_group` | fd 及其子进程被清理                              |
+- **bash** → `ProcessGroupTree` + `isolate_command_process_group`（说明：shell 启动的后台进程一律被 `taskkill /F /T` 终止）
+- **pwsh** → `ProcessGroupTree` + `isolate_command_process_group`（说明：PowerShell 命令的子进程树被完整清理）
+- **grep** → `ProcessGroupTree` + `isolate_command_process_group`（说明：ripgrep 及其子进程被清理）
+- **find** → `ProcessGroupTree` + `isolate_command_process_group`（说明：fd 及其子进程被清理）
 
 > `ChildOnly` 模式已废弃。新增 spawn 子进程的工具必须使用 `ProcessGroupTree` + `isolate_command_process_group`。
 
@@ -116,18 +112,16 @@ loop {
 
 ## 反模式
 
-| ❌ 不要                                                         | ✅ 应该                                                                                | 原因                                                                                                                                                                                                                        |
-| :-------------------------------------------------------------- | :------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 用脚本批量改代码                                                | 手动逐处修改                                                                           | 正则替换容易引入 Bug                                                                                                                                                                                                        |
-| 创建 `main_v2.rs` 等变体                                        | 原地修改原文件                                                                         | 文件膨胀导致混乱                                                                                                                                                                                                            |
-| 使用不安全的 `unsafe` 代码                                      | 纯 safe Rust                                                                           | 项目 `forbid(unsafe_code)`                                                                                                                                                                                                  |
-| 放任 `target/` 无限膨胀                                         | 定期 `cargo sweep --file` 清理旧产物                                                   | Cargo 永不删除旧文件，debug .pdb 和增量缓存可累积到数百 GB                                                                                                                                                                  |
-| 用裸 `std::process::Child`                                      | 用 `ProcessGuard` 封装                                                                 | Drop 时不 kill 子进程，abort 后变孤儿                                                                                                                                                                                       |
-| 扩展 sibling 发现逻辑忽略 auto-discovery 根（`extensions/`）    | 发现函数先检查 parent/cluster_root 目录名是否为 `extensions`，是则跳过 sibling 发现    | 根下每个目录是独立扩展，不是 bundle 多入口；漏查会把全部独立扩展误判为同一包，多文件扩展的相对 import 因 root 检查失败报 `Unsupported module specifier`（#35，`discover_sibling_index_entries` 曾漏掉 cluster_root 层检查） |
-| 对带 `extension.json` 的扩展做 sibling 启发式发现               | 有 manifest 时只加载声明 entrypoint（`discover_related_extension_entries` guard，D28） | 目录内模块文件（含 `pi.registerCommand`）和子目录门面（`fusion/index.ts`）会被误判为额外入口，逐个加载超 hostcall budget；子目录被注册为 root 导致扩展内合法相对 import 误判逃逸（#35 follow-up）                           |
-| 包收集逻辑在发现资源子目录后忽略包根扩展入口                    | has_any_dir 时仍复用 `resolve_extension_entries(package_root)` 收集根扩展入口          | `-e <目录>` 静默成功是假象：`prompts/` 等资源目录存在时根 `index.ts` 扩展根本没加载（#35 follow-up，`collect_package_resources`）                                                                                           |
-| spawn 子进程不显式设置 stdin（依赖默认继承）                    | 显式 `.stdin(Stdio::null())` 或 `Stdio::piped()`                                       | 默认继承父进程 stdin；GUI 宿主（Obsidian/Electron）下父进程 stdin 是活跃 JSONL 管道，cmd 包装的 shim（`prettier.cmd`/`npx.cmd`）等待该管道挂起，verify 10s 超时（#34）。全库 20+ 处 spawn 均显式 null，唯 verify 遗漏       |
-| 用 `Path::is_absolute()` 判断"绝对形式路径"                     | 同时检查 `components()` 是否含 `RootDir`/`Prefix`                                      | **Windows 上 `/tmp/x` 这类 root-relative 路径（无盘符）`is_absolute()` 返回 false**，会漏判导致路径逃逸校验失效（#33 及同类问题的根因，已在 conformance/mod.rs、logging.rs 修复）                                           |
-| 测试 fixture 用 `format!("cwd:\"{}\"", path.display())` 拼 JSON | 用 `serde_json::to_string(&path.to_string_lossy())`                                    | Windows 路径反斜杠未转义会生成非法 JSON（migrations 测试根因）                                                                                                                                                              |
-| 用 `PathBuf::push` 拼接 `C:` 盘符与相对段                       | 显式 `format!("{drive}\\{path}")`                                                      | Windows 上 `PathBuf::from("C:").push("Users")` 得到 `C:Users`（丢分隔符，auth home_dir 根因）                                                                                                                               |
-| `cargo test <模块名>` 定位单元测试                              | `cargo test --lib <模块名>`                                                            | 不加 `--lib` 会编译所有集成测试 target（e2e 等），大幅延长等待时间                                                                                                                                                          |
+- **❌ 用脚本批量改代码** → 手动逐处修改（原因：正则替换容易引入 Bug）
+- **❌ 创建 `main_v2.rs` 等变体** → 原地修改原文件（原因：文件膨胀导致混乱）
+- **❌ 使用不安全的 `unsafe` 代码** → 纯 safe Rust（原因：项目 `forbid(unsafe_code)`）
+- **❌ 放任 `target/` 无限膨胀** → 定期 `cargo sweep --file` 清理旧产物（原因：Cargo 永不删除旧文件，debug .pdb 和增量缓存可累积到数百 GB）
+- **❌ 用裸 `std::process::Child`** → 用 `ProcessGuard` 封装（原因：Drop 时不 kill 子进程，abort 后变孤儿）
+- **❌ 扩展 sibling 发现逻辑忽略 auto-discovery 根（`extensions/`）** → 发现函数先检查 parent/cluster_root 目录名是否为 `extensions`，是则跳过 sibling 发现（原因：根下每个目录是独立扩展，不是 bundle 多入口；漏查会把全部独立扩展误判为同一包，多文件扩展的相对 import 因 root 检查失败报 `Unsupported module specifier`（#35，`discover_sibling_index_entries` 曾漏掉 cluster_root 层检查））
+- **❌ 对带 `extension.json` 的扩展做 sibling 启发式发现** → 有 manifest 时只加载声明 entrypoint（`discover_related_extension_entries` guard，D28）（原因：目录内模块文件（含 `pi.registerCommand`）和子目录门面（`fusion/index.ts`）会被误判为额外入口，逐个加载超 hostcall budget；子目录被注册为 root 导致扩展内合法相对 import 误判逃逸（#35 follow-up））
+- **❌ 包收集逻辑在发现资源子目录后忽略包根扩展入口** → has_any_dir 时仍复用 `resolve_extension_entries(package_root)` 收集根扩展入口（原因：`-e <目录>` 静默成功是假象：`prompts/` 等资源目录存在时根 `index.ts` 扩展根本没加载（#35 follow-up，`collect_package_resources`））
+- **❌ spawn 子进程不显式设置 stdin（依赖默认继承）** → 显式 `.stdin(Stdio::null())` 或 `Stdio::piped()`（原因：默认继承父进程 stdin；GUI 宿主（Obsidian/Electron）下父进程 stdin 是活跃 JSONL 管道，cmd 包装的 shim（`prettier.cmd`/`npx.cmd`）等待该管道挂起，verify 10s 超时（#34）。全库 20+ 处 spawn 均显式 null，唯 verify 遗漏）
+- **❌ 用 `Path::is_absolute()` 判断"绝对形式路径"** → 同时检查 `components()` 是否含 `RootDir`/`Prefix`（原因：**Windows 上 `/tmp/x` 这类 root-relative 路径（无盘符）`is_absolute()` 返回 false**，会漏判导致路径逃逸校验失效（#33 及同类问题的根因，已在 conformance/mod.rs、logging.rs 修复））
+- **❌ 测试 fixture 用 `format!("cwd:\"{}\"", path.display())` 拼 JSON** → 用 `serde_json::to_string(&path.to_string_lossy())`（原因：Windows 路径反斜杠未转义会生成非法 JSON（migrations 测试根因））
+- **❌ 用 `PathBuf::push` 拼接 `C:` 盘符与相对段** → 显式 `format!("{drive}\\{path}")`（原因：Windows 上 `PathBuf::from("C:").push("Users")` 得到 `C:Users`（丢分隔符，auth home_dir 根因））
+- **❌ `cargo test <模块名>` 定位单元测试** → `cargo test --lib <模块名>`（原因：不加 `--lib` 会编译所有集成测试 target（e2e 等），大幅延长等待时间）
