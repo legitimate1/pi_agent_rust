@@ -5,13 +5,13 @@
 
 ## 症状路由表
 
-| 症状 | 前 3 条命令 |
-|---|---|
-| Provider 流式/工具调用回归 | `cargo test provider_streaming -- --nocapture` ; `rg -n "stream|tool|delta|event|SSE" src/providers src/sse.rs src/provider.rs` ; `cargo test conformance` |
-| 会话重放/索引漂移 | `cargo test session -- --nocapture` ; `rg -n "Session|save|open|index|jsonl|sqlite" src/session.rs src/session_index.rs src/session_sqlite.rs` ; `cargo test conformance` |
-| 扩展策略/运行时故障 | `cargo test extension -- --nocapture` ; `rg -n "policy|hostcall|capability|quickjs|deny|allow" src/extensions.rs src/extensions_js.rs src/extension_*.rs` ; `cargo test conformance` |
-| 安装器/卸载器/技能问题 | `bash tests/installer_regression.sh` ; `rg -n "AGENT_SKILL_STATUS|CHECKSUM_STATUS|SIGSTORE_STATUS|COMPLETIONS_STATUS" install.sh` ; `rg -n "managed skill|expected skill directory|PIAR_AGENT_SKILL" uninstall.sh` |
-| 交互式与 RPC 行为分歧 | `cargo test e2e_rpc -- --nocapture` ; `rg -n "interactive|rpc|stdin|event|session" src/main.rs src/interactive.rs src/rpc.rs` ; `cargo test conformance` |
+| 症状                       | 前 3 条命令                                                                                                                                                                                                             |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Provider 流式/工具调用回归 | `cargo test provider_streaming -- --nocapture` ; `rg -n "stream\|tool\|delta\|event\|SSE" src/providers src/sse.rs src/provider.rs` ; `cargo test conformance`                                                          |
+| 会话重放/索引漂移          | `cargo test session -- --nocapture` ; `rg -n "Session\|save\|open\|index\|jsonl\|sqlite" src/session.rs src/session_index.rs src/session_sqlite.rs` ; `cargo test conformance`                                          |
+| 扩展策略/运行时故障        | `cargo test extension -- --nocapture` ; `rg -n "policy\|hostcall\|capability\|quickjs\|deny\|allow" src/extensions.rs src/extensions_js.rs src/extension_*.rs` ; `cargo test conformance`                               |
+| 安装器/卸载器/技能问题     | `bash tests/installer_regression.sh` ; `rg -n "AGENT_SKILL_STATUS\|CHECKSUM_STATUS\|SIGSTORE_STATUS\|COMPLETIONS_STATUS" install.sh` ; `rg -n "managed skill\|expected skill directory\|PIAR_AGENT_SKILL" uninstall.sh` |
+| 交互式与 RPC 行为分歧      | `cargo test e2e_rpc -- --nocapture` ; `rg -n "interactive\|rpc\|stdin\|event\|session" src/main.rs src/interactive.rs src/rpc.rs` ; `cargo test conformance`                                                            |
 
 > `cargo test <词>` 是子串匹配，`session` 会覆盖 session_index_tests / session_sqlite / session_store_v2 等，`extension` 会覆盖 ext_conformance 等，命中面比字面更宽，属预期。
 
@@ -20,6 +20,7 @@
 ## Playbook 1：Provider 流式 / 工具调用回归
 
 ### 症状
+
 - 流式响应卡住、截断或产出畸形 delta。
 - 不同 provider 后端之间的工具调用事件不一致。
 - 改动 provider 或解析器后 provider 流式测试失败。
@@ -58,6 +59,7 @@ rg -n "parse|event|data:" src/sse.rs
 ## Playbook 2：会话持久化 / 索引漂移
 
 ### 症状
+
 - 两次运行之间会话重放/历史意外不一致。
 - 会话索引元数据与存储条目不匹配。
 - 改动会话相关代码后 save/open 路径回归。
@@ -95,6 +97,7 @@ rg -n "append|save|open|index|metadata" src/session.rs src/session_index.rs src/
 ## Playbook 3：扩展运行时 / 策略回归
 
 ### 症状
+
 - hostcall 被意外拒绝/放行。
 - 能力策略按 profile 表现不一致。
 - QuickJS 运行时行为与预期策略执行偏离。
@@ -132,6 +135,7 @@ rg -n "allow|deny|policy|capability|hostcall" src/extensions.rs src/extensions_j
 ## Playbook 4：安装器 / 卸载器 / 技能安装失败
 
 ### 症状
+
 - 安装器汇总状态错误、含糊或自相矛盾。
 - 既有自定义技能目录被意外改动。
 - 卸载删除了非预期路径。
@@ -174,6 +178,7 @@ rg -n "remove_installed_skills|is_expected_skill_directory|is_managed_skill_file
 ## Playbook 5：CLI/TUI 与 RPC 行为分歧
 
 ### 症状
+
 - 交互模式正常而 RPC/stdin 模式失败（或反之）。
 - 不同表面的事件顺序/形状不一致。
 
