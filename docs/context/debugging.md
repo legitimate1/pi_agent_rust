@@ -22,6 +22,7 @@
 - 流式响应卡住、截断或产出畸形 delta。
 - 不同 provider 后端之间的工具调用事件不一致。
 - 改动 provider 或解析器后 provider 流式测试失败。
+- 长思考后整个响应中断：`API error: JSON parse error: EOF while parsing a string at line N column M`（上游 SSE 中途截断，现已自动重试；若重试后仍频繁出现 → 反馈上游网关，如 opencode.ai）。
 
 ### 前 3 条命令
 

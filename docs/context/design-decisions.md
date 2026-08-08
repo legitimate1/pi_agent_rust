@@ -661,3 +661,15 @@
 **不选 B 的原因**：维持全系统访问 + 事后审计 — 无法在 spawn 前拦截危险命令；OS 级沙箱（容器/VM）— 部署复杂、牺牲性能。
 
 **何时重新考虑**：若扩展生态出现合法需要 ambient 能力的工作负载，可评估按扩展细粒度授权（仍保留审计）。
+
+## D35: 截断类 SSE parse error 分类为瞬时错误自动重试（2026-08-08）
+
+**决策**：`openai.rs` 的 `process_event` 解析 SSE chunk 失败时，按 `serde_json` 错误分类分流：`Category::Eof`（`EOF while parsing ...`，数据不完整）→ 包装为 `Error::sse(UnexpectedEof)`（自带 `(transient connection drop)` 标记 → 可重试）；其他 parse error（语法/类型错误）保持 `Error::api` 不可重试。
+
+**理由**：第三方网关（opencode.ai）长思考后实测发送截断 chunk 并关闭连接，Pi 收到半帧 JSON；`EofWhileParsing*` 只能由「数据不完整」产生，唯一合法解释是传输截断 → 瞬时性成立；此前映射到 `Error::api` 不可重试，整个响应直接断流。复用 #118 的 `Error::sse` 标记机制，无需改文本分类正则。
+
+**不选 B 的原因**：
+- 全部 parse error 设为可重试 — 语法/类型错误是确定性失败，重试只会重复计费并掩盖客户端 bug（上游分类器保守原则的边界：只对证据确凿的截断开窄门）
+- 改 `is_retryable_error` 正则匹配 `eof while parsing` — 依赖消息文本，不如在错误源头用 typed 分类精确
+
+**何时重新考虑**：若上游修复截断问题、或 Pi 侧改为流式解析（半帧入缓冲等下一帧），此分类可撤销或降级。
