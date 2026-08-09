@@ -172,16 +172,31 @@ impl OpenAIProvider {
 
     /// Detect a provider-specific reasoning dialect for this transport.
     ///
-    /// DeepSeek is identified the same way `ModelEntry::is_deepseek_reasoning_model`
-    /// does it — by the canonical provider id (so the `deep-seek` alias also
-    /// matches) or a `deepseek.com` base URL — AND only for reasoning models, so a
-    /// non-reasoning DeepSeek model (e.g. `deepseek-chat`) emits no
-    /// `thinking`/`reasoning_effort` (byte-for-byte as before #113, gh #114).
-    /// Every other OpenAI-compatible reasoning provider is tagged `Standard` and
-    /// gets the plain `reasoning_effort` field instead.
+    /// DeepSeek is identified, in priority order, by:
+    /// 1. the catalog-declared dialect `compat.thinkingFormat == "deepseek"`
+    ///    (models.json) — this is the only signal that works when a DeepSeek
+    ///    model is routed through a gateway whose provider id / base URL do not
+    ///    match the heuristics below (e.g. `opencode-go` → deepseek-v4-flash);
+    /// 2. the canonical provider id (so the `deep-seek` alias also matches) or
+    ///    a `deepseek.com` base URL — the same way
+    ///    `ModelEntry::is_deepseek_reasoning_model` does it.
+    ///
+    /// The dialect fires only for reasoning models, so a non-reasoning DeepSeek
+    /// model (e.g. `deepseek-chat`) emits no `thinking`/`reasoning_effort`
+    /// (byte-for-byte as before #113, gh #114). Every other OpenAI-compatible
+    /// reasoning provider is tagged `Standard` and gets the plain
+    /// `reasoning_effort` field instead.
     fn reasoning_style(&self) -> Option<ReasoningStyle> {
         if !self.reasoning {
             return None;
+        }
+        if self
+            .compat
+            .as_ref()
+            .and_then(|c| c.thinking_format.as_deref())
+            .is_some_and(|format| format.eq_ignore_ascii_case("deepseek"))
+        {
+            return Some(ReasoningStyle::DeepSeek);
         }
         let provider_is_deepseek = canonical_provider_id(&self.provider)
             .is_some_and(|canonical| canonical == "deepseek")
@@ -1807,6 +1822,76 @@ mod tests {
             .expect("serialize request");
         assert_eq!(value["thinking"]["type"], "enabled");
         assert_eq!(value["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn test_build_request_compat_thinking_format_deepseek_wins_over_gateway() {
+        // A DeepSeek reasoning model routed through a gateway that is NOT
+        // identifiable by provider id or base URL (e.g. `opencode-go` →
+        // https://opencode.ai/zen/go/v1) must still get the DeepSeek dialect
+        // when the catalog declares `compat.thinkingFormat: "deepseek"`.
+        // Previously the gateway fell into the `Standard` branch and the
+        // request carried `reasoning_effort` without the `thinking` wrapper —
+        // the upstream model then self-allocated its reasoning depth and
+        // intermittently returned empty `reasoning_content` (the
+        // deepseek-v4-flash / opencode-go empty-thinking failure mode).
+        let provider = OpenAIProvider::new("deepseek-v4-flash")
+            .with_provider_name("opencode-go")
+            .with_base_url("https://opencode.ai/zen/go/v1".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                thinking_format: Some("deepseek".to_string()),
+                ..Default::default()
+            }));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("solve it".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::<ToolDef>::new().into(),
+        };
+        let options = StreamOptions {
+            thinking_level: Some(crate::model::ThinkingLevel::XHigh),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert_eq!(value["thinking"]["type"], "enabled");
+        assert_eq!(value["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn test_build_request_gateway_without_thinking_format_stays_standard() {
+        // An opencode-go model without `compat.thinkingFormat` must NOT get the
+        // DeepSeek `thinking` wrapper — it keeps the plain `reasoning_effort`
+        // (Standard dialect). Guards against over-matching on the gateway.
+        let provider = OpenAIProvider::new("mimo-v2.5")
+            .with_provider_name("opencode-go")
+            .with_base_url("https://opencode.ai/zen/go/v1".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig::default()));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("solve it".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::<ToolDef>::new().into(),
+        };
+        let options = StreamOptions {
+            thinking_level: Some(crate::model::ThinkingLevel::High),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert!(
+            value.get("thinking").is_none(),
+            "Standard dialect must not emit the DeepSeek thinking wrapper"
+        );
+        assert_eq!(value["reasoning_effort"], "high");
     }
 
     #[test]
