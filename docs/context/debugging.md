@@ -23,6 +23,7 @@
 - 不同 provider 后端之间的工具调用事件不一致。
 - 改动 provider 或解析器后 provider 流式测试失败。
 - 长思考后整个响应中断：`API error: JSON parse error: EOF while parsing a string at line N column M`（上游 SSE 中途截断，现已自动重试；若重试后仍频繁出现 → 反馈上游网关，如 opencode.ai）。
+- 模型间歇性「不思考」：assistant 消息的 thinking 块为空串（约半数轮次），用户输入轮尤为明显，且与操作类型无关。**根因通常是请求侧未发送思考参数**——`reasoning_style()` 通过 provider id / base_url 识别 DeepSeek 方言，opencode-go 网关（`opencode.ai/zen/go/v1`）两者都不匹配时落入 Standard 分支，请求体只有 `reasoning_effort` 没有 `thinking` 包装，模型自分配思考深度（时开时关）。修复：`compat.thinkingFormat == "deepseek"`（models.json）已纳入检测优先级（见 `reasoning_style()`）。排查时先核对 models.json 中该模型的 `compat.thinkingFormat` 是否声明，再检查请求体是否同时含 `thinking` + `reasoning_effort`。
 
 ### 前 3 条命令
 

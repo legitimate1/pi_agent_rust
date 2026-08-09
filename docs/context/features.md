@@ -28,7 +28,7 @@
 ## Provider 层
 
 - **Anthropic API（流式 + 扩展思考 + 工具）** ✅ → `src/providers/anthropic.rs`
-- **OpenAI Chat Completions（含所有兼容推理模型的 reasoning_effort）** ✅ → `src/providers/openai.rs`
+- **OpenAI Chat Completions（含所有兼容推理模型的 reasoning_effort + DeepSeek thinking 方言）** ✅ → `src/providers/openai.rs`
 - **OpenAI Responses / Codex Responses** ✅ → `src/providers/openai_responses.rs`
 - **Gemini（流式 + 工具）** ✅ → `src/providers/gemini.rs`
 - **Cohere（流式 + 工具）** ✅ → `src/providers/cohere.rs`
@@ -40,7 +40,7 @@
 - **本地 Provider** — ollama/llamacpp/mistralrs/lmstudio 内置，默认端口直连、无需 API key ✅ → `src/provider_metadata.rs` `src/providers/openai.rs`
 - **认证与凭据管理** — API Key / OAuth（PKCE+刷新）/ AWS 凭据链 / Service Key / Bearer Token，存 `~/.pi/agent/auth.json`（文件锁防并发损坏），支持 `$ENV:` 与 `$CMD:` 动态解析 ✅ → `src/auth.rs`
 - **Provider 运行时热切换** — `set_model` 跨 provider 切换时直接在内存创建/替换 provider 实例（anthropic ↔ openai ↔ gemini 等），无需重启进程 ✅ → `src/agent.rs` `src/providers/mod.rs`
-- **opencode-go（OpenCode Zen Go，deepseek-v4-flash 等）** ✅ → `src/provider_metadata.rs` `src/app.rs`
+- **opencode-go（OpenCode Zen Go，deepseek-v4-flash 等，含思考参数透传）** — 网关下的 DeepSeek 模型经 `compat.thinkingFormat: "deepseek"` 识别方言，正确发送 `thinking` + `reasoning_effort` ✅ → `src/provider_metadata.rs` `src/app.rs` `src/providers/openai.rs`
 - **流式截断自动重试** — 上游 SSE 中途截断（`JSON parse error: EOF while parsing a string`）分类为瞬时错误自动重试，不再直接断流；语法类 parse error 仍不可重试 ✅ → `src/providers/openai.rs` `src/rpc.rs`
 
 ## 工具系统

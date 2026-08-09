@@ -20,6 +20,7 @@
 - **Windows 文件竞争是瞬态错误** — `MoveFileExW`（rename/persist）遇无 `FILE_SHARE_DELETE` 持有者返回 os error 5（`PermissionDenied`）；`CreateFileW` 遇无对应共享模式持有者返回 os error 32（`ERROR_SHARING_VIOLATION`）。两者都是「其他进程短暂持有句柄」，**应重试而非失败**（会话保存已实现重试，见 `is_transient_file_contention`）。Defender 实时扫描、编辑器、并行 pi 实例是常见持有者。
 - **RPC 会话持久化链以 session header 为根** — persister 启动扫描时 header 行的 id 计入 `last_entry_id`（作为首条 entry 的 parentId）但不计入 `rp_` 序列号。跳过 header 会导致首条 entry 无 parentId、leaf 回溯链截断。
 - **上游网关可能发送截断的 SSE chunk** — 第三方代理（opencode.ai 等）在长思考/长输出后可能中途关闭连接，Pi 收到半帧 JSON。`serde_json` 的 `Category::Eof` 类解析错误（`EOF while parsing a string/value/list/object`）已分类为瞬时错误（`Error::sse` + `(transient connection drop)` 标记）→ 自动重试；**语法/类型类 parse error（`Expected...`/`Invalid...`）仍不可重试**——同样的坏数据重试多少次都会失败。给 provider 错误处理加分类时遵守此边界。
+- **API Key 解析优先级：CLI `--api-key` > auth.json > models.json `apiKey`** — `resolve_api_key`（`src/app.rs`）/ `AuthStorage::resolve_api_key`（`src/auth.rs`）按此顺序解析。**排查 401/凭据问题时必须用 auth.json 里的 key 手动验证**——models.json 中可能残留历史旧 key（余额不足/已轮换），它只在 auth.json 缺省时生效，容易误导排查（曾因用 models.json 旧 key 测试误判「余额不足」）。
 
 ## 子进程管理约定
 
