@@ -21,6 +21,7 @@
 - **RPC 会话持久化链以 session header 为根** — persister 启动扫描时 header 行的 id 计入 `last_entry_id`（作为首条 entry 的 parentId）但不计入 `rp_` 序列号。跳过 header 会导致首条 entry 无 parentId、leaf 回溯链截断。
 - **上游网关可能发送截断的 SSE chunk** — 第三方代理（opencode.ai 等）在长思考/长输出后可能中途关闭连接，Pi 收到半帧 JSON。`serde_json` 的 `Category::Eof` 类解析错误（`EOF while parsing a string/value/list/object`）已分类为瞬时错误（`Error::sse` + `(transient connection drop)` 标记）→ 自动重试；**语法/类型类 parse error（`Expected...`/`Invalid...`）仍不可重试**——同样的坏数据重试多少次都会失败。给 provider 错误处理加分类时遵守此边界。
 - **API Key 解析优先级：CLI `--api-key` > auth.json > models.json `apiKey`** — `resolve_api_key`（`src/app.rs`）/ `AuthStorage::resolve_api_key`（`src/auth.rs`）按此顺序解析。**排查 401/凭据问题时必须用 auth.json 里的 key 手动验证**——models.json 中可能残留历史旧 key（余额不足/已轮换），它只在 auth.json 缺省时生效，容易误导排查（曾因用 models.json 旧 key 测试误判「余额不足」）。
+- **`models.json` 的 `thinkingLevelMap` 值必须是字符串，不能是 `null`** — `CompatConfig.thinking_level_map` 是 `HashMap<String, String>`，任何 `"off": null` 之类写法会导致**整个 models.json 解析失败**，Pi 静默回退到内置模型注册表（自定义 provider/模型/成本配置全部失效，且无显式报错）。写法：`"off": "minimal"`（映射到 Gemini 官方档位）而非 `"off": null`（"无映射"语义）。排查自定义模型不生效时先验证 models.json 能被 `serde_json` 完整解析。
 
 ## 子进程管理约定
 

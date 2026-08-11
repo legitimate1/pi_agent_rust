@@ -669,7 +669,21 @@
 **理由**：第三方网关（opencode.ai）长思考后实测发送截断 chunk 并关闭连接，Pi 收到半帧 JSON；`EofWhileParsing*` 只能由「数据不完整」产生，唯一合法解释是传输截断 → 瞬时性成立；此前映射到 `Error::api` 不可重试，整个响应直接断流。复用 #118 的 `Error::sse` 标记机制，无需改文本分类正则。
 
 **不选 B 的原因**：
+
 - 全部 parse error 设为可重试 — 语法/类型错误是确定性失败，重试只会重复计费并掩盖客户端 bug（上游分类器保守原则的边界：只对证据确凿的截断开窄门）
 - 改 `is_retryable_error` 正则匹配 `eof while parsing` — 依赖消息文本，不如在错误源头用 typed 分类精确
 
 **何时重新考虑**：若上游修复截断问题、或 Pi 侧改为流式解析（半帧入缓冲等下一帧），此分类可撤销或降级。
+
+## D36: Gemini 思考链支持（2026-08-11）
+
+**决策**：gemini/vertex provider 支持 Gemini 3.x 思考链——发送侧 `thinkingConfig.thinkingLevel`（Pi 级别映射：`off→minimal`、`xhigh→high`、其余同名，per-model `thinkingLevelMap` 优先），接收侧 `thought: true` part 映射为 `ThinkingStart/Delta/End` 事件，`maxOutputTokens` 固定用满官方上限 65536。
+
+**理由**：Gemini 3 系列不支持完全关闭思考（官方文档明确），`off` 需要映射到最接近的档位——`minimal` 对大多数简单查询不推理；`high` 是官方最高档，`xhigh` 超出范围降级为 `high`。思考 token 与输出共享 `maxOutputTokens` 额度，固定 65536 避免 high 档深度思考 + 长回答被截断（此前默认 8192 会撞顶）。
+
+**不选 B 的原因**：
+
+- `off` 不传 thinkingConfig — 模型用默认 `medium`，语义上 off 名存实亡且更贵
+- 继续忽略 thought part — 思考内容混入正文 text 或静默丢弃，用户无法看到思考链，usage 也不准
+
+**何时重新考虑**：若 Google 提供真正的 thinking-off 档位（如 `minimal` 语义强化），或 `thinkingLevelMap` 出现 `xhigh` 官方映射，可调整映射表。

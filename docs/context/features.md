@@ -30,7 +30,8 @@
 - **Anthropic API（流式 + 扩展思考 + 工具）** ✅ → `src/providers/anthropic.rs`
 - **OpenAI Chat Completions（含所有兼容推理模型的 reasoning_effort + DeepSeek thinking 方言）** ✅ → `src/providers/openai.rs`
 - **OpenAI Responses / Codex Responses** ✅ → `src/providers/openai_responses.rs`
-- **Gemini（流式 + 工具）** ✅ → `src/providers/gemini.rs`
+- **Gemini（流式 + 工具 + 思考链）** ✅ → `src/providers/gemini.rs`
+- **Gemini 思考链（thinkingConfig 发送 + thought part 接收）** — Gemini 3.x 系列 `thinkingConfig.thinkingLevel` 支持：`off→minimal`（3.x 无法完全关思考）、`xhigh→high`（超范围降级）、其余同名直传；响应侧 `thought: true` part 映射为 `ThinkingStart/Delta/End` 事件；`maxOutputTokens` 固定 65536（思考 token 共享额度）；vertex provider 同步支持 ✅ → `src/providers/gemini.rs` `src/providers/vertex.rs`
 - **Cohere（流式 + 工具）** ✅ → `src/providers/cohere.rs`
 - **Azure OpenAI** ✅ → `src/providers/azure.rs`
 - **Bedrock / Vertex AI / GitHub Copilot / GitLab Duo** ✅ → `src/providers/*.rs`
