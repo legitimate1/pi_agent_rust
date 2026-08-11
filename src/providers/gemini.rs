@@ -6,8 +6,8 @@
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
-    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ToolCall, Usage,
-    UserContent,
+    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ThinkingContent,
+    ThinkingLevel, ToolCall, Usage, UserContent,
 };
 use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
@@ -26,7 +26,33 @@ use std::pin::Pin;
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 const GOOGLE_GEMINI_CLI_BASE: &str = "https://cloudcode-pa.googleapis.com";
 const GOOGLE_ANTIGRAVITY_BASE: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
-pub(crate) const DEFAULT_MAX_TOKENS: u32 = 8192;
+/// Gemini 3.x 官方输出 token 上限。思考 token 与输出共享该额度,
+/// 因此发送侧直接用满,避免 high 档深度思考 + 长回答被截断。
+pub(crate) const GEMINI_MAX_OUTPUT_TOKENS: u32 = 65536;
+
+/// Map pi's thinking level onto Gemini's `thinkingConfig.thinkingLevel`.
+///
+/// Gemini 3 系列不支持完全关闭思考,`off` 映射为官方最接近的
+/// `minimal`(对大多数简单查询不推理,复杂任务仍可能极少推理);
+/// `xhigh` 超出 Gemini 支持范围(最高 `high`),降级为 `high`。
+/// Per-model `thinkingLevelMap` from the catalog overrides the built-in
+/// mapping (same contract as `anthropic_effort_for_level`).
+pub(crate) fn gemini_thinking_level_for_level(
+    level: ThinkingLevel,
+    compat: Option<&CompatConfig>,
+) -> String {
+    if let Some(map) = compat.and_then(|c| c.thinking_level_map.as_ref())
+        && let Some(mapped) = map.get(level.to_string().as_str())
+    {
+        return mapped.clone();
+    }
+    match level {
+        ThinkingLevel::Off | ThinkingLevel::Minimal => "minimal".to_string(),
+        ThinkingLevel::Low => "low".to_string(),
+        ThinkingLevel::Medium => "medium".to_string(),
+        ThinkingLevel::High | ThinkingLevel::XHigh => "high".to_string(),
+    }
+}
 
 fn authorization_override(
     options: &StreamOptions,
@@ -159,7 +185,6 @@ impl GeminiProvider {
     }
 
     /// Build the request body for the Gemini API.
-    #[allow(clippy::unused_self)]
     pub fn build_request(&self, context: &Context<'_>, options: &StreamOptions) -> GeminiRequest {
         let contents = Self::build_contents(context);
         let system_instruction = context.system_prompt.as_deref().map(|s| GeminiContent {
@@ -185,15 +210,22 @@ impl GeminiProvider {
             None
         };
 
+        // Gemini 3 系列思考强度:仅当显式设置了 thinking level 时发送
+        // thinkingConfig(不设置则模型使用自身默认,如 3.6 Flash 默认 medium)。
+        let thinking_config = options.thinking_level.map(|level| GeminiThinkingConfig {
+            thinking_level: gemini_thinking_level_for_level(level, self.compat.as_ref()),
+        });
+
         GeminiRequest {
             contents,
             system_instruction,
             tools,
             tool_config,
             generation_config: Some(GeminiGenerationConfig {
-                max_output_tokens: options.max_tokens.or(Some(DEFAULT_MAX_TOKENS)),
+                max_output_tokens: Some(GEMINI_MAX_OUTPUT_TOKENS),
                 temperature: options.temperature,
                 candidate_count: Some(1),
+                thinking_config,
             }),
         }
     }
@@ -667,7 +699,7 @@ where
         })
     }
 
-    #[allow(clippy::unnecessary_wraps)]
+    #[allow(clippy::unnecessary_wraps, clippy::too_many_lines)]
     fn process_candidate(&mut self, candidate: GeminiCandidate) -> Result<()> {
         let has_finish_reason = candidate.finish_reason.is_some();
 
@@ -686,6 +718,41 @@ where
         if let Some(content) = candidate.content {
             for part in content.parts {
                 match part {
+                    GeminiPart::Thought { text, .. } => {
+                        // Thinking parts (Gemini 3 系列 `thought: true`) accumulate
+                        // into a Thinking content block; ThinkingEnd is emitted for
+                        // all open blocks when the finish reason arrives below.
+                        let last_is_thinking =
+                            matches!(self.partial.content.last(), Some(ContentBlock::Thinking(_)));
+
+                        self.ensure_started();
+
+                        let content_index = if last_is_thinking {
+                            self.partial.content.len() - 1
+                        } else {
+                            let idx = self.partial.content.len();
+                            self.partial
+                                .content
+                                .push(ContentBlock::Thinking(ThinkingContent {
+                                    thinking: String::new(),
+                                    thinking_signature: None,
+                                }));
+                            self.pending_events
+                                .push_back(StreamEvent::ThinkingStart { content_index: idx });
+                            idx
+                        };
+
+                        if let Some(ContentBlock::Thinking(t)) =
+                            self.partial.content.get_mut(content_index)
+                        {
+                            t.thinking.push_str(&text);
+                        }
+
+                        self.pending_events.push_back(StreamEvent::ThinkingDelta {
+                            content_index,
+                            delta: text,
+                        });
+                    }
                     GeminiPart::Text { text } => {
                         // Accumulate text into partial
                         let last_is_text =
@@ -831,6 +898,14 @@ pub(crate) struct GeminiContent {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum GeminiPart {
+    /// Thinking part: `{"text": "...", "thought": true}` (Gemini 3 系列)。
+    /// 必须排在 `Text` 之前:untagged 反序列化按声明顺序尝试,
+    /// 否则带 `thought` 标记的 part 会被 `Text` 变体吞掉。
+    Thought {
+        text: String,
+        #[serde(rename = "thought")]
+        thought: bool,
+    },
     Text {
         text: String,
     },
@@ -903,6 +978,15 @@ pub(crate) struct GeminiGenerationConfig {
     pub(crate) temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) candidate_count: Option<u32>,
+    /// Gemini 3 系列思考强度控制 (`thinkingConfig.thinkingLevel`)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thinking_config: Option<GeminiThinkingConfig>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GeminiThinkingConfig {
+    pub(crate) thinking_level: String,
 }
 
 // ============================================================================
@@ -992,8 +1076,9 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
                     ContentBlock::Thinking(_)
                     | ContentBlock::Image(_)
                     | ContentBlock::RedactedThinking(_) => {
-                        // Anthropic-shaped thinking blocks (including redacted
-                        // markers) and image blocks have no Gemini equivalent.
+                        // Gemini API 不接受请求中的 thought part(Gemini 2.5/3
+                        // 系列的思考内容只出现在响应侧),因此历史 thinking
+                        // 块不回传;image 块同样没有请求等价物。
                     }
                 }
             }
@@ -1517,6 +1602,33 @@ mod tests {
                 content: None,
                 reason: None,
             },
+            StreamEvent::ThinkingStart { content_index, .. } => EventSummary {
+                kind: "thinking_start".to_string(),
+                content_index: Some(*content_index),
+                delta: None,
+                content: None,
+                reason: None,
+            },
+            StreamEvent::ThinkingDelta {
+                content_index,
+                delta,
+            } => EventSummary {
+                kind: "thinking_delta".to_string(),
+                content_index: Some(*content_index),
+                delta: Some(delta.clone()),
+                content: None,
+                reason: None,
+            },
+            StreamEvent::ThinkingEnd {
+                content_index,
+                content,
+            } => EventSummary {
+                kind: "thinking_end".to_string(),
+                content_index: Some(*content_index),
+                delta: None,
+                content: Some(content.clone()),
+                reason: None,
+            },
             StreamEvent::TextEnd {
                 content_index,
                 content,
@@ -1587,7 +1699,12 @@ mod tests {
         assert!(json.get("tools").is_none() || json["tools"].is_null());
 
         // Generation config should match.
-        assert_eq!(json["generationConfig"]["maxOutputTokens"], 1024);
+        // maxOutputTokens 固定用满官方上限(思考 token 共享额度,见
+        // GEMINI_MAX_OUTPUT_TOKENS),不随 options.max_tokens 变化。
+        assert_eq!(
+            json["generationConfig"]["maxOutputTokens"],
+            GEMINI_MAX_OUTPUT_TOKENS
+        );
         assert!((json["generationConfig"]["temperature"].as_f64().unwrap() - 0.7).abs() < 0.01);
         assert_eq!(json["generationConfig"]["candidateCount"], 1);
     }
@@ -1665,10 +1782,97 @@ mod tests {
         let req = provider.build_request(&context, &options);
         let json = serde_json::to_value(&req).expect("serialize");
 
-        // Default max tokens should be DEFAULT_MAX_TOKENS (8192).
+        // Default max tokens should be GEMINI_MAX_OUTPUT_TOKENS (65536).
         assert_eq!(
             json["generationConfig"]["maxOutputTokens"],
-            DEFAULT_MAX_TOKENS
+            GEMINI_MAX_OUTPUT_TOKENS
+        );
+    }
+
+    #[test]
+    fn test_build_request_thinking_level_mapping() {
+        let provider = GeminiProvider::new("gemini-3.6-flash");
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })],
+            vec![],
+        );
+
+        // Pi level -> Gemini thinkingConfig.thinkingLevel.
+        let cases = [
+            (crate::model::ThinkingLevel::Minimal, "minimal"),
+            (crate::model::ThinkingLevel::Low, "low"),
+            (crate::model::ThinkingLevel::Medium, "medium"),
+            (crate::model::ThinkingLevel::High, "high"),
+            // xhigh 超出 Gemini 范围,降级为 high。
+            (crate::model::ThinkingLevel::XHigh, "high"),
+            // Gemini 3 不支持完全关闭思考,off 映射为最接近的 minimal。
+            (crate::model::ThinkingLevel::Off, "minimal"),
+        ];
+        for (level, expected) in cases {
+            let options = crate::provider::StreamOptions {
+                thinking_level: Some(level),
+                ..Default::default()
+            };
+            let req = provider.build_request(&context, &options);
+            let json = serde_json::to_value(&req).expect("serialize");
+            assert_eq!(
+                json["generationConfig"]["thinkingConfig"]["thinkingLevel"], expected,
+                "level {level:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_request_thinking_level_map_overrides_builtin() {
+        let mut map = HashMap::new();
+        map.insert("high".to_string(), "medium".to_string());
+        let provider = GeminiProvider::new("gemini-3.6-flash").with_compat(Some(CompatConfig {
+            thinking_level_map: Some(map),
+            ..CompatConfig::default()
+        }));
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })],
+            vec![],
+        );
+        let options = crate::provider::StreamOptions {
+            thinking_level: Some(crate::model::ThinkingLevel::High),
+            ..Default::default()
+        };
+
+        let req = provider.build_request(&context, &options);
+        let json = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(
+            json["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "medium"
+        );
+    }
+
+    #[test]
+    fn test_build_request_no_thinking_level_omits_thinking_config() {
+        let provider = GeminiProvider::new("gemini-3.6-flash");
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })],
+            vec![],
+        );
+        let options = crate::provider::StreamOptions::default();
+
+        let req = provider.build_request(&context, &options);
+        let json = serde_json::to_value(&req).expect("serialize");
+        assert!(
+            json["generationConfig"].get("thinkingConfig").is_none(),
+            "thinkingConfig should be omitted when no thinking level is set"
         );
     }
 

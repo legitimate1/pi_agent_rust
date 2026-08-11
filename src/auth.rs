@@ -4817,7 +4817,7 @@ pub fn load_default_auth(path: &Path) -> Result<AuthStorage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     use std::time::Duration;
 

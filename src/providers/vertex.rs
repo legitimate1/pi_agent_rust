@@ -13,14 +13,15 @@
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
-    AssistantMessage, ContentBlock, StopReason, StreamEvent, TextContent, ToolCall, Usage,
+    AssistantMessage, ContentBlock, StopReason, StreamEvent, TextContent, ThinkingContent,
+    ToolCall, Usage,
 };
 use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions};
 use crate::providers::gemini::{
     self, GeminiCandidate, GeminiContent, GeminiFunctionCall, GeminiFunctionCallingConfig,
-    GeminiGenerationConfig, GeminiPart, GeminiRequest, GeminiStreamResponse, GeminiTool,
-    GeminiToolConfig,
+    GeminiGenerationConfig, GeminiPart, GeminiRequest, GeminiStreamResponse, GeminiThinkingConfig,
+    GeminiTool, GeminiToolConfig,
 };
 use crate::sse::SseStream;
 use async_trait::async_trait;
@@ -175,7 +176,6 @@ impl VertexProvider {
     }
 
     /// Build the Gemini-format request body (for Google-native models).
-    #[allow(clippy::unused_self)]
     pub fn build_gemini_request(
         &self,
         context: &Context<'_>,
@@ -209,15 +209,20 @@ impl VertexProvider {
             None
         };
 
+        let thinking_config = options.thinking_level.map(|level| GeminiThinkingConfig {
+            thinking_level: gemini::gemini_thinking_level_for_level(level, self.compat.as_ref()),
+        });
+
         GeminiRequest {
             contents,
             system_instruction,
             tools,
             tool_config,
             generation_config: Some(GeminiGenerationConfig {
-                max_output_tokens: options.max_tokens.or(Some(gemini::DEFAULT_MAX_TOKENS)),
+                max_output_tokens: Some(gemini::GEMINI_MAX_OUTPUT_TOKENS),
                 temperature: options.temperature,
                 candidate_count: Some(1),
+                thinking_config,
             }),
         }
     }
@@ -447,7 +452,7 @@ where
         Ok(())
     }
 
-    #[allow(clippy::unnecessary_wraps)]
+    #[allow(clippy::unnecessary_wraps, clippy::too_many_lines)]
     fn process_candidate(&mut self, candidate: GeminiCandidate) -> Result<()> {
         // Handle finish reason.
         if let Some(ref reason) = candidate.finish_reason {
@@ -463,6 +468,41 @@ where
         if let Some(content) = candidate.content {
             for part in content.parts {
                 match part {
+                    GeminiPart::Thought { text, .. } => {
+                        // Thinking parts (Gemini 3 系列 `thought: true`) accumulate
+                        // into a Thinking content block; ThinkingEnd is emitted for
+                        // all open blocks when the finish reason arrives below.
+                        let last_is_thinking =
+                            matches!(self.partial.content.last(), Some(ContentBlock::Thinking(_)));
+                        if !last_is_thinking {
+                            let content_index = self.partial.content.len();
+                            self.partial
+                                .content
+                                .push(ContentBlock::Thinking(ThinkingContent {
+                                    thinking: String::new(),
+                                    thinking_signature: None,
+                                }));
+
+                            self.ensure_started();
+
+                            self.pending_events
+                                .push_back(StreamEvent::ThinkingStart { content_index });
+                        }
+                        let content_index = self.partial.content.len() - 1;
+
+                        if let Some(ContentBlock::Thinking(t)) =
+                            self.partial.content.get_mut(content_index)
+                        {
+                            t.thinking.push_str(&text);
+                        }
+
+                        self.ensure_started();
+
+                        self.pending_events.push_back(StreamEvent::ThinkingDelta {
+                            content_index,
+                            delta: text,
+                        });
+                    }
                     GeminiPart::Text { text } => {
                         let last_is_text =
                             matches!(self.partial.content.last(), Some(ContentBlock::Text(_)));
@@ -758,7 +798,11 @@ mod tests {
             json["systemInstruction"]["parts"][0]["text"],
             "You are helpful."
         );
-        assert_eq!(json["generationConfig"]["maxOutputTokens"], 1024);
+        // maxOutputTokens 固定用满官方上限(与 gemini provider 一致)。
+        assert_eq!(
+            json["generationConfig"]["maxOutputTokens"],
+            gemini::GEMINI_MAX_OUTPUT_TOKENS
+        );
     }
 
     #[test]

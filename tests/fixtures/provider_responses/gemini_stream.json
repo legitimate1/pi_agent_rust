@@ -235,6 +235,51 @@
         { "kind": "text_end", "content_index": 0, "content": "hi there" },
         { "kind": "done", "reason": "stop" }
       ]
+    },
+    {
+      "name": "thinking_then_text",
+      "events": [
+        {
+          "candidates": [
+            {
+              "content": {
+                "parts": [{ "text": "Let me reason step by step.", "thought": true }]
+              }
+            }
+          ]
+        },
+        {
+          "candidates": [
+            {
+              "content": { "parts": [{ "text": "The answer is 42." }] },
+              "finishReason": "STOP"
+            }
+          ],
+          "usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 15,
+            "totalTokenCount": 25
+          }
+        }
+      ],
+      "expected": [
+        { "kind": "start" },
+        { "kind": "thinking_start", "content_index": 0 },
+        {
+          "kind": "thinking_delta",
+          "content_index": 0,
+          "delta": "Let me reason step by step."
+        },
+        { "kind": "text_start", "content_index": 1 },
+        { "kind": "text_delta", "content_index": 1, "delta": "The answer is 42." },
+        {
+          "kind": "thinking_end",
+          "content_index": 0,
+          "content": "Let me reason step by step."
+        },
+        { "kind": "text_end", "content_index": 1, "content": "The answer is 42." },
+        { "kind": "done", "reason": "stop" }
+      ]
     }
   ]
 }
