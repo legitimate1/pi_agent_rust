@@ -1184,6 +1184,83 @@ mod tests {
         assert_eq!(converted[0].role, Some("user".to_string()));
     }
 
+    /// 真实 API 集成验证(需有效 Google 凭证,默认跳过):
+    /// `GOOGLE_API_KEY` 或 auth.json 的 google key,然后 `cargo test --lib
+    /// providers::gemini::tests::live_gemini_thinking_stream -- --ignored`
+    ///
+    /// 验证目标:
+    /// 1. thinkingConfig 正确发送(请求体含 thinkingLevel)
+    /// 2. 思考 token 计入 usage(output 明显 > 正文)
+    /// 3. 若 API 返回 thought part,会被 Thinking 事件捕获(3.x 目前只回
+    ///    thoughtSignature/thoughtsTokenCount,不返回 thought 文本)
+    #[test]
+    #[ignore = "requires live Google API key"]
+    fn live_gemini_thinking_stream() {
+        // 从 auth.json 读 google key(与 Agent 一致),或环境变量覆盖。
+        let api_key = std::env::var("GOOGLE_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+            .or_else(|| {
+                let auth = crate::auth::AuthStorage::load(
+                    dirs::home_dir()
+                        .expect("home dir")
+                        .join(".pi/agent/auth.json"),
+                )
+                .expect("load auth.json");
+                auth.resolve_api_key("google", None)
+            })
+            .expect("Google API key (GOOGLE_API_KEY or auth.json google)");
+
+        let provider = GeminiProvider::new("gemini-flash-latest");
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text(
+                    "设计一个分布式日志系统:日写入量 50 亿条、P99 延迟 50ms、突发流量 20 倍、只能 3 台裸金属、支持任意字段组合查询且 P99<200ms。请先给出推理过程再给方案。"
+                        .to_string(),
+                ),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+        let options = StreamOptions {
+            api_key: Some(api_key),
+            thinking_level: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            let mut text = String::new();
+            let mut thinking = String::new();
+            let mut saw_done = false;
+            while let Some(event) = stream.next().await {
+                match event.expect("stream event") {
+                    StreamEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                    StreamEvent::ThinkingDelta { delta, .. } => thinking.push_str(&delta),
+                    StreamEvent::Done { message, .. } => {
+                        saw_done = true;
+                        eprintln!(
+                            "usage: output={} input={} total={}",
+                            message.usage.output, message.usage.input, message.usage.total_tokens
+                        );
+                        eprintln!("thinking chars: {}", thinking.len());
+                        eprintln!("text chars: {}", text.len());
+                        assert!(message.usage.output > 0, "expected non-zero output tokens");
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saw_done, "stream should complete");
+            assert!(!text.is_empty(), "expected some text output");
+            // Gemini 3.x 不返回 thought 文本(只有 thoughtSignature/计数),
+            // 所以这里不断言 thinking 非空,只打印供人工核对。
+        });
+    }
+
     #[test]
     fn test_tool_conversion() {
         let tool = ToolDef {

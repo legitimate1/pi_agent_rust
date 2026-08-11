@@ -684,6 +684,8 @@
 **不选 B 的原因**：
 
 - `off` 不传 thinkingConfig — 模型用默认 `medium`，语义上 off 名存实亡且更贵
-- 继续忽略 thought part — 思考内容混入正文 text 或静默丢弃，用户无法看到思考链，usage 也不准
+- 继续忽略 thought part — 思考 token 计入 usage 但不单独统计，思考强度不可控（发送侧是唯一能控制思考的方式）
 
-**何时重新考虑**：若 Google 提供真正的 thinking-off 档位（如 `minimal` 语义强化），或 `thinkingLevelMap` 出现 `xhigh` 官方映射，可调整映射表。
+**实测结论（2026-08-11，gemini-flash-latest / 3.6-flash）**：`thinkingLevel: high` 确认生效——`thoughtsTokenCount` 847→1149（+36%），思考 token 计入 `candidatesTokenCount`（usage.output）。但 Google 3.x **不返回思考文本 part**（v1beta/v1alpha 均实测，只有 `thoughtSignature` + `thoughtsTokenCount`），因此接收侧 `GeminiPart::Thought` 分支目前不触发——保留为防御性实现（Google 未来开放思考文本时生效）。
+
+**何时重新考虑**：若 Google 提供真正的 thinking-off 档位（如 `minimal` 语义强化）、开放思考文本返回、或 `thinkingLevelMap` 出现 `xhigh` 官方映射，可调整映射表。
