@@ -6,6 +6,7 @@
 ## 症状路由表
 
 - **Provider 流式/工具调用回归** → `cargo test provider_streaming -- --nocapture`；`rg -n "stream|tool|delta|event|SSE" src/providers src/sse.rs src/provider.rs`；`cargo test conformance`
+- **中断后下次请求 400（tool_calls 未跟随 tool messages）** → `rg -n "build_abort_message|build_error_message|ToolCall" src/agent.rs`；`cargo test --lib abort_tests`（含回归 `abort_during_streaming_tool_call_strips_dangling_tool_call`）
 - **会话重放/索引漂移** → `cargo test session -- --nocapture`；`rg -n "Session|save|open|index|jsonl|sqlite" src/session.rs src/session_index.rs src/session_sqlite.rs`；`cargo test conformance`
 - **扩展策略/运行时故障** → `cargo test extension -- --nocapture`；`rg -n "policy|hostcall|capability|quickjs|deny|allow" src/extensions.rs src/extensions_js.rs src/extension_*.rs`；`cargo test conformance`
 - **安装器/卸载器/技能问题** → `bash tests/installer_regression.sh`；`rg -n "AGENT_SKILL_STATUS|CHECKSUM_STATUS|SIGSTORE_STATUS|COMPLETIONS_STATUS" install.sh`；`rg -n "managed skill|expected skill directory|PIAR_AGENT_SKILL" uninstall.sh`
@@ -24,6 +25,7 @@
 - 改动 provider 或解析器后 provider 流式测试失败。
 - 长思考后整个响应中断：`API error: JSON parse error: EOF while parsing a string at line N column M`（上游 SSE 中途截断，现已自动重试；若重试后仍频繁出现 → 反馈上游网关，如 opencode.ai）。
 - 模型间歇性「不思考」：assistant 消息的 thinking 块为空串（约半数轮次），用户输入轮尤为明显，且与操作类型无关。**根因通常是请求侧未发送思考参数**——`reasoning_style()` 通过 provider id / base_url 识别 DeepSeek 方言，opencode-go 网关（`opencode.ai/zen/go/v1`）两者都不匹配时落入 Standard 分支，请求体只有 `reasoning_effort` 没有 `thinking` 包装，模型自分配思考深度（时开时关）。修复：`compat.thinkingFormat == "deepseek"`（models.json）已纳入检测优先级（见 `reasoning_style()`）。排查时先核对 models.json 中该模型的 `compat.thinkingFormat` 是否声明，再检查请求体是否同时含 `thinking` + `reasoning_effort`。
+- 中断（RPC `abort`/TUI Esc）后**下次请求 400**：`assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'`。**根因**：流式输出 tool_call 期间中断时，abort/error 消息保留了已累积的 ToolCall blocks 并持久化，下次 `build_context` 原样发给 provider（opencode-go 网关校验严格）。**修复**（已落地）：`build_abort_message`/`build_error_message` strip dangling tool calls（与迭代上限路径一致）。排查时验证 abort 消息 content 无 `ToolCall` 块；**已损坏的旧会话**需手动删除 JSONL 中 `stop_reason: Aborted/Error` 且 content 含 `toolCall` 的那条 assistant 消息，代码不会自动清理历史数据。
 
 ### 前 3 条命令
 

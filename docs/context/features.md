@@ -19,6 +19,7 @@
 - **队列消息携带 `messageId` — 客户端分配或服务端 UUID fallback** ✅ → `src/rpc.rs`
 - **set_model/set_thinking_level 支持 persist 参数** — `persist=false` 仅内存切换，不写会话文件 ✅ → `src/rpc.rs` `src/acp.rs` `src/extension_dispatcher.rs` `src/sdk.rs` `src/session.rs` `src/agent.rs`
 - **CLI 子命令（doctor/config/list/info 等）** ✅ → `src/main.rs`
+- **doctor swarm 预检跨平台磁盘余量探测** — `disk_available_kb()` Unix 用 `df -Pk`；Windows 用 sysinfo 枚举磁盘卷匹配挂载点（root-relative 路径如 `/data/...` 自动补当前盘符），无 `df` 环境也能报告 target/tmp 余量 ✅ → `src/doctor.rs`
 - **Extended Thinking 级别** — off/minimal/low/medium/high/xhigh，`--thinking` 或 `/thinking` 切换 ✅ → `src/agent.rs` `src/models.rs`
 - **交互式 Autocomplete** — `@` 文件引用 + `/` 斜杠命令补全，模糊评分排序，背景线程每 30s 重建项目索引（WalkBuilder 尊重 .gitignore，5000 条缓存上限） ✅ → `src/autocomplete.rs` `src/interactive/`
 - **Credential-Aware 模型选择** — `Ctrl+L` 打开模型选择器（只列凭据就绪的模型），`Ctrl+P`/`Ctrl+Shift+P` 循环切换，provider ID/别名大小写不敏感 ✅ → `src/model_selector.rs` `src/interactive/model_selector_ui.rs`
@@ -60,6 +61,7 @@
 - **扩展工具 onUpdate 流式进度推送**（工具执行中 `onUpdate({content, details})`，经 rquickjs Function 桥接到 Rust `ToolUpdate`） ✅ → `src/extensions.rs` `src/extensions_js.rs` `src/extension_tools.rs`
 - **扩展工具同名覆盖内置工具** ✅ → `src/tools/mod.rs` `src/agent.rs`
 - **内置 pwsh 工具**（PowerShell 命令执行、尾部截断 2000 行/1MB、exit 0 时自动过滤 stderr、绝对路径 fallback 解决带空格 PATH 解析 bug） ✅ → `src/tools/pwsh.rs`
+- **bash 工具 Windows 平台支持（Git Bash）** — `resolve_bash_shell()` 按平台解析：Unix 用 `/bin/bash` 家族；Windows 查找 Git Bash 安装位（`%ProgramFiles%\Git`、`%LOCALAPPDATA%\Programs\Git`、scoop），找不到 fallback `sh`。`bash_available()`（测试门控）与 RPC 的 `run_bash_rpc` 复用同一解析，保证测试跳过与工具实际可用性一致 ✅ → `src/tools/bash.rs` `src/tools/mod.rs` `src/rpc.rs`
 - **运行时禁用内置工具**（`disabledTools` 配置） ✅ → `src/config.rs` `src/main.rs`
 - **工具描述外部覆盖**（`toolDescriptions` 配置，免编译修改工具描述） ✅ → `src/config.rs` `src/tools/mod.rs` `src/agent.rs`
 - **编辑后轻量验证（verify 参数）** — edit/hashline_edit/write 支持可选 verify 参数，编辑后自动运行语法/格式检查（.rs→rustfmt, .json/.toml→进程内解析, .ts/.md→prettier 全局直调、无全局安装时 npx 回退）。结果附在 details.verify，不阻断流程。**扩展 checker 见 `verify-tool.md`** ✅ → `src/tools/verify.rs` `src/tools/edit.rs` `src/tools/hashline.rs` `src/tools/write.rs`
@@ -92,6 +94,8 @@
 - **Session Store V2 Sidecar** — 分段日志 + 偏移索引 + 周期检查点 + 迁移/回滚台账；大会话 O(index+tail) 快速恢复，损坏帧 fail-closed ✅ → `src/session_store_v2.rs`
 - **`pi migrate` 子命令** — JSONL → V2 sidecar 迁移（`--dry-run` 校验不落盘） ✅ → `src/cli.rs` `src/session_store_v2.rs`
 - **RPC 方法 `append_custom_entry`** — 客户端（如 pidian 苏格拉底）注入自定义 entry 经 pi 会话管理落盘（CustomEntry，不影响 API 消息链路） ✅ → `src/rpc.rs` `src/session.rs`
+- **中断/错误消息清理 dangling tool calls** — 流式输出 tool_call 过程中 abort/error 时，`build_abort_message`/`build_error_message` strip 掉未完成的 ToolCall blocks（与迭代上限路径一致），防止持久化「有 tool_call 无 tool 响应」的消息污染会话——否则下次请求被 provider 拒绝（`tool_calls must be followed by tool messages` 400） ✅ → `src/agent.rs`
+- **SDK `SessionOptions.auth_path` 注入** — 可选指定 auth.json 加载路径（默认 `Config::auth_path`），embedder/测试可指向独立 auth 文件，避免与共享用户级 auth.json 的目录锁竞争 ✅ → `src/sdk.rs`
 
 ## 模型注册表
 

@@ -689,3 +689,29 @@
 **实测结论（2026-08-11，gemini-flash-latest / 3.6-flash）**：`thinkingLevel: high` 确认生效——`thoughtsTokenCount` 847→1149（+36%），思考 token 计入 `candidatesTokenCount`（usage.output）。但 Google 3.x **不返回思考文本 part**（v1beta/v1alpha 均实测，只有 `thoughtSignature` + `thoughtsTokenCount`），因此接收侧 `GeminiPart::Thought` 分支目前不触发——保留为防御性实现（Google 未来开放思考文本时生效）。
 
 **何时重新考虑**：若 Google 提供真正的 thinking-off 档位（如 `minimal` 语义强化）、开放思考文本返回、或 `thinkingLevelMap` 出现 `xhigh` 官方映射，可调整映射表。
+
+## D37: 中断/错误消息 strip dangling tool calls（2026-08-12）
+
+**决策**：`build_abort_message`/`build_error_message`（`src/agent.rs`）在克隆 partial 消息后删除未完成的 `ToolCall` content blocks，再持久化。
+
+**理由**：流式输出 tool_call 期间中断（RPC abort/TUI Esc/流错误）时，partial 里已有 `ToolCall` 块但没有对应 tool 响应消息；持久化后下次请求发给 provider（opencode-go 网关）会被拒——`assistant message with tool_calls must be followed by tool messages`（HTTP 400），会话从此卡死。迭代上限路径（`max_tool_iterations`）早已有同样的 strip（agent.rs 1686-1689），abort/error 路径是补漏。
+
+**不选 B 的原因**：
+
+- 保留 tool_call 让下次请求「重放工具调用」——provider 层校验严格，请求根本发不出去；且部分参数不完整无法执行
+- 用 `revert_incomplete_response` 整体回退消息——只在 retry 路径（`run_continue_with_abort`）使用，abort 后正常发新消息不经过它，且回退会丢中断前已输出的文本
+
+**何时重新考虑**：若 provider 允许未完成的 tool_call（或 API 支持「丢弃未完成调用」语义），可保留文本、仅标记 tool_call 无效。
+
+## D38: Windows 磁盘余量探测用 sysinfo 卷枚举（2026-08-12）
+
+**决策**：`disk_available_kb`（`src/doctor.rs`）Windows 分支用 `sysinfo::Disks` 枚举磁盘卷、按挂载点前缀匹配路径所在卷，返回 `available_space()`（KiB）；Unix 分支保持 `df -Pk` 不变。
+
+**理由**：Windows 没有 `df`，doctor swarm 预检/temp-dir 检查此前 `available_kb` 恒为 `None`，导致 headroom 判定失败、测试在 Windows 全挂。sysinfo 是项目已有依赖（`Cargo.toml`），零新增成本。
+
+**不选 B 的原因**：
+
+- `std::fs::canonicalize` 后在 Windows 返回 `\?\C:\...` verbatim 形式，`starts_with("C:\\")` 为 false，不能用于挂载点匹配——需手动解析（`windows_absolute_path`：root-relative 路径补当前盘符前缀）
+- 调 PowerShell `Get-PSDrive`/`Get-Volume`——进程开销大、解析脆弱，且破坏「doctor 不依赖 shell」的架构
+
+**何时重新考虑**：若引入 windows crate 的 `GetDiskFreeSpaceExW` 直调，可替换 sysinfo（当前 sysinfo 枚举 + 前缀匹配足够且跨盘符正确）。
