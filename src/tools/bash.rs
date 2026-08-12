@@ -77,6 +77,67 @@ fn bash_cancellation_details(
     })
 }
 
+/// Resolve a usable bash shell binary for the current platform.
+///
+/// Unix: the classic `/bin/bash` family, falling back to `sh`.
+/// Windows: Git Bash's MSYS bash in the common install locations
+/// (`%ProgramFiles%\Git`, `%LOCALAPPDATA%\Programs\Git`, scoop), falling
+/// back to `sh` to preserve historical behavior on systems without Git
+/// for Windows.
+pub fn resolve_bash_shell() -> String {
+    #[cfg(unix)]
+    {
+        for path in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
+            if Path::new(path).exists() {
+                return path.to_string();
+            }
+        }
+        "sh".to_string()
+    }
+    #[cfg(windows)]
+    {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(pf) = std::env::var_os(var) {
+                let pf = PathBuf::from(pf);
+                candidates.push(pf.join("Git").join("bin").join("bash.exe"));
+                candidates.push(pf.join("Git").join("usr").join("bin").join("bash.exe"));
+            }
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let local = PathBuf::from(local);
+            candidates.push(
+                local
+                    .join("Programs")
+                    .join("Git")
+                    .join("bin")
+                    .join("bash.exe"),
+            );
+        }
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            let home = PathBuf::from(home);
+            candidates.push(
+                home.join("scoop")
+                    .join("apps")
+                    .join("git")
+                    .join("current")
+                    .join("bin")
+                    .join("bash.exe"),
+            );
+        }
+        for candidate in candidates {
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+        "sh".to_string()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        "sh".to_string()
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn run_bash_command(
     cwd: &Path,
@@ -108,14 +169,7 @@ pub async fn run_bash_command(
         ));
     }
 
-    let shell = shell_path.unwrap_or_else(|| {
-        for path in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
-            if Path::new(path).exists() {
-                return path;
-            }
-        }
-        "sh"
-    });
+    let shell = shell_path.map_or_else(resolve_bash_shell, str::to_string);
 
     let mut cmd = command_with_default_sigpipe_in_dir(shell, cwd)
         .map_err(|e| Error::tool("bash", format!("Failed to prepare shell: {e}")))?;

@@ -18,6 +18,7 @@ mod read;
 pub(crate) mod verify;
 mod write;
 
+pub(crate) use bash::resolve_bash_shell;
 pub use bash::{BashRunResult, BashTool};
 pub use edit::EditTool;
 pub use find::FindTool;
@@ -2956,15 +2957,14 @@ pub(crate) fn rg_available() -> bool {
 /// Matches the shell resolution logic in [`run_bash_command`] so that
 /// tests skip consistently wherever the tool itself would fail to spawn.
 pub(crate) fn bash_available() -> bool {
-    // Mirror the exact lookup BashTool uses: check Unix paths, then fallback to "sh".
-    for path in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
-        if Path::new(path).exists() {
-            return true;
-        }
+    let shell = resolve_bash_shell();
+    // A resolved absolute path exists by construction (Git Bash on Windows,
+    // the Unix `/bin/bash` family); anything else is the "sh" fallback,
+    // which must be probed through PATH like the tool itself does.
+    if Path::new(&shell).is_absolute() && Path::new(&shell).is_file() {
+        return true;
     }
-    // On platforms where none of the Unix paths exist (e.g. Windows), fall back
-    // to checking whether "sh" is in PATH — the same fallback BashTool uses.
-    std::process::Command::new("sh")
+    std::process::Command::new(&shell)
         .arg("-c")
         .arg("true")
         .stdout(Stdio::null())

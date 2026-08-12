@@ -292,6 +292,12 @@ pub struct SessionOptions {
     pub no_session: bool,
     pub session_path: Option<PathBuf>,
     pub session_dir: Option<PathBuf>,
+
+    /// Optional auth file to load instead of the default
+    /// [`Config::auth_path`]. Embedders and tests can point at a
+    /// dedicated auth.json to avoid contending for the shared user-level
+    /// file (and its directory lock).
+    pub auth_path: Option<PathBuf>,
     pub extension_paths: Vec<PathBuf>,
     pub extension_policy: Option<String>,
     pub repair_policy: Option<String>,
@@ -346,6 +352,7 @@ impl Default for SessionOptions {
             no_session: true,
             session_path: None,
             session_dir: None,
+            auth_path: None,
             extension_paths: Vec::new(),
             extension_policy: None,
             repair_policy: None,
@@ -1701,7 +1708,8 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
 
     let config = Config::load()?;
 
-    let mut auth = AuthStorage::load_async(Config::auth_path()).await?;
+    let auth_path = options.auth_path.clone().unwrap_or_else(Config::auth_path);
+    let mut auth = AuthStorage::load_async(auth_path).await?;
     auth.refresh_expired_oauth_tokens().await?;
 
     let global_dir = Config::global_dir();
@@ -1914,6 +1922,10 @@ mod tests {
             api_key: Some("dummy-key".to_string()),
             working_directory: Some(working_directory.to_path_buf()),
             no_session: true,
+            // Isolated auth: the path does not exist, so AuthStorage::load
+            // skips the directory lock entirely — no contention with the
+            // real user-level auth.json under parallel test execution.
+            auth_path: Some(working_directory.join("auth.json")),
             ..SessionOptions::default()
         }
     }
@@ -1941,6 +1953,7 @@ mod tests {
             thinking: Some(crate::model::ThinkingLevel::Low),
             working_directory: Some(tmp.path().to_path_buf()),
             no_session: true,
+            auth_path: Some(tmp.path().join("auth.json")),
             ..SessionOptions::default()
         };
 
@@ -1990,6 +2003,7 @@ mod tests {
             working_directory: Some(sdk_cwd.path().to_path_buf()),
             no_session: false,
             session_dir: Some(session_root.path().to_path_buf()),
+            auth_path: Some(process_cwd.path().join("auth.json")),
             ..SessionOptions::default()
         }))
         .expect("create session");
@@ -2035,6 +2049,7 @@ mod tests {
             working_directory: Some(sdk_cwd.path().to_path_buf()),
             no_session: false,
             session_dir: Some(PathBuf::from("sessions")),
+            auth_path: Some(process_cwd.path().join("auth.json")),
             ..SessionOptions::default()
         }))
         .expect("create session");
@@ -2086,6 +2101,7 @@ mod tests {
             working_directory: Some(sdk_cwd.path().to_path_buf()),
             no_session: false,
             session_path: Some(PathBuf::from("relative/existing.jsonl")),
+            auth_path: Some(process_cwd.path().join("auth.json")),
             ..SessionOptions::default()
         }))
         .expect("create session");
@@ -2171,6 +2187,7 @@ mod tests {
             api_key: Some("dummy-key".to_string()),
             working_directory: Some(tmp.path().to_path_buf()),
             no_session: true,
+            auth_path: Some(tmp.path().join("auth.json")),
             ..SessionOptions::default()
         };
 

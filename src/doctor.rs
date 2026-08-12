@@ -2547,7 +2547,7 @@ fn collect_swarm_headroom_path(env_name: &str) -> SwarmHeadroomPath {
     }
 
     let under_expected_root = path_under_swarm_scratch_root(&path);
-    let available_kb = disk_available_kb(&path).ok().flatten();
+    let available_kb = disk_available_kb(&path);
     let problem = if !under_expected_root {
         Some("outside_expected_root".to_string())
     } else if available_kb.is_none() {
@@ -10329,16 +10329,20 @@ fn check_swarm_temp_dir(env_name: &str, findings: &mut Vec<Finding>) {
     }
 
     match disk_available_kb(&path) {
-        Ok(available_kb) => {
-            findings.push(swarm_temp_dir_finding(env_name, &path, available_kb, None));
+        Some(available_kb) => {
+            findings.push(swarm_temp_dir_finding(
+                env_name,
+                &path,
+                Some(available_kb),
+                None,
+            ));
         }
-        Err(err) => {
-            let detail = err.to_string();
+        None => {
             findings.push(swarm_temp_dir_finding(
                 env_name,
                 &path,
                 None,
-                Some(detail.as_str()),
+                Some("disk probe unavailable"),
             ));
         }
     }
@@ -10436,21 +10440,74 @@ fn path_under_swarm_scratch_root(path: &Path) -> bool {
     path.starts_with(Path::new(SWARM_CARGO_SCRATCH_ROOT))
 }
 
-fn disk_available_kb(path: &Path) -> std::io::Result<Option<u64>> {
-    if which_tool("df").is_none() {
-        return Ok(None);
+fn disk_available_kb(path: &Path) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        // Windows has no `df`; enumerate disk volumes via sysinfo and match
+        // the path's mount point. Root-relative paths (e.g. `/data/tmp/...`)
+        // resolve against the current drive so `C:\data\tmp\...` matches the
+        // `C:\` mount point. Note: `std::fs::canonicalize` returns the
+        // `\\?\C:\...` verbatim form here, which does NOT `starts_with` a
+        // normal `C:\` mount point — hence the manual drive resolution.
+        use sysinfo::Disks;
+        let resolved = windows_absolute_path(path);
+        let disks = Disks::new_with_refreshed_list();
+        let bytes = disks
+            .list()
+            .iter()
+            .find(|disk| resolved.starts_with(disk.mount_point()))
+            .map(sysinfo::Disk::available_space);
+        bytes.map(|bytes| bytes / 1024)
     }
-    let path_arg = path.display().to_string();
-    let outcome = run_tool_with_timeout(
-        SwarmProbeCommand::Df,
-        &["-Pk", path_arg.as_str()],
-        None,
-        SWARM_PROBE_TIMEOUT,
-    )?;
-    if outcome.success {
-        Ok(parse_df_available_kb(&outcome.stdout))
-    } else {
-        Ok(None)
+    #[cfg(not(windows))]
+    {
+        if which_tool("df").is_none() {
+            return None;
+        }
+        let path_arg = path.display().to_string();
+        let outcome = run_tool_with_timeout(
+            SwarmProbeCommand::Df,
+            &["-Pk", path_arg.as_str()],
+            None,
+            SWARM_PROBE_TIMEOUT,
+        )
+        .ok()?;
+        if outcome.success {
+            parse_df_available_kb(&outcome.stdout)
+        } else {
+            None
+        }
+    }
+}
+
+/// Resolve a path to an absolute drive-prefixed form on Windows, suitable for
+/// matching against sysinfo mount points (`C:\`).
+#[cfg(windows)]
+fn windows_absolute_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    match path.components().next() {
+        // `C:\data\...` already carries its drive prefix.
+        Some(Component::Prefix(_)) => path.to_path_buf(),
+        // `/data/...` is root-relative: prefix the current drive.
+        Some(Component::RootDir) => {
+            let Some(cwd) = std::env::current_dir().ok() else {
+                return path.to_path_buf();
+            };
+            let mut resolved = PathBuf::new();
+            if let Some(Component::Prefix(prefix)) = cwd.components().next() {
+                // `C:` + `\data\...` — push the prefix and root separately so
+                // the root does not overwrite the drive letter.
+                resolved.push(prefix.as_os_str());
+                resolved.push(std::path::MAIN_SEPARATOR_STR);
+            }
+            let tail = path
+                .strip_prefix(std::path::MAIN_SEPARATOR_STR)
+                .unwrap_or(path);
+            resolved.push(tail);
+            resolved
+        }
+        // Relative path: resolve against the current directory.
+        _ => std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path)),
     }
 }
 

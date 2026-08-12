@@ -4495,6 +4495,10 @@ mod retry_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn run_bash_rpc_cancelled_context_kills_process_tree() {
+        if !crate::tools::bash_available() {
+            eprintln!("skipping: no bash shell available on this system");
+            return;
+        }
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().expect("tempdir");
             let marker = tmp.path().join("leaked_child.txt");
@@ -4562,6 +4566,10 @@ mod retry_tests {
 
     #[test]
     fn run_bash_rpc_large_output_completes_without_deadlock() {
+        if !crate::tools::bash_available() {
+            eprintln!("skipping: no bash shell available on this system");
+            return;
+        }
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().expect("tempdir");
             let (_abort_tx, abort_rx) = oneshot::channel();
@@ -5543,10 +5551,7 @@ async fn run_bash_rpc(
     command: &str,
     mut abort_rx: oneshot::Receiver<()>,
 ) -> Result<BashRpcResult> {
-    let shell = ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .unwrap_or("sh");
+    let shell = crate::tools::resolve_bash_shell();
 
     let command = format!("trap 'code=$?; wait; exit $code' EXIT\n{command}");
 

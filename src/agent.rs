@@ -1403,6 +1403,14 @@ impl Agent {
         message.stop_reason = StopReason::Aborted;
         message.error_message = Some("Aborted".to_string());
         message.timestamp = Utc::now().timestamp_millis();
+        // Strip dangling tool calls: the stream was interrupted mid-call, so
+        // there is no corresponding tool response. Persisting the call would
+        // make the next request fail with "assistant message with tool_calls
+        // must be followed by tool messages" (same rationale as the
+        // max-tool-iterations strip below).
+        message
+            .content
+            .retain(|b| !matches!(b, ContentBlock::ToolCall(_)));
         message
     }
 
@@ -1425,6 +1433,12 @@ impl Agent {
         message.stop_reason = StopReason::Error;
         message.error_message = Some(error_message);
         message.timestamp = Utc::now().timestamp_millis();
+        // Strip dangling tool calls (same rationale as build_abort_message):
+        // a stream that failed mid-tool-call must not persist a tool_call
+        // without its response.
+        message
+            .content
+            .retain(|b| !matches!(b, ContentBlock::ToolCall(_)));
         message
     }
 
@@ -6284,6 +6298,10 @@ mod extensions_integration_tests {
 
     #[test]
     fn tool_call_hook_can_rewrite_bash_command_via_replace_input() {
+        if !crate::tools::bash_available() {
+            eprintln!("skipping: no bash shell available on this system");
+            return;
+        }
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -6932,6 +6950,88 @@ mod abort_tests {
     }
 
     #[derive(Debug)]
+    struct ToolCallThenPendingProvider {
+        calls: AtomicUsize,
+    }
+
+    impl ToolCallThenPendingProvider {
+        const fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn base_message() -> AssistantMessage {
+            AssistantMessage {
+                content: Vec::new(),
+                api: "test-api".to_string(),
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            }
+        }
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for ToolCallThenPendingProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                // First call: open a tool call in the stream, then hang. The
+                // agent must strip the dangling tool call when aborted mid-call.
+                return Ok(Box::pin(
+                    futures::stream::iter(vec![
+                        Ok(StreamEvent::Start {
+                            partial: Self::base_message(),
+                        }),
+                        Ok(StreamEvent::ToolCallStart {
+                            content_index: 0,
+                            id: "call-stream-1".to_string(),
+                            name: "read".to_string(),
+                        }),
+                    ])
+                    .chain(futures::stream::pending::<crate::error::Result<StreamEvent>>()),
+                ));
+            }
+            let mut done = Self::base_message();
+            done.content = vec![ContentBlock::Text(TextContent::new(format!(
+                "resumed-response-{call}"
+            )))];
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamEvent::Start {
+                    partial: Self::base_message(),
+                }),
+                Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: done,
+                }),
+            ])))
+        }
+    }
+
+    #[derive(Debug)]
     struct HangingTool;
 
     #[async_trait]
@@ -7343,6 +7443,91 @@ mod abort_tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             assert_abort_resume_timeline_boundaries(&timeline);
+        });
+    }
+
+    #[test]
+    fn abort_during_streaming_tool_call_strips_dangling_tool_call() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let provider = Arc::new(ToolCallThenPendingProvider::new());
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+
+            let tool_call_started = Arc::new(Notify::new());
+            let (abort_handle, abort_signal) = AbortHandle::new();
+            let started_for_abort = Arc::clone(&tool_call_started);
+            let abort_join = handle.spawn(async move {
+                started_for_abort.notified().await;
+                abort_handle.abort();
+            });
+
+            let aborted = agent_session
+                .run_text_with_abort("first".to_string(), Some(abort_signal), {
+                    let tool_call_started = Arc::clone(&tool_call_started);
+                    move |event| {
+                        if matches!(
+                            event,
+                            AgentEvent::MessageUpdate {
+                                assistant_message_event:
+                                    AssistantMessageEvent::ToolCallStart { .. },
+                                ..
+                            }
+                        ) {
+                            tool_call_started.notify_one();
+                        }
+                    }
+                })
+                .await
+                .expect("aborted run");
+            abort_join.await;
+
+            assert_eq!(aborted.stop_reason, StopReason::Aborted);
+            assert!(
+                !aborted
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolCall(_))),
+                "abort message must not retain dangling tool calls: {aborted:?}"
+            );
+
+            // A follow-up prompt must stream normally — the persisted abort
+            // message must not poison the next provider request.
+            let resumed = agent_session
+                .run_text("second".to_string(), |_| {})
+                .await
+                .expect("resumed run");
+            assert_eq!(resumed.stop_reason, StopReason::Stop);
+            assert!(resumed.error_message.is_none());
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let persisted = session
+                .lock(cx.cx())
+                .await
+                .expect("lock session")
+                .to_messages_for_current_path();
+            for message in &persisted {
+                if let Message::Assistant(assistant) = message {
+                    assert!(
+                        !assistant
+                            .content
+                            .iter()
+                            .any(|b| matches!(b, ContentBlock::ToolCall(_))),
+                        "persisted assistant message must not contain dangling tool calls: {assistant:?}"
+                    );
+                }
+            }
         });
     }
 
