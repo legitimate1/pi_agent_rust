@@ -5108,6 +5108,49 @@ fn path_is_in_leaf_allowed_extension_root(
         .any(|root| root != nearest && root.starts_with(nearest))
 }
 
+/// Resolve a node:fs host mutation path (rename/unlink/rmdir/rm) to a
+/// canonical absolute path and verify it stays inside the workspace root
+/// or a registered extension root. Mirrors `__pi_host_write_file_sync`'s
+/// confinement: the parent directory is canonicalized so the leaf does not
+/// need to exist yet, then `starts_with` checks are applied. Returns a
+/// denied error naming the operation when the path is outside allowed roots.
+fn resolve_host_mutation_path(
+    op: &str,
+    path: &str,
+    process_cwd: &str,
+    extension_id: Option<&str>,
+    module_state: &Rc<RefCell<PiJsModuleState>>,
+    fallback_roots: &Arc<std::sync::Mutex<Vec<PathBuf>>>,
+) -> std::result::Result<PathBuf, rquickjs::Error> {
+    let workspace_root = crate::extensions::safe_canonicalize(Path::new(process_cwd));
+    let requested = PathBuf::from(path);
+    let requested_abs = if requested.is_absolute() {
+        requested
+    } else {
+        workspace_root.join(requested)
+    };
+    let checked_path = if let Some(parent) = requested_abs.parent() {
+        let canon_parent = crate::extensions::safe_canonicalize(parent);
+        canon_parent.join(requested_abs.file_name().unwrap_or_default())
+    } else {
+        requested_abs
+    };
+    let in_ext_root = path_is_in_allowed_extension_root(
+        &checked_path,
+        extension_id,
+        module_state,
+        fallback_roots,
+    );
+    let allowed = checked_path.starts_with(&workspace_root) || in_ext_root;
+    if !allowed {
+        return Err(rquickjs::Error::new_loading_message(
+            path,
+            format!("host {op} denied: path outside extension root"),
+        ));
+    }
+    Ok(checked_path)
+}
+
 #[derive(Clone, Debug)]
 struct PiJsResolver {
     state: Rc<RefCell<PiJsModuleState>>,
@@ -11849,12 +11892,42 @@ export function realpathSync(path, _opts) {
 export function unlinkSync(path) {
   const normalized = __pi_vfs.resolvePath(path, false);
   __pi_vfs.checkWriteAccess(normalized);
-  if (__pi_vfs.symlinks.delete(normalized)) {
+  const isLink = __pi_vfs.symlinks.has(normalized);
+  const bytes = __pi_vfs.files.get(normalized);
+  const inVfs = isLink || bytes !== undefined;
+
+  if (!inVfs) {
+    // Not in the VFS: without a host bridge there is nothing to remove.
+    if (__pi_vfs.isCurrentExtensionTempPath(normalized) || typeof globalThis.__pi_host_unlink_sync !== "function") {
+      throw new Error(`ENOENT: no such file or directory, unlink '${String(path ?? "")}'`);
+    }
+    // VFS miss but the file may exist on disk (leftover residue): remove it
+    // there. ENOENT from the host is propagated (Node semantics).
+    globalThis.__pi_host_unlink_sync(normalized);
     return;
   }
-  if (!__pi_vfs.files.delete(normalized)) {
-    throw new Error(`ENOENT: no such file or directory, unlink '${String(path ?? "")}'`);
+
+  if (isLink) {
+    // Symlinks are virtual-only VFS entries; no disk counterpart.
+    __pi_vfs.symlinks.delete(normalized);
+    return;
   }
+
+  // VFS hit: persist the removal to disk first, then drop the VFS entry.
+  // ENOENT means the file was never persisted (or already removed on disk);
+  // the VFS is the source of truth, so the unlink still succeeds.
+  if (!__pi_vfs.isCurrentExtensionTempPath(normalized) && typeof globalThis.__pi_host_unlink_sync === "function") {
+    try {
+      globalThis.__pi_host_unlink_sync(normalized);
+    } catch (e) {
+      const message = String((e && e.message) ? e.message : e);
+      const notFound = message.includes("No such file") || message.includes("ENOENT");
+      if (!notFound) {
+        throw e;
+      }
+    }
+  }
+  __pi_vfs.files.delete(normalized);
 }
 export function rmdirSync(path, _opts) {
   const normalized = __pi_vfs.resolvePath(path, false);
@@ -11865,6 +11938,17 @@ export function rmdirSync(path, _opts) {
   if (__pi_vfs.symlinks.has(normalized)) {
     throw new Error(`ENOTDIR: not a directory, rmdir '${String(path ?? "")}'`);
   }
+  const inVfs = __pi_vfs.dirs.has(normalized);
+
+  if (!inVfs) {
+    if (__pi_vfs.isCurrentExtensionTempPath(normalized) || typeof globalThis.__pi_host_rmdir_sync !== "function") {
+      throw new Error(`ENOENT: no such file or directory, rmdir '${String(path ?? "")}'`);
+    }
+    // VFS miss: remove the directory on disk if it exists there (leftover).
+    globalThis.__pi_host_rmdir_sync(normalized, false);
+    return;
+  }
+
   for (const filePath of __pi_vfs.files.keys()) {
     if (filePath.startsWith(`${normalized}/`)) {
       throw new Error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
@@ -11880,48 +11964,91 @@ export function rmdirSync(path, _opts) {
       throw new Error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
     }
   }
-  if (!__pi_vfs.dirs.delete(normalized)) {
-    throw new Error(`ENOENT: no such file or directory, rmdir '${String(path ?? "")}'`);
+
+  // VFS hit: persist the removal to disk first, then drop the VFS entry.
+  // ENOENT means the directory was never persisted (or already removed on
+  // disk); the VFS is the source of truth, so the rmdir still succeeds.
+  if (!__pi_vfs.isCurrentExtensionTempPath(normalized) && typeof globalThis.__pi_host_rmdir_sync === "function") {
+    try {
+      globalThis.__pi_host_rmdir_sync(normalized, false);
+    } catch (e) {
+      const message = String((e && e.message) ? e.message : e);
+      const notFound = message.includes("No such file") || message.includes("ENOENT");
+      if (!notFound) {
+        throw e;
+      }
+    }
   }
+  __pi_vfs.dirs.delete(normalized);
 }
 export function rmSync(path, opts) {
   const normalized = __pi_vfs.resolvePath(path, false);
   __pi_vfs.checkWriteAccess(normalized);
-  if (__pi_vfs.files.has(normalized)) {
+  const recursive = !!(opts && typeof opts === "object" && opts.recursive);
+
+  const isLink = __pi_vfs.symlinks.has(normalized);
+  const isFile = __pi_vfs.files.has(normalized);
+  const isDir = __pi_vfs.dirs.has(normalized);
+  const inVfs = isLink || isFile || isDir;
+
+  // Non-recursive directory removal delegates to rmdirSync to keep the
+  // ENOTEMPTY checks and host persistence in one place.
+  if (isDir && !recursive) {
+    rmdirSync(normalized);
+    return;
+  }
+
+  if (!inVfs) {
+    // Not in the VFS: without a host bridge there is nothing to remove.
+    if (__pi_vfs.isCurrentExtensionTempPath(normalized) || typeof globalThis.__pi_host_rm_sync !== "function") {
+      throw new Error(`ENOENT: no such file or directory, rm '${String(path ?? "")}'`);
+    }
+    // VFS miss: remove the entry on disk if it exists there (leftover).
+    // ENOENT from the host is propagated (Node semantics).
+    globalThis.__pi_host_rm_sync(normalized, recursive);
+    return;
+  }
+
+  // VFS hit: persist the removal to disk first, then drop the VFS entries.
+  // ENOENT means the entry was never persisted (or already removed on disk);
+  // the VFS is the source of truth, so the removal still succeeds.
+  if (!__pi_vfs.isCurrentExtensionTempPath(normalized) && typeof globalThis.__pi_host_rm_sync === "function") {
+    try {
+      globalThis.__pi_host_rm_sync(normalized, recursive);
+    } catch (e) {
+      const message = String((e && e.message) ? e.message : e);
+      const notFound = message.includes("No such file") || message.includes("ENOENT");
+      if (!notFound) {
+        throw e;
+      }
+    }
+  }
+
+  if (isLink || isFile) {
+    __pi_vfs.symlinks.delete(normalized);
     __pi_vfs.files.delete(normalized);
     return;
   }
-  if (__pi_vfs.symlinks.has(normalized)) {
-    __pi_vfs.symlinks.delete(normalized);
-    return;
+
+  // Directory (recursive): drop the whole VFS subtree.
+  for (const filePath of Array.from(__pi_vfs.files.keys())) {
+    if (filePath === normalized || filePath.startsWith(`${normalized}/`)) {
+      __pi_vfs.files.delete(filePath);
+    }
   }
-  if (__pi_vfs.dirs.has(normalized)) {
-    const recursive = !!(opts && typeof opts === "object" && opts.recursive);
-    if (!recursive) {
-      rmdirSync(normalized);
-      return;
+  for (const dirPath of Array.from(__pi_vfs.dirs)) {
+    if (dirPath === normalized || dirPath.startsWith(`${normalized}/`)) {
+      __pi_vfs.dirs.delete(dirPath);
     }
-    for (const filePath of Array.from(__pi_vfs.files.keys())) {
-      if (filePath === normalized || filePath.startsWith(`${normalized}/`)) {
-        __pi_vfs.files.delete(filePath);
-      }
-    }
-    for (const dirPath of Array.from(__pi_vfs.dirs)) {
-      if (dirPath === normalized || dirPath.startsWith(`${normalized}/`)) {
-        __pi_vfs.dirs.delete(dirPath);
-      }
-    }
-    for (const linkPath of Array.from(__pi_vfs.symlinks.keys())) {
-      if (linkPath === normalized || linkPath.startsWith(`${normalized}/`)) {
-        __pi_vfs.symlinks.delete(linkPath);
-      }
-    }
-    if (!__pi_vfs.dirs.has("/")) {
-      __pi_vfs.dirs.add("/");
-    }
-    return;
   }
-  throw new Error(`ENOENT: no such file or directory, rm '${String(path ?? "")}'`);
+  for (const linkPath of Array.from(__pi_vfs.symlinks.keys())) {
+    if (linkPath === normalized || linkPath.startsWith(`${normalized}/`)) {
+      __pi_vfs.symlinks.delete(linkPath);
+    }
+  }
+  if (!__pi_vfs.dirs.has("/")) {
+    __pi_vfs.dirs.add("/");
+  }
 }
 export function copyFileSync(src, dest, _mode) {
   writeFileSync(dest, readFileSync(src));
@@ -11931,6 +12058,8 @@ export function renameSync(oldPath, newPath) {
   const dst = __pi_vfs.resolvePath(newPath, false);
   __pi_vfs.checkWriteAccess(src);
   __pi_vfs.checkWriteAccess(dst);
+
+  // Symlinks are virtual-only VFS entries; just migrate the map entry.
   const linkTarget = __pi_vfs.symlinks.get(src);
   if (linkTarget !== undefined) {
     __pi_vfs.ensureDir(__pi_vfs.dirname(dst));
@@ -11938,14 +12067,79 @@ export function renameSync(oldPath, newPath) {
     __pi_vfs.symlinks.delete(src);
     return;
   }
-  const bytes = __pi_vfs.files.get(src);
-  if (bytes !== undefined) {
-    __pi_vfs.ensureDir(__pi_vfs.dirname(dst));
-    __pi_vfs.files.set(dst, bytes);
+
+  const srcBytes = __pi_vfs.files.get(src);
+  const srcIsDir = __pi_vfs.dirs.has(src);
+  const srcInVfs = srcBytes !== undefined || srcIsDir;
+
+  if (!srcInVfs) {
+    // Not in the VFS: without a host bridge there is nothing to rename.
+    if (__pi_vfs.isCurrentExtensionTempPath(src) || typeof globalThis.__pi_host_rename_sync !== "function") {
+      throw new Error(`ENOENT: no such file or directory, rename '${String(oldPath ?? "")}'`);
+    }
+    // VFS miss: rename the entry on disk if it exists there (leftover or
+    // host-created file). ENOENT from the host is propagated.
+    globalThis.__pi_host_rename_sync(src, dst);
+    // The destination on disk has been (atomically) replaced: drop any
+    // stale VFS entry so a later read does not return old bytes.
+    __pi_vfs.files.delete(dst);
+    __pi_vfs.symlinks.delete(dst);
+    __pi_vfs.dirs.delete(dst);
+    return;
+  }
+
+  // VFS hit: persist the rename to disk first, then migrate the VFS entry.
+  // ENOENT means the source was never persisted (or already gone on disk);
+  // the VFS is the source of truth, so the rename still succeeds.
+  if (!__pi_vfs.isCurrentExtensionTempPath(src) && typeof globalThis.__pi_host_rename_sync === "function") {
+    try {
+      globalThis.__pi_host_rename_sync(src, dst);
+    } catch (e) {
+      const message = String((e && e.message) ? e.message : e);
+      const notFound = message.includes("No such file") || message.includes("ENOENT");
+      if (!notFound) {
+        throw e;
+      }
+    }
+  }
+
+  __pi_vfs.ensureDir(__pi_vfs.dirname(dst));
+  // The destination on disk has been (atomically) replaced: drop stale
+  // VFS entries of a different kind (file→dir, dir→file, ...).
+  __pi_vfs.files.delete(dst);
+  __pi_vfs.symlinks.delete(dst);
+  __pi_vfs.dirs.delete(dst);
+
+  if (srcBytes !== undefined) {
+    __pi_vfs.files.set(dst, srcBytes);
     __pi_vfs.files.delete(src);
     return;
   }
-  throw new Error(`ENOENT: no such file or directory, rename '${String(oldPath ?? "")}'`);
+
+  // Directory: migrate the whole VFS subtree under src to dst.
+  const fileMoves = [];
+  for (const key of __pi_vfs.files.keys()) {
+    if (key === src || key.startsWith(`${src}/`)) {
+      fileMoves.push([key, `${dst}${key.slice(src.length)}`]);
+    }
+  }
+  for (const [from, to] of fileMoves) {
+    const value = __pi_vfs.files.get(from);
+    __pi_vfs.files.delete(from);
+    __pi_vfs.files.set(to, value);
+  }
+  for (const dir of Array.from(__pi_vfs.dirs)) {
+    if (dir === src || dir.startsWith(`${src}/`)) {
+      __pi_vfs.dirs.delete(dir);
+      __pi_vfs.dirs.add(`${dst}${dir.slice(src.length)}`);
+    }
+  }
+  for (const [from, target] of Array.from(__pi_vfs.symlinks)) {
+    if (from === src || from.startsWith(`${src}/`)) {
+      __pi_vfs.symlinks.delete(from);
+      __pi_vfs.symlinks.set(`${dst}${from.slice(src.length)}`, target);
+    }
+  }
 }
 export function mkdirSync(path, _opts) {
   const resolved = __pi_vfs.resolvePath(path, true);
@@ -17953,6 +18147,217 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 rquickjs::Error::new_loading_message(
                                     &path,
                                     format!("host write: write error: {e}"),
+                                )
+                            })?;
+
+                            Ok(())
+                        }
+                    }),
+                )?;
+
+                // __pi_host_rename_sync(old_path, new_path) -> void (throws on error)
+                // Synchronous real-filesystem rename for node:fs renameSync.
+                // Both source and destination paths are confined to the
+                // workspace root AND any registered extension roots; either
+                // path outside → denied. Mirrors Node.js semantics: an
+                // existing destination is atomically replaced.
+                global.set(
+                    "__pi_host_rename_sync",
+                    Func::from({
+                        let process_cwd = process_cwd.clone();
+                        let allowed_read_roots = Arc::clone(&allowed_read_roots);
+                        let module_state = Rc::clone(&module_state);
+                        move |ctx: Ctx<'_>,
+                              old_path: String,
+                              new_path: String|
+                              -> rquickjs::Result<()> {
+                            let extension_id = current_extension_id(&ctx);
+
+                            // Standalone PiJsRuntime without extension context:
+                            // keep VFS-only semantics.
+                            if extension_id.is_none() {
+                                return Ok(());
+                            }
+
+                            let src = resolve_host_mutation_path(
+                                "rename",
+                                &old_path,
+                                &process_cwd,
+                                extension_id.as_deref(),
+                                &module_state,
+                                &allowed_read_roots,
+                            )?;
+                            let dst = resolve_host_mutation_path(
+                                "rename",
+                                &new_path,
+                                &process_cwd,
+                                extension_id.as_deref(),
+                                &module_state,
+                                &allowed_read_roots,
+                            )?;
+
+                            // Ensure destination parent exists (matches
+                            // __pi_host_write_file_sync).
+                            if let Some(parent) = dst.parent() {
+                                fs::create_dir_all(parent).map_err(|e| {
+                                    rquickjs::Error::new_loading_message(
+                                        &new_path,
+                                        format!("host rename: mkdir error: {e}"),
+                                    )
+                                })?;
+                            }
+
+                            fs::rename(&src, &dst).map_err(|e| {
+                                rquickjs::Error::new_loading_message(
+                                    &old_path,
+                                    format!("host rename: {e}"),
+                                )
+                            })?;
+
+                            Ok(())
+                        }
+                    }),
+                )?;
+
+                // __pi_host_unlink_sync(path) -> void (throws on error)
+                // Synchronous real-filesystem unlink for node:fs unlinkSync.
+                // Confined to the workspace root AND any registered extension
+                // roots, matching the write/rename host functions. The shim
+                // tolerates ENOENT when the entry only exists in the in-memory
+                // VFS (e.g. a never-persisted file) and propagates other
+                // errors so the VFS stays consistent with the disk.
+                global.set(
+                    "__pi_host_unlink_sync",
+                    Func::from({
+                        let process_cwd = process_cwd.clone();
+                        let allowed_read_roots = Arc::clone(&allowed_read_roots);
+                        let module_state = Rc::clone(&module_state);
+                        move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<()> {
+                            let extension_id = current_extension_id(&ctx);
+
+                            if extension_id.is_none() {
+                                return Ok(());
+                            }
+
+                            let checked_path = resolve_host_mutation_path(
+                                "unlink",
+                                &path,
+                                &process_cwd,
+                                extension_id.as_deref(),
+                                &module_state,
+                                &allowed_read_roots,
+                            )?;
+
+                            std::fs::remove_file(&checked_path).map_err(|e| {
+                                rquickjs::Error::new_loading_message(
+                                    &path,
+                                    format!("host unlink: {e}"),
+                                )
+                            })?;
+
+                            Ok(())
+                        }
+                    }),
+                )?;
+
+                // __pi_host_rmdir_sync(path, recursive) -> void (throws on error)
+                // Synchronous real-filesystem directory removal for node:fs
+                // rmdirSync/rmSync directory branches. Confined to the
+                // workspace root AND any registered extension roots.
+                global.set(
+                    "__pi_host_rmdir_sync",
+                    Func::from({
+                        let process_cwd = process_cwd.clone();
+                        let allowed_read_roots = Arc::clone(&allowed_read_roots);
+                        let module_state = Rc::clone(&module_state);
+                        move |ctx: Ctx<'_>,
+                              path: String,
+                              recursive: bool|
+                              -> rquickjs::Result<()> {
+                            let extension_id = current_extension_id(&ctx);
+
+                            if extension_id.is_none() {
+                                return Ok(());
+                            }
+
+                            let checked_path = resolve_host_mutation_path(
+                                "rmdir",
+                                &path,
+                                &process_cwd,
+                                extension_id.as_deref(),
+                                &module_state,
+                                &allowed_read_roots,
+                            )?;
+
+                            let result = if recursive {
+                                std::fs::remove_dir_all(&checked_path)
+                            } else {
+                                std::fs::remove_dir(&checked_path)
+                            };
+                            result.map_err(|e| {
+                                rquickjs::Error::new_loading_message(
+                                    &path,
+                                    format!("host rmdir: {e}"),
+                                )
+                            })?;
+
+                            Ok(())
+                        }
+                    }),
+                )?;
+
+                // __pi_host_rm_sync(path, recursive) -> void (throws on error)
+                // Synchronous real-filesystem removal for node:fs rmSync.
+                // Resolves the entry type first so a single call can remove
+                // files, symlinks, or directories (recursively when asked).
+                // Confined to the workspace root AND any registered extension
+                // roots.
+                global.set(
+                    "__pi_host_rm_sync",
+                    Func::from({
+                        let process_cwd = process_cwd.clone();
+                        let allowed_read_roots = Arc::clone(&allowed_read_roots);
+                        let module_state = Rc::clone(&module_state);
+                        move |ctx: Ctx<'_>,
+                              path: String,
+                              recursive: bool|
+                              -> rquickjs::Result<()> {
+                            let extension_id = current_extension_id(&ctx);
+
+                            if extension_id.is_none() {
+                                return Ok(());
+                            }
+
+                            let checked_path = resolve_host_mutation_path(
+                                "rm",
+                                &path,
+                                &process_cwd,
+                                extension_id.as_deref(),
+                                &module_state,
+                                &allowed_read_roots,
+                            )?;
+
+                            let metadata =
+                                std::fs::symlink_metadata(&checked_path).map_err(|e| {
+                                    rquickjs::Error::new_loading_message(
+                                        &path,
+                                        format!("host rm: {e}"),
+                                    )
+                                })?;
+
+                            let result = if metadata.is_dir() {
+                                if recursive {
+                                    std::fs::remove_dir_all(&checked_path)
+                                } else {
+                                    std::fs::remove_dir(&checked_path)
+                                }
+                            } else {
+                                std::fs::remove_file(&checked_path)
+                            };
+                            result.map_err(|e| {
+                                rquickjs::Error::new_loading_message(
+                                    &path,
+                                    format!("host rm: {e}"),
                                 )
                             })?;
 
@@ -27370,6 +27775,310 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert!(
                 error.contains("host write denied"),
                 "expected host write denial, got: {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_host_rename_and_unlink_persist_to_disk() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let ext = temp_dir.path().join("ext");
+            std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+            std::fs::create_dir_all(&ext).expect("mkdir ext");
+            let tmp_path = ext.join("data.json.tmp");
+            let final_path = ext.join("data.json");
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext, Some("ext.test"));
+
+            let script = format!(
+                r#"
+                globalThis.diskPersist = {{}};
+                import('node:module').then(({{ createRequire }}) => {{
+                    const require = createRequire('/tmp/example.js');
+                    const fs = require('node:fs');
+                    return __pi_with_extension_async("ext.test", async () => {{
+                        try {{
+                            // Seed an existing destination to verify the
+                            // atomic-replace (overwrite) semantics.
+                            fs.writeFileSync({final_path:?}, 'old');
+                            fs.writeFileSync({tmp_path:?}, '{{"v":1}}');
+                            fs.renameSync({tmp_path:?}, {final_path:?});
+                            globalThis.diskPersist.renamedRead = fs.readFileSync({final_path:?}, 'utf8');
+                            globalThis.diskPersist.tmpGone = !fs.existsSync({tmp_path:?});
+                            fs.unlinkSync({final_path:?});
+                            globalThis.diskPersist.unlinkedGone = !fs.existsSync({final_path:?});
+                            globalThis.diskPersist.ok = true;
+                        }} catch (err) {{
+                            globalThis.diskPersist.ok = false;
+                            globalThis.diskPersist.error = String((err && err.message) || err || '');
+                        }}
+                    }});
+                }}).finally(() => {{
+                    globalThis.diskPersist.done = true;
+                }});
+                "#
+            );
+            runtime
+                .eval(&script)
+                .await
+                .expect("eval rename/unlink persist");
+
+            let result = get_global_json(&runtime, "diskPersist").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(
+                result["ok"],
+                serde_json::json!(true),
+                "js error: {}",
+                result["error"]
+            );
+            assert_eq!(result["renamedRead"], serde_json::json!("{\"v\":1}"));
+            assert_eq!(result["tmpGone"], serde_json::json!(true));
+            assert_eq!(result["unlinkedGone"], serde_json::json!(true));
+
+            // Disk assertions: rename moved the file (tmp gone, final has new
+            // content) and unlink removed it entirely.
+            assert!(!tmp_path.exists(), "tmp should be renamed away on disk");
+            assert!(!final_path.exists(), "final should be unlinked on disk");
+        });
+    }
+
+    #[test]
+    fn pijs_host_rename_and_unlink_deny_cross_extension_root_access() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let ext_a = temp_dir.path().join("ext-a");
+            let ext_b = temp_dir.path().join("ext-b");
+            std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+            std::fs::create_dir_all(&ext_a).expect("mkdir ext-a");
+            std::fs::create_dir_all(&ext_b).expect("mkdir ext-b");
+            let target_path = ext_a.join("owned.txt");
+            let stolen_path = ext_b.join("stolen.txt");
+            std::fs::write(&target_path, "secret").expect("write owned file");
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext_a, Some("ext.a"));
+            runtime.add_extension_root_with_id(ext_b, Some("ext.b"));
+
+            let script = format!(
+                r#"
+                globalThis.crossExtensionMutation = {{}};
+                import('node:module').then(({{ createRequire }}) => {{
+                    const require = createRequire('/tmp/example.js');
+                    const fs = require('node:fs');
+                    return __pi_with_extension_async("ext.b", async () => {{
+                        try {{
+                            fs.renameSync({target_path:?}, {stolen_path:?});
+                            globalThis.crossExtensionMutation.renameOk = true;
+                        }} catch (err) {{
+                            globalThis.crossExtensionMutation.renameOk = false;
+                            globalThis.crossExtensionMutation.renameError = String((err && err.message) || err || '');
+                        }}
+                        try {{
+                            fs.unlinkSync({target_path:?});
+                            globalThis.crossExtensionMutation.unlinkOk = true;
+                        }} catch (err) {{
+                            globalThis.crossExtensionMutation.unlinkOk = false;
+                            globalThis.crossExtensionMutation.unlinkError = String((err && err.message) || err || '');
+                        }}
+                    }});
+                }}).finally(() => {{
+                    globalThis.crossExtensionMutation.done = true;
+                }});
+                "#
+            );
+            runtime
+                .eval(&script)
+                .await
+                .expect("eval cross-extension rename/unlink");
+
+            let result = get_global_json(&runtime, "crossExtensionMutation").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(result["renameOk"], serde_json::json!(false));
+            let rename_error = result["renameError"].as_str().unwrap_or_default();
+            // The shim's checkWriteAccess guard fires first with the generic
+            // write denial; the host rename guard ("host rename denied") is
+            // the defense-in-depth layer behind it.
+            assert!(
+                rename_error.contains("host write denied")
+                    || rename_error.contains("host rename denied"),
+                "expected host rename denial, got: {rename_error}"
+            );
+            assert_eq!(result["unlinkOk"], serde_json::json!(false));
+            let unlink_error = result["unlinkError"].as_str().unwrap_or_default();
+            assert!(
+                unlink_error.contains("host write denied")
+                    || unlink_error.contains("host unlink denied"),
+                "expected host unlink denial, got: {unlink_error}"
+            );
+            // The owned file must remain untouched on disk.
+            assert!(
+                target_path.exists(),
+                "owned file should survive cross-extension mutation attempts"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&target_path).expect("read owned file"),
+                "secret"
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_host_unlink_removes_disk_residue_not_in_vfs() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let ext = temp_dir.path().join("ext");
+            std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+            std::fs::create_dir_all(&ext).expect("mkdir ext");
+            // Disk residue that was never loaded into the VFS (e.g. written
+            // by a previous session or by the host).
+            let residue_path = ext.join("residue.txt");
+            std::fs::write(&residue_path, "leftover").expect("write residue");
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext, Some("ext.test"));
+
+            let script = format!(
+                r#"
+                globalThis.residueCleanup = {{}};
+                import('node:module').then(({{ createRequire }}) => {{
+                    const require = createRequire('/tmp/example.js');
+                    const fs = require('node:fs');
+                    return __pi_with_extension_async("ext.test", async () => {{
+                        try {{
+                            fs.unlinkSync({residue_path:?});
+                            globalThis.residueCleanup.gone = !fs.existsSync({residue_path:?});
+                            globalThis.residueCleanup.ok = true;
+                        }} catch (err) {{
+                            globalThis.residueCleanup.ok = false;
+                            globalThis.residueCleanup.error = String((err && err.message) || err || '');
+                        }}
+                    }});
+                }}).finally(() => {{
+                    globalThis.residueCleanup.done = true;
+                }});
+                "#
+            );
+            runtime.eval(&script).await.expect("eval residue cleanup");
+
+            let result = get_global_json(&runtime, "residueCleanup").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(
+                result["ok"],
+                serde_json::json!(true),
+                "js error: {}",
+                result["error"]
+            );
+            assert_eq!(result["gone"], serde_json::json!(true));
+            assert!(
+                !residue_path.exists(),
+                "residue should be removed from disk"
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_host_rmdir_rm_persist_to_disk() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let ext = temp_dir.path().join("ext");
+            std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+            std::fs::create_dir_all(&ext).expect("mkdir ext");
+            let empty_dir = ext.join("empty");
+            let tree_dir = ext.join("tree");
+            std::fs::create_dir_all(&empty_dir).expect("mkdir empty dir");
+            std::fs::create_dir_all(tree_dir.join("sub")).expect("mkdir tree");
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext, Some("ext.test"));
+
+            let script = format!(
+                r#"
+                globalThis.dirRemoval = {{}};
+                import('node:module').then(({{ createRequire }}) => {{
+                    const require = createRequire('/tmp/example.js');
+                    const fs = require('node:fs');
+                    return __pi_with_extension_async("ext.test", async () => {{
+                        try {{
+                            // Directory tree created on disk only (host side):
+                            // rmdirSync of the empty dir and rmSync recursive
+                            // of the tree must both persist.
+                            fs.rmdirSync({empty_dir:?});
+                            globalThis.dirRemoval.emptyGone = !fs.existsSync({empty_dir:?});
+                            fs.rmSync({tree_dir:?}, {{ recursive: true }});
+                            globalThis.dirRemoval.treeGone = !fs.existsSync({tree_dir:?});
+                            globalThis.dirRemoval.ok = true;
+                        }} catch (err) {{
+                            globalThis.dirRemoval.ok = false;
+                            globalThis.dirRemoval.error = String((err && err.message) || err || '');
+                        }}
+                    }});
+                }}).finally(() => {{
+                    globalThis.dirRemoval.done = true;
+                }});
+                "#
+            );
+            runtime.eval(&script).await.expect("eval rmdir/rm persist");
+
+            let result = get_global_json(&runtime, "dirRemoval").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(
+                result["ok"],
+                serde_json::json!(true),
+                "js error: {}",
+                result["error"]
+            );
+            assert_eq!(result["emptyGone"], serde_json::json!(true));
+            assert_eq!(result["treeGone"], serde_json::json!(true));
+            assert!(!empty_dir.exists(), "empty dir should be removed on disk");
+            assert!(
+                !tree_dir.exists(),
+                "tree should be removed recursively on disk"
             );
         });
     }
