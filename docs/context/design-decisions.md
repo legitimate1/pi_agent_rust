@@ -715,3 +715,38 @@
 - 调 PowerShell `Get-PSDrive`/`Get-Volume`——进程开销大、解析脆弱，且破坏「doctor 不依赖 shell」的架构
 
 **何时重新考虑**：若引入 windows crate 的 `GetDiskFreeSpaceExW` 直调，可替换 sysinfo（当前 sysinfo 枚举 + 前缀匹配足够且跨盘符正确）。
+
+## D39: workspace bundle 发现要求父目录声明 pi.extensions（2026-08-13）
+
+**决策**：`discover_workspace_bundle_entries`（`src/extensions.rs`）只把「父目录自身 `package.json` 声明了 `pi.extensions`」的目录当作 bundle 根；否则直接返回空，不做任何兄弟目录扫描。
+
+**理由**：
+
+- 修复 e2e_auto_repair 实测失败：`w-winter-dot314`（dotfiles 聚合仓库，40 个兄弟目录各有独立 package.json，恰好卡在 `MAX_BUNDLE_CLUSTER_DIRS=40` 阈值内）被无脑当 bundle 根扫描，`subagent/`、`tools/` 等无关扩展全被卷为入口（`subagent/index.ts` 的 `registerSubagentExtension` 被执行，`fs.watch` ENOENT）
+- `third-party/` 平台根目录同样被卷：jyaunches-pi-canvas 加载时串到 w-winter-dot314/subagent 的代码（同栈 `registerSubagentExtension`），两个扩展互相污染
+- 这是 D27/D28（extensions 根 + manifest 启发式 guard）的补全：前两轮只挡了「目录名=extensions」的根，没挡「任意聚合/平台目录」；本决策把「何为 bundle 根」从目录结构启发式收敛为「父 package.json 显式声明」
+
+**不选 B 的原因**：
+
+- 调整 `MAX_BUNDLE_CLUSTER_DIRS`（如 40→20）— 阈值不可靠，w-winter-dot314 恰好 40 是巧合，其他聚合仓库可能 25/30，阈值永远有边界案例
+- 调用方过滤 — D27 已否决（发现函数应自己保证语义正确）
+- 收紧 `is_likely_flat_extension_entry` — D28 已否决（启发式永远有盲区）
+
+**何时重新考虑**：与 D28 相同——若未来支持「manifest 声明多入口 bundle」（父 package.json 的 `pi.extensions` 数组列出全部入口），本 guard 已天然兼容（父目录有声明才会扫描，且按声明 resolve）；若出现「无声明但确为 bundle」的合法场景，应要求扩展显式声明而非再放宽启发式。
+
+## D40: drop-in 认证诚实降级（2026-08-13）
+
+**决策**：`docs/evidence/dropin-certification-verdict.json` 的 `overall_verdict` 从 `CERTIFIED` 降为 `NOT_CERTIFIED`；`dropin-differential-evidence-suite.json` 的 `overall_status` 从 `pass` 降为 `blocked`；`dropin-parity-gap-ledger.json` 的 `gap-cli-slash-command-surface` 从 `resolved` 重开为 `open` + `high`。slash/tool_io 差分测试改为 runner 不可用时 fail-closed（skip 而非失败）。
+
+**理由**：
+
+- `legacy_pi_mono_code/pi-mono` 快照**故意残缺**（git 全历史 `coding-agent/src/core/` blob 数 = 0，原作者 `39ec5ac2` restore 也是残缺版），differential runner 永远无法执行 → 此前的 `CERTIFIED`/`pass` 是**无法复现的声明**（G10/G11 门禁本应防的正是这种）
+- 原作者后续提交已转向自建契约测试（conformance fixtures、RPC surface），不再维护 legacy 差分；diff 测试留作 fail-closed 门禁是「记得但不管」的定位
+- 降级后 AGENTS.md 的 Drop-In 规则自动生效：不再允许把 Pi Rust 描述为严格 drop-in 替代品——这是诚实的定位，与「原作者不维护差分」的判断一致
+
+**不选 B 的原因**：
+
+- 保留 `CERTIFIED` 但标注「不可复现」— 证据文件要求可复现，撒谎比降级更糟
+- 彻底删除 dropin 测试/认证体系 — 破坏与上游的契约对齐，未来若重新 provision 完整快照可恢复差分验证，保留体系成本低
+
+**何时重新考虑**：若未来重新拉取完整 pi-mono 快照（含 core/）并跑通差分，可将 verdict 恢复；或彻底放弃 drop-in 声明后移除认证体系（届时 dropin_* 测试可一并移除）。
