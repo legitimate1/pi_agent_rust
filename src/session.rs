@@ -1340,12 +1340,32 @@ impl Session {
         }
 
         if let Some(path) = &cli.session {
-            let mut session = Self::open(path).await?;
-            session.session_dir = session_dir
-                .clone()
-                .or_else(|| infer_session_root_from_path(Path::new(path)));
-            session.set_autosave_durability_mode(durability_mode);
-            return Ok(session);
+            let session_path = Path::new(path);
+            if session_path.exists() {
+                let mut session = Self::open(path).await?;
+                session.session_dir = session_dir
+                    .clone()
+                    .or_else(|| infer_session_root_from_path(session_path));
+                session.set_autosave_durability_mode(durability_mode);
+                return Ok(session);
+            }
+            if cli.print {
+                // Print mode with an explicit --session that does not exist yet:
+                // create a fresh session and persist to that path (#46).
+                // Relative paths resolve against --session-dir (or the cwd).
+                let store_kind = SessionStoreKind::from_config(config);
+                let resolved = Self::resolve_session_write_path(path, session_dir.as_deref())?;
+                // save() only creates the parent directory when generating a
+                // fresh path; an explicit --session target needs it upfront.
+                if let Some(parent) = resolved.parent() {
+                    asupersync::fs::create_dir_all(parent).await?;
+                }
+                let mut session = Self::create_with_dir_and_store(session_dir, store_kind);
+                session.path = Some(resolved);
+                session.set_autosave_durability_mode(durability_mode);
+                return Ok(session);
+            }
+            return Err(crate::Error::SessionNotFound { path: path.clone() });
         }
 
         if cli.resume {
@@ -1596,6 +1616,22 @@ impl Session {
     /// Create a new session with an optional base directory override.
     pub fn create_with_dir(session_dir: Option<PathBuf>) -> Self {
         Self::create_with_dir_and_store(session_dir, SessionStoreKind::Jsonl)
+    }
+
+    /// Resolve an explicit `--session` write target for a fresh session.
+    ///
+    /// Relative paths resolve against `session_dir` when set, otherwise the
+    /// current working directory. Absolute paths are used as-is.
+    fn resolve_session_write_path(path: &str, session_dir: Option<&Path>) -> Result<PathBuf> {
+        let raw = Path::new(path);
+        if raw.is_absolute() {
+            return Ok(raw.to_path_buf());
+        }
+        let base = match session_dir {
+            Some(dir) => dir.to_path_buf(),
+            None => std::env::current_dir()?,
+        };
+        Ok(base.join(raw))
     }
 
     pub fn create_with_dir_and_store(
@@ -6749,6 +6785,64 @@ mod tests {
         assert_eq!(
             session.autosave_durability_mode(),
             AutosaveDurabilityMode::Throughput
+        );
+    }
+
+    #[test]
+    fn test_session_new_print_with_session_creates_missing_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let target = temp_dir.path().join("print-session.jsonl");
+        let mut cli = crate::cli::Cli::parse_from([
+            "pi",
+            "--print",
+            "--session-dir",
+            temp_dir.path().to_str().expect("utf8"),
+            "--session",
+            "print-session.jsonl",
+            "hello",
+        ]);
+        crate::app::normalize_cli(&mut cli);
+        let config = Config::default();
+        let session =
+            run_async(async { Session::new(&cli, &config).await }).expect("create session");
+        assert_eq!(session.path.as_deref(), Some(target.as_path()));
+        assert!(session.session_dir.is_some());
+    }
+
+    #[test]
+    fn test_session_new_print_with_absolute_session_uses_path_as_is() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let target = temp_dir.path().join("abs-session.jsonl");
+        let mut cli = crate::cli::Cli::parse_from([
+            "pi",
+            "--print",
+            "--session",
+            target.to_str().expect("utf8"),
+            "hello",
+        ]);
+        crate::app::normalize_cli(&mut cli);
+        let config = Config::default();
+        let session =
+            run_async(async { Session::new(&cli, &config).await }).expect("create session");
+        assert_eq!(session.path.as_deref(), Some(target.as_path()));
+    }
+
+    #[test]
+    fn test_session_new_interactive_missing_session_still_errors() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let target = temp_dir.path().join("missing.jsonl");
+        let cli = crate::cli::Cli::parse_from([
+            "pi",
+            "--session",
+            target.to_str().expect("utf8"),
+            "hello",
+        ]);
+        let config = Config::default();
+        let err = run_async(async { Session::new(&cli, &config).await })
+            .expect_err("interactive --session with missing path must error");
+        assert!(
+            err.to_string().contains("Session not found"),
+            "expected SessionNotFound, got {err}"
         );
     }
 

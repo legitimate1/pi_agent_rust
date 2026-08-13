@@ -1333,7 +1333,10 @@ async fn run(
         }
     });
     let is_print_mode = mode.eq("text") || mode.eq("json");
-    if is_print_mode {
+    if is_print_mode && !cli.no_session && cli.session_dir.is_none() && cli.session.is_none() {
+        // Print mode is ephemeral by default, but explicit --session-dir /
+        // --session opts into session persistence (#46). `normalize_cli` already
+        // handles `cli.print`; this covers `--mode json` without `-p`.
         cli.no_session = true;
     }
     if mode.eq("text") && initial.is_none() && messages.is_empty() {

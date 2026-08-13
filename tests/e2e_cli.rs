@@ -2928,6 +2928,132 @@ fn e2e_cli_print_mode_vcr_roundtrip() {
 }
 
 #[test]
+fn e2e_cli_print_mode_with_session_dir_persists_session() {
+    let mut harness = CliTestHarness::new("e2e_cli_print_mode_with_session_dir_persists_session");
+
+    let request_body = json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Reply with the single word: pong."}]}
+        ],
+        "system": expected_system_prompt("You are a test harness model."),
+        "max_tokens": 64000,
+        "stream": true
+    });
+
+    setup_vcr_anthropic(&mut harness, "e2e_print_session_dir", &request_body, "pong");
+
+    let session_dir = harness.harness.temp_path("sessions-print");
+    let mut args: Vec<&str> = vec![
+        "-p",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--session-dir",
+    ];
+    args.push(session_dir.to_str().expect("utf8"));
+    args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+    args.extend_from_slice(&[
+        "--system-prompt",
+        "You are a test harness model.",
+        "Reply with the single word: pong.",
+    ]);
+
+    let result = harness.run(&args);
+    assert!(
+        result.exit_code == 0,
+        "expected exit code 0, got {}.\nstderr:\n{}\nstdout:\n{}",
+        result.exit_code,
+        result.stderr,
+        result.stdout,
+    );
+    assert_contains(&harness.harness, &result.stdout, "pong");
+
+    let jsonl_count = count_jsonl_files(&session_dir);
+    harness
+        .harness
+        .log()
+        .info_ctx("verify", "Session persisted in print mode", |ctx| {
+            ctx.push(("session_dir".into(), session_dir.display().to_string()));
+            ctx.push(("jsonl_count".into(), jsonl_count.to_string()));
+        });
+    assert!(
+        jsonl_count >= 1,
+        "print mode with --session-dir must persist a session file"
+    );
+}
+
+#[test]
+fn e2e_cli_print_mode_with_named_session_persists_to_exact_path() {
+    let mut harness =
+        CliTestHarness::new("e2e_cli_print_mode_with_named_session_persists_to_exact_path");
+
+    let request_body = json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Reply with the single word: pong."}]}
+        ],
+        "system": expected_system_prompt("You are a test harness model."),
+        "max_tokens": 64000,
+        "stream": true
+    });
+
+    setup_vcr_anthropic(
+        &mut harness,
+        "e2e_print_named_session",
+        &request_body,
+        "pong",
+    );
+
+    let session_dir = harness.harness.temp_path("sessions-named");
+    let session_file = session_dir.join("named.jsonl");
+    let mut args: Vec<&str> = vec![
+        "-p",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--session-dir",
+    ];
+    args.push(session_dir.to_str().expect("utf8"));
+    args.extend_from_slice(&["--session", "named.jsonl"]);
+    args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+    args.extend_from_slice(&[
+        "--system-prompt",
+        "You are a test harness model.",
+        "Reply with the single word: pong.",
+    ]);
+
+    let result = harness.run(&args);
+    assert!(
+        result.exit_code == 0,
+        "expected exit code 0, got {}.\nstderr:\n{}\nstdout:\n{}",
+        result.exit_code,
+        result.stderr,
+        result.stdout,
+    );
+    assert_contains(&harness.harness, &result.stdout, "pong");
+
+    harness
+        .harness
+        .log()
+        .info_ctx("verify", "Named session persisted", |ctx| {
+            ctx.push(("session_file".into(), session_file.display().to_string()));
+        });
+    assert!(
+        session_file.exists(),
+        "print mode with --session must write to the exact path: {}",
+        session_file.display()
+    );
+    let content = fs::read_to_string(&session_file).expect("read session file");
+    assert!(
+        content.contains("\"type\": \"session\"") || content.contains("\"type\":\"session\""),
+        "session file must start with a v3 session header, got: {content}"
+    );
+}
+
+#[test]
 fn e2e_cli_print_mode_stdin_sends_to_provider() {
     let mut harness = CliTestHarness::new("e2e_cli_print_mode_stdin_sends_to_provider");
 

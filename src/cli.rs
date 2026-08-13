@@ -343,11 +343,15 @@ pub struct Cli {
     #[arg(short = 'r', long)]
     pub resume: bool,
 
-    /// Use specific session file path
+    /// Use specific session file path. In print mode, a non-existent path
+    /// creates a fresh session persisted there (relative paths resolve
+    /// against --session-dir, else the cwd).
     #[arg(long)]
     pub session: Option<String>,
 
-    /// Directory for session storage/lookup
+    /// Directory for session storage/lookup. In print mode, setting this
+    /// (with or without --session) persists the session instead of discarding
+    /// it; combine with --no-session to keep print ephemeral.
     #[arg(long)]
     pub session_dir: Option<String>,
 

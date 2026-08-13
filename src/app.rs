@@ -91,8 +91,13 @@ pub fn normalize_cli(cli: &mut cli::Cli) {
         cli.mode = Some("rpc".to_string());
     }
 
-    if cli.print {
-        cli.no_session = true;
+    if cli.print && !cli.no_session {
+        // Print mode is ephemeral by default (no session file), but an explicit
+        // --session-dir / --session opts into persistence (#46).
+        let explicit_session = cli.session_dir.is_some() || cli.session.is_some();
+        if !explicit_session {
+            cli.no_session = true;
+        }
     }
 
     if let Some(provider) = &mut cli.provider {
@@ -1417,6 +1422,47 @@ mod tests {
     }
 
     #[test]
+    fn normalize_cli_print_with_session_dir_keeps_session_persistence() {
+        let mut cli = cli::Cli::parse_from(["pi", "--print", "--session-dir", "/tmp/s", "hello"]);
+        normalize_cli(&mut cli);
+        assert!(
+            !cli.no_session,
+            "print + --session-dir must persist session"
+        );
+    }
+
+    #[test]
+    fn normalize_cli_print_with_session_keeps_session_persistence() {
+        let mut cli = cli::Cli::parse_from(["pi", "--print", "--session", "s.jsonl", "hello"]);
+        normalize_cli(&mut cli);
+        assert!(!cli.no_session, "print + --session must persist session");
+    }
+
+    #[test]
+    fn normalize_cli_print_with_explicit_no_session_stays_ephemeral() {
+        let mut cli = cli::Cli::parse_from([
+            "pi",
+            "--print",
+            "--no-session",
+            "--session-dir",
+            "/tmp/s",
+            "hello",
+        ]);
+        normalize_cli(&mut cli);
+        assert!(cli.no_session, "--no-session must stay authoritative");
+    }
+
+    #[test]
+    fn normalize_cli_interactive_keeps_session_persistence() {
+        let mut cli = cli::Cli::parse_from(["pi", "--session-dir", "/tmp/s"]);
+        normalize_cli(&mut cli);
+        assert!(
+            !cli.no_session,
+            "interactive mode keeps session persistence"
+        );
+    }
+
+    #[test]
     fn validate_rpc_args_rejects_file_arguments() {
         let cli = cli::Cli::parse_from(["pi", "--mode", "rpc", "@src/main.rs", "hello"]);
 
@@ -2202,16 +2248,24 @@ mod tests {
                 provider in prop::option::of("[A-Za-z0-9_-]{1,20}"),
                 print in any::<bool>(),
                 initial_no_session in any::<bool>(),
+                session_dir in prop::option::of("[A-Za-z0-9_/-]{1,20}"),
+                session in prop::option::of("[A-Za-z0-9_/.-]{1,20}"),
             ) {
                 let mut cli = cli::Cli::parse_from(["pi"]);
                 cli.provider = provider.clone();
                 cli.print = print;
                 cli.no_session = initial_no_session;
+                cli.session_dir = session_dir.clone();
+                cli.session = session.clone();
 
                 normalize_cli(&mut cli);
 
                 let expected_provider = provider.map(|value: String| value.to_ascii_lowercase());
-                let expected_no_session = if print { true } else { initial_no_session };
+                // Explicit session persistence opts out of the print-mode
+                // ephemeral default; explicit --no-session stays authoritative.
+                let explicit_session = session_dir.is_some() || session.is_some();
+                let expected_no_session =
+                    initial_no_session || (print && !explicit_session);
 
                 prop_assert_eq!(cli.provider, expected_provider);
                 prop_assert_eq!(cli.no_session, expected_no_session);
