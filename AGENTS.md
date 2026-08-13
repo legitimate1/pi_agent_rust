@@ -1,14 +1,8 @@
-# ═══ AGENTS.md 项目上下文 ═══
-
 # pi_agent_rust — Pi CLI 编程智能体
 
 高性能 AI 编程智能体 CLI，Rust 移植版。提供交互式终端界面、流式响应、工具执行、会话持久化。
 
 **技术栈**: Rust 2024 nightly · asupersync · rich_rust · serde · clap · rquickjs
-
----
-
-> 在此 Rust 代码库中工作的 AI 编程智能体指南。
 
 ---
 
