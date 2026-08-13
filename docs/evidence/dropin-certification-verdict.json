@@ -1,8 +1,8 @@
 {
   "schema": "pi.dropin.certification_verdict.v1",
-  "git_commit": "52e9fbfb24352045985b59df9d7ea63f1f8f2ef8",
-  "generated_at_utc": "2026-05-18T19:37:26Z",
-  "overall_verdict": "CERTIFIED",
+  "git_commit": "5ea7dee012729a8033d19d8c35d6d714603babbd",
+  "generated_at_utc": "2026-08-12T00:00:00Z",
+  "overall_verdict": "NOT_CERTIFIED",
   "hard_gate_results": [
     {
       "gate_id": "non_mock_unit",
@@ -174,14 +174,16 @@
     },
     {
       "gate_id": "G10-differential-evidence-suite",
-      "status": "pass",
+      "status": "blocked",
       "blocking": true,
-      "detail": "dropin-differential-evidence-suite passes with slash_command_differential backed by real mirrored RPC execution.",
+      "detail": "dropin-differential-evidence-suite blocked: slash_command_differential cannot run without legacy pi-mono runner (snapshot incomplete)",
       "artifact_path": "docs/evidence/dropin-differential-evidence-suite.json",
       "bead": "bd-7derw"
     }
   ],
-  "blocking_reasons": [],
+  "blocking_reasons": [
+    "gap-cli-slash-command-surface: legacy pi-mono differential runner unavailable (snapshot incomplete, coding-agent/src/core missing); slash-command parity not verified"
+  ],
   "evidence_index": [
     {
       "path": "docs/non-mock-rubric.json",

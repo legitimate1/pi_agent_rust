@@ -2,14 +2,14 @@
   "schema": "pi.dropin.differential_evidence_suite.v1",
   "bead_id": "bd-lnmtp.4.4",
   "gate_id": "G10-differential-evidence-suite",
-  "generated_at_utc": "2026-05-18T19:37:26Z",
-  "overall_status": "pass",
+  "generated_at_utc": "2026-08-12T00:00:00Z",
+  "overall_status": "blocked",
   "description": "Unified evidence bundle aggregating differential test harnesses from G04, G05, G08, and G09 gate completions. The G04 slash-command differential runner now executes Rust Pi and pi-mono over mirrored RPC for credential-free pass-evidence scenarios.",
   "component_evidence": [
     {
       "gate_id": "G04-cli-parity",
       "component": "slash_command_differential",
-      "status": "pass",
+      "status": "blocked",
       "test_harness": "tests/dropin_slash_differential.rs",
       "description": "Slash command differential coverage is certified for credential-free RPC-observable slash behavior. UI-only, process-exit, negative parser, and model-dependent compaction scenarios remain explicitly out of pass evidence and fail closed with documented policy.",
       "evidence_artifacts": [
@@ -18,7 +18,8 @@
         "tests/dropin_slash_differential/mod.rs preflights CARGO_BIN_EXE_pi plus legacy pi-mono RPC paths and drives both runtimes with JSONL RPC commands",
         "RPC-observable slash scenarios are mapped to JSONL RPC commands; UI-only, exit, invalid, and model-dependent compaction scenarios are policy-excluded from pass evidence",
         "Comprehensive CLI edge case coverage (tests/cli_edge_cases.rs) is supporting coverage only, not differential parity evidence"
-      ]
+      ],
+      "detail": "slash-command differential runner unavailable: legacy pi-mono snapshot incomplete (coding-agent/src/core missing); pass evidence cannot be reproduced on this machine"
     },
     {
       "gate_id": "G05-json-rpc-parity",
