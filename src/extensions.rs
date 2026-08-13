@@ -21287,6 +21287,22 @@ fn discover_workspace_bundle_entries(package_dir: &Path) -> Result<Vec<PathBuf>>
         return Ok(Vec::new());
     };
 
+    // Only treat the parent directory as a bundle root when it declares
+    // `pi.extensions` itself (a real workspace bundle). Without this guard,
+    // any multi-directory parent — e.g. a platform `third-party/` root or a
+    // dotfiles repo holding many independent extensions — would be scanned
+    // as a bundle, pulling unrelated sibling extensions (subagent, tools,
+    // ...) in as entrypoints. Regression observed on w-winter-dot314
+    // (40 sibling dirs, each with package.json) and third-party/.
+    let Some(parent_package_entries) =
+        read_pi_extensions_from_package(&workspace_root.join("package.json"))?
+    else {
+        return Ok(Vec::new());
+    };
+    if parent_package_entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let mut cluster_dirs = Vec::new();
     if let Ok(entries) = fs::read_dir(workspace_root) {
         for entry in entries.flatten() {
@@ -32205,6 +32221,51 @@ mod tests {
         assert_eq!(discovered.len(), 2);
         assert!(discovered.contains(&safe_canonicalize(&a_index)));
         assert!(discovered.contains(&safe_canonicalize(&b_index)));
+    }
+
+    #[test]
+    fn discover_related_extension_entries_does_not_bundle_platform_sibling_dirs_without_parent_manifest()
+     {
+        // Regression: a multi-file extension living in a platform/aggregate
+        // directory (e.g. third-party/, dotfiles repo) with many sibling dirs
+        // each declaring their own package.json must NOT be pulled into a
+        // bundle. Before the workspace-bundle guard, `w-winter-dot314` (40
+        // sibling dirs, each with package.json) and `third-party/` were
+        // scanned as bundle roots, loading unrelated extensions (subagent,
+        // tools, ...) as entrypoints.
+        let temp = tempdir().expect("tempdir");
+        let platform_root = temp.path().join("third-party");
+        let ext = platform_root.join("w-winter-dot314");
+        let agentic = ext.join("agentic-compaction");
+        let subagent = ext.join("subagent");
+        std::fs::create_dir_all(&agentic).expect("mkdir agentic-compaction");
+        std::fs::create_dir_all(&subagent).expect("mkdir subagent");
+
+        let agentic_index = agentic.join("index.ts");
+        std::fs::write(&agentic_index, "export default {};\n").expect("write agentic index");
+        std::fs::write(
+            agentic.join("package.json"),
+            r#"{ "pi": { "extensions": ["./index.ts"] } }"#,
+        )
+        .expect("write agentic package");
+
+        let subagent_index = subagent.join("index.ts");
+        std::fs::write(&subagent_index, "export default {};\n").expect("write subagent index");
+        std::fs::write(
+            subagent.join("package.json"),
+            r#"{ "pi": { "extensions": ["./index.ts"] } }"#,
+        )
+        .expect("write subagent package");
+
+        // The platform root has no package.json, so the bundle discovery must
+        // not kick in: only the declared entrypoint is loaded.
+        let discovered = discover_related_extension_entries(&agentic_index)
+            .expect("discover should not error for platform-sibling multi-file extension");
+        assert_eq!(
+            discovered,
+            vec![safe_canonicalize(&agentic_index)],
+            "platform sibling dirs without a parent bundle manifest must stay independent"
+        );
     }
 
     #[test]

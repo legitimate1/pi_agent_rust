@@ -315,6 +315,7 @@ fn is_nonblocking_auto_repair_failure(result: &ExtResult) -> bool {
             || (result.id == "npm/agentsbox"
                 && result.source_tier == "npm-registry"
                 && (error.contains("module is not defined")
+                    || error.contains("Unsupported OS: win")
                     || (error.contains("ENOENT: no such file or directory")
                         && error.contains("agentsbox/dist/package.json"))))
     })
