@@ -5,15 +5,19 @@
   "description": "@file expansion: single file reference is expanded into message content",
   "cli_args": [
     "-p",
-    "--provider", "anthropic",
-    "--model", "claude-sonnet-4-5",
+    "--provider",
+    "anthropic",
+    "--model",
+    "claude-sonnet-4-5",
     "--no-tools",
     "--no-extensions",
     "--no-skills",
     "--no-prompt-templates",
     "--no-themes",
-    "--thinking", "off",
-    "--system-prompt", "Summarize the file.",
+    "--thinking",
+    "off",
+    "--system-prompt",
+    "Summarize the file.",
     "@__TEMP_FILE_1__",
     "Summarize this."
   ],
@@ -33,11 +37,26 @@
           "method": "POST",
           "url": "https://api.anthropic.com/v1/messages",
           "headers": [
-            ["Content-Type", "application/json"],
-            ["Accept", "text/event-stream"],
-            ["X-API-Key", "[REDACTED]"],
-            ["anthropic-version", "2023-06-01"],
-            ["Content-Type", "application/json"]
+            [
+              "Content-Type",
+              "application/json"
+            ],
+            [
+              "Accept",
+              "text/event-stream"
+            ],
+            [
+              "X-API-Key",
+              "[REDACTED]"
+            ],
+            [
+              "anthropic-version",
+              "2023-06-01"
+            ],
+            [
+              "Content-Type",
+              "application/json"
+            ]
           ],
           "body": {
             "model": "claude-sonnet-4-5",
@@ -52,14 +71,17 @@
                 ]
               }
             ],
-            "max_tokens": 8192,
+            "max_tokens": 64000,
             "stream": true
           }
         },
         "response": {
           "status": 200,
           "headers": [
-            ["Content-Type", "text/event-stream; charset=utf-8"]
+            [
+              "Content-Type",
+              "text/event-stream; charset=utf-8"
+            ]
           ],
           "body_chunks": [
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-5\",\"id\":\"msg_golden_atfile_001\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":30,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":1,\"service_tier\":\"standard\"}}}\n\n",
@@ -76,9 +98,14 @@
   },
   "expected": {
     "exit_code": 0,
-    "stdout_contains": ["Hello, world!"],
+    "stdout_contains": [
+      "Hello, world!"
+    ],
     "stdout_not_contains": [],
-    "stderr_not_contains": ["error", "panic"],
+    "stderr_not_contains": [
+      "error",
+      "panic"
+    ],
     "no_session_files": true
   }
 }
