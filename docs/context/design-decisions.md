@@ -750,3 +750,19 @@
 - 彻底删除 dropin 测试/认证体系 — 破坏与上游的契约对齐，未来若重新 provision 完整快照可恢复差分验证，保留体系成本低
 
 **何时重新考虑**：若未来重新拉取完整 pi-mono 快照（含 core/）并跑通差分，可将 verdict 恢复；或彻底放弃 drop-in 声明后移除认证体系（届时 dropin_* 测试可一并移除）。
+
+## D41: print 模式会话落盘 opt-in（2026-08-13）
+
+**决策**：print 模式（`-p` / `--mode text|json`）保持默认不落盘（一次性输出即弃）；显式 `--session-dir` 或 `--session` 时 opt-in 持久化，会话以标准 v3 JSONL 落盘（成功与失败都落盘）；显式 `--no-session` 优先级最高。`--session` 指向不存在的路径时创建新会话（仅 print 模式；交互模式保持报 `SessionNotFound`）。
+
+**理由**：
+
+- task 扩展等无人值守场景（`pi -p @prompt`）失败时需要完整会话上下文供诊断，但 stdout NDJSON 事件流体积大数倍且不落盘——标准会话文件可被 `-c`/`-r`/`--export` 复用
+- 默认不落盘保护 print 高频临时调用：不污染默认 `sessions/` 目录、不产生无人认领的会话文件
+
+**不选 B 的原因**：
+
+- print 总是落盘 — 每个临时 `pi -p "..."` 都写默认 sessions/，目录膨胀且行为破坏（task 扩展可 hack 重定向，但那是脏方案）
+- 复用 `--no-session` 现有语义（print 强制 no-session）— 无法表达"我要落盘"的诉求，参数被静默忽略是 bug 而非特性
+
+**何时重新考虑**：若 print 模式普遍需要持久化（如所有无人值守调用都带 session-dir），可考虑环境变量/配置默认开启；若出现 print 会话文件无人认领导致目录膨胀，可加 TTL 清理。

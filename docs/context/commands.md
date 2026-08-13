@@ -204,10 +204,10 @@ pi migrate ~/.pi/agent/sessions
 
 - `-c, --continue` → 继续最近会话
 - `-r, --resume` → 打开会话选择器 UI
-- `--session <PATH>` → 打开指定会话文件
-- `--session-dir <DIR>` → 覆盖会话存储目录
-- `--no-session` → 不持久化会话
-- `-p, --print` → 单次响应，无交互
+- `--session <PATH>` → 打开指定会话文件；print 模式下路径不存在则创建新会话并写入该路径（相对路径解析为 `<session-dir>/<name>`，无 session-dir 时相对 cwd）
+- `--session-dir <DIR>` → 覆盖会话存储目录；print 模式下显式指定即启用会话落盘（不指定则 print 默认不落盘）
+- `--no-session` → 不持久化会话（优先级最高，print 模式下也生效）
+- `-p, --print` → 单次响应，无交互；默认不落盘，显式 `--session-dir`/`--session` 时落盘（成功与失败都落盘，供无人值守任务诊断）
 - `--mode text|json|rpc` → 输出/协议模式
 - `--extension-policy safe|balanced|permissive` → 扩展能力配置文件
 - `--repair-policy off|suggest|auto-safe|auto-strict` → 扩展自动修复策略

@@ -96,6 +96,7 @@
 - **RPC 方法 `append_custom_entry`** — 客户端（如 pidian 苏格拉底）注入自定义 entry 经 pi 会话管理落盘（CustomEntry，不影响 API 消息链路） ✅ → `src/rpc.rs` `src/session.rs`
 - **中断/错误消息清理 dangling tool calls** — 流式输出 tool_call 过程中 abort/error 时，`build_abort_message`/`build_error_message` strip 掉未完成的 ToolCall blocks（与迭代上限路径一致），防止持久化「有 tool_call 无 tool 响应」的消息污染会话——否则下次请求被 provider 拒绝（`tool_calls must be followed by tool messages` 400） ✅ → `src/agent.rs`
 - **SDK `SessionOptions.auth_path` 注入** — 可选指定 auth.json 加载路径（默认 `Config::auth_path`），embedder/测试可指向独立 auth 文件，避免与共享用户级 auth.json 的目录锁竞争 ✅ → `src/sdk.rs`
+- **print 模式会话落盘** — `-p`/`--mode text|json` 默认不落盘（一次性输出即弃），但显式 `--session-dir`/`--session` 时 opt-in 持久化：`--session-dir <dir>` 落盘到 `<dir>/<encoded_cwd>/<时间戳>_<id>.jsonl`（自动建目录），`--session <name>` 精确写入 `<session-dir>/<name>`（文件不存在则创建、已存在则继续追加）；成功与失败都落盘；显式 `--no-session` 仍优先 ✅ → `src/app.rs` `src/main.rs` `src/session.rs`
 
 ## 模型注册表
 

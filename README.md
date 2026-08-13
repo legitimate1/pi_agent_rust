@@ -50,7 +50,7 @@ pi "Help me refactor this function to use async/await"
 # Continue a previous session
 pi --continue
 
-# Single-shot mode (no session)
+# Single-shot mode (ephemeral by default; opt-in session with --session-dir/--session)
 pi -p "What does this error mean?" < error.log
 ```
 
@@ -103,7 +103,7 @@ Point any other OpenAI-compatible server via `~/.pi/agent/models.json` (see [doc
 
 All tools: automatic truncation (2000 lines / 1MB), detailed metadata, process-group cleanup (no orphaned processes).
 
-- **Session management** — JSONL tree sessions with branching, `--continue`, `--resume`, `--no-session`, automatic compaction for long conversations, SQLite session index + V2 sidecar for fast resume at scale
+- **Session management** — JSONL tree sessions with branching, `--continue`, `--resume`, `--no-session`, automatic compaction for long conversations, SQLite session index + V2 sidecar for fast resume at scale; print mode persists sessions on demand via `--session-dir`/`--session` (success and failure alike, for unattended task diagnostics)
 - **Autocomplete** — `@` file references and `/` slash commands with fuzzy scoring; background re-index every 30s
 - **Skills & prompt templates** — `SKILL.md` under `~/.pi/agent/skills/` or `.pi/skills/` invoked via `/skill:name`; templates via `/<name>` with positional args; share as packages (`pi install npm:@org/pi-packages`)
 - **Credentials** — API keys, OAuth, AWS credential chains, bearer tokens stored in `~/.pi/agent/auth.json`; `pi config` shows per-provider status
