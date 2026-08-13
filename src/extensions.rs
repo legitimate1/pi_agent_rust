@@ -22280,11 +22280,35 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
                 "Dispatching AMAC group"
             );
 
-            for req in group.requests {
-                if let Some((call_id, outcome, elapsed_ns)) = dispatch_one(runtime, host, req).await
-                {
-                    AMAC_EXECUTOR.with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
-                    completions.push((call_id, outcome));
+            match decision {
+                crate::hostcall_amac::AmacToggleDecision::Interleave { width } => {
+                    // Truly concurrent dispatch: run up to `width` requests in
+                    // flight at once. `buffered` preserves stream order, so
+                    // completions land in original request order.
+                    use futures::StreamExt as _;
+                    let results = futures::stream::iter(
+                        group
+                            .requests
+                            .into_iter()
+                            .map(|req| dispatch_one(runtime, host, req)),
+                    )
+                    .buffered(width)
+                    .collect::<Vec<_>>()
+                    .await;
+                    for (call_id, outcome, elapsed_ns) in results.into_iter().flatten() {
+                        AMAC_EXECUTOR.with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
+                        completions.push((call_id, outcome));
+                    }
+                }
+                crate::hostcall_amac::AmacToggleDecision::Sequential { .. } => {
+                    for req in group.requests {
+                        if let Some((call_id, outcome, elapsed_ns)) =
+                            dispatch_one(runtime, host, req).await
+                        {
+                            AMAC_EXECUTOR.with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
+                            completions.push((call_id, outcome));
+                        }
+                    }
                 }
             }
         }
@@ -33950,6 +33974,124 @@ mod tests {
                     .expect("read finalErr"),
                 Value::Null
             );
+        });
+    }
+
+    #[test]
+    fn amac_interleaves_parallel_exec_hostcalls_concurrently() {
+        futures::executor::block_on(async {
+            let dir = tempdir().expect("tempdir");
+            let manager = ExtensionManager::new();
+            let host = JsRuntimeHost {
+                tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
+                manager_ref: Arc::downgrade(&manager.inner),
+                manager_snapshot: Arc::clone(&manager.snapshot),
+                manager_snapshot_version: Arc::clone(&manager.snapshot_version),
+                http: Arc::new(HttpConnector::with_defaults()),
+                policy: ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    max_memory_mb: 256,
+                    default_caps: Vec::new(),
+                    deny_caps: Vec::new(),
+                    ..Default::default()
+                },
+                interceptor: None,
+            };
+
+            let runtime = PiJsRuntime::new().await.expect("runtime");
+
+            // Force interleave for the batch: low min_batch_size + telemetry
+            // primed with high stall ratio (see decide_toggle rules 3-5).
+            AMAC_EXECUTOR.with(|cell| {
+                let mut executor = cell.borrow_mut();
+                *executor = crate::hostcall_amac::AmacBatchExecutor::new(
+                    crate::hostcall_amac::AmacBatchExecutorConfig::new(true, 2, 16),
+                );
+                for _ in 0..100 {
+                    executor.observe_call(500_000);
+                }
+            });
+
+            // Four independent exec hostcalls launched together, each sleeping
+            // ~2s. Serial dispatch would take >= 8s; interleaved dispatch
+            // finishes in ~2-4s.
+            #[cfg(windows)]
+            let probe = r#"
+                globalThis.parallelDone = false;
+                globalThis.parallelErr = null;
+                globalThis.parallelResults = null;
+                Promise.all([1, 2, 3, 4].map((i) =>
+                    pi.exec("powershell", ["-NoProfile", "-Command", `Start-Sleep -Seconds 2; Write-Output done-${i}`])
+                        .then((r) => ({ i, code: r.code, stdout: String(r.stdout || "").trim() }))
+                )).then((rs) => { globalThis.parallelResults = rs; globalThis.parallelDone = true; })
+                  .catch((e) => { globalThis.parallelErr = { code: e.code, message: e.message || String(e) }; globalThis.parallelDone = true; });
+            "#;
+            #[cfg(not(windows))]
+            let probe = r#"
+                globalThis.parallelDone = false;
+                globalThis.parallelErr = null;
+                globalThis.parallelResults = null;
+                Promise.all([1, 2, 3, 4].map((i) =>
+                    pi.exec("sh", ["-c", `sleep 2; echo done-${i}`])
+                        .then((r) => ({ i, code: r.code, stdout: String(r.stdout || "").trim() }))
+                )).then((rs) => { globalThis.parallelResults = rs; globalThis.parallelDone = true; })
+                  .catch((e) => { globalThis.parallelErr = { code: e.code, message: e.message || String(e) }; globalThis.parallelDone = true; });
+            "#;
+            runtime.eval(probe).await.expect("eval");
+
+            let started = Instant::now();
+            let deadline = started + Duration::from_secs(30);
+            loop {
+                pump_js_runtime_once(&runtime, &host).await.expect("pump");
+                let done = runtime
+                    .read_global_json("parallelDone")
+                    .await
+                    .expect("read parallelDone");
+                if done == Value::Bool(true) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "parallel exec hostcalls did not complete within 30s"
+                );
+            }
+            let elapsed = started.elapsed();
+
+            // Restore the default executor so other tests on this thread are
+            // not affected by the primed telemetry / low min_batch_size.
+            AMAC_EXECUTOR.with(|cell| {
+                *cell.borrow_mut() = AmacBatchExecutor::default();
+            });
+
+            assert!(
+                elapsed < Duration::from_secs(6),
+                "4 × 2s exec hostcalls should interleave (got {elapsed:?}; serial would be >= 8s)"
+            );
+
+            assert_eq!(
+                runtime
+                    .read_global_json("parallelErr")
+                    .await
+                    .expect("read parallelErr"),
+                Value::Null
+            );
+
+            let results = runtime
+                .read_global_json("parallelResults")
+                .await
+                .expect("read parallelResults");
+            let arr = results.as_array().expect("results array");
+            assert_eq!(arr.len(), 4, "all four exec results present: {arr:?}");
+            for entry in arr {
+                let idx = entry.get("i").and_then(Value::as_i64).expect("index");
+                assert_eq!(entry.get("code"), Some(&json!(0)), "exit 0: {entry:?}");
+                let stdout = entry.get("stdout").and_then(Value::as_str).expect("stdout");
+                let expected = format!("done-{idx}");
+                assert_eq!(
+                    stdout, expected,
+                    "each exec result must carry its own output (no cross-contamination): {entry:?}"
+                );
+            }
         });
     }
 

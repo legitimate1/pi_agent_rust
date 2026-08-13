@@ -103,7 +103,7 @@ impl AmacGroupKey {
     pub const fn interleave_safe(&self) -> bool {
         matches!(
             self,
-            Self::SessionRead | Self::EventRead | Self::Tool | Self::Http | Self::Log
+            Self::SessionRead | Self::EventRead | Self::Tool | Self::Exec | Self::Http | Self::Log
         )
     }
 
@@ -385,6 +385,10 @@ pub struct AmacBatchExecutorConfig {
     pub stall_threshold_ns: u64,
     /// Stall-ratio threshold (0..1000) required before AMAC interleaving.
     pub stall_ratio_threshold: u64,
+    /// Allow interleaving of Exec groups. Escape hatch: Exec calls have side
+    /// effects, so operators can force serialized Exec dispatch via
+    /// `PI_HOSTCALL_AMAC_EXEC_INTERLEAVE=0` if a caller depends on ordering.
+    pub exec_interleave: bool,
 }
 
 impl Default for AmacBatchExecutorConfig {
@@ -396,15 +400,7 @@ impl Default for AmacBatchExecutorConfig {
 impl AmacBatchExecutorConfig {
     #[must_use]
     pub fn from_env() -> Self {
-        let enabled = std::env::var("PI_HOSTCALL_AMAC")
-            .ok()
-            .as_deref()
-            .is_none_or(|value| {
-                !matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "off" | "disabled"
-                )
-            });
+        let enabled = env_flag_default_true(std::env::var("PI_HOSTCALL_AMAC").ok().as_deref());
         let min_batch_size = std::env::var("PI_HOSTCALL_AMAC_MIN_BATCH")
             .ok()
             .and_then(|raw| raw.trim().parse::<usize>().ok())
@@ -425,12 +421,20 @@ impl AmacBatchExecutorConfig {
             .and_then(|raw| raw.trim().parse::<u64>().ok())
             .unwrap_or(AMAC_STALL_RATIO_THRESHOLD)
             .clamp(1, 1_000);
+        // Escape hatch: Exec groups interleave by default, but can be forced
+        // back to serial dispatch when a caller depends on exec ordering.
+        let exec_interleave = env_flag_default_true(
+            std::env::var("PI_HOSTCALL_AMAC_EXEC_INTERLEAVE")
+                .ok()
+                .as_deref(),
+        );
         Self {
             min_batch_size,
             max_interleave_width,
             enabled,
             stall_threshold_ns,
             stall_ratio_threshold,
+            exec_interleave,
         }
     }
 
@@ -442,6 +446,7 @@ impl AmacBatchExecutorConfig {
             enabled,
             stall_threshold_ns: AMAC_STALL_THRESHOLD_NS,
             stall_ratio_threshold: AMAC_STALL_RATIO_THRESHOLD,
+            exec_interleave: true,
         }
     }
 
@@ -646,6 +651,15 @@ impl AmacBatchExecutor {
             };
         }
 
+        // Rule 2b: Exec interleave escape hatch — Exec calls have side effects
+        // and may depend on serialized execution, so honor an explicit opt-out
+        // (PI_HOSTCALL_AMAC_EXEC_INTERLEAVE=0).
+        if matches!(key, AmacGroupKey::Exec) && !self.config.exec_interleave {
+            return AmacToggleDecision::Sequential {
+                reason: "exec_interleave_disabled",
+            };
+        }
+
         // Rule 3: Insufficient telemetry history → conservative sequential.
         if self.telemetry.total_calls < TELEMETRY_WINDOW_SIZE as u64 {
             return AmacToggleDecision::Sequential {
@@ -691,6 +705,19 @@ impl Default for AmacBatchExecutor {
 }
 
 // ── Helper functions ─────────────────────────────────────────────────────
+
+/// Parse a boolean-style env value where absence (or an unrecognized value)
+/// means the default `true`. Recognized disabling forms are the usual
+/// `0/false/off/disabled` spellings (case-insensitive).
+#[must_use]
+fn env_flag_default_true(value: Option<&str>) -> bool {
+    value.is_none_or(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "disabled"
+        )
+    })
+}
 
 /// Compute optimal interleave width from stall ratio and group characteristics.
 fn compute_interleave_width(
@@ -802,6 +829,12 @@ mod tests {
         make_request(HostcallKind::Http)
     }
 
+    fn exec_request() -> HostcallRequest {
+        make_request(HostcallKind::Exec {
+            cmd: "echo".to_string(),
+        })
+    }
+
     fn log_request() -> HostcallRequest {
         make_request(HostcallKind::Log)
     }
@@ -849,6 +882,7 @@ mod tests {
         assert!(AmacGroupKey::SessionRead.interleave_safe());
         assert!(AmacGroupKey::EventRead.interleave_safe());
         assert!(AmacGroupKey::Tool.interleave_safe());
+        assert!(AmacGroupKey::Exec.interleave_safe());
         assert!(AmacGroupKey::Http.interleave_safe());
         assert!(AmacGroupKey::Log.interleave_safe());
     }
@@ -858,7 +892,6 @@ mod tests {
         assert!(!AmacGroupKey::SessionWrite.interleave_safe());
         assert!(!AmacGroupKey::EventWrite.interleave_safe());
         assert!(!AmacGroupKey::Ui.interleave_safe());
-        assert!(!AmacGroupKey::Exec.interleave_safe());
     }
 
     // ── Telemetry tests ──────────────────────────────────────────────
@@ -1022,6 +1055,68 @@ mod tests {
                 reason: "ordering_dependency"
             }
         );
+    }
+
+    #[test]
+    fn plan_interleaves_exec_groups_with_sufficient_telemetry() {
+        let mut executor = AmacBatchExecutor::new(AmacBatchExecutorConfig::new(true, 2, 16));
+
+        // Prime telemetry with high stall ratio.
+        for _ in 0..100 {
+            executor.observe_call(500_000);
+        }
+
+        let requests: Vec<HostcallRequest> = (0..8).map(|_| exec_request()).collect();
+        let plan = executor.plan_batch(requests);
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].key, AmacGroupKey::Exec);
+        assert!(
+            plan.decisions[0].is_interleave(),
+            "exec groups should interleave once the escape hatch is on: {:?}",
+            plan.decisions[0]
+        );
+    }
+
+    #[test]
+    fn plan_sequential_for_exec_when_escape_hatch_disabled() {
+        let mut config = AmacBatchExecutorConfig::new(true, 2, 16);
+        config.exec_interleave = false;
+        let mut executor = AmacBatchExecutor::new(config);
+
+        // Prime telemetry with high stall ratio.
+        for _ in 0..100 {
+            executor.observe_call(500_000);
+        }
+
+        let requests: Vec<HostcallRequest> = (0..8).map(|_| exec_request()).collect();
+        let plan = executor.plan_batch(requests);
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(
+            plan.decisions[0],
+            AmacToggleDecision::Sequential {
+                reason: "exec_interleave_disabled"
+            }
+        );
+    }
+
+    #[test]
+    fn env_flag_default_true_parses_escape_hatch_forms() {
+        // Absent → default on.
+        assert!(env_flag_default_true(None));
+        // Disabling forms (case-insensitive).
+        for value in ["0", "false", "off", "disabled", "FALSE", "Off"] {
+            assert!(
+                !env_flag_default_true(Some(value)),
+                "value {value:?} should disable"
+            );
+        }
+        // Enabling and unrecognized forms stay on.
+        for value in ["1", "true", "on", "enabled", "banana", ""] {
+            assert!(
+                env_flag_default_true(Some(value)),
+                "value {value:?} should enable"
+            );
+        }
     }
 
     #[test]
@@ -1291,6 +1386,7 @@ mod tests {
         assert_eq!(config.max_interleave_width, 32);
         assert_eq!(config.stall_threshold_ns, AMAC_STALL_THRESHOLD_NS);
         assert_eq!(config.stall_ratio_threshold, AMAC_STALL_RATIO_THRESHOLD);
+        assert!(config.exec_interleave, "exec interleave should default on");
     }
 
     #[test]

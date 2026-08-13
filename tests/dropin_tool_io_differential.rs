@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+#[cfg(not(windows))]
 use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
@@ -149,20 +150,23 @@ async fn run_scenario(scenario: &Scenario) -> pi::PiResult<()> {
                 );
                 return Ok(());
             }
-            let leak_path = root.join("leaked.txt");
-            let command = "sh -c 'sleep 2; printf leaked > leaked.txt' & sleep 5";
-            let output = execute(
-                &BashTool::new(root),
-                json!({"command": command, "timeout": 1}),
-            )
-            .await?;
-            assert!(output.is_error, "{}: timeout must be an error", scenario.id);
-            std::thread::sleep(Duration::from_secs(3));
-            assert!(
-                !leak_path.exists(),
-                "{}: timed-out bash process group leaked a descendant writer",
-                scenario.id
-            );
+            #[cfg(not(windows))]
+            {
+                let leak_path = root.join("leaked.txt");
+                let command = "sh -c 'sleep 2; printf leaked > leaked.txt' & sleep 5";
+                let output = execute(
+                    &BashTool::new(root),
+                    json!({"command": command, "timeout": 1}),
+                )
+                .await?;
+                assert!(output.is_error, "{}: timeout must be an error", scenario.id);
+                std::thread::sleep(Duration::from_secs(3));
+                assert!(
+                    !leak_path.exists(),
+                    "{}: timed-out bash process group leaked a descendant writer",
+                    scenario.id
+                );
+            }
         }
         "bash_command_prefix_env" => {
             let tool = BashTool::with_shell(

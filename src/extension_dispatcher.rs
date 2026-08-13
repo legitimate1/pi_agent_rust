@@ -2718,16 +2718,36 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         for (group, decision) in plan.groups.into_iter().zip(plan.decisions.iter()) {
             let group_key = group.key.clone();
             let start = Instant::now();
-            // Dispatch each request in the group sequentially.
-            // AMAC decision metadata is recorded for telemetry but the
-            // actual dispatch remains sequential within a single-threaded
-            // async executor — true concurrency is achieved at the reactor
-            // mesh level (bd-3ar8v.4.20).
-            for request in group.requests {
-                let req_start = Instant::now();
-                self.dispatch_and_complete(request).await;
-                let elapsed_ns = u64::try_from(req_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                self.amac_executor.borrow_mut().observe_call(elapsed_ns);
+            // AMAC decision metadata is recorded for telemetry. Interleaved
+            // groups run with bounded concurrency (up to `width` in flight);
+            // sequential groups stay strictly ordered. `dispatch_and_complete`
+            // takes `&self` and owns its completion path, so concurrent
+            // dispatch is safe within the single-threaded async executor.
+            if let crate::hostcall_amac::AmacToggleDecision::Interleave { width } = decision {
+                let width = (*width).clamp(1, group.requests.len().max(1));
+                for chunk in group.requests.chunks(width) {
+                    let elapsed = futures::future::join_all(chunk.iter().map(|request| {
+                        let request = request.clone();
+                        let req_start = Instant::now();
+                        async move {
+                            self.dispatch_and_complete(request).await;
+                            u64::try_from(req_start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                        }
+                    }))
+                    .await;
+                    let mut executor = self.amac_executor.borrow_mut();
+                    for elapsed_ns in elapsed {
+                        executor.observe_call(elapsed_ns);
+                    }
+                }
+            } else {
+                for request in group.requests {
+                    let req_start = Instant::now();
+                    self.dispatch_and_complete(request).await;
+                    let elapsed_ns =
+                        u64::try_from(req_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    self.amac_executor.borrow_mut().observe_call(elapsed_ns);
+                }
             }
 
             let group_elapsed_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
