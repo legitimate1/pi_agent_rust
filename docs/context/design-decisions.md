@@ -766,3 +766,21 @@
 - 复用 `--no-session` 现有语义（print 强制 no-session）— 无法表达"我要落盘"的诉求，参数被静默忽略是 bug 而非特性
 
 **何时重新考虑**：若 print 模式普遍需要持久化（如所有无人值守调用都带 session-dir），可考虑环境变量/配置默认开启；若出现 print 会话文件无人认领导致目录膨胀，可加 TTL 清理。
+
+## D42: Exec hostcall 并发执行 + AMAC Interleave 决策落地（2026-08-14）
+
+**决策**：`Exec` 组加入 AMAC `interleave_safe` 白名单，且让 AMAC 的 Interleave 决策真正落地——interleave 组（session 读/tool/exec/http/log）用有界并发（自适应宽度）执行并保序收集，不再顺序 await；同时提供逃生开关 `PI_HOSTCALL_AMAC_EXEC_INTERLEAVE=0` 强制 exec 串行。
+
+**理由**：
+
+- subagent 扩展 `Promise.all` + `spawn` 并行拉起 4 个子进程被强制串行（4 任务 1m32s vs bash 直启 7s）——Exec 注释本意即"独立、可并行"
+- 原实现中 Interleave 决策只写日志、从未消费（两条 dispatch 路径都顺序 await），白名单放行也不会产生并发——必须连决策消费一起修
+- Exec 有副作用，保留逃生开关（环境变量）应对潜在的顺序依赖调用方，避免一次改动全量受影响
+
+**不选 B 的原因**：
+
+- 仅把 Exec 加白名单 — 决策从未被消费，并发不生效（已实证）
+- 扩展侧绕过（spawn 加 `longLived: true` 走 `__pi_spawn_native`）— 那是 LSP 专用通道（OS 级进程 + 后台 pump），短生命周期命令的输出收集/超时/kill 语义不匹配
+- Exec 恒并发、不加开关 — 无自适应（stall 低时并发是浪费），且无回退手段
+
+**何时重新考虑**：若发现调用方依赖 exec 顺序 → 设 `PI_HOSTCALL_AMAC_EXEC_INTERLEAVE=0`；若冷启动首轮 batch 串行影响明显 → 调低 `PI_HOSTCALL_AMAC_STALL_RATIO_THRESHOLD` 或 `PI_HOSTCALL_AMAC_MIN_BATCH`。

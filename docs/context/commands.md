@@ -234,6 +234,21 @@ pi migrate ~/.pi/agent/sessions
 pi --tools read,write,edit,grep,find,ls,hashline_edit,pwsh
 ```
 
+## 运行环境变量
+
+### AMAC hostcall 调度（`src/hostcall_amac.rs`）
+
+批量 hostcall 按类型分组，stall 遥测（EMA）驱动每组选择**并发（interleave）或串行（sequential）**。interleave 组的并发宽度、阈值与逃生开关均可调：
+
+- `PI_HOSTCALL_AMAC` — 全局开关（`0|false|off|disabled` 禁用 → 全部串行）；默认开
+- `PI_HOSTCALL_AMAC_MIN_BATCH` — 考虑并发的最小批量（默认 4）；低于此值恒串行
+- `PI_HOSTCALL_AMAC_MAX_WIDTH` — 单组最大并发宽度（默认 16）
+- `PI_HOSTCALL_AMAC_STALL_THRESHOLD_NS` — 单次调用视为 stall 的耗时阈值（默认 100_000ns）
+- `PI_HOSTCALL_AMAC_STALL_RATIO_THRESHOLD` — 允许并发的最低 stall 占比（0..1000，默认 200）
+- `PI_HOSTCALL_AMAC_EXEC_INTERLEAVE` — **Exec 组逃生开关**（`0|false|off|disabled` 强制 exec 串行）；默认开。Exec 有副作用，若调用方依赖 exec 顺序依赖，用它回退
+
+冷启动注意：stall 遥测需积累 64 次观察后才允许并发——首轮 batch 仍保守串行。
+
 ## RPC 协议
 
 ### `append_custom_entry`（会话注入）

@@ -70,6 +70,7 @@ Session persistence + index (JSONL, optional SQLite)
 - **`agent.rs`** → Agent 循环（工具迭代、扩展合并、ToolDef 构建）
 - **`extensions.rs`** → 扩展管理器、能力策略、生命周期
 - **`extensions_js.rs`** → QuickJS 运行时、虚拟模块、HostcallKind
+- **`hostcall_amac.rs`** → AMAC 批量调度器：hostcall 按类型分组，stall 遥测驱动并发/串行决策
 - **`extension_tools.rs`** → 扩展工具包装器 + 收集函数
 - **`rpc.rs`** → RPC/stdin 服务器模式、RPC 方法分发（get_commands/get_tree/get_version 等）、RpcSessionPersister（进程侧主动会话持久化）
 - **`providers/mod.rs`** → Provider 工厂 + 扩展 stream-simple 桥接
@@ -151,6 +152,7 @@ guard.kill() │
 
 - **双执行通道**：fast lane（已知安全模式，省分配/解析）与 compatibility lane（兜底），两者走同一能力策略；`forced_compat_*_kill_switch` 可全局/单扩展强制兼容通道
 - **Shadow dual execution**：采样小部分只读 hostcall 双通道执行并对指纹，分歧超预算自动回退 fast lane
+- **AMAC 批量调度**：批量 hostcall 按类型分组（session 读/写、events 读/写、tool、exec、http、ui、log），stall 遥测（EMA）驱动每组决策——并发组（session 读/tool/exec/http/log）按自适应宽度真正并行执行并保序收集，串行组（session 写/events 写/ui）严格保序；Exec 组默认可并发，`PI_HOSTCALL_AMAC_EXEC_INTERLEAVE=0` 强制串行（逃生通道）
 - **Trust 生命周期**：`pending → acknowledged → trusted → killed`；kill switch 隔离扩展并写审计记录，lift 需显式操作
 - **命令级 exec 调解**：spawn 前分类 command+arg 签名，默认阻断关键危险类（递归删除、磁盘/设备写入、反弹 shell），safe/strict 策略可阻断 shutdown/杀进程/改凭据文件
 - **决策引擎**：CUSUM+BOCPD 负载体制检测、Conformal 预测包络（自适应异常阈值）、PAC-Bayes 安全界（不确定时否决激进优化）、IPS/WIS/DR + ESS 离策略评估（样本不足/高后悔 fail-closed）、VOI 实验选择、OCO 后悔跟踪回滚
