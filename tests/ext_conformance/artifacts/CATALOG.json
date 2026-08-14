@@ -51,18 +51,6 @@
       "total_bytes": 1553
     },
     {
-      "name": "claude-rules",
-      "type": "single-file",
-      "tier": "simple",
-      "capabilities_used": [
-        "event_hook",
-        "ui"
-      ],
-      "has_deps": false,
-      "file_count": 1,
-      "total_bytes": 2486
-    },
-    {
       "name": "confirm-destructive",
       "type": "single-file",
       "tier": "simple",

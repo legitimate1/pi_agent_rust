@@ -389,6 +389,10 @@ pub struct AmacBatchExecutorConfig {
     /// effects, so operators can force serialized Exec dispatch via
     /// `PI_HOSTCALL_AMAC_EXEC_INTERLEAVE=0` if a caller depends on ordering.
     pub exec_interleave: bool,
+    /// Minimum hostcall observations before telemetry-driven interleaving is
+    /// considered (Rule 3 cold-start guard). Set 0 to disable the guard.
+    /// Defaults to the telemetry window size.
+    pub min_telemetry: u64,
 }
 
 impl Default for AmacBatchExecutorConfig {
@@ -428,6 +432,13 @@ impl AmacBatchExecutorConfig {
                 .ok()
                 .as_deref(),
         );
+        // Cold-start guard: interleaving decisions are only trusted after
+        // this many observed calls. `PI_HOSTCALL_AMAC_MIN_TELEMETRY=0`
+        // disables the guard entirely.
+        let min_telemetry = std::env::var("PI_HOSTCALL_AMAC_MIN_TELEMETRY")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(TELEMETRY_WINDOW_SIZE as u64);
         Self {
             min_batch_size,
             max_interleave_width,
@@ -435,6 +446,7 @@ impl AmacBatchExecutorConfig {
             stall_threshold_ns,
             stall_ratio_threshold,
             exec_interleave,
+            min_telemetry,
         }
     }
 
@@ -447,6 +459,7 @@ impl AmacBatchExecutorConfig {
             stall_threshold_ns: AMAC_STALL_THRESHOLD_NS,
             stall_ratio_threshold: AMAC_STALL_RATIO_THRESHOLD,
             exec_interleave: true,
+            min_telemetry: TELEMETRY_WINDOW_SIZE as u64,
         }
     }
 
@@ -660,8 +673,26 @@ impl AmacBatchExecutor {
             };
         }
 
+        // Rule 2c: Exec groups interleave with deterministic width. Subprocess
+        // execution is second-scale blocking: launching n independent
+        // processes concurrently is strictly faster than serial, so stall
+        // telemetry (a statistical proxy designed for microsecond memory-level
+        // parallelism) carries no information for Exec. Skipping Rules 3-4
+        // also prevents the cold-start guard from locking Exec to serial in
+        // TUI sessions, where QuickJS hostcall volume never reaches the
+        // telemetry window (native tools bypass the hostcall queue).
+        if matches!(key, AmacGroupKey::Exec) {
+            let width = group_size.min(self.config.max_interleave_width);
+            if width < 2 {
+                return AmacToggleDecision::Sequential {
+                    reason: "computed_width_too_low",
+                };
+            }
+            return AmacToggleDecision::Interleave { width };
+        }
+
         // Rule 3: Insufficient telemetry history → conservative sequential.
-        if self.telemetry.total_calls < TELEMETRY_WINDOW_SIZE as u64 {
+        if self.telemetry.total_calls < self.config.min_telemetry {
             return AmacToggleDecision::Sequential {
                 reason: "insufficient_telemetry",
             };
@@ -1078,6 +1109,94 @@ mod tests {
     }
 
     #[test]
+    fn plan_interleaves_exec_groups_without_telemetry() {
+        // TUI cold-start scenario: zero hostcall observations. Exec must
+        // interleave anyway — subprocess concurrency is a deterministic win,
+        // and the cold-start guard (Rule 3) would otherwise lock it to serial
+        // forever in sessions where hostcall volume never reaches 64 calls.
+        let mut executor = AmacBatchExecutor::new(AmacBatchExecutorConfig::new(true, 2, 16));
+        assert_eq!(executor.telemetry().snapshot().total_calls, 0);
+
+        let requests: Vec<HostcallRequest> = (0..4).map(|_| exec_request()).collect();
+        let plan = executor.plan_batch(requests);
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].key, AmacGroupKey::Exec);
+        assert_eq!(
+            plan.decisions[0],
+            AmacToggleDecision::Interleave { width: 4 },
+            "width = min(batch, max_width) without stall inference"
+        );
+    }
+
+    #[test]
+    fn plan_interleaves_exec_but_not_http_with_low_stall_ratio() {
+        // Low stall ratio (fast hostcalls) must not gate Exec: its benefit is
+        // deterministic. Http keeps the stall-ratio gate (Rule 4).
+        let mut executor = AmacBatchExecutor::new(AmacBatchExecutorConfig::new(true, 2, 16));
+        for _ in 0..100 {
+            executor.observe_call(10_000); // below stall threshold → ratio ≈ 0
+        }
+
+        let mut requests = Vec::new();
+        for _ in 0..4 {
+            requests.push(exec_request());
+        }
+        for _ in 0..4 {
+            requests.push(http_request());
+        }
+        let plan = executor.plan_batch(requests);
+        assert_eq!(plan.groups.len(), 2);
+        assert_eq!(plan.groups[0].key, AmacGroupKey::Exec);
+        assert!(
+            plan.decisions[0].is_interleave(),
+            "Exec must interleave despite low stall ratio: {:?}",
+            plan.decisions[0]
+        );
+        assert_eq!(plan.groups[1].key, AmacGroupKey::Http);
+        assert!(
+            !plan.decisions[1].is_interleave(),
+            "Http must stay sequential at low stall ratio: {:?}",
+            plan.decisions[1]
+        );
+    }
+
+    #[test]
+    fn plan_interleaves_http_with_sparse_telemetry_when_guard_disabled() {
+        // min_telemetry = 0 trusts even sparse observations: 10 high-stall
+        // samples would be rejected by the default guard (64), but qualify
+        // here — the stall-ratio gate (Rule 4) still applies.
+        let config = AmacBatchExecutorConfig {
+            min_telemetry: 0,
+            ..AmacBatchExecutorConfig::new(true, 2, 16)
+        };
+        let mut executor = AmacBatchExecutor::new(config);
+        for _ in 0..10 {
+            executor.observe_call(500_000); // high stall
+        }
+
+        let requests: Vec<HostcallRequest> = (0..4).map(|_| http_request()).collect();
+        let plan = executor.plan_batch(requests);
+        assert_eq!(plan.groups.len(), 1);
+        assert!(
+            plan.decisions[0].is_interleave(),
+            "min_telemetry=0 must trust sparse high-stall observations: {:?}",
+            plan.decisions[0]
+        );
+
+        // The same sparse telemetry with the default guard → still sequential.
+        let mut guarded = AmacBatchExecutor::new(AmacBatchExecutorConfig::new(true, 2, 16));
+        for _ in 0..10 {
+            guarded.observe_call(500_000);
+        }
+        let plan = guarded.plan_batch((0..4).map(|_| http_request()).collect());
+        assert!(
+            !plan.decisions[0].is_interleave(),
+            "default guard must reject sparse telemetry: {:?}",
+            plan.decisions[0]
+        );
+    }
+
+    #[test]
     fn plan_sequential_for_exec_when_escape_hatch_disabled() {
         let mut config = AmacBatchExecutorConfig::new(true, 2, 16);
         config.exec_interleave = false;
@@ -1387,6 +1506,10 @@ mod tests {
         assert_eq!(config.stall_threshold_ns, AMAC_STALL_THRESHOLD_NS);
         assert_eq!(config.stall_ratio_threshold, AMAC_STALL_RATIO_THRESHOLD);
         assert!(config.exec_interleave, "exec interleave should default on");
+        assert_eq!(
+            config.min_telemetry, TELEMETRY_WINDOW_SIZE as u64,
+            "cold-start guard should default to the telemetry window size"
+        );
     }
 
     #[test]

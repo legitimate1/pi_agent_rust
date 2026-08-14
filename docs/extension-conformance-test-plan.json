@@ -1,6 +1,6 @@
 {
   "schema": "pi.ext.conformance-matrix.v1",
-  "generated_at": "2026-05-12T19:32:10Z",
+  "generated_at": "2026-08-14T06:19:21Z",
   "task": "bd-2kyq",
   "matrix": [
     {
@@ -297,7 +297,6 @@
         }
       ],
       "exemplar_extensions": [
-        "claude-rules",
         "file-trigger",
         "git-checkpoint",
         "mac-system-theme",
@@ -641,6 +640,7 @@
       "exemplar_extensions": [
         "auto-commit-on-exit",
         "bookmark",
+        "claude-rules",
         "confirm-destructive",
         "custom-compaction",
         "custom-footer",
@@ -832,7 +832,6 @@
     {
       "cell_key": "EventHook:Ui",
       "fixture_extensions": [
-        "claude-rules",
         "file-trigger",
         "git-checkpoint",
         "mac-system-theme",
@@ -1010,6 +1009,7 @@
       "fixture_extensions": [
         "auto-commit-on-exit",
         "bookmark",
+        "claude-rules",
         "confirm-destructive",
         "custom-compaction",
         "custom-footer",

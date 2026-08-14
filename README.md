@@ -211,11 +211,11 @@ cargo build --release                    # Build (binary at target/release/pi)
 ```
 
 - Rust 2024 **nightly** required (`rust-toolchain.toml`)
-- `#![forbid(unsafe_code)]` project-wide; release profile: `opt-level=3` + thin LTO + `panic=abort` + `strip`
-- Default features: `sqlite-sessions` + `tui`; `--features full` adds image-resize/jemalloc/clipboard/wasm-host/syntax-highlighting
+- `#![forbid(unsafe_code)]` project-wide; release profile (`[profile.release]`): `opt-level = 3` + `lto = "thin"` + `panic = "abort"` + `strip = true`; binary size budget: `BINARY_SIZE_RELEASE_BUDGET_MB`
+- Default features: `sqlite-sessions` + `tui`; `--features full` adds image-resize/jemalloc/clipboard/wasm-host/syntax-highlighting; jemalloc stays opt-in (opt-in jemalloc benchmark variants), never enabled by default
 - Releases are tag-driven (`vX.Y.Z` must match `Cargo.toml` version); publish order: `asupersync` → `rich_rust` → `charmed-*` → `pi_agent_rust`
 
-For contributors and maintainers: development workflow, full command reference, architecture notes, and debugging playbooks live in `AGENTS.md` and `docs/context/` (`features.md`, `architecture.md`, `commands.md`, `conventions.md`, `design-decisions.md`, `debugging.md`). Extended docs index: [docs/](docs/) — session, tree, TUI, RPC, SDK, settings, models, providers, extension architecture, security, and swarm operations runbooks.
+For contributors and maintainers: development workflow, full command reference, architecture notes, and debugging playbooks live in `AGENTS.md` and `docs/context/` (`features.md`, `architecture.md`, `commands.md`, `conventions.md`, `design-decisions.md`, `debugging.md`). Extended docs index: [docs/](docs/) — session, tree, TUI, RPC, SDK, settings, models, providers, extension architecture, security, and swarm operations runbooks. Fourth-wave self-healing closeout gate: evidence schema `pi.swarm.fourth_wave_self_healing.closeout_gate.v1`, governed by [contract](docs/contracts/fourth-wave-self-healing-closeout-gate-contract.json) with evidence at [docs/evidence/fourth-wave-self-healing-closeout-gate.json](docs/evidence/fourth-wave-self-healing-closeout-gate.json).
 
 ## License
 

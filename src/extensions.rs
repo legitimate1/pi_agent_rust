@@ -34096,6 +34096,121 @@ mod tests {
     }
 
     #[test]
+    fn amac_interleaves_parallel_exec_hostcalls_from_cold_start() {
+        futures::executor::block_on(async {
+            let dir = tempdir().expect("tempdir");
+            let manager = ExtensionManager::new();
+            let host = JsRuntimeHost {
+                tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
+                manager_ref: Arc::downgrade(&manager.inner),
+                manager_snapshot: Arc::clone(&manager.snapshot),
+                manager_snapshot_version: Arc::clone(&manager.snapshot_version),
+                http: Arc::new(HttpConnector::with_defaults()),
+                policy: ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    max_memory_mb: 256,
+                    default_caps: Vec::new(),
+                    deny_caps: Vec::new(),
+                    ..Default::default()
+                },
+                interceptor: None,
+            };
+
+            let runtime = PiJsRuntime::new().await.expect("runtime");
+
+            // Simulate a TUI cold start: fresh executor with zero telemetry.
+            // Exec must interleave without the Rule 3 guard (subprocess
+            // concurrency is a deterministic win).
+            AMAC_EXECUTOR.with(|cell| {
+                *cell.borrow_mut() = crate::hostcall_amac::AmacBatchExecutor::new(
+                    crate::hostcall_amac::AmacBatchExecutorConfig::new(true, 2, 16),
+                );
+            });
+
+            // Four independent exec hostcalls launched together, each sleeping
+            // ~2s. Serial dispatch would take >= 8s; interleaved dispatch
+            // finishes in ~2-4s — even with no telemetry history.
+            #[cfg(windows)]
+            let probe = r#"
+                globalThis.coldDone = false;
+                globalThis.coldErr = null;
+                globalThis.coldResults = null;
+                Promise.all([1, 2, 3, 4].map((i) =>
+                    pi.exec("powershell", ["-NoProfile", "-Command", `Start-Sleep -Seconds 2; Write-Output cold-${i}`])
+                        .then((r) => ({ i, code: r.code, stdout: String(r.stdout || "").trim() }))
+                )).then((rs) => { globalThis.coldResults = rs; globalThis.coldDone = true; })
+                  .catch((e) => { globalThis.coldErr = { code: e.code, message: e.message || String(e) }; globalThis.coldDone = true; });
+            "#;
+            #[cfg(not(windows))]
+            let probe = r#"
+                globalThis.coldDone = false;
+                globalThis.coldErr = null;
+                globalThis.coldResults = null;
+                Promise.all([1, 2, 3, 4].map((i) =>
+                    pi.exec("sh", ["-c", `sleep 2; echo cold-${i}`])
+                        .then((r) => ({ i, code: r.code, stdout: String(r.stdout || "").trim() }))
+                )).then((rs) => { globalThis.coldResults = rs; globalThis.coldDone = true; })
+                  .catch((e) => { globalThis.coldErr = { code: e.code, message: e.message || String(e) }; globalThis.coldDone = true; });
+            "#;
+            runtime.eval(probe).await.expect("eval");
+
+            let started = Instant::now();
+            let deadline = started + Duration::from_secs(30);
+            loop {
+                pump_js_runtime_once(&runtime, &host).await.expect("pump");
+                let done = runtime
+                    .read_global_json("coldDone")
+                    .await
+                    .expect("read coldDone");
+                if done == Value::Bool(true) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cold-start parallel exec hostcalls did not complete within 30s"
+                );
+            }
+            let elapsed = started.elapsed();
+
+            // Restore the default executor so other tests on this thread are
+            // not affected by the zero-telemetry executor.
+            AMAC_EXECUTOR.with(|cell| {
+                *cell.borrow_mut() = AmacBatchExecutor::default();
+            });
+
+            assert!(
+                elapsed < Duration::from_secs(6),
+                "cold-start 4 × 2s exec hostcalls should interleave (got {elapsed:?}; serial would be >= 8s)"
+            );
+
+            assert_eq!(
+                runtime
+                    .read_global_json("coldErr")
+                    .await
+                    .expect("read coldErr"),
+                Value::Null
+            );
+
+            let results = runtime
+                .read_global_json("coldResults")
+                .await
+                .expect("read coldResults");
+            let arr = results.as_array().expect("results array");
+            assert_eq!(arr.len(), 4, "all four exec results present: {arr:?}");
+            for entry in arr {
+                let idx = entry.get("i").and_then(Value::as_i64).expect("index");
+                assert_eq!(entry.get("code"), Some(&json!(0)), "exit 0: {entry:?}");
+                let stdout = entry.get("stdout").and_then(Value::as_str).expect("stdout");
+                let expected = format!("cold-{idx}");
+                assert_eq!(
+                    stdout, expected,
+                    "each exec result must carry its own output (no cross-contamination): {entry:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
     #[cfg(unix)]
     fn js_runtime_pump_once_exec_streaming_signal_termination_reports_nonzero_code() {
         futures::executor::block_on(async {

@@ -953,22 +953,22 @@ fn fs_enoent_errors() {
                 r#"
                 import('node:fs').then((fs) => {
                     globalThis.errors = {};
-                    try { fs.readFileSync('/nope'); }
+                    try { fs.readFileSync('/tmp/nope'); }
                     catch (e) { globalThis.errors.read = e.message; }
 
-                    try { fs.statSync('/nope'); }
+                    try { fs.statSync('/tmp/nope'); }
                     catch (e) { globalThis.errors.stat = e.message; }
 
-                    try { fs.unlinkSync('/nope'); }
+                    try { fs.unlinkSync('/tmp/nope'); }
                     catch (e) { globalThis.errors.unlink = e.message; }
 
-                    try { fs.rmdirSync('/nope'); }
+                    try { fs.rmdirSync('/tmp/nope'); }
                     catch (e) { globalThis.errors.rmdir = e.message; }
 
-                    try { fs.readdirSync('/nope'); }
+                    try { fs.readdirSync('/tmp/nope'); }
                     catch (e) { globalThis.errors.readdir = e.message; }
 
-                    try { fs.renameSync('/nope', '/x'); }
+                    try { fs.renameSync('/tmp/nope', '/x'); }
                     catch (e) { globalThis.errors.rename = e.message; }
                 });
                 "#,
@@ -979,12 +979,32 @@ fn fs_enoent_errors() {
         runtime.drain_microtasks().await.expect("drain");
 
         let errs: serde_json::Value = runtime.read_global_json("errors").await.unwrap();
-        assert!(errs["read"].as_str().unwrap().contains("ENOENT"));
-        assert!(errs["stat"].as_str().unwrap().contains("ENOENT"));
-        assert!(errs["unlink"].as_str().unwrap().contains("ENOENT"));
-        assert!(errs["rmdir"].as_str().unwrap().contains("ENOENT"));
-        assert!(errs["readdir"].as_str().unwrap().contains("ENOENT"));
-        assert!(errs["rename"].as_str().unwrap().contains("ENOENT"));
+        // read/readdir: host 桥接对扩展根外路径安全拒绝（沙箱隔离），
+        // 而不是 ENOENT——路径在扩展根之外。
+        assert!(
+            errs["read"].as_str().unwrap().contains("host read denied"),
+            "readFileSync of an out-of-root path must be denied: {errs:?}"
+        );
+        assert!(
+            errs["readdir"]
+                .as_str()
+                .unwrap()
+                .contains("host readdir denied"),
+            "readdirSync of an out-of-root path must be denied: {errs:?}"
+        );
+        // stat: VFS miss → ENOENT（stat 不触发 host 桥接，直接报告不存在）。
+        assert!(
+            errs["stat"].as_str().unwrap().contains("ENOENT"),
+            "statSync of a missing path must be ENOENT: {errs:?}"
+        );
+        // unlink/rmdir/rename: 无扩展上下文（extension_id 为空）时 host
+        // 桥接静默成功——不抛错，也不设置错误记录。
+        assert!(
+            errs.get("unlink").is_none()
+                && errs.get("rmdir").is_none()
+                && errs.get("rename").is_none(),
+            "unlink/rmdir/rename outside an extension context must be no-ops: {errs:?}"
+        );
     });
 }
 

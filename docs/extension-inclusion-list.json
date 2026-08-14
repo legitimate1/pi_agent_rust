@@ -1,18 +1,18 @@
 {
   "schema": "pi.ext.inclusion_list.v1",
-  "generated_at": "2026-05-11T00:02:12.088808964+00:00",
+  "generated_at": "2026-08-14T05:11:21.846713400+00:00",
   "summary": {
-    "tier1_count": 184,
+    "tier1_count": 183,
     "tier1_review_count": 24,
-    "tier2_count": 9,
-    "total_must_pass": 208,
-    "total_stretch": 9,
+    "tier2_count": 10,
+    "total_must_pass": 207,
+    "total_stretch": 10,
     "capability_coverage": {
-      "ExtensionAPI_import": 206,
-      "event_hook": 101,
+      "ExtensionAPI_import": 205,
+      "event_hook": 100,
       "events_api": 11,
       "exec_api": 29,
-      "export_default": 202,
+      "export_default": 201,
       "registerFlag": 12,
       "registerProvider": 8,
       "registerShortcut": 19,
@@ -26,7 +26,7 @@
       "agents-mikeastock": 1,
       "community": 58,
       "npm-registry": 66,
-      "official-pi-mono": 60,
+      "official-pi-mono": 59,
       "third-party-github": 23
     }
   },
@@ -51,7 +51,7 @@
         "ui_header"
       ],
       "category": "tool",
-      "risk_level": "low",
+      "risk_level": "minimal",
       "inclusion_rationale": "Official pi-mono extension (MIT license, score=60); canonical reference for conformance"
     },
     {
@@ -73,7 +73,7 @@
         "export_default"
       ],
       "category": "exec",
-      "risk_level": "low",
+      "risk_level": "minimal",
       "inclusion_rationale": "Official pi-mono extension (MIT license, score=60); canonical reference for conformance"
     },
     {
@@ -95,7 +95,7 @@
         "registerTool"
       ],
       "category": "tool",
-      "risk_level": "low",
+      "risk_level": "minimal",
       "inclusion_rationale": "Official pi-mono extension (MIT license, score=60); canonical reference for conformance"
     },
     {
@@ -116,28 +116,6 @@
         "export_default"
       ],
       "category": "basic",
-      "risk_level": "minimal",
-      "inclusion_rationale": "Official pi-mono extension (MIT license, score=60); canonical reference for conformance"
-    },
-    {
-      "id": "claude-rules",
-      "name": "claude-rules",
-      "directory": "claude-rules",
-      "source_tier": "official-pi-mono",
-      "license": "MIT",
-      "score": 60.0,
-      "provenance": {
-        "checksum_sha256": "59b1c0aad64a423e7cd3d6e084b45b3c84cf8080b9485524a877886fd9870c97",
-        "source_type": "git",
-        "source_repo": "https://github.com/badlogic/pi-mono",
-        "source_path": "packages/coding-agent/examples/extensions/claude-rules.ts"
-      },
-      "capabilities": [
-        "ExtensionAPI_import",
-        "event_hook",
-        "export_default"
-      ],
-      "category": "event-hook",
       "risk_level": "minimal",
       "inclusion_rationale": "Official pi-mono extension (MIT license, score=60); canonical reference for conformance"
     },
@@ -1521,7 +1499,7 @@
       "license": "MIT",
       "score": 60.0,
       "provenance": {
-        "checksum_sha256": "f30bbefe1cafe5c97dc3811b42fd6ea3463c7c9cba72ea6d2a7291e453561389",
+        "checksum_sha256": "38785b5018df258cd07cbcb2566da93f0c6eda4bb5f56cf3671a8575aff0ca5d",
         "source_type": "git",
         "source_repo": "https://github.com/badlogic/pi-mono",
         "source_path": "packages/coding-agent/examples/extensions/doom-component.ts"
@@ -2945,7 +2923,7 @@
       "source_tier": "npm-registry",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "a5a45c18ab6b231f8f1f98e584a253353e57c2cd2ff2a3f23a2dca9a6b68a15a",
+        "checksum_sha256": "70c002e831bd43a0c22540b2b8ce0885d3aaff780140abc0217a4f6a79648824",
         "source_type": "npm",
         "npm_package": "vaayne-agent-kit",
         "npm_version": "1.0.0"
@@ -4477,6 +4455,22 @@
   ],
   "tier2": [
     {
+      "id": "claude-rules",
+      "name": "claude-rules",
+      "directory": "",
+      "source_tier": "official-pi-mono",
+      "license": "UNKNOWN",
+      "score": 60.0,
+      "provenance": {
+        "checksum_sha256": "",
+        "source_type": "not-yet-vendored"
+      },
+      "capabilities": [],
+      "category": "unknown",
+      "risk_level": "unknown",
+      "inclusion_rationale": "High-scoring candidate (score=60); not yet vendored, awaiting acquisition"
+    },
+    {
       "id": "igor-makarov/pi-extension-sandbox",
       "name": "pi-extension-sandbox",
       "directory": "",
@@ -4629,7 +4623,6 @@
         "auto-commit-on-exit",
         "bash-spawn-hook",
         "bookmark",
-        "claude-rules",
         "community/ferologics-notify",
         "community/hjanuschka-clipboard",
         "community/hjanuschka-cost-tracker",
@@ -4832,7 +4825,6 @@
         "with-deps"
       ],
       "event_hook": [
-        "claude-rules",
         "community/hjanuschka-loop",
         "community/hjanuschka-plan-mode",
         "community/hjanuschka-resistance",
@@ -4984,7 +4976,6 @@
         "auto-commit-on-exit",
         "bash-spawn-hook",
         "bookmark",
-        "claude-rules",
         "community/ferologics-notify",
         "community/hjanuschka-clipboard",
         "community/hjanuschka-cost-tracker",
@@ -5473,7 +5464,6 @@
         "timed-confirm"
       ],
       "event-hook": [
-        "claude-rules",
         "community/hjanuschka-resistance",
         "community/hjanuschka-status-widget",
         "community/hjanuschka-ultrathink",

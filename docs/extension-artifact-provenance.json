@@ -78,21 +78,6 @@
       }
     },
     {
-      "id": "claude-rules",
-      "directory": "claude-rules",
-      "retrieved": "2026-02-05",
-      "checksum": {
-        "sha256": "59b1c0aad64a423e7cd3d6e084b45b3c84cf8080b9485524a877886fd9870c97"
-      },
-      "name": "claude-rules",
-      "license": "MIT",
-      "source": {
-        "type": "git",
-        "repo": "https://github.com/badlogic/pi-mono",
-        "path": "packages/coding-agent/examples/extensions/claude-rules.ts"
-      }
-    },
-    {
       "id": "community/ferologics-notify",
       "directory": "community/ferologics-notify",
       "retrieved": "2026-02-05",
@@ -1090,7 +1075,7 @@
       "directory": "doom-overlay",
       "retrieved": "2026-02-05",
       "checksum": {
-        "sha256": "f30bbefe1cafe5c97dc3811b42fd6ea3463c7c9cba72ea6d2a7291e453561389"
+        "sha256": "38785b5018df258cd07cbcb2566da93f0c6eda4bb5f56cf3671a8575aff0ca5d"
       },
       "name": "doom-overlay",
       "license": "MIT",
@@ -2301,7 +2286,7 @@
       "directory": "npm/vaayne-agent-kit",
       "retrieved": "2026-02-05",
       "checksum": {
-        "sha256": "a5a45c18ab6b231f8f1f98e584a253353e57c2cd2ff2a3f23a2dca9a6b68a15a"
+        "sha256": "70c002e831bd43a0c22540b2b8ce0885d3aaff780140abc0217a4f6a79648824"
       },
       "name": "@vaayne/agent-kit",
       "version": "1.0.0",

@@ -164,7 +164,12 @@ fn gemini_url(model: &str) -> String {
 fn gemini_body(prompt: &str) -> serde_json::Value {
     json!({
         "contents": [{"parts": [{"text": prompt}], "role": "user"}],
-        "generationConfig": {"candidateCount": 1, "maxOutputTokens": 8192},
+        "generationConfig": {
+            "candidateCount": 1,
+            // maxOutputTokens 固定用满官方上限（GEMINI_MAX_OUTPUT_TOKENS），
+            // 与 provider 实际发送一致（见 src/providers/gemini.rs）。
+            "maxOutputTokens": 65536,
+        },
     })
 }
 

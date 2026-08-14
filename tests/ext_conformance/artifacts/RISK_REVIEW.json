@@ -1,12 +1,12 @@
 {
   "schema": "pi.ext.risk_review.v1",
-  "generated_at": "2026-05-12T19:32:38.050112219+00:00",
+  "generated_at": "2026-08-14T06:19:41.852618500+00:00",
   "summary": {
-    "total_artifacts": 208,
-    "license_clear": 184,
+    "total_artifacts": 207,
+    "license_clear": 183,
     "license_copyleft": 0,
     "license_unknown": 24,
-    "security_clean": 105,
+    "security_clean": 104,
     "security_info_only": 97,
     "security_warnings": 6,
     "security_critical": 0,
@@ -16,7 +16,7 @@
   },
   "license_distribution": {
     "Apache-2.0": 1,
-    "MIT": 183,
+    "MIT": 182,
     "UNKNOWN": 24
   },
   "artifacts": [
@@ -74,16 +74,6 @@
     {
       "id": "bookmark",
       "directory": "bookmark",
-      "license": "MIT",
-      "license_source": "provenance_manifest",
-      "redistributable": "yes",
-      "security_severity": "clean",
-      "has_npm_deps": false,
-      "risk_level": "minimal"
-    },
-    {
-      "id": "claude-rules",
-      "directory": "claude-rules",
       "license": "MIT",
       "license_source": "provenance_manifest",
       "redistributable": "yes",
