@@ -784,3 +784,21 @@
 - Exec 恒并发、不加开关 — 无自适应（stall 低时并发是浪费），且无回退手段
 
 **何时重新考虑**：若发现调用方依赖 exec 顺序 → 设 `PI_HOSTCALL_AMAC_EXEC_INTERLEAVE=0`；若冷启动首轮 batch 串行影响明显 → 调低 `PI_HOSTCALL_AMAC_STALL_RATIO_THRESHOLD` 或 `PI_HOSTCALL_AMAC_MIN_BATCH`。
+
+## D43: Exec 组跳过 AMAC 遥测门槛（Rule 3/4）+ 门槛可配置（2026-08-14）
+
+**决策**：`decide_toggle` 新增 Rule 2c——Exec 组跳过 Rule 3（telemetry ≥ 64 冷启动保护）与 Rule 4（stall 比率门槛），宽度确定性取 `min(batch_size, max_width)`；`AmacBatchExecutorConfig` 新增 `min_telemetry` 字段（env `PI_HOSTCALL_AMAC_MIN_TELEMETRY`，默认 64，`0` 关闭保护），Rule 3 引用该字段。
+
+**理由**：
+
+- 复测发现 TUI 会话中 Rule 3 永久锁死 Exec：telemetry 只来自 QuickJS hostcall（原生工具不贡献），每轮 subagent 仅 4–5 次观察，解锁需 13–16 轮 → 体验等价于永远串行
+- 只跳 Rule 3 不够：telemetry 混入大量快速调用（SessionRead 等）会稀释 EMA stall_ratio 至 20% 以下，Rule 4 仍锁死 Exec
+- Exec 是秒级进程阻塞，并发收益确定性（n 个独立进程并行必然 ≤ 串行），stall 检测（为微秒级内存级并行设计）对 Exec 无信息量；宽度不依赖 stall 推断，与 cache 行为无关
+
+**不选 B 的原因**：
+
+- 按组独立统计、Exec 用小阈值（如 ≥4 解锁）— 引入额外状态机，收益不明确；Exec 的并发正确性不依赖任何统计置信
+- 首次 batch 并发 + 观察（width=2 起步）— 与跳过门槛语义重叠，多一套状态
+- 扩展侧绕过（longLived 通道）— LSP 专用，短生命周期命令语义不匹配（D42 已述）
+
+**何时重新考虑**：若并发后调用方出现顺序依赖 → `PI_HOSTCALL_AMAC_EXEC_INTERLEAVE=0`；若 Http/Tool 组在 TUI 场景也需要冷启动并发 → `PI_HOSTCALL_AMAC_MIN_TELEMETRY=0`（或考虑按组区分门槛）。

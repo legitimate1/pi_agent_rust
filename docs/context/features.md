@@ -78,7 +78,7 @@
 - **WASM 扩展** ✅ → `src/extensions.rs`
 - **能力策略模型（Strict/Prompt/Permissive）** ✅ → `src/extensions.rs:1139`
 - **Hostcall 调度（tool/exec/http/session/ui/events/log）** ✅ → `src/extensions_js.rs`
-- **Exec hostcall 并发执行** — 并行 exec/spawn 请求真正并发执行（stall 遥测自适应并发宽度）；`PI_HOSTCALL_AMAC_EXEC_INTERLEAVE=0` 可强制 exec 串行 ✅ → `src/hostcall_amac.rs` `src/extensions.rs` `src/extension_dispatcher.rs`
+- **Exec hostcall 并发执行** — 并行 exec/spawn 请求真正并发执行：Exec 组冷启动即并发（跳过遥测门槛，宽度 = min(batch, max)），不依赖 stall 推断；`PI_HOSTCALL_AMAC_EXEC_INTERLEAVE=0` 可强制 exec 串行 ✅ → `src/hostcall_amac.rs` `src/extensions.rs` `src/extension_dispatcher.rs`
 - **RPC 模式扩展交互 UI（select/confirm/input）** ✅ → `src/extensions.rs` `src/rpc.rs`
 - **虚拟模块系统（Node.js builtins + npm stubs）** ✅ → `src/extensions_js.rs`
 - **VFS write-through 落盘**（`writeFileSync`/`appendFileSync` 写 VFS 内存后同步写真实文件系统） ✅ → `src/extensions_js.rs`
