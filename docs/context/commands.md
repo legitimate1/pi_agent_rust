@@ -266,7 +266,26 @@ pi --tools read,write,edit,grep,find,ls,hashline_edit,pwsh
 - `customType` 必填且非空；`data` 可选任意 JSON
 - 落盘格式：`{"type":"custom","id":...,"parentId":...,"timestamp":...,"customType":...,"data":...}`（camelCase）
 - CustomEntry **不进入 API 消息链路**（`append_model_message_for_entry` 忽略），不影响 LLM 请求
-- 完整 RPC 方法清单见 `features.md`「会话管理」域
+- 完整 RPC 方法清单见下方「RPC 方法清单」
+
+### RPC 方法清单
+
+`src/rpc.rs` 分发的 RPC 方法（含职责与协作模块）：
+
+- `prompt` / `steer` / `follow_up` — 发送消息与队列入队；可选 `messageId`（未提供时服务端生成）
+- `abort` — 取消当前 turn
+- `compact` — 手动触发会话压缩
+- `estimate_tokens` — 会话 token 用量估算 | `src/rpc.rs` + `src/compaction.rs`
+- `get_commands` — 斜杠命令查询（含扩展注册的命令）| `src/rpc.rs` + `src/extensions.rs`
+- `get_tree` — 会话树形结构（分支/叶子）| `src/rpc.rs`
+- `get_version` — 版本号 + Git SHA | `src/rpc.rs`
+- `get_system_prompt` — 当前 system prompt 及注册的工具定义 | `src/rpc.rs` + `src/agent.rs`
+- `session_state` — 会话状态（含模型 `compat` 字段，如 `thinkingLevelMap`）| `src/rpc.rs`
+- `remove_from_queue` / `clear_queue` / `get_queue` — 按 messageId 精确取消 / 清空 / 查看队列 | `src/rpc.rs`
+- `queue_update` — 事件推送：队列状态变更时实时同步给客户端 | `src/rpc.rs`
+- `set_model` / `set_thinking_level` — 支持可选 `persist` 参数（`false` 仅内存切换不写会话文件）| `src/rpc.rs` + `src/acp.rs` + `src/extension_dispatcher.rs` + `src/sdk.rs` + `src/session.rs` + `src/agent.rs`
+- `append_custom_entry` — 客户端注入自定义消息落盘（见上）| `src/rpc.rs` + `src/session.rs`
+- `run_bash_rpc` — bash 可用性探测复用（与工具 bash 同一解析）| `src/rpc.rs` + `src/tools/mod.rs`
 
 ## 版本迁移注意事项
 

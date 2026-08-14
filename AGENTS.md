@@ -2,7 +2,8 @@
 
 高性能 AI 编程智能体 CLI，Rust 移植版。提供交互式终端界面、流式响应、工具执行、会话持久化。
 
-**技术栈**: Rust 2024 nightly · asupersync · rich_rust · serde · clap · rquickjs
+- **语言/框架** — Rust 2024 nightly（见 `rust-toolchain.toml`），单静态二进制分发
+- **关键依赖** — asupersync（结构化并发运行时）、rich_rust（终端 UI）、serde、clap、rquickjs（扩展沙箱）
 
 ---
 
@@ -99,17 +100,27 @@ cargo test -- --nocapture                # 带输出
 5. 清理暂存区、修剪远程分支
 6. 提供上下文给下一次会话
 
-## 接手时查阅
+## 快速导航
 
-### 核心必读（每次接手先读这 3 个）
+> 📌 **接手必读** = 接手项目时就要读完
+> 🔍 **按需查询** = 开发中遇到具体问题再查，接手时不预读
 
-- **完整功能清单（每条功能→文件映射）** → `docs/context/features.md`
-- **详细架构（工具系统、扩展加载流程、模块关系）** → `docs/context/architecture.md`
-- **命名规范、隐含假设、反模式** → `docs/context/conventions.md`
+### 接手必读
 
-### 按需查阅（仅特定场景需要）
+- **功能目录（含文件映射）** — `docs/context/features.md`
+  - 有什么功能、代码在哪；先 `grep 关键词` 命中即要点，需要全局视角时整读
+- **架构骨架** — `docs/context/architecture.md`
+  - 核心数据流、工具系统、扩展加载流程、模块关系、运行时不变量
+- **命名规范、约定与反模式** — `docs/context/conventions.md`
+  - 反模式跨域通用，不可按域切，必读
 
-- **做架构级改动、理解历史决策背景** → `docs/context/design-decisions.md`
-- **修改运行配置/机制（profile 契约、部署机制、RPC 协议、CLI 参考、低频验证命令）** → `docs/context/commands.md`
-- **新增静态检查工具 / 优化 verify 检查逻辑** → `docs/context/verify-tool.md`
-- **症状排查 / 回归调试（provider/session/extension/安装器改动后测试失败；含症状路由表、调试 playbook、安装器补丁模式）** → `docs/context/debugging.md`
+### 按需查询
+
+- **开发命令（低频/发布/RPC 协议）** — `docs/context/commands.md`
+  - 修改运行配置/机制、跑低频命令、发布流程时读；高频命令见本文件上方
+- **设计决策（为什么没选 B）** — `docs/context/design-decisions.md`
+  - 做架构级改动、理解决策背景时读；过时决策在 `docs/context/design-decisions-archive.md`
+- **verify 验证引擎** — `docs/context/verify-tool.md`
+  - 新增静态检查工具 / 优化 verify 检查逻辑时读
+- **症状排查手册** — `docs/context/debugging.md`
+  - 症状已知但根因不明时读：症状路由表、调试 playbook、安装器补丁模式

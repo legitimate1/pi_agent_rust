@@ -2,114 +2,98 @@
 
 ## CLI 与交互
 
-- **交互式 TUI（流式渲染、Markdown、主题）** ✅ → `src/interactive.rs` + `src/tui.rs`
-- **非交互式 Print 模式** ✅ → `src/main.rs`
-- **RPC/stdin 服务器模式（含 sessionId 修复）** ✅ → `src/rpc.rs`
-- **RPC 进程侧主动会话持久化（防客户端崩溃丢数据）** ✅ → `src/rpc.rs`
-- **RPC 方法 `estimate_tokens`（会话 token 估算）** ✅ → `src/rpc.rs` `src/compaction.rs`
-- **RPC 方法 `get_commands` — 合并扩展注册的斜杠命令** ✅ → `src/rpc.rs` `src/extensions.rs`
-- **RPC 方法 `get_tree` — 查询会话树形结构（分支/叶子）** ✅ → `src/rpc.rs`
-- **RPC 方法 `get_version` — 返回 pi 版本号和 Git SHA** ✅ → `src/rpc.rs`
-- **RPC 方法 `get_system_prompt` — 返回当前会话的 system prompt 及注册的工具定义** ✅ → `src/rpc.rs` `src/agent.rs`
-- **`session_state` 返回模型 `compat` 字段** — 客户端可获取 `thinkingLevelMap` 等兼容性配置 ✅ → `src/rpc.rs`
-- **RPC 方法 `remove_from_queue` — 按 messageId 精确取消队列消息** ✅ → `src/rpc.rs`
-- **RPC 方法 `clear_queue` — 一键清空 steer/follow_up 队列** ✅ → `src/rpc.rs`
-- **RPC 方法 `get_queue` — 查询队列当前内容（steering + follow_up）** ✅ → `src/rpc.rs`
-- **`queue_update` 事件推送 — 队列状态变更时实时同步给客户端** ✅ → `src/rpc.rs`
-- **队列消息携带 `messageId` — 客户端分配或服务端 UUID fallback** ✅ → `src/rpc.rs`
-- **set_model/set_thinking_level 支持 persist 参数** — `persist=false` 仅内存切换，不写会话文件 ✅ → `src/rpc.rs` `src/acp.rs` `src/extension_dispatcher.rs` `src/sdk.rs` `src/session.rs` `src/agent.rs`
-- **CLI 子命令（doctor/config/list/info 等）** ✅ → `src/main.rs`
-- **doctor swarm 预检跨平台磁盘余量探测** — `disk_available_kb()` Unix 用 `df -Pk`；Windows 用 sysinfo 枚举磁盘卷匹配挂载点（root-relative 路径如 `/data/...` 自动补当前盘符），无 `df` 环境也能报告 target/tmp 余量 ✅ → `src/doctor.rs`
-- **Extended Thinking 级别** — off/minimal/low/medium/high/xhigh，`--thinking` 或 `/thinking` 切换 ✅ → `src/agent.rs` `src/models.rs`
-- **交互式 Autocomplete** — `@` 文件引用 + `/` 斜杠命令补全，模糊评分排序，背景线程每 30s 重建项目索引（WalkBuilder 尊重 .gitignore，5000 条缓存上限） ✅ → `src/autocomplete.rs` `src/interactive/`
-- **Credential-Aware 模型选择** — `Ctrl+L` 打开模型选择器（只列凭据就绪的模型），`Ctrl+P`/`Ctrl+Shift+P` 循环切换，provider ID/别名大小写不敏感 ✅ → `src/model_selector.rs` `src/interactive/model_selector_ui.rs`
-- **`~/.pi/agent/SYSTEM.md` 覆盖默认系统提示词** ✅ → `src/app.rs`
-- **`.pi/SYSTEM.md` 项目级系统提示词** — 优先级高于用户级 ✅ → `src/app.rs`
+- **交互式 TUI** — 流式渲染、Markdown 样式、主题支持 | `src/interactive.rs` + `src/tui.rs`
+- **非交互式 Print 模式** — 单次响应输出，无交互界面 | `src/main.rs`
+- **RPC/stdin 服务器模式** — 客户端经 stdin 发送请求、接收流式事件 | `src/rpc.rs`
+- **会话 token 用量估算** — 供客户端预判上下文占用 | `src/rpc.rs` + `src/compaction.rs`
+- **斜杠命令查询** — 返回可用命令，含扩展注册的命令 | `src/rpc.rs` + `src/extensions.rs`
+- **会话树查询** — 返回会话的分支/叶子结构 | `src/rpc.rs`
+- **版本查询** — 返回 pi 版本号和 Git SHA | `src/rpc.rs`
+- **系统提示词查询** — 返回当前会话的 system prompt 及注册的工具定义 | `src/rpc.rs` + `src/agent.rs`
+- **会话状态查询** — 含模型兼容配置，供客户端渲染思考级别选项 | `src/rpc.rs`
+- **消息队列管理** — 查看/精确取消/清空待处理消息，变更实时推送 | `src/rpc.rs`
+- **模型/思考级别临时切换** — 可选仅内存切换，重启后恢复默认 | `src/rpc.rs` + `src/acp.rs` + `src/session.rs` + `src/agent.rs`
+- **CLI 子命令** — doctor/config/list/info 等诊断与配置命令 | `src/main.rs` + `src/cli.rs`
+- **doctor 环境诊断** — 配置/目录/认证/会话/swarm 预检，含跨平台磁盘余量探测 | `src/doctor.rs`
+- **Extended Thinking 级别** — off/minimal/low/medium/high/xhigh，`--thinking` 或 `/thinking` 切换 | `src/agent.rs` + `src/models.rs`
+- **交互式 Autocomplete** — `@` 文件引用 + `/` 斜杠命令补全，背景自动重建项目索引 | `src/autocomplete.rs` + `src/interactive/`
+- **凭据感知模型选择** — `Ctrl+L` 选择器（只列凭据就绪模型），`Ctrl+P`/`Ctrl+Shift+P` 循环切换 | `src/model_selector.rs` + `src/interactive/model_selector_ui.rs`
+- **用户级系统提示词覆盖** — `~/.pi/agent/SYSTEM.md` 替代默认提示词 | `src/app.rs`
+- **项目级系统提示词覆盖** — `.pi/SYSTEM.md`，优先级高于用户级 | `src/app.rs`
 
 ## Provider 层
 
-- **Anthropic API（流式 + 扩展思考 + 工具）** ✅ → `src/providers/anthropic.rs`
-- **OpenAI Chat Completions（含所有兼容推理模型的 reasoning_effort + DeepSeek thinking 方言）** ✅ → `src/providers/openai.rs`
-- **OpenAI Responses / Codex Responses** ✅ → `src/providers/openai_responses.rs`
-- **Gemini（流式 + 工具 + 思考链）** ✅ → `src/providers/gemini.rs`
-- **Gemini 思考强度控制（thinkingConfig 发送）** — Gemini 3.x 系列 `thinkingConfig.thinkingLevel` 支持：`off→minimal`（3.x 无法完全关思考）、`xhigh→high`（超范围降级）、其余同名直传；`maxOutputTokens` 固定 65536（思考 token 共享额度）；vertex provider 同步支持。**实测**：high 档思考加深（thoughtsTokenCount 847→1149），思考 token 计入 usage.output；Google 3.x 不返回思考文本（仅 thoughtSignature + 计数），故 `GeminiPart::Thought` 接收分支为防御性实现（Google 未来开放思考文本时生效） ✅ → `src/providers/gemini.rs` `src/providers/vertex.rs`
-- **Cohere（流式 + 工具）** ✅ → `src/providers/cohere.rs`
-- **Azure OpenAI** ✅ → `src/providers/azure.rs`
-- **Bedrock / Vertex AI / GitHub Copilot / GitLab Duo** ✅ → `src/providers/*.rs`
-- **扩展 stream-simple Provider 桥接** ✅ → `src/providers/mod.rs`
-- **Provider 工厂 + 路由** ✅ → `src/providers/mod.rs`
-- **12 个 native provider 实现模块** — anthropic/openai/openai_responses/gemini/cohere/azure/bedrock/vertex/copilot/gitlab/cursor/model_fetch ✅ → `src/providers/*.rs`（除 mod.rs 外 12 个）
-- **本地 Provider** — ollama/llamacpp/mistralrs/lmstudio 内置，默认端口直连、无需 API key ✅ → `src/provider_metadata.rs` `src/providers/openai.rs`
-- **认证与凭据管理** — API Key / OAuth（PKCE+刷新）/ AWS 凭据链 / Service Key / Bearer Token，存 `~/.pi/agent/auth.json`（文件锁防并发损坏），支持 `$ENV:` 与 `$CMD:` 动态解析 ✅ → `src/auth.rs`
-- **Provider 运行时热切换** — `set_model` 跨 provider 切换时直接在内存创建/替换 provider 实例（anthropic ↔ openai ↔ gemini 等），无需重启进程 ✅ → `src/agent.rs` `src/providers/mod.rs`
-- **opencode-go（OpenCode Zen Go，deepseek-v4-flash 等，含思考参数透传）** — 网关下的 DeepSeek 模型经 `compat.thinkingFormat: "deepseek"` 识别方言，正确发送 `thinking` + `reasoning_effort` ✅ → `src/provider_metadata.rs` `src/app.rs` `src/providers/openai.rs`
-- **流式截断自动重试** — 上游 SSE 中途截断（`JSON parse error: EOF while parsing a string`）分类为瞬时错误自动重试，不再直接断流；语法类 parse error 仍不可重试 ✅ → `src/providers/openai.rs` `src/rpc.rs`
+- **Anthropic API** — 流式 + 扩展思考 + 工具调用 | `src/providers/anthropic.rs`
+- **OpenAI Chat Completions** — 兼容推理模型思考参数 + DeepSeek thinking 方言 | `src/providers/openai.rs`
+- **OpenAI Responses / Codex Responses** — 新一代响应式 API | `src/providers/openai_responses.rs`
+- **Gemini** — 流式 + 工具 + 思考链，思考强度可调 | `src/providers/gemini.rs` + `src/providers/vertex.rs`
+- **Cohere** — 流式 + 工具调用 | `src/providers/cohere.rs`
+- **Azure OpenAI** — 企业版 OpenAI 通道 | `src/providers/azure.rs`
+- **Bedrock / Vertex AI / GitHub Copilot / GitLab Duo** | `src/providers/*.rs`
+- **本地 Provider** — ollama/llamacpp/mistralrs/lmstudio，默认端口直连、无需 API key | `src/provider_metadata.rs` + `src/providers/openai.rs`
+- **认证与凭据管理** — API Key / OAuth（PKCE+刷新）/ AWS 凭据链 / Service Key / Bearer Token，支持环境变量与命令动态解析 | `src/auth.rs`
+- **Provider 运行时热切换** — 跨 provider 切换模型无需重启进程 | `src/agent.rs` + `src/providers/mod.rs`
+- **OpenAI 兼容网关方言识别** — 按网关声明识别 DeepSeek 思考参数方言并正确发送 | `src/provider_metadata.rs` + `src/providers/openai.rs`
+- **流式截断自动重试** — 上游 SSE 中途截断分类为瞬时错误自动重试，语法错误不重试 | `src/providers/openai.rs` + `src/rpc.rs`
 
 ## 工具系统
 
-- **ToolRegistry — 工具注册表** ✅ → `src/tools/mod.rs`
-- **内置 9 工具（read/bash/pwsh/edit/write/grep/find/ls/hashline）** ✅ → `src/tools/` 各子模块
-- **进程清理模式统一为 ProcessGroupTree** — 所有 spawn 子进程的工具（bash/pwsh/grep/find）均使用 `isolate_command_process_group` + `taskkill /F /T` 杀整个进程树 ✅ → `src/tools/bash.rs` `src/tools/pwsh.rs` `src/tools/grep.rs` `src/tools/find.rs`
-- **`Tool::execute()` 支持 abort 信号** — trait 新增 `abort: Option<AbortSignal>` 参数，long-running 工具在循环中检查并主动 kill 子进程 ✅ → `src/tools/mod.rs` `src/abort.rs`
-- **`ProcessGuard::wait_with_cancellation()` 支持 abort 信号** — 循环中检查外部 abort + cx.checkpoint + 超时 ✅ → `src/tools/mod.rs:3381`
-- **ReadTool — 无 CWD/agent-dir 路径限制** + head/tail/info/diff 参数 + 编码自动检测 ✅ → `src/tools/read.rs`
-- **WriteTool / EditTool / HashlineEditTool — 无 CWD 路径限制**（可写入任意绝对路径） ✅ → `src/tools/write.rs` `src/tools/edit.rs` `src/tools/hashline.rs`
-- **@file CLI 参数 — 无 CWD 路径限制**（`pi @任意路径` 可读任意目录文件，≤100MB 检查 + 1MB 截断） ✅ → `src/tools/mod.rs` `process_file_arguments`
-- **EditTool — 直接写入**（非 tempfile 原子重命名，避让 Windows 句柄冲突） ✅ → `src/tools/edit.rs`
-- **FindTool / GrepTool / LsTool — 无 CWD 路径限制**（可搜索/列出任意绝对路径） ✅ → `src/tools/find.rs` `src/tools/grep.rs` `src/tools/ls.rs`
-- **扩展工具收集** ✅ → `src/extension_tools.rs:100`
-- **扩展工具 onUpdate 流式进度推送**（工具执行中 `onUpdate({content, details})`，经 rquickjs Function 桥接到 Rust `ToolUpdate`） ✅ → `src/extensions.rs` `src/extensions_js.rs` `src/extension_tools.rs`
-- **扩展工具同名覆盖内置工具** ✅ → `src/tools/mod.rs` `src/agent.rs`
-- **内置 pwsh 工具**（PowerShell 命令执行、尾部截断 2000 行/1MB、exit 0 时自动过滤 stderr、绝对路径 fallback 解决带空格 PATH 解析 bug） ✅ → `src/tools/pwsh.rs`
-- **bash 工具 Windows 平台支持（Git Bash）** — `resolve_bash_shell()` 按平台解析：Unix 用 `/bin/bash` 家族；Windows 查找 Git Bash 安装位（`%ProgramFiles%\Git`、`%LOCALAPPDATA%\Programs\Git`、scoop），找不到 fallback `sh`。`bash_available()`（测试门控）与 RPC 的 `run_bash_rpc` 复用同一解析，保证测试跳过与工具实际可用性一致 ✅ → `src/tools/bash.rs` `src/tools/mod.rs` `src/rpc.rs`
-- **运行时禁用内置工具**（`disabledTools` 配置） ✅ → `src/config.rs` `src/main.rs`
-- **工具描述外部覆盖**（`toolDescriptions` 配置，免编译修改工具描述） ✅ → `src/config.rs` `src/tools/mod.rs` `src/agent.rs`
-- **编辑后轻量验证（verify 参数）** — edit/hashline_edit/write 支持可选 verify 参数，编辑后自动运行语法/格式检查（.rs→rustfmt, .json/.toml→进程内解析, .ts/.md→prettier 全局直调、无全局安装时 npx 回退）。结果附在 details.verify，不阻断流程。**扩展 checker 见 `verify-tool.md`** ✅ → `src/tools/verify.rs` `src/tools/edit.rs` `src/tools/hashline.rs` `src/tools/write.rs`
-- **ProcessGuard 子进程生命周期管理** — 统一管理 spawn 子进程的清理：ambient cancellation、超时 kill、abort 信号检查、Drop 自动回收 ✅ → `src/tools/mod.rs:3337`
-- **Tool trait + JSON Schema 定义** ✅ → `src/tools/mod.rs`
-- **Abort 信号原语** — 共享 `AbortHandle`/`AbortSignal`，打破 agent.rs ↔ tools/mod.rs 循环依赖 ✅ → `src/abort.rs`
+- **工具注册表** — 内置/扩展工具统一注册、JSON Schema 定义、按名路由 | `src/tools/mod.rs`
+- **内置 9 工具** — read/bash/pwsh/edit/write/grep/find/ls/hashline | `src/tools/` 各子模块
+- **子进程统一生命周期管理** — spawn 子进程受控清理（abort/超时/Drop），杀整棵进程树防孤儿 | `src/tools/mod.rs` + `src/abort.rs` + `src/tools/bash.rs` + `src/tools/pwsh.rs` + `src/tools/grep.rs` + `src/tools/find.rs`
+- **工具可取消执行** — abort 信号穿透到工具层，长任务循环检查并主动终止 | `src/tools/mod.rs` + `src/abort.rs`
+- **ReadTool** — 任意路径读取，head/tail/info/diff 参数，编码自动检测 | `src/tools/read.rs`
+- **Write/Edit/HashlineEdit** — 任意绝对路径写入与编辑 | `src/tools/write.rs` + `src/tools/edit.rs` + `src/tools/hashline.rs`
+- **@file CLI 参数** — `pi @路径` 读取任意目录文件，带大小上限与截断 | `src/tools/mod.rs`
+- **Find/Grep/Ls** — 任意绝对路径下搜索与列出 | `src/tools/find.rs` + `src/tools/grep.rs` + `src/tools/ls.rs`
+- **内置 pwsh 工具** — PowerShell 命令执行，长输出尾部截断，exit 0 时过滤 stderr | `src/tools/pwsh.rs`
+- **bash 工具 Windows 支持** — 自动定位 Git Bash 安装，缺失时优雅降级 | `src/tools/bash.rs` + `src/tools/mod.rs` + `src/rpc.rs`
+- **扩展工具收集与覆盖** — 收集扩展注册工具，同名覆盖内置工具 | `src/extension_tools.rs` + `src/tools/mod.rs` + `src/agent.rs`
+- **扩展工具流式进度推送** — 工具执行中实时推送 content/details 进度 | `src/extensions.rs` + `src/extensions_js.rs` + `src/extension_tools.rs`
+- **运行时禁用内置工具** — `disabledTools` 配置启动时过滤 | `src/config.rs` + `src/main.rs`
+- **工具描述外部覆盖** — `toolDescriptions` 配置免编译修改描述 | `src/config.rs` + `src/tools/mod.rs` + `src/agent.rs`
+- **编辑后轻量验证** — edit/hashline_edit/write 可选 verify 参数，自动语法/格式检查，结果附 details 不阻断 | `src/tools/verify.rs` + `src/tools/edit.rs` + `src/tools/hashline.rs` + `src/tools/write.rs`
 
 ## 扩展系统
 
-- **JS/TS 扩展加载（QuickJS）** ✅ → `src/extensions_js.rs`
-- **JS Runtime 中断机制** — `InterruptBudget.external_trigger` 外部中断 + QuickJS interrupt hook 停止死循环 ✅ → `src/extensions_js.rs:4616`
-- **扩展工具 abort 信号桥接** — agent 的 `AbortSignal` 经 `ExtensionToolWrapper → JsRuntimeCommand → await_js_task` 全链路透传：首次检测到 abort 时调 JS `__pi_abort_task(task_id)` 触发扩展的 `AbortController`（扩展可用 `signal.aborted` / `addEventListener('abort')` 优雅退出），下一轮仍 pending 则 `request_interrupt()` 硬中断兜底 ✅ → `src/extension_tools.rs` `src/extensions.rs` `src/extensions_js.rs`
-- **Native Rust 扩展（`*.native.json`）** ✅ → `src/extensions.rs`
-- **WASM 扩展** ✅ → `src/extensions.rs`
-- **能力策略模型（Strict/Prompt/Permissive）** ✅ → `src/extensions.rs:1139`
-- **Hostcall 调度（tool/exec/http/session/ui/events/log）** ✅ → `src/extensions_js.rs`
-- **Exec hostcall 并发执行** — 并行 exec/spawn 请求真正并发执行：Exec 组冷启动即并发（跳过遥测门槛，宽度 = min(batch, max)），不依赖 stall 推断；`PI_HOSTCALL_AMAC_EXEC_INTERLEAVE=0` 可强制 exec 串行 ✅ → `src/hostcall_amac.rs` `src/extensions.rs` `src/extension_dispatcher.rs`
-- **RPC 模式扩展交互 UI（select/confirm/input）** ✅ → `src/extensions.rs` `src/rpc.rs`
-- **虚拟模块系统（Node.js builtins + npm stubs）** ✅ → `src/extensions_js.rs`
-- **VFS write-through 落盘**（`writeFileSync`/`appendFileSync` 写 VFS 内存后同步写真实文件系统） ✅ → `src/extensions_js.rs`
+- **JS/TS 扩展加载** — QuickJS 沙箱运行，无需 Node/Bun | `src/extensions_js.rs`
+- **JS 运行时中断** — 死循环/长任务可被外部中断硬停 | `src/extensions_js.rs`
+- **扩展工具取消传播** — 先通知 JS 侧 AbortController 优雅退出，仍挂起则硬中断兜底 | `src/extension_tools.rs` + `src/extensions.rs` + `src/extensions_js.rs`
+- **Native Rust 扩展** — `*.native.json` 声明式注册 | `src/extensions.rs`
+- **WASM 扩展** | `src/extensions.rs`
+- **能力策略模型** — Strict/Prompt/Permissive 三档门控 hostcall | `src/extensions.rs`
+- **Hostcall 调度** — tool/exec/http/session/ui/events/log 分派 | `src/extensions_js.rs`
+- **Exec hostcall 并行执行** — 批量命令有界并发拉起子进程，保序收集 | `src/hostcall_amac.rs` + `src/extensions.rs` + `src/extension_dispatcher.rs`
+- **RPC 模式扩展交互 UI** — select/confirm/input 提示组件 | `src/extensions.rs` + `src/rpc.rs`
+- **虚拟模块系统** — Node.js builtins 垫片 + npm 包 stub | `src/extensions_js.rs`
+- **VFS 写穿透落盘** — 虚拟文件系统写入同步到真实文件系统 | `src/extensions_js.rs`
 
 ## 会话管理
 
-- **JSONL 会话（v3）** ✅ → `src/session.rs`
-- **分支 / 树结构** ✅ → `src/session.rs`
-- **SQLite 会话后端** ✅ → `src/session.rs`
-- **会话索引元数据** ✅ → `src/session_index.rs`
-- **会话保存 Windows 文件竞争重试** — persist/append 遇 PermissionDenied（os error 5）或 sharing violation（os error 32）退避重试；append fsync 拒绝降级警告（数据已入页缓存） ✅ → `src/session.rs`
-- **RPC 会话持久化链根修复** — persister 启动扫描计入 session header id，首条 entry parentId 链接链根 ✅ → `src/rpc.rs`
-- **RPC 持久化补写 user 消息** — MessageStart(User) 实时落盘（防 session.save 关闭时 user 丢失） ✅ → `src/rpc.rs`
-- **Session Store V2 Sidecar** — 分段日志 + 偏移索引 + 周期检查点 + 迁移/回滚台账；大会话 O(index+tail) 快速恢复，损坏帧 fail-closed ✅ → `src/session_store_v2.rs`
-- **`pi migrate` 子命令** — JSONL → V2 sidecar 迁移（`--dry-run` 校验不落盘） ✅ → `src/cli.rs` `src/session_store_v2.rs`
-- **RPC 方法 `append_custom_entry`** — 客户端（如 pidian 苏格拉底）注入自定义 entry 经 pi 会话管理落盘（CustomEntry，不影响 API 消息链路） ✅ → `src/rpc.rs` `src/session.rs`
-- **中断/错误消息清理 dangling tool calls** — 流式输出 tool_call 过程中 abort/error 时，`build_abort_message`/`build_error_message` strip 掉未完成的 ToolCall blocks（与迭代上限路径一致），防止持久化「有 tool_call 无 tool 响应」的消息污染会话——否则下次请求被 provider 拒绝（`tool_calls must be followed by tool messages` 400） ✅ → `src/agent.rs`
-- **SDK `SessionOptions.auth_path` 注入** — 可选指定 auth.json 加载路径（默认 `Config::auth_path`），embedder/测试可指向独立 auth 文件，避免与共享用户级 auth.json 的目录锁竞争 ✅ → `src/sdk.rs`
-- **print 模式会话落盘** — `-p`/`--mode text|json` 默认不落盘（一次性输出即弃），但显式 `--session-dir`/`--session` 时 opt-in 持久化：`--session-dir <dir>` 落盘到 `<dir>/<encoded_cwd>/<时间戳>_<id>.jsonl`（自动建目录），`--session <name>` 精确写入 `<session-dir>/<name>`（文件不存在则创建、已存在则继续追加）；成功与失败都落盘；显式 `--no-session` 仍优先 ✅ → `src/app.rs` `src/main.rs` `src/session.rs`
+- **JSONL 会话存储** — 增量追加的会话文件格式 | `src/session.rs`
+- **分支 / 树结构** — 会话可分支、多叶 | `src/session.rs`
+- **SQLite 会话后端** — 可选替代存储 | `src/session.rs`
+- **会话索引元数据** — 按目录/时间索引会话供选择器与恢复 | `src/session_index.rs`
+- **RPC 模式进程侧主动会话持久化** — 消息实时落盘，客户端崩溃不丢数据 | `src/rpc.rs` + `src/session.rs`
+- **Windows 文件竞争自动重试** — 保存遇瞬态句柄占用退避重试 | `src/session.rs`
+- **分段日志 Sidecar 存储** — 快速恢复大会话，损坏帧 fail-closed | `src/session_store_v2.rs`
+- **会话存储迁移命令** — `pi migrate` 将 JSONL 迁移到 sidecar，支持 dry-run 校验 | `src/cli.rs` + `src/session_store_v2.rs`
+- **客户端自定义消息注入** — 经 pi 落盘但不进入 LLM 消息链路 | `src/rpc.rs` + `src/session.rs`
+- **中断时清理未完成工具调用** — 避免持久化无响应的 tool_call 污染会话 | `src/agent.rs`
+- **print 模式会话落盘 opt-in** — 显式 `--session-dir`/`--session` 时持久化，成功与失败都落盘 | `src/app.rs` + `src/main.rs` + `src/session.rs`
+- **SDK 独立认证文件** — 可选指定 auth.json 加载路径，供嵌入方与测试隔离凭据 | `src/sdk.rs`
 
 ## 模型注册表
 
-- **内置模型注册** ✅ → `src/models.rs`
-- **`models.json` 自定义模型加载** ✅ → `src/models.rs:698`
-- **Provider 元数据（别名 + 认证键）** ✅ → `src/provider_metadata.rs`
-- **`supports_xhigh()` 检查 `compat.thinkingLevelMap`** — 第三方 provider 在 models.json 中声明 `thinkingLevelMap.xhigh` 即可支持 xhigh，无需硬编码 ✅ → `src/models.rs:30`
+- **内置模型注册** | `src/models.rs`
+- **自定义模型加载** — `models.json` 扩展模型定义 | `src/models.rs`
+- **Provider 元数据** — 别名 + 认证键声明 | `src/provider_metadata.rs`
+- **第三方模型 xhigh 档支持** — 经 `compat.thinkingLevelMap` 声明即可，无需硬编码 | `src/models.rs`
 
 ## 资源与配置管理
 
-- **`skill_mode: "project_only"` 配置** — 项目可跳过全局技能 ✅ → `src/package_manager.rs`
-- **`global_skills` 白名单** — 选择加载特定全局技能，可与 `project_only` 叠加 ✅ → `src/package_manager.rs`
-- **Skills 系统** — `~/.pi/agent/skills/` 或 `.pi/skills/` 下 `SKILL.md`，`/skill:name` 调用 ✅ → `src/resources.rs` `src/package_manager.rs`
-- **Prompt Templates** — `.pi/prompts/` 或 `~/.pi/agent/prompts/` Markdown，`/template` 调用，支持 `$1`/`$2`/`$@` 位置参数展开 ✅ → `src/resources.rs`
-- **Packages 共享** — `pi install npm:@org/pi-packages` 安装技能/提示词/主题/扩展包 ✅ → `src/package_manager.rs`
+- **技能仅项目模式** — `skill_mode: "project_only"` 跳过全局技能 | `src/package_manager.rs`
+- **全局技能白名单** — `global_skills` 只加载指定全局技能，可与 project_only 叠加 | `src/package_manager.rs`
+- **Skills 系统** — `~/.pi/agent/skills/` 或 `.pi/skills/` 下 `SKILL.md`，`/skill:name` 调用 | `src/resources.rs` + `src/package_manager.rs`
+- **Prompt Templates** — `.pi/prompts/` 或 `~/.pi/agent/prompts/` Markdown，`/template` 调用，支持 `$1`/`$2`/`$@` 位置参数 | `src/resources.rs`
+- **Packages 共享** — `pi install` 安装技能/提示词/主题/扩展包 | `src/package_manager.rs`
