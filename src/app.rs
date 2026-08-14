@@ -238,6 +238,15 @@ pub fn build_system_prompt(
             cwd.display().to_string()
         };
         let _ = write!(prompt, "\nCurrent working directory: {cwd_display}");
+        // Follows include_cwd: temp_dir() embeds the OS user name on Windows
+        // (e.g. C:\Users\alice\AppData\Local\Temp), same privacy semantics as
+        // --hide-cwd-in-prompt. (#49)
+        let temp_display = if test_mode {
+            "<TEMP>".to_string()
+        } else {
+            std::env::temp_dir().display().to_string()
+        };
+        let _ = write!(prompt, "\nCurrent temporary directory: {temp_display}");
     }
 
     Ok(prompt)

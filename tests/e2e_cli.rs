@@ -2801,7 +2801,9 @@ const PRINT_MODE_ISOLATION_FLAGS: &[&str] = &[
 /// Build the system prompt that the binary produces when given `--system-prompt`
 /// with `PI_TEST_MODE=1`.  The binary always appends a timestamp/cwd footer.
 fn expected_system_prompt(custom: &str) -> String {
-    format!("{custom}\nCurrent date and time: <TIMESTAMP>\nCurrent working directory: <CWD>")
+    format!(
+        "{custom}\nCurrent date and time: <TIMESTAMP>\nCurrent working directory: <CWD>\nCurrent temporary directory: <TEMP>"
+    )
 }
 
 fn expected_anthropic_tools(enabled: &[&str]) -> Vec<serde_json::Value> {

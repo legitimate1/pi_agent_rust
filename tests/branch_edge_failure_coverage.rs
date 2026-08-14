@@ -880,6 +880,7 @@ fn build_system_prompt_test_mode_uses_placeholders() {
     .expect("build system prompt");
     assert!(prompt.contains("<TIMESTAMP>"));
     assert!(prompt.contains("<CWD>"));
+    assert!(prompt.contains("<TEMP>"));
     assert!(!prompt.contains("/tmp/test_cwd"));
 }
 
@@ -902,6 +903,8 @@ fn build_system_prompt_non_test_mode_uses_real_values() {
     .expect("build system prompt");
     assert!(!prompt.contains("<TIMESTAMP>"));
     assert!(prompt.contains("/tmp/test_cwd"));
+    let temp = std::env::temp_dir();
+    assert!(prompt.contains(&format!("Current temporary directory: {}", temp.display())));
 }
 
 #[test]

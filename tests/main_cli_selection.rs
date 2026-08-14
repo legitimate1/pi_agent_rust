@@ -473,6 +473,7 @@ fn build_system_prompt_test_mode_suppresses_ambient_project_context() {
     assert!(!prompt.contains("SUB"));
     assert!(prompt.contains("Current date and time: <TIMESTAMP>"));
     assert!(prompt.contains("Current working directory: <CWD>"));
+    assert!(prompt.contains("Current temporary directory: <TEMP>"));
 }
 
 #[test]
