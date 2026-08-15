@@ -9,7 +9,7 @@
 - **斜杠命令查询** — 返回可用命令，含扩展注册的命令 | `src/rpc.rs` + `src/extensions.rs`
 - **会话树查询** — 返回会话的分支/叶子结构 | `src/rpc.rs`
 - **版本查询** — 返回 pi 版本号和 Git SHA | `src/rpc.rs`
-- **系统提示词查询** — 返回当前会话的 system prompt 及注册的工具定义 | `src/rpc.rs` + `src/agent.rs`
+- **系统提示词查询** — 返回当前会话的 system prompt 及注册的工具定义（tools 为应用 tools.toml 覆盖后的最终定义）| `src/rpc.rs` + `src/agent.rs`
 - **会话状态查询** — 含模型兼容配置，供客户端渲染思考级别选项 | `src/rpc.rs`
 - **消息队列管理** — 查看/精确取消/清空待处理消息，变更实时推送 | `src/rpc.rs`
 - **模型/思考级别临时切换** — 可选仅内存切换，重启后恢复默认 | `src/rpc.rs` + `src/acp.rs` + `src/session.rs` + `src/agent.rs`
@@ -20,6 +20,7 @@
 - **凭据感知模型选择** — `Ctrl+L` 选择器（只列凭据就绪模型），`Ctrl+P`/`Ctrl+Shift+P` 循环切换 | `src/model_selector.rs` + `src/interactive/model_selector_ui.rs`
 - **用户级系统提示词覆盖** — `~/.pi/agent/SYSTEM.md` 替代默认提示词 | `src/app.rs`
 - **项目级系统提示词覆盖** — `.pi/SYSTEM.md`，优先级高于用户级 | `src/app.rs`
+- **系统提示词运行时事实注入** — 自动追加当前日期、工作目录、临时目录（test_mode 下用 `<TIMESTAMP>`/`<CWD>`/`<TEMP>` 占位符）| `src/app.rs`
 
 ## Provider 层
 
@@ -51,7 +52,8 @@
 - **扩展工具收集与覆盖** — 收集扩展注册工具，同名覆盖内置工具 | `src/extension_tools.rs` + `src/tools/mod.rs` + `src/agent.rs`
 - **扩展工具流式进度推送** — 工具执行中实时推送 content/details 进度 | `src/extensions.rs` + `src/extensions_js.rs` + `src/extension_tools.rs`
 - **运行时禁用内置工具** — `disabledTools` 配置启动时过滤 | `src/config.rs` + `src/main.rs`
-- **工具描述外部覆盖** — `toolDescriptions` 配置免编译修改描述 | `src/config.rs` + `src/tools/mod.rs` + `src/agent.rs`
+- **工具描述外部覆盖** — `toolDescriptions` 配置免编译修改描述（旧入口，tools.toml 优先）| `src/config.rs` + `src/tools/mod.rs` + `src/agent.rs`
+- **tools.toml 工具可见信息覆盖** — `~/.pi/agent/tools.toml` + `.pi/tools.toml`（项目优先）逐工具覆盖 description 与 parameters（JSON Schema），description 同时作用于提示词文字层与 API schema 层，未覆盖工具保持默认 | `src/tool_overrides.rs` + `src/config.rs` + `src/tools/mod.rs` + `src/agent.rs` + `src/app.rs` + `src/main.rs` + `src/sdk.rs` + `src/acp.rs`
 - **编辑后轻量验证** — edit/hashline_edit/write 可选 verify 参数，自动语法/格式检查，结果附 details 不阻断 | `src/tools/verify.rs` + `src/tools/edit.rs` + `src/tools/hashline.rs` + `src/tools/write.rs`
 
 ## 扩展系统

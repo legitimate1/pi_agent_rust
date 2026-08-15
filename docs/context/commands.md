@@ -279,7 +279,7 @@ pi --tools read,write,edit,grep,find,ls,hashline_edit,pwsh
 - `get_commands` — 斜杠命令查询（含扩展注册的命令）| `src/rpc.rs` + `src/extensions.rs`
 - `get_tree` — 会话树形结构（分支/叶子）| `src/rpc.rs`
 - `get_version` — 版本号 + Git SHA | `src/rpc.rs`
-- `get_system_prompt` — 当前 system prompt 及注册的工具定义 | `src/rpc.rs` + `src/agent.rs`
+- `get_system_prompt` — 当前 system prompt 及注册的工具定义（tools 为应用 tools.toml 覆盖后的最终定义）| `src/rpc.rs` + `src/agent.rs`
 - `session_state` — 会话状态（含模型 `compat` 字段，如 `thinkingLevelMap`）| `src/rpc.rs`
 - `remove_from_queue` / `clear_queue` / `get_queue` — 按 messageId 精确取消 / 清空 / 查看队列 | `src/rpc.rs`
 - `queue_update` — 事件推送：队列状态变更时实时同步给客户端 | `src/rpc.rs`

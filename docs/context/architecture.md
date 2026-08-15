@@ -57,7 +57,7 @@ abort 信号（`src/abort.rs` 共享原语）沿 Agent 循环 → 工具执行 �
 
 1. `main.rs` → 获取默认工具列表
 2. 过滤 `disabledTools` 配置中列出的工具（如 `bash`）
-3. 创建 `ToolRegistry` 内置工具
+3. 创建 `ToolRegistry` 内置工具（`tool_config_with_overrides` 合并 settings.json `toolDescriptions` + `tools.toml` 覆盖，tools.toml 优先）
 4. `enable_extensions_with_policy()` 按能力策略加载扩展
 5. 收集扩展工具包装器
 6. `extend_tools()` → **同名扩展工具覆盖内置工具**
@@ -65,7 +65,8 @@ abort 信号（`src/abort.rs` 共享原语）沿 Agent 循环 → 工具执行 �
 ## 模块关系
 
 - **`abort.rs`** → 共享 AbortHandle/AbortSignal 原语，打破 agent ↔ tools 循环依赖
-- **`app.rs`** → 系统提示词构建（SYSTEM.md 加载、default_system_prompt、project context files）
+- **`app.rs`** → 系统提示词构建（SYSTEM.md 加载、default_system_prompt、project context files、date/cwd/temp 运行时事实注入）
+- **`tool_overrides.rs`** → tools.toml 覆盖加载：合并用户级 `~/.pi/agent/tools.toml` + 项目级 `.pi/tools.toml`（项目 key 优先），产出 description / parameters 覆盖表
 - **`tools/` 模块目录** → ToolRegistry + 内置工具模块 + verify 内部验证引擎
 - **`tools/verify.rs`** → 编辑后轻量验证引擎：文件类型检测→检查器映射（.rs/.json/.toml/.ts/.md）→进程内/外部进程执行
 - **`agent.rs`** → Agent 循环（工具迭代、扩展合并、ToolDef 构建）

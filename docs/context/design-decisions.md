@@ -429,3 +429,23 @@
 **不选 B 的原因**：按组独立统计小阈值（额外状态机，收益不明确）；首次 batch 并发 + 观察起步（与跳过门槛语义重叠）；扩展侧 longLived 绕过（LSP 专用，语义不匹配）。
 
 **何时重新考虑**：若并发后调用方出现顺序依赖 → 逃生开关；若 Http/Tool 组在 TUI 场景也需要冷启动并发 → `PI_HOSTCALL_AMAC_MIN_TELEMETRY=0`。
+
+## D44: tools.toml 工具可见信息覆盖（2026-08-15）
+
+**决策**：新增 `tools.toml`（用户级 `~/.pi/agent/tools.toml` + 项目级 `.pi/tools.toml`，项目 key 优先）逐工具覆盖「LLM 可见信息」：`description` 与 `parameters`（内嵌 JSON 文本整体替换 JSON Schema）。description 同时作用于提示词文字层（`Available tools:` 列表）与 API tool schema 层，两层保持一致。未列出的工具保持内置默认，删除条目/文件即恢复默认（不冻结核心更新）。`settings.json` 的 `toolDescriptions` 保留兼容，tools.toml 优先。
+
+**理由**：用户需要外放所有 LLM 可见描述（此前只有 description 且仅 schema 层可改、提示词文字层与参数层完全硬编码）；TOML 逐工具覆盖保留「只显示启用工具」的过滤逻辑与默认跟随；项目级提供团队一致性，与 SYSTEM.md 双层语义对称。
+
+**不选 B 的原因**：纯文本整段接管 `tools.md`（破坏 enabled 过滤、冻结默认）；parameters 部分字段嵌套覆盖（schema 合并语义复杂，收益低）；只做用户级（丢失项目级团队锁定能力）。
+
+**何时重新考虑**：如果出现「只改某个参数 description」的高频诉求，可增加部分字段合并覆盖。
+
+## D45: 系统提示词注入当前临时目录（2026-08-15）
+
+**决策**：`build_system_prompt` 在 cwd 注入旁新增 `Current temporary directory: {path}`，经 `std::env::temp_dir()` 跨平台解析（Windows `%TEMP%` / Unix `$TMPDIR`/`/tmp`），test_mode 下用 `<TEMP>` 占位符，跟随 `include_cwd` 开关。
+
+**理由**：Agent 需要临时目录时无需自行查询；temp 路径会话内稳定但跨机器不同（Windows 含用户名、macOS `$TMPDIR` 随机），与 cwd 同属「运行时环境事实」，放核心保证确定性（扩展注入发生在核心构建之后，感知 test_mode 占位符会把约定泄漏到扩展层）；跟随 `--hide-cwd-in-prompt` 隐私语义（Windows temp 路径含 OS 用户名）。
+
+**不选 B 的原因**：用扩展注入（扩展需感知 `PI_TEST_MODE` + 事件 ctx 无 temp 通道，需核心加字段，等于没去核心化）。
+
+**何时重新考虑**：若核心推出「事实注入 vs 业务注入」的提示词分层机制（事实类保留核心、业务类外放扩展），本条随之调整。
