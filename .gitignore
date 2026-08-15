@@ -275,9 +275,3 @@ storage.sqlite3-wal.corrupt-*
 /ubs_findings.txt
 
 sweep.timestamp
-
-# subagent work session scratch (JSONL transcripts)
-pidian-*-explore
-pidian-*-explore.lock
-*-explore
-*-explore.lock
