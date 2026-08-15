@@ -222,6 +222,7 @@ pub mod terminal_images;
 #[doc(hidden)]
 pub mod theme;
 #[doc(hidden)]
+pub mod tool_overrides;
 pub mod tools;
 #[doc(hidden)]
 pub mod tui;

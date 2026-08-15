@@ -1181,7 +1181,7 @@ async fn run(
             let pre_tools = Arc::new(ToolRegistry::new(
                 &pre_enabled_tools,
                 &cwd,
-                Some(pi_core::tool_config::ToolConfig::from(&config)),
+                Some(config.tool_config_with_overrides(&Config::global_dir(), &cwd)?),
             ));
 
             let resolved_risk = config.resolve_extension_risk_with_metadata();
@@ -1232,7 +1232,7 @@ async fn run(
         let pre_tools = Arc::new(ToolRegistry::new(
             &pre_enabled_tools,
             &cwd,
-            Some(pi_core::tool_config::ToolConfig::from(&config)),
+            Some(config.tool_config_with_overrides(&Config::global_dir(), &cwd)?),
         ));
 
         let resolved_risk = config.resolve_extension_risk_with_metadata();
@@ -1275,6 +1275,7 @@ async fn run(
 
     let global_dir = Config::global_dir();
     let package_dir = Config::package_dir();
+    let tool_overrides = pi::tool_overrides::load_tool_overrides(&global_dir, &cwd)?;
     let models_path = default_models_path(&global_dir);
     let mut model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
     if let Some(error) = model_registry.error() {
@@ -1431,6 +1432,7 @@ async fn run(
         &package_dir,
         test_mode,
         !cli.hide_cwd_in_prompt,
+        Some(&tool_overrides.descriptions),
     )?;
     let provider =
         providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;
@@ -1456,7 +1458,7 @@ async fn run(
     let tools = ToolRegistry::new(
         &enabled_tools,
         &cwd,
-        Some(pi_core::tool_config::ToolConfig::from(&config)),
+        Some(config.tool_config_with_overrides(&global_dir, &cwd)?),
     );
     let session_arc = Arc::new(Mutex::new(session));
     let compaction_settings = ResolvedCompactionSettings {
@@ -1610,6 +1612,7 @@ async fn run(
                         &package_dir,
                         test_mode,
                         !cli.hide_cwd_in_prompt,
+                        Some(&tool_overrides.descriptions),
                     )?;
                     agent_session.agent.set_system_prompt(Some(system_prompt));
                 }

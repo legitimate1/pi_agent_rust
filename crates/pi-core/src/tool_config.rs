@@ -7,6 +7,8 @@ pub struct ToolConfig {
     pub image_auto_resize: bool,
     pub block_images: bool,
     pub tool_descriptions: HashMap<String, String>,
+    /// Per-tool JSON Schema overrides for tool parameters (from tools.toml).
+    pub tool_parameters: HashMap<String, serde_json::Value>,
 }
 
 impl Default for ToolConfig {
@@ -17,6 +19,7 @@ impl Default for ToolConfig {
             image_auto_resize: true,
             block_images: false,
             tool_descriptions: HashMap::new(),
+            tool_parameters: HashMap::new(),
         }
     }
 }

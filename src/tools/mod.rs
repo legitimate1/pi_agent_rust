@@ -2803,6 +2803,7 @@ pub(crate) fn resize_image_if_needed(
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
     description_overrides: HashMap<String, String>,
+    parameter_overrides: HashMap<String, serde_json::Value>,
 }
 
 impl ToolRegistry {
@@ -2842,6 +2843,7 @@ impl ToolRegistry {
         Self {
             tools,
             description_overrides,
+            parameter_overrides: config.tool_parameters,
         }
     }
 
@@ -2850,6 +2852,7 @@ impl ToolRegistry {
         Self {
             tools,
             description_overrides: HashMap::new(),
+            parameter_overrides: HashMap::new(),
         }
     }
 
@@ -2895,6 +2898,11 @@ impl ToolRegistry {
     /// Get the description override for a tool, if any.
     pub fn description_override(&self, name: &str) -> Option<&str> {
         self.description_overrides.get(name).map(String::as_str)
+    }
+
+    /// Get the JSON Schema parameters override for a tool, if any.
+    pub fn parameter_override(&self, name: &str) -> Option<&serde_json::Value> {
+        self.parameter_overrides.get(name)
     }
 }
 // ============================================================================

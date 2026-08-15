@@ -1,0 +1,35 @@
+# =============================================================================
+# tools.toml — 内置工具「LLM 可见信息」覆盖示例
+# =============================================================================
+# 生效位置（项目级优先于用户级，逐 key 合并）：
+#   - 用户级：~/.pi/agent/tools.toml
+#   - 项目级：<项目>/.pi/tools.toml
+#
+# 语义：
+#   - description：替换工具描述。同时作用于两层——系统提示词文字层
+#     （"Available tools:" 列表）和 API tool schema 的 description。
+#   - parameters：内嵌 JSON 文本，整体替换工具的 JSON Schema 参数定义。
+#     未填写的字段（或未列出的工具）保持内置默认值；删除条目/文件即恢复默认。
+#
+# 本文件是 bash 工具的完整默认值示例：把下面内容复制到上面的生效位置，
+# 修改后即可覆盖该工具对 LLM 的全部可见信息。
+# =============================================================================
+
+[bash]
+description = "在当前工作目录执行 bash 命令。返回合并的 stdout+stderr。非零退出码视为错误。超限输出自动截断（完整输出以文件保留，路径见 details）。timeout 默认 120 秒，设 0 禁用。"
+parameters = """
+{
+  "type": "object",
+  "properties": {
+    "command": {
+      "type": "string",
+      "description": "Bash command to execute"
+    },
+    "timeout": {
+      "type": "integer",
+      "description": "Timeout in seconds (default 120; set 0 to disable)"
+    }
+  },
+  "required": ["command"]
+}
+"""

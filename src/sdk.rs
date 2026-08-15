@@ -399,11 +399,11 @@ pub trait ToolFactory: Send + Sync {
 /// (e.g. wrap each tool with an approval gate, or add a `Task` tool
 /// that spawns a nested session).
 pub fn default_tool_registry(enabled: &[&str], cwd: &Path, config: &Config) -> ToolRegistry {
-    ToolRegistry::new(
-        enabled,
-        cwd,
-        Some(pi_core::tool_config::ToolConfig::from(config)),
-    )
+    let global_dir = Config::global_dir();
+    let tool_config = config
+        .tool_config_with_overrides(&global_dir, cwd)
+        .unwrap_or_else(|_| pi_core::tool_config::ToolConfig::from(config));
+    ToolRegistry::new(enabled, cwd, Some(tool_config))
 }
 
 /// Lightweight handle for programmatic embedding.
@@ -1753,6 +1753,8 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         .map(String::as_str)
         .collect::<Vec<_>>();
 
+    let tool_overrides = crate::tool_overrides::load_tool_overrides(&global_dir, &cwd)
+        .map_err(|err| Error::validation(err.to_string()))?;
     let system_prompt = app::build_system_prompt(
         &cli,
         &cwd,
@@ -1762,6 +1764,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         &package_dir,
         std::env::var_os("PI_TEST_MODE").is_some(),
         options.include_cwd_in_prompt,
+        Some(&tool_overrides.descriptions),
     )
     .map_err(|err| Error::validation(err.to_string()))?;
 
@@ -1785,11 +1788,10 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
 
     let tools = options.tool_factory.as_ref().map_or_else(
         || {
-            ToolRegistry::new(
-                &enabled_tools,
-                &cwd,
-                Some(pi_core::tool_config::ToolConfig::from(&config)),
-            )
+            let tool_config = config
+                .tool_config_with_overrides(&global_dir, &cwd)
+                .unwrap_or_else(|_| pi_core::tool_config::ToolConfig::from(&config));
+            ToolRegistry::new(&enabled_tools, &cwd, Some(tool_config))
         },
         |factory| factory.create_tool_registry(&enabled_tools, &cwd, &config),
     );

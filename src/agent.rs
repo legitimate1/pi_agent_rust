@@ -1225,7 +1225,11 @@ impl Agent {
                     ToolDef {
                         name: name.to_string(),
                         description,
-                        parameters: t.parameters(),
+                        parameters: self
+                            .tools
+                            .parameter_override(name)
+                            .cloned()
+                            .unwrap_or_else(|| t.parameters()),
                     }
                 })
                 .collect();
@@ -1287,7 +1291,11 @@ impl Agent {
                     ToolDef {
                         name: name.to_string(),
                         description,
-                        parameters: t.parameters(),
+                        parameters: self
+                            .tools
+                            .parameter_override(name)
+                            .cloned()
+                            .unwrap_or_else(|| t.parameters()),
                     }
                 })
                 .collect();

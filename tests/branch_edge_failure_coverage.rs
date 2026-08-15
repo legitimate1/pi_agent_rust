@@ -876,6 +876,7 @@ fn build_system_prompt_test_mode_uses_placeholders() {
         package_dir,
         true, // test_mode
         true, // include_cwd
+        None, // tool_descriptions
     )
     .expect("build system prompt");
     assert!(prompt.contains("<TIMESTAMP>"));
@@ -899,12 +900,70 @@ fn build_system_prompt_non_test_mode_uses_real_values() {
         package_dir,
         false,
         true,
+        None,
     )
     .expect("build system prompt");
     assert!(!prompt.contains("<TIMESTAMP>"));
     assert!(prompt.contains("/tmp/test_cwd"));
     let temp = std::env::temp_dir();
     assert!(prompt.contains(&format!("Current temporary directory: {}", temp.display())));
+}
+
+#[test]
+fn build_system_prompt_applies_tool_description_overrides() {
+    use std::collections::HashMap;
+
+    let cli = Cli::parse_from(["pi"]);
+    let cwd = Path::new("/tmp/test_cwd");
+    let global_dir = Path::new("/tmp/nonexistent_global");
+    let package_dir = Path::new("/tmp/nonexistent_package");
+    let mut overrides = HashMap::new();
+    overrides.insert("bash".to_string(), "custom bash description".to_string());
+    let prompt = app::build_system_prompt(
+        &cli,
+        cwd,
+        &["bash", "read"],
+        None,
+        global_dir,
+        package_dir,
+        true,
+        true,
+        Some(&overrides),
+    )
+    .expect("build system prompt");
+    assert!(prompt.contains("custom bash description"));
+    assert!(!prompt.contains("Execute bash commands"));
+    assert!(prompt.contains("Read file contents")); // 未覆盖工具保持默认
+}
+
+#[test]
+fn tool_registry_parameter_override_flows_from_config() {
+    let mut config = pi_core::tool_config::ToolConfig::default();
+    config.tool_parameters.insert(
+        "bash".to_string(),
+        serde_json::json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } }
+        }),
+    );
+    config.tool_descriptions.insert(
+        "bash".to_string(),
+        "overridden bash description".to_string(),
+    );
+    let registry = pi::tools::ToolRegistry::new(&["bash", "read"], Path::new("."), Some(config));
+
+    // Schema 层覆盖生效
+    assert_eq!(
+        registry.parameter_override("bash").unwrap()["properties"]["command"]["type"],
+        "string"
+    );
+    assert_eq!(
+        registry.description_override("bash"),
+        Some("overridden bash description")
+    );
+    // 未覆盖工具无 override，走默认
+    assert!(registry.parameter_override("read").is_none());
+    assert!(registry.description_override("read").is_none());
 }
 
 #[test]
@@ -922,6 +981,7 @@ fn build_system_prompt_with_skills_prompt() {
         package_dir,
         true,
         true,
+        None,
     )
     .expect("build system prompt");
     assert!(prompt.contains("Available Skills"));
@@ -943,6 +1003,7 @@ fn build_system_prompt_includes_hashline_edit_description_and_guideline() {
         package_dir,
         true,
         true,
+        None,
     )
     .expect("build system prompt");
     assert!(

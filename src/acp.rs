@@ -1258,10 +1258,14 @@ fn resolve_acp_thinking_level(
 }
 
 /// Build a system prompt for ACP mode without requiring a `Cli` struct.
-fn build_acp_system_prompt(cwd: &std::path::Path, enabled_tools: &[&str]) -> String {
+fn build_acp_system_prompt(
+    cwd: &std::path::Path,
+    enabled_tools: &[&str],
+    tools: &ToolRegistry,
+) -> String {
     use std::fmt::Write as _;
 
-    let tool_descriptions = [
+    let default_tool_descriptions = [
         ("read", "Read file contents"),
         ("bash", "Execute bash commands"),
         ("edit", "Make surgical edits to files"),
@@ -1276,8 +1280,9 @@ fn build_acp_system_prompt(cwd: &std::path::Path, enabled_tools: &[&str]) -> Str
          You have access to the following tools:\n\n",
     );
 
-    for (name, description) in &tool_descriptions {
+    for (name, description) in &default_tool_descriptions {
         if enabled_tools.contains(name) {
+            let description = tools.description_override(name).unwrap_or(description);
             let _ = writeln!(prompt, "- **{name}**: {description}");
         }
     }
@@ -1348,7 +1353,11 @@ fn handle_session_new(
     let tools = ToolRegistry::new(
         &enabled_tools,
         &cwd,
-        Some(pi_core::tool_config::ToolConfig::from(&options.config)),
+        Some(
+            options
+                .config
+                .tool_config_with_overrides(&Config::global_dir(), &cwd)?,
+        ),
     );
 
     // ACP should respect the same configured default provider/model preference
@@ -1360,7 +1369,7 @@ fn handle_session_new(
         .map_err(|e| Error::provider("acp", e.to_string()))?;
 
     // Build system prompt directly (avoids constructing a Cli struct).
-    let system_prompt = build_acp_system_prompt(&cwd, &enabled_tools);
+    let system_prompt = build_acp_system_prompt(&cwd, &enabled_tools, &tools);
 
     // Resolve API key from auth storage and model entry.
     let api_key = options

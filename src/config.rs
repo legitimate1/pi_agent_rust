@@ -1016,7 +1016,31 @@ impl From<&Config> for pi_core::tool_config::ToolConfig {
             image_auto_resize: c.image_auto_resize(),
             block_images: c.image_block_images(),
             tool_descriptions: c.tool_descriptions.clone().unwrap_or_default(),
+            tool_parameters: HashMap::new(),
         }
+    }
+}
+
+impl Config {
+    /// Build the [`ToolConfig`] for this settings config, layered on top of
+    /// the user- and project-level `tools.toml` overrides.
+    ///
+    /// `tools.toml` wins over `settings.json` `toolDescriptions` on key
+    /// collisions; `settings.json` values still apply for keys not present
+    /// in TOML.
+    pub fn tool_config_with_overrides(
+        &self,
+        global_dir: &Path,
+        cwd: &Path,
+    ) -> Result<pi_core::tool_config::ToolConfig> {
+        let mut tool_config = pi_core::tool_config::ToolConfig::from(self);
+        let overrides = crate::tool_overrides::load_tool_overrides(global_dir, cwd)
+            .map_err(|err| Error::Config(err.to_string()))?;
+        for (name, description) in overrides.descriptions {
+            tool_config.tool_descriptions.insert(name, description);
+        }
+        tool_config.tool_parameters = overrides.parameters;
+        Ok(tool_config)
     }
 }
 

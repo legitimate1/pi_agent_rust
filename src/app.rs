@@ -3,7 +3,7 @@
 //! This module exists to make core CLI logic testable without invoking the full
 //! interactive agent loop.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
@@ -153,6 +153,7 @@ pub fn build_initial_content(initial: &InitialMessage) -> Vec<ContentBlock> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::implicit_hasher)]
 pub fn build_system_prompt(
     cli: &cli::Cli,
     cwd: &Path,
@@ -162,6 +163,7 @@ pub fn build_system_prompt(
     package_dir: &Path,
     test_mode: bool,
     include_cwd: bool,
+    tool_descriptions: Option<&HashMap<String, String>>,
 ) -> Result<String> {
     use std::fmt::Write as _;
 
@@ -206,7 +208,7 @@ pub fn build_system_prompt(
     let mut prompt = custom_prompt
         .or(project_system_md)
         .or(user_system_md)
-        .unwrap_or_else(|| default_system_prompt(enabled_tools, package_dir));
+        .unwrap_or_else(|| default_system_prompt(enabled_tools, package_dir, tool_descriptions));
 
     if let Some(append_prompt) = append_prompt {
         prompt.push_str("\n\n");
@@ -267,8 +269,12 @@ fn resolve_prompt_input(input: Option<&str>, description: &str) -> Result<Option
     }
 }
 
-fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
-    let tool_descriptions = [
+fn default_system_prompt(
+    enabled_tools: &[&str],
+    package_dir: &Path,
+    tool_descriptions: Option<&HashMap<String, String>>,
+) -> String {
+    let default_tool_descriptions = [
         ("read", "Read file contents"),
         ("bash", "Execute bash commands (ls, grep, find, etc.)"),
         (
@@ -290,7 +296,15 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
 
     let mut tools = Vec::new();
     for tool in enabled_tools {
-        if let Some((_, description)) = tool_descriptions.iter().find(|(name, _)| name == tool) {
+        let description = tool_descriptions
+            .and_then(|overrides| overrides.get(*tool).map(String::as_str))
+            .or_else(|| {
+                default_tool_descriptions
+                    .iter()
+                    .find(|(name, _)| name == tool)
+                    .map(|(_, description)| *description)
+            });
+        if let Some(description) = description {
             tools.push(format!("- {tool}: {description}"));
         }
     }
