@@ -100,6 +100,7 @@ Point any other OpenAI-compatible server via `~/.pi/agent/models.json` (see [doc
 | `write` / `edit` / `hashline_edit` | Create, surgical replace (LINE#HASH anchors for precision), optional post-edit syntax verification |
 | `bash` / `pwsh`                    | Execute shell commands with timeout + process-tree cleanup                                         |
 | `grep` / `find` / `ls`             | Search content / discover files / list directories (respects `.gitignore`)                         |
+| `ast_grep` / `ast_edit`            | Structural code search & staged rewrite over ASTs (tree-sitter; comments/strings never match)      |
 
 All tools: automatic truncation (2000 lines / 1MB), detailed metadata, process-group cleanup (no orphaned processes).
 

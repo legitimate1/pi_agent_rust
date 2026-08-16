@@ -55,6 +55,7 @@
 - **工具描述外部覆盖** — `toolDescriptions` 配置免编译修改描述（旧入口，tools.toml 优先）| `src/config.rs` + `src/tools/mod.rs` + `src/agent.rs`
 - **tools.toml 工具可见信息覆盖** — `~/.pi/agent/tools.toml` + `.pi/tools.toml`（项目优先）逐工具覆盖 description 与 parameters（JSON Schema），description 同时作用于提示词文字层与 API schema 层，未覆盖工具保持默认 | `src/tool_overrides.rs` + `src/config.rs` + `src/tools/mod.rs` + `src/agent.rs` + `src/app.rs` + `src/main.rs` + `src/sdk.rs` + `src/acp.rs`
 - **编辑后轻量验证** — edit/hashline_edit/write 可选 verify 参数，自动语法/格式检查，结果附 details 不阻断 | `src/tools/verify.rs` + `src/tools/edit.rs` + `src/tools/hashline.rs` + `src/tools/write.rs`
+- **AST 结构搜索与编辑** — `ast_grep`（按语法树模式搜索，注释/字符串不算匹配）与 `ast_edit`（分阶段 staged 重写：proposal + unified diff、回滚、32 个 proposal 淘汰），按文件扩展名自动选语言（rust/python/js/ts/tsx/bash/go/ruby）| `src/ast_tools.rs`
 
 ## 扩展系统
 

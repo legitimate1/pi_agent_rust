@@ -3,7 +3,7 @@
 高性能 AI 编程智能体 CLI，Rust 移植版。提供交互式终端界面、流式响应、工具执行、会话持久化。
 
 - **语言/框架** — Rust 2024 nightly（见 `rust-toolchain.toml`），单静态二进制分发
-- **关键依赖** — asupersync（结构化并发运行时）、rich_rust（终端 UI）、serde、clap、rquickjs（扩展沙箱）
+- **关键依赖** — asupersync（结构化并发运行时）、rich_rust（终端 UI）、serde、clap、rquickjs（扩展沙箱）、ast-grep-language/ast-grep-core（AST 结构工具）
 
 ---
 
