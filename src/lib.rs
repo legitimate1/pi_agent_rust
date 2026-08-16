@@ -69,6 +69,7 @@ pub mod agent;
 pub use pi_core::agent_cx;
 #[doc(hidden)]
 pub mod app;
+pub mod ast_tools;
 #[doc(hidden)]
 pub mod auth;
 #[doc(hidden)]

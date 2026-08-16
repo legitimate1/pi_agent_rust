@@ -58,7 +58,11 @@ Resulting behavior:
 
 ### Appearance
 
-- `theme` (string): Theme name to apply. Defaults to `dark` if unset.
+- `theme` (string): Theme to apply. Built-ins: `dark`, `light`, `solarized`; also
+  accepts a discovered theme name or a path to a theme JSON file. `light/dark`,
+  `auto`, or `system` auto-detect dark/light from the terminal background via the
+  `COLORFGBG` environment variable (dark when unavailable). If unset, auto-detects
+  the same way.
 - `hide_thinking_block` (bool): Hide thinking blocks in interactive output. Default `false`.
 - `show_hardware_cursor` (bool): Show terminal hardware cursor. Default `false` unless
   `PI_HARDWARE_CURSOR=1`.
@@ -159,6 +163,24 @@ Accessor defaults:
 }
 ```
 
+### Subagents
+
+- `subagent_structured_results` (bool): Default `false`. Alias: `subagentStructuredResults`.
+  When `true`, the `subagent` tool appends a machine-readable
+  `<subagent-structured-result>` block to its result text: a compact JSON array
+  with one entry per child (`agent`, `step`, `status`, `exitCode`, `output`,
+  `error` — the same field names as the `pi.subagent.result.v1` details
+  schema). `output`/`error` are truncated to 2 KiB each and the whole block is
+  capped at 16 KiB; when entries must be dropped, the final array element is
+  `{"truncated": true, "omittedResults": N}`. Default `false` keeps the tool
+  output byte-identical to previous releases.
+
+```json
+{
+  "subagent_structured_results": true
+}
+```
+
 ### Images
 
 - `images.auto_resize` (bool): Default `true`.
@@ -185,6 +207,7 @@ Accessor defaults:
 - `thinking_budgets.medium`: default `8192`
 - `thinking_budgets.high`: default `16384`
 - `thinking_budgets.xhigh`: default `32768`
+- `thinking_budgets.max`: default `65536`
 
 ### Packages and resources
 

@@ -129,8 +129,27 @@ and run the report with `PERF_EVIDENCE_DIR`:
 
 ```bash
 PERF_EVIDENCE_DIR=tests/perf/reports \
-  rch exec -- cargo test --test perf_budgets --profile perf generate_budget_report -- --nocapture
+  PI_GENERATE_PERF_BUDGET_REPORT=1 rch exec -- cargo test --test perf_budgets --profile perf generate_budget_report -- --nocapture
 ```
+
+Both report-producing integration tests are read-only during ordinary test
+runs. Refresh tracked artifacts only with their explicit opt-ins:
+
+```bash
+PI_GENERATE_PERF_BUDGET_REPORT=1 cargo test --test perf_budgets generate_budget_report -- --nocapture
+PI_GENERATE_BENCH_SCHEMA_DOCS=1 cargo test --test bench_schema generate_schema_doc -- --nocapture
+```
+
+In `pi.perf.budget_summary.v2`, `performance_claims_authorized=true` governs
+blanket quantitative performance copy. It therefore requires strict,
+source-bound, same-run evidence for **all declared budgets**: every budget must
+have data and PASS, including budgets that are not CI-enforced, and there must
+be no data-contract failures. `budget_data_missing` and `budget_failed` are the
+aggregate blocker codes; the CI-specific counts and blockers remain as
+diagnostics. When that authoritative lineage is incomplete, the tracked report
+is a canonical all-`NO_DATA` blocked sentinel and deliberately does not inspect
+ambient Cargo targets, ignored artifacts, or filesystem mtimes. A complete
+strict lineage is required before real artifact evaluation begins.
 
 `tests/perf_budgets.rs` checks `PERF_EVIDENCE_DIR`/`PERF_EVIDENCE_DIRS` before
 `CARGO_TARGET_DIR`, so the report can consume staged evidence that RCH actually
@@ -489,7 +508,7 @@ match expected schemas:
 - `tests/full_suite_gate/certification_verdict.json` (`pi.ci.certification_lane.v1`)
 - `tests/full_suite_gate/perf3x_bead_coverage_audit.json` (`pi.perf3x.bead_coverage.audit.v1`)
 - `tests/full_suite_gate/practical_finish_checkpoint.json` (`pi.perf3x.practical_finish_checkpoint.v1`)
-- `tests/perf/reports/budget_summary.json` (`pi.perf.budget_summary.v1`)
+- `tests/perf/reports/budget_summary.json` (`pi.perf.budget_summary.v2`)
 - `tests/perf/reports/perf_comparison.json` (`pi.ext.perf_comparison.v1`)
 - `tests/perf/reports/stress_triage.json` (`pi.ext.stress_triage.v1`)
 - `tests/perf/reports/parameter_sweeps.json` (`pi.perf.parameter_sweeps.v1`)
@@ -505,7 +524,7 @@ required = {
     "tests/full_suite_gate/certification_verdict.json": "pi.ci.certification_lane.v1",
     "tests/full_suite_gate/perf3x_bead_coverage_audit.json": "pi.perf3x.bead_coverage.audit.v1",
     "tests/full_suite_gate/practical_finish_checkpoint.json": "pi.perf3x.practical_finish_checkpoint.v1",
-    "tests/perf/reports/budget_summary.json": "pi.perf.budget_summary.v1",
+    "tests/perf/reports/budget_summary.json": "pi.perf.budget_summary.v2",
     "tests/perf/reports/perf_comparison.json": "pi.ext.perf_comparison.v1",
     "tests/perf/reports/stress_triage.json": "pi.ext.stress_triage.v1",
     "tests/perf/reports/parameter_sweeps.json": "pi.perf.parameter_sweeps.v1",

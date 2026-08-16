@@ -248,6 +248,8 @@ ast-grep-language = { version = "0.40", default-features = false, features = [
     "tree-sitter-javascript",
     "tree-sitter-typescript",
     "tree-sitter-ruby",
+    "tree-sitter-rust",
+    "tree-sitter-go",
 ] }
 unicode-normalization = "0.1"
 toml = "1.0.3"

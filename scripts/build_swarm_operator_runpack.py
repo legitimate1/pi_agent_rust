@@ -278,7 +278,7 @@ SEMANTIC_ROUTE_RUNPACK_GOLDEN = "semantic_route_runpack_projection.json"
 UPDATE_GOLDEN_ENV = "UPDATE_SWARM_OPERATOR_RUNPACK_GOLDEN"
 DEFAULT_MAX_ITEMS = 8
 DEFAULT_STALE_AFTER_HOURS = 24
-DEFAULT_CAPTURE_TIMEOUT_SECONDS = 12
+DEFAULT_CAPTURE_TIMEOUT_SECONDS = 30
 CAPTURE_SNIPPET_MAX_CHARS = 1200
 SCORECARD_MAX_PER_DIMENSION = 2
 AGENT_MAIL_SCHEMA_CORRUPT_FIXTURE = Path(
@@ -10166,19 +10166,25 @@ def is_temp_artifact_path(path: str) -> bool:
 
 
 def temp_artifact_kind_from_path(path: str, fallback: str) -> str:
+    if fallback not in {"temp_artifact", "command_output"}:
+        return fallback
+
     lowered = path.lower()
-    if "cargo" in lowered and "target" in lowered:
-        return "cargo_target_dir"
-    if "tmp" in lowered and "cargo" in lowered:
-        return "cargo_tmpdir"
-    if ".rch-target" in lowered:
-        return "rch_remote_target_dir"
-    if ".rch-tmp" in lowered:
-        return "rch_remote_tmpdir"
+    # Specific leaf/workspace markers must win over broad parent-directory
+    # hints. RCH and CI commonly place every test temp path below a directory
+    # containing `cargo`, `target`, or both.
     if "clean-worktree" in lowered or "clean_worktree" in lowered:
         return "clean_worktree_validation_dir"
     if "git_scan" in lowered or "ubs" in lowered:
         return "ubs_shadow_workspace"
+    if ".rch-target" in lowered:
+        return "rch_remote_target_dir"
+    if ".rch-tmp" in lowered:
+        return "rch_remote_tmpdir"
+    if "cargo" in lowered and "target" in lowered:
+        return "cargo_target_dir"
+    if "tmp" in lowered and "cargo" in lowered:
+        return "cargo_tmpdir"
     return fallback
 
 

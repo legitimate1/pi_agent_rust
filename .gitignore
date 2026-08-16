@@ -275,3 +275,7 @@ storage.sqlite3-wal.corrupt-*
 /ubs_findings.txt
 
 sweep.timestamp
+sweep.timestamp
+.env
+agy.mcp.json
+factory.mcp.json

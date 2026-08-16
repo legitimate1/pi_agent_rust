@@ -14,7 +14,181 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
+## [v0.2.0] — 2026-08-06 — Release
+
+### Breaking Changes
+
+- **The Rust SDK now boxes in-process prompt results** —
+  `SessionPromptResult::InProcess` carries `Box<AssistantMessage>`. SDK callers
+  that construct or pattern-match this variant must account for the box.
+- **Assistant stop metadata is richer** — `AssistantMessage` adds optional
+  structured `stop_details`, `pi::sdk` now exports `StopDetails`, and
+  `StopReason` adds `PauseTurn` and `Refusal`. Downstream `AssistantMessage`
+  struct literals must initialize the new field (normally with `None`), and
+  exhaustive `StopReason` matches must handle the new variants.
+- **The minimum supported Rust version is now 1.95** — published crate metadata
+  declares Rust 1.95, while repository release builds remain reproducibly
+  pinned to `nightly-2026-07-05`.
+- **Static model-catalog lookup is now fallible** —
+  `pi::providers::static_registry_models` returns `Result<Vec<String>>` so
+  malformed, unsafe, or resource-exceeding local catalog data cannot be
+  mistaken for a valid empty fallback.
+- **Fetched-catalog persistence is provenance-bearing** — the public
+  `persist_provider_model_catalog` API now accepts a `ProviderModelCatalog`
+  rather than arbitrary provider/model rows, and that catalog's fields are
+  private with read-only accessors. The generated on-disk schema advances from
+  `pi.models.fetched.v1` to `pi.models.fetched.v2`. Pi preserves v1 bytes;
+  move `models.fetched.json` aside first, then run a verified live
+  `--fetch-models <provider> --refresh-models --persist-models` refresh to
+  create the v2 catalog.
+- **Runtime credentials now outrank `models.json` credentials** — explicit,
+  ambient, stored, or external-provider credentials are used before a
+  provider route's `apiKey`; the route value is now a fallback. Live catalog
+  discovery and inference therefore use the same credential precedence.
+
 ### Features
+
+- **Native, opt-in subagent orchestration** — the ninth built-in tool can run
+  one named child agent, bounded parallel tasks, or a sequential chain. Child
+  processes inherit the parent environment (including auth/router variables),
+  apply each agent definition's model, reasoning, skill, and configured-or-default
+  tool list, stream structured progress, and are cancelled and reaped with their
+  parent. Addresses [#132](https://github.com/Dicklesworthstone/pi_agent_rust/issues/132),
+  [#144](https://github.com/Dicklesworthstone/pi_agent_rust/issues/144), and
+  [#145](https://github.com/Dicklesworthstone/pi_agent_rust/issues/145).
+- **Provider and model parity improvements** — Anthropic `pause_turn` responses
+  resume with a bounded continuation budget, refusal details remain structured,
+  extension-registered providers can stream through the provider factory, and
+  the built-in catalog includes GPT-5.6 Sol, Terra, and Luna seeds.
+- **Live provider catalogs are usable outside the TUI** — `--fetch-models`
+  prints model IDs and exits, `--refresh-models` requires a genuine live
+  response, and `--persist-models` atomically records only verified live or
+  same-process-cache results in `models.fetched.json`. Persisted provider/model
+  membership carries a fetch timestamp and non-secret endpoint/transport
+  fingerprint that excludes credential, URL-query, and header values; rows are
+  ignored with an actionable error if the current route shape no longer
+  matches, while credential rotation remains valid. Separate CLI invocations
+  start with an empty in-memory cache. The generated catalog feeds future
+  `--list-models` and interactive model pickers without rewriting or overriding
+  hand-authored `models.json`. Fixes
+  [#150](https://github.com/Dicklesworthstone/pi_agent_rust/issues/150).
+- **Retired GitHub Models routing removed** — the `github-models` preset and
+  dead upstream autocomplete rows are no longer exposed after GitHub retired
+  the service on 2026-07-30. The distinct `github-copilot` native provider
+  remains supported.
+- **Injectable model credential resolution** — harnesses and SDK embedders can
+  load the model registry without ambient process credentials affecting model
+  availability, while production continues to use `AuthStorage`.
+
+### Reliability and Release Integrity
+
+- **Truncated tool calls fail explicitly** — a provider token limit reached
+  while a tool call is incomplete now ends the turn as an error instead of
+  silently treating an unusable partial call as a normal length stop. Fixes
+  [#148](https://github.com/Dicklesworthstone/pi_agent_rust/issues/148).
+- **File-lock ownership is identity-aware** — long-held locks refresh a
+  heartbeat, stale reclaim checks ownership, and displaced owners cannot remove
+  a replacement lock directory.
+- **Model-catalog filesystem policy is deterministic under root and ordinary
+  users** — reads enforce the effective Unix owner/group/other class on both
+  files and traversed directories. Generated-catalog persistence preflights
+  target and directory read/write/search access before creating directories,
+  locks, or temporary files, and rejects final symlinks without mutation.
+- **Concurrency-sensitive tests are deterministic** — RPC crash-recovery
+  checkpoints, process-wide current-directory mutation, remote-worker fixtures,
+  and extension memory/scanner cases now isolate their shared state.
+- **Extension corpus scans are read-only by default** — ordinary test runs now
+  validate the committed entry-point scan in place and keep auxiliary scan
+  results in memory, so an ignored generated file cannot contaminate the
+  fail-closed must-pass source snapshot. Maintainers can regenerate scan
+  artifacts explicitly with `PI_GENERATE_EXT_ENTRY_SCAN=1`.
+- **Release builds no longer compile duplicate process-inspection stacks** —
+  the direct `sysinfo` dependency now matches the version already used by the
+  runtime. This preserves process-tree behavior while reducing binary-size
+  pressure.
+- **Embedded release resources are losslessly size-optimized** — deterministic
+  gzip and compile-time LZSS encoding preserve the exact source bytes while
+  avoiding duplicate large text literals in the executable. The release-only
+  LLVM machine outliner further reduces repeated instruction sequences without
+  changing development/test profiles; round-trip, CLI-parity, and executable
+  hardening checks guard the shipping path.
+- **Extension filesystem fallback is more robust** — a denied host `readdir`
+  no longer aborts the filesystem shim before later fallback paths are checked.
+- **Extension VFS isolation is enforced end to end** — registered roots under
+  `/tmp` remain host-backed while unrelated scratch paths stay private per
+  extension; cached data, every hop of virtual symlink resolution, and shared
+  file-descriptor operations are re-authorized for the active extension. The
+  raw shared VFS state is no longer exposed to extension code.
+- **Extension reloads use fresh JavaScript realms** — reset-time registry and
+  intrinsic checks are hygiene evidence before dropping a realm, not authority
+  to reuse arbitrary mutable module/global state. Versioned transpile-cache
+  artifacts remain reusable across cold owner-isolated realms.
+- **Context-evidence suppression is deterministic** — duplicate stale/unsafe
+  suppression records are collapsed per source and reason while the complete
+  excluded-item audit trail is retained.
+- **Release evidence fails closed** — must-pass extension evidence is bound to
+  the exact authoritative inclusion-list identities, corresponding validated
+  manifest metadata, source-tree/inclusion-list/manifest digests, run lineage,
+  non-skipped per-extension events, and exact declared runtime registrations.
+  Stale, smaller, or identity-expanded historical evidence cannot certify a
+  release. PiJS tool-call regression inputs now require exactly 2,000
+  executable-path-verified perf-profile QuickJS iterations through the
+  production extension manager; the 1-call lane gates arithmetic mean latency
+  and the 10-call lane gates
+  aggregate throughput. Debug, unverified-profile, preview, native-comparison,
+  explicitly ineligible, malformed, stale, and uncontrolled host-page-cache
+  load records cannot satisfy their respective gates. These checks gate
+  performance-claim admission. v0.2.0 remains explicitly
+  performance-claims-NOT-authorized because its checked-in budget summary is a
+  valid blocked/NO_DATA artifact; publication may proceed only without
+  quantitative or global performance claims. The producer and validator share
+  the canonical G01–G12 contract. The v2 claim contract also pins the complete
+  19-budget inventory and requires every declared budget to have data and pass
+  before its global performance-authorization boolean can become true; CI-only
+  counters remain additional diagnostics rather than an authorization loophole.
+  Per-target build manifests now identify selected sibling-project crates by
+  their locked registry version, source, and checksum instead of attributing
+  binaries to unrelated sibling repository HEADs.
+- **Cargo-audit vulnerability findings are remediated** — the lockfile
+  advances `anyhow`, `crossbeam-epoch`, `event-listener`, `memmap2`,
+  `plist`/`quick-xml`, and the optional Wasmtime component host to their
+  patched release lines. Warning-only upstream maintenance inventory remains
+  tracked separately. Wasmtime 47 compatibility also uses a movable owned
+  runtime guard and gains real component load, call, trap, and malformed-input
+  coverage.
+
+### Internal
+
+- Decomposed the extension monolith behind the stable `src/extensions.rs`
+  façade: manager orchestration, protocol/reactor, filesystem, exec mediation,
+  permission drift, event coalescing, native/Wasm runtime, and
+  characterization-test domains now live in focused `src/extensions/` modules
+  while public type definitions and import paths remain in the façade. Addresses
+  [#130](https://github.com/Dicklesworthstone/pi_agent_rust/issues/130).
+- Extracted the extension compatibility scanner into its own module while
+  preserving the public compatibility contract and expanded the conformance,
+  governance, provider, SDK, RPC, and swarm evidence suites.
+
+## [v0.1.23] — 2026-07-28 — Release
+
+### Features
+
+- **First-class `max` thinking level above `xhigh`** — `--thinking max`,
+  `/thinking max`, ACP `session/set_config_option`, and RPC
+  `available_thinking_levels` all accept the new 7th level. Anthropic
+  adaptive-thinking models send `output_config.effort: "max"` (Opus 4.6 /
+  Sonnet 4.6 accept `max` without `xhigh`, per the documented effort matrix);
+  DeepSeek reasoning models send `reasoning_effort: "max"` (with `xhigh`
+  keeping its historical `"max"` mapping so existing configs are unchanged);
+  models without a `max` wire value clamp to `xhigh`/`high`. Legacy
+  budget-based thinking gains a `thinking_budgets.max` slot (default `65536`).
+  Fixes [#139](https://github.com/Dicklesworthstone/pi_agent_rust/issues/139).
+- **Atlas Cloud provider preset** — `atlascloud` (aliases `atlas-cloud`,
+  `atlas`) routes through the OpenAI-compatible chat-completions adapter at
+  `https://api.atlascloud.ai/v1` with `ATLASCLOUD_API_KEY` /
+  `ATLAS_CLOUD_API_KEY`. From
+  [#141](https://github.com/Dicklesworthstone/pi_agent_rust/pull/141),
+  implemented independently after verifying the live service.
 
 - **Newer z.ai (GLM) and MiniMax models in the registry** — the model catalog
   now includes z.ai **GLM-5.1** (`glm-5.1`, 200K context) and **GLM-5.2**
@@ -38,6 +212,37 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ### Bug Fixes
 
+- **`--mode rpc` no longer drops or hangs the turn when stdin closes**
+  — piping a single command (`printf '{"type":"prompt",...}' | pi --mode
+  rpc`) tore the session down while the prompt task was still starting or
+  streaming: current builds silently lost every event after the ack, older
+  builds hung after `turn_start`. The RPC loop now drains in-flight work at
+  EOF (streaming turns with retries and queued steering/follow-ups,
+  extension commands, auto-compaction, background bash), cancels extension
+  UI requests that can no longer be answered, guards the activity flags
+  against panic/cancellation leaks, and flushes the stdout writer behind a
+  shutdown sentinel so the full stream through `agent_end` reaches the
+  client. Fixes
+  [#137](https://github.com/Dicklesworthstone/pi_agent_rust/issues/137).
+- **Startup no longer probes the npm registry for installed packages** —
+  installed exact and conventional-range npm specs are now satisfied
+  locally (ranges like `npm:pkg@^1.2.0` previously re-ran a full
+  `npm install` on every startup, and dist-tag specs could fail startup
+  lock verification), `npm root -g` runs at most once per resolution pass,
+  and `pi update` refreshes ranges/dist-tags while exact pins stay pinned,
+  matching upstream TypeScript pi semantics. Lock entries whose stored
+  `pinned` classification predates this change rotate cleanly instead of
+  hard-failing verification. No new dependencies. From the report in
+  [#140](https://github.com/Dicklesworthstone/pi_agent_rust/pull/140).
+- **CI gates repaired on main** — `tests/e2e_transient_retry_resume.rs` is
+  registered in the suite-classification and traceability registries
+  (caught via
+  [#135](https://github.com/Dicklesworthstone/pi_agent_rust/pull/135));
+  the provider-metadata snapshot suite reflects reality again (95 canonical
+  providers / 51 aliases, including previously unregistered `cursor`,
+  `llamacpp`, and `mistralrs`); and `clippy --all-targets -- -D warnings`
+  is clean again (six `future_not_send` guard-across-await sites converted
+  to `OwnedMutexGuard`).
 - **Windows `WSAENOTCONN` retry now also fires for TLS errors surfaced through
   non-`Io` variants** — `is_retryable_not_connected_tls` walks the `TlsError`
   source chain in addition to matching the direct `Io` variant, so a "socket
@@ -45,6 +250,19 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   detected and retried with a fresh connection. Hardens
   [#111](https://github.com/Dicklesworthstone/pi_agent_rust/issues/111) /
   [#106](https://github.com/Dicklesworthstone/pi_agent_rust/issues/106).
+- **Streamed tool-call partials carry id/name from the first delta**
+  ([#129](https://github.com/Dicklesworthstone/pi_agent_rust/issues/129)),
+  **fsync refusals on virtiofs/FUSE filesystems no longer fail writes**
+  ([#136](https://github.com/Dicklesworthstone/pi_agent_rust/issues/136)),
+  and the extension compatibility layer supports current Pi package APIs
+  (pi-subagents 0.34.0 import contract; groundwork for
+  [#132](https://github.com/Dicklesworthstone/pi_agent_rust/issues/132)).
+
+### Internal
+
+- Async runtime migrated to **asupersync 0.3.9** with `OwnedMutexGuard` at
+  every spawned lock site; the fuzz workspace dropped its stale asupersync
+  git-rev pin and re-locked on the published crate.
 
 ## [v0.1.22] — 2026-07-10
 
@@ -987,12 +1205,19 @@ Key early commits:
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.20...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.2.0...HEAD
+[v0.2.0]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.23...v0.2.0
+[v0.1.23]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.22...v0.1.23
+[v0.1.22]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.21...v0.1.22
 [v0.1.20]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.19...v0.1.20
 [v0.1.19]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.18...v0.1.19
 [v0.1.18]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.17...v0.1.18
 [v0.1.17]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.16...v0.1.17
 [v0.1.16]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.15...v0.1.16
+[v0.1.15]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.14...v0.1.15
+[v0.1.14]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.13...v0.1.14
+[v0.1.12]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.11...v0.1.12
+[v0.1.11]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.10...v0.1.11
 [v0.1.9]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.8...v0.1.9
 [v0.1.8]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.7...v0.1.8
 [v0.1.7]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.6...v0.1.7
