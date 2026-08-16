@@ -124,3 +124,5 @@ cargo test -- --nocapture                # 带输出
   - 新增静态检查工具 / 优化 verify 检查逻辑时读
 - **症状排查手册** — `docs/context/debugging.md`
   - 症状已知但根因不明时读：症状路由表、调试 playbook、安装器补丁模式
+- **追上游 / 合并上游** — `docs/upstream/`
+  - 追上游时读 `fork-merge-sop.md`(SOP)+ `known-test-failures.md`(对照基准)+ `upstream-qa-bead-swarm-guide.md`(体系理解);全量测试跑完对照已知失败清单
