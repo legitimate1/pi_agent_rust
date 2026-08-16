@@ -23,9 +23,9 @@
 //! rolls back already-written files from the staged originals.
 //! `action: "reject"` discards the proposal with zero writes.
 
+use crate::abort::AbortSignal;
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
-use crate::abort::AbortSignal;
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
 use ast_grep_core::{AstGrep, Pattern};
 use ast_grep_language::SupportLang;
@@ -414,7 +414,8 @@ impl AstGrepTool {
         }
     }
 
-    fn run(&self, input: AstGrepInput) -> Result<ToolOutput> {
+    #[allow(clippy::too_many_lines)]
+    fn run(&self, input: &AstGrepInput) -> Result<ToolOutput> {
         if input.pattern.trim().is_empty() {
             return Err(Error::validation("`pattern` must not be empty"));
         }
@@ -545,6 +546,7 @@ impl AstGrepTool {
 }
 
 #[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
 impl Tool for AstGrepTool {
     fn name(&self) -> &str {
         "ast_grep"
@@ -600,7 +602,7 @@ impl Tool for AstGrepTool {
     ) -> Result<ToolOutput> {
         let input: AstGrepInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
-        self.run(input)
+        self.run(&input)
     }
 }
 
@@ -810,6 +812,7 @@ impl AstEditTool {
         Ok((current, replacements))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn stage(&self, input: &AstEditInput) -> Result<ToolOutput> {
         let ops = input
             .ops
@@ -1082,6 +1085,7 @@ impl AstEditTool {
 }
 
 #[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
 impl Tool for AstEditTool {
     fn name(&self) -> &str {
         "ast_edit"
