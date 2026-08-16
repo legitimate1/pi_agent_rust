@@ -17,7 +17,7 @@
             "bd-zeccr.4": "Completed structure-aware swarm input fuzz/property harnesses with minimized golden fixture",
             "bd-zeccr.5": "Completed metamorphic swarm replay equivalence transforms and negative control"
           },
-          "path": ".beads/issues.jsonl"
+          "path": "docs/evidence/closeout-evidence-registry.json"
         }
       ],
       "id": "child_beads_closed",
@@ -39,7 +39,7 @@
               ],
               "commit": "0730f099ab0a39a12e4096cb6d7f765b36763d13",
               "docs_or_evidence_paths": [
-                ".beads/issues.jsonl"
+                "docs/evidence/closeout-evidence-registry.json"
               ],
               "negative_control": {
                 "evidence": [
@@ -172,7 +172,7 @@
               ],
               "commit": "f001464e216fa02d7e691fd7831e24077f92c685",
               "docs_or_evidence_paths": [
-                ".beads/issues.jsonl"
+                "docs/evidence/closeout-evidence-registry.json"
               ],
               "negative_control": {
                 "evidence": [
@@ -274,7 +274,7 @@
         {
           "boundary": "Beads issue state, dependencies, comments, and close reasons remain the work ledger.",
           "evidence": [
-            ".beads/issues.jsonl"
+            "docs/evidence/closeout-evidence-registry.json"
           ],
           "id": "beads_are_source_of_truth",
           "status": "pass"
@@ -469,7 +469,7 @@
       ],
       "commit": "0730f099ab0a39a12e4096cb6d7f765b36763d13",
       "docs_or_evidence_paths": [
-        ".beads/issues.jsonl"
+        "docs/evidence/closeout-evidence-registry.json"
       ],
       "negative_control": {
         "evidence": [
@@ -602,7 +602,7 @@
       ],
       "commit": "f001464e216fa02d7e691fd7831e24077f92c685",
       "docs_or_evidence_paths": [
-        ".beads/issues.jsonl"
+        "docs/evidence/closeout-evidence-registry.json"
       ],
       "negative_control": {
         "evidence": [
@@ -750,7 +750,7 @@
     {
       "boundary": "Beads issue state, dependencies, comments, and close reasons remain the work ledger.",
       "evidence": [
-        ".beads/issues.jsonl"
+        "docs/evidence/closeout-evidence-registry.json"
       ],
       "id": "beads_are_source_of_truth",
       "status": "pass"
