@@ -1,5 +1,26 @@
 version: 2
 updates:
+  # DISABLED for this fork: upstream's dependabot auto-update would create
+  # noise PRs here. If you want model-catalog bumps again, remove the
+  # "enabled: false" line below.
+  - package-ecosystem: npm
+    directory: /scripts
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 0
+    enabled: false
+  # (original upstream block kept below for reference, disabled)
+  # - package-ecosystem: npm
+  #   directory: /scripts
+  #   schedule:
+  #     interval: weekly
+  #     day: monday
+  #   open-pull-requests-limit: 2
+  #   commit-message:
+  #     prefix: "chore(deps)"
+  #   allow:
+  #     - dependency-name: "@earendil-works/pi-ai"
   # Bump the pinned upstream model-catalog source so picking up new models is a
   # version bump (handled with scripts/gen-model-catalog.mjs + the
   # model-catalog-drift workflow), not a manual edit. See gh #117 and
