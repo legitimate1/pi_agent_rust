@@ -23,6 +23,24 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+fn bash_command() -> Command {
+    if cfg!(windows) {
+        // On Windows, `Command::new("bash")` may resolve to WSL bash
+        // (C:\Windows\System32\bash.exe) which is first in PATH and mangles
+        // `C:\` Windows paths (`\U` treated as escape → `C:Usersm...`).
+        // Prefer Git's bash which understands Windows paths via cygpath.
+        for candidate in [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+        ] {
+            if Path::new(candidate).exists() {
+                return Command::new(candidate);
+            }
+        }
+    }
+    Command::new("bash")
+}
+
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const TESTING_POLICY_PATH: &str = "docs/testing-policy.md";
@@ -3586,7 +3604,7 @@ exit 0
         std::fs::write(&profile_data_path, bytes).expect("write profile data fixture");
     }
 
-    let output = Command::new("bash")
+    let output = bash_command()
         .arg(BENCH_EXTENSION_WORKLOADS_SCRIPT_PATH)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("PATH", joined_path)
@@ -4367,7 +4385,7 @@ fn capture_baseline_cross_env_diagnosis_emits_structured_report_and_log() {
     )
     .expect("write canary baseline fixture");
 
-    let output = Command::new("bash")
+    let output = bash_command()
         .arg(CAPTURE_BASELINE_SCRIPT_PATH)
         .arg("--diagnose-env")
         .arg(format!("ci={}", baseline_ci.display()))

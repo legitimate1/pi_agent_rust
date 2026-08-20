@@ -488,7 +488,12 @@ fn tool_bash_nonexistent_working_directory() {
 fn tool_bash_timeout_kills_process() {
     asupersync::test_utils::run_test(|| async {
         let _h = TestHarness::new("bash_timeout_kills");
-        let tool = pi::tools::BashTool::new(std::path::Path::new("/tmp"));
+        let cwd = if cfg!(windows) {
+            _h.temp_dir().to_path_buf()
+        } else {
+            std::path::PathBuf::from("/tmp")
+        };
+        let tool = pi::tools::BashTool::new(&cwd);
         let input = json!({
             "command": "sleep 30",
             "timeout": 1
@@ -864,7 +869,12 @@ fn tool_write_missing_content() {
 fn tool_bash_missing_command() {
     asupersync::test_utils::run_test(|| async {
         let _h = TestHarness::new("bash_missing_command");
-        let tool = pi::tools::BashTool::new(std::path::Path::new("/tmp"));
+        let cwd = if cfg!(windows) {
+            _h.temp_dir().to_path_buf()
+        } else {
+            std::path::PathBuf::from("/tmp")
+        };
+        let tool = pi::tools::BashTool::new(&cwd);
         // Missing command field
         let input = json!({ "timeout": 5 });
         let result = exec_tool(&tool, "bash-bad-1", input).await;
@@ -1487,7 +1497,12 @@ fn agent_event_lifecycle_with_tools() {
 fn tool_bash_exit_code_capture() {
     asupersync::test_utils::run_test(|| async {
         let _h = TestHarness::new("bash_exit_code");
-        let tool = pi::tools::BashTool::new(std::path::Path::new("/tmp"));
+        let cwd = if cfg!(windows) {
+            _h.temp_dir().to_path_buf()
+        } else {
+            std::path::PathBuf::from("/tmp")
+        };
+        let tool = pi::tools::BashTool::new(&cwd);
         let input = json!({ "command": "exit 42" });
         let result = exec_tool(&tool, "bash-exit-1", input).await;
 
@@ -1506,7 +1521,12 @@ fn tool_bash_exit_code_capture() {
 fn tool_bash_stdout_stderr_capture() {
     asupersync::test_utils::run_test(|| async {
         let _h = TestHarness::new("bash_stderr");
-        let tool = pi::tools::BashTool::new(std::path::Path::new("/tmp"));
+        let cwd = if cfg!(windows) {
+            _h.temp_dir().to_path_buf()
+        } else {
+            std::path::PathBuf::from("/tmp")
+        };
+        let tool = pi::tools::BashTool::new(&cwd);
         let input = json!({ "command": "echo 'out_msg' && echo 'err_msg' >&2" });
         let result = exec_tool(&tool, "bash-stderr-1", input).await;
 

@@ -511,10 +511,10 @@
   "rollup": {
     "entry_count": 14,
     "severity_counts": {
-      "high": 0,
+      "high": 1,
       "medium": 0,
       "low": 0,
-      "resolved": 12,
+      "resolved": 11,
       "waived": 1,
       "retired": 1
     },

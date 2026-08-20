@@ -69,16 +69,38 @@ bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
 
 die() { red "ERROR: $*" >&2; exit 1; }
 
+to_unix_path_if_needed() {
+  local p="$1"
+  if [[ "$p" == *\\* ]] || [[ "$p" =~ ^[A-Za-z]: ]]; then
+    if command -v cygpath >/dev/null 2>&1; then
+      cygpath -u "$p" 2>/dev/null || printf '%s' "$p"
+      return
+    fi
+  fi
+  printf '%s' "$p"
+}
+
 # ─── CLI Parsing ─────────────────────────────────────────────────────────────
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --rounds)  ROUNDS="$2"; shift 2 ;;
-    --output)  OUTPUT="$2"; shift 2 ;;
+    --output)  OUTPUT="$(to_unix_path_if_needed "$2")"; shift 2 ;;
     --quick)   QUICK=1; ROUNDS=3; WARMUP_ROUNDS=0; shift ;;
-    --validate) VALIDATE_ONLY="$2"; shift 2 ;;
-    --diagnose-env) DIAGNOSE_ENVS+=("$2"); shift 2 ;;
-    --diagnose-output) DIAGNOSE_OUTPUT="$2"; shift 2 ;;
+    --validate) VALIDATE_ONLY="$(to_unix_path_if_needed "$2")"; shift 2 ;;
+    --diagnose-env)
+      raw="$2"
+      if [[ "$raw" == *"="* ]]; then
+        label="${raw%%=*}"
+        path_part="${raw#*=}"
+        path_part="$(to_unix_path_if_needed "$path_part")"
+        DIAGNOSE_ENVS+=("$label=$path_part")
+      else
+        DIAGNOSE_ENVS+=("$raw")
+      fi
+      shift 2
+      ;;
+    --diagnose-output) DIAGNOSE_OUTPUT="$(to_unix_path_if_needed "$2")"; shift 2 ;;
     --variance-alert-pct) VARIANCE_ALERT_PCT="$2"; shift 2 ;;
     --no-rch)
       if [[ "$SEEN_REQUIRE_RCH" == true ]]; then
