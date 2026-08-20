@@ -68,7 +68,7 @@
                 ]
               }
             ],
-            "system": "JSON mode event stream test.\nCurrent date and time: <TIMESTAMP>\nCurrent working directory: <CWD>",
+            "system": "JSON mode event stream test.\nCurrent date and time: <TIMESTAMP>\nCurrent working directory: <CWD>\nCurrent temporary directory: <TEMP>",
             "max_tokens": 64000,
             "stream": true
           }

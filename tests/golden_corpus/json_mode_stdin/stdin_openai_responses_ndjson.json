@@ -4,16 +4,21 @@
   "surface": "json_mode_stdin",
   "description": "JSON mode with stdin: OpenAI Responses NDJSON stream playback",
   "cli_args": [
-    "--mode", "json",
-    "--provider", "openai",
-    "--model", "gpt-4o-mini",
+    "--mode",
+    "json",
+    "--provider",
+    "openai",
+    "--model",
+    "gpt-4o-mini",
     "--no-tools",
     "--no-extensions",
     "--no-skills",
     "--no-prompt-templates",
     "--no-themes",
-    "--thinking", "off",
-    "--system-prompt", "JSON stdin test."
+    "--thinking",
+    "off",
+    "--system-prompt",
+    "JSON stdin test."
   ],
   "stdin": "JSON stdin body\n",
   "env_overrides": {
@@ -29,9 +34,18 @@
           "method": "POST",
           "url": "https://api.openai.com/v1/responses",
           "headers": [
-            ["Authorization", "[REDACTED]"],
-            ["Content-Type", "application/json"],
-            ["Accept", "text/event-stream, application/x-ndjson, application/ndjson"]
+            [
+              "Authorization",
+              "[REDACTED]"
+            ],
+            [
+              "Content-Type",
+              "application/json"
+            ],
+            [
+              "Accept",
+              "text/event-stream, application/x-ndjson, application/ndjson"
+            ]
           ],
           "body": {
             "model": "gpt-4o-mini",
@@ -39,11 +53,14 @@
               {
                 "role": "user",
                 "content": [
-                  { "type": "input_text", "text": "JSON stdin body" }
+                  {
+                    "type": "input_text",
+                    "text": "JSON stdin body"
+                  }
                 ]
               }
             ],
-            "instructions": "JSON stdin test.\nCurrent date and time: <TIMESTAMP>\nCurrent working directory: <CWD>",
+            "instructions": "JSON stdin test.\nCurrent date and time: <TIMESTAMP>\nCurrent working directory: <CWD>\nCurrent temporary directory: <TEMP>",
             "stream": true,
             "store": false
           }
@@ -51,7 +68,10 @@
         "response": {
           "status": 200,
           "headers": [
-            ["Content-Type", "application/x-ndjson"]
+            [
+              "Content-Type",
+              "application/x-ndjson"
+            ]
           ],
           "body_chunks": [
             "{\"type\":\"response.output_text.delta\",\"item_id\":\"msg_ndjson_stdin_1\",\"content_index\":0,\"delta\":\"stdin \"}\n",
@@ -66,7 +86,10 @@
     "exit_code": 0,
     "stdout_contains": [],
     "stdout_not_contains": [],
-    "stderr_not_contains": ["error", "panic"],
+    "stderr_not_contains": [
+      "error",
+      "panic"
+    ],
     "no_session_files": true,
     "json_event_sequence": [
       "session",
