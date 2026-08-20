@@ -142,7 +142,11 @@ fn swarm_replay_preview_text_matches_golden() -> TestResult {
         output_text(&output.stderr)
     );
     let expected = fs::read_to_string(repo_root().join(GOLDEN_TEXT_PATH))?;
-    assert_eq!(output_text(&output.stdout), expected);
+    let normalize = |value: &str| value.replace("\r\n", "\n").replace('\r', "\n");
+    assert_eq!(
+        normalize(&output_text(&output.stdout)),
+        normalize(&expected)
+    );
     Ok(())
 }
 
