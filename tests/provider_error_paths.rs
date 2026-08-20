@@ -144,7 +144,7 @@ fn openai_body(model: &str, prompt: &str) -> serde_json::Value {
 fn gemini_body(prompt: &str) -> serde_json::Value {
     json!({
         "contents": [{"parts": [{"text": prompt}], "role": "user"}],
-        "generationConfig": {"candidateCount": 1, "maxOutputTokens": 8192},
+        "generationConfig": {"candidateCount": 1, "maxOutputTokens": 65536},
     })
 }
 

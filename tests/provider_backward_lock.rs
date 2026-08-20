@@ -527,8 +527,8 @@ fn gemini_default_max_tokens_8192() {
     let req = provider.build_request(&context, &options);
     let v = serde_json::to_value(&req).expect("serialize");
     assert_eq!(
-        v["generationConfig"]["maxOutputTokens"], 8192,
-        "Gemini default maxOutputTokens locked at 8192"
+        v["generationConfig"]["maxOutputTokens"], 65536,
+        "Gemini default maxOutputTokens locked at 65536 (GEMINI_MAX_OUTPUT_TOKENS)"
     );
 }
 
@@ -1035,11 +1035,11 @@ fn max_tokens_field_name_differs_by_provider() {
     assert_eq!(v["max_output_tokens"], 1024);
     assert!(v["max_tokens"].is_null());
 
-    // Gemini: generationConfig.maxOutputTokens (camelCase)
+    // Gemini: generationConfig.maxOutputTokens (camelCase) — fixed at GEMINI_MAX_OUTPUT_TOKENS 65536, not honoring options.max_tokens
     let v =
         serde_json::to_value(GeminiProvider::new("gemini-2.5-pro").build_request(&context, &opts))
             .unwrap();
-    assert_eq!(v["generationConfig"]["maxOutputTokens"], 1024);
+    assert_eq!(v["generationConfig"]["maxOutputTokens"], 65536);
 
     // Cohere: max_tokens
     let v =
