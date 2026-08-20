@@ -19,6 +19,7 @@
 - **只认 Cargo**，不用其他包管理器
 - Rust 2024 nightly（见 `rust-toolchain.toml`）
 - 不安全代码禁止（`#![forbid(unsafe_code)]`）
+- **Windows 构建约束** — 依赖 `ring` / `libsqlite3-sys` / `rquickjs-sys` / `tree-sitter` 等含 C/C++ 代码的 crate，编译必须依赖 MSVC 工具链（`cl.exe`）。Windows 下所有 `cargo` 相关命令**必须通过 `pwsh` 执行**（`$PROFILE` 已自动注入 `vcvars64` 并补全 `fd` / `cygpath` / `sccache` / `lld-link` 路径），**禁止在 `bash` / `git bash` 中直接执行 `cargo`**，否则将因缺失 MSVC 环境导致 `build-script-build` 失败；如需绕过自动注入请显式调用 `cargo.exe`
 
 ## 代码编辑规范
 
@@ -118,6 +119,8 @@ cargo test -- --nocapture                # 带输出
 
 - **开发命令（低频/发布/RPC 协议）** — `docs/context/commands.md`
   - 修改运行配置/机制、跑低频命令、发布流程时读；高频命令见本文件上方
+- **Windows 开发环境搭建** — `docs/context/windows-setup.md`
+  - 新机/重装后首次搭建，或 `cargo` 报 MSVC/linker/sccache 错误时读；含一键搭建、自适配清单与故障排查
 - **设计决策（为什么没选 B）** — `docs/context/design-decisions.md`
   - 做架构级改动、理解决策背景时读；过时决策在 `docs/context/design-decisions-archive.md`
 - **verify 验证引擎** — `docs/context/verify-tool.md`

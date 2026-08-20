@@ -22,8 +22,9 @@ rustflags = ["-L", "/usr/local/lib"]
 PKG_CONFIG_PATH = { value = "/usr/local/libdata/pkgconfig", force = false }
 
 # Use LLD for faster linking on Windows (MSVC target)
+# Scoop installs LLVM to user dir; keep lld-link (not MSVC link.exe) per project config.
 [target.x86_64-pc-windows-msvc]
-linker = "C:\\Program Files\\LLVM\\bin\\lld-link.exe"
+linker = "C:\\Users\\m\\scoop\\apps\\llvm\\current\\bin\\lld-link.exe"
 # Raise the main-thread stack to 8 MiB (MSVC default is 1 MiB). Debug builds
 # of the CLI regularly exceed 1 MiB on some startup paths (clap-derived parse
 # + bubbletea-derived models) and overflow the main thread; release builds
