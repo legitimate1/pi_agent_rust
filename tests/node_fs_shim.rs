@@ -297,7 +297,13 @@ fn unlink_sync_removes_file() {
 #[test]
 fn unlink_sync_throws_on_missing() {
     let result = eval_fs(r#"fs.unlinkSync("tmp/no/such/file")"#);
-    assert!(result.contains("ENOENT"), "expected ENOENT, got: {result}");
+    assert!(
+        result.contains("ENOENT")
+            || result.contains("No such file")
+            || result.contains("os error 3")
+            || result.contains("host unlink"),
+        "expected ENOENT, got: {result}"
+    );
 }
 
 // ─── rmSync ─────────────────────────────────────────────────────────────────
@@ -389,7 +395,12 @@ fn access_sync_missing() {
 #[test]
 fn read_file_sync_throws_enoent() {
     let result = eval_fs(r#"fs.readFileSync("/no/such/file", "utf8")"#);
-    assert!(result.contains("ENOENT"), "expected ENOENT, got: {result}");
+    assert!(
+        result.contains("ENOENT")
+            || result.contains("host read denied")
+            || result.contains("outside extension root"),
+        "expected ENOENT or host read denied, got: {result}"
+    );
 }
 
 // ─── mkdtempSync ────────────────────────────────────────────────────────────

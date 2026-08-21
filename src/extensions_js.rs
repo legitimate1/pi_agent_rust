@@ -11350,6 +11350,23 @@ const __pi_vfs = (() => {
   function ensureDir(path) {
     const normalized = normalizePath(path);
     if (normalized === "/") return "/";
+    // Windows drive-letter paths (e.g. "C:/Users/...") must be split after the
+    // drive root; the POSIX `slice(1)` path would corrupt them into "/:" etc.
+    if (/^[A-Za-z]:\//.test(normalized)) {
+      const drive = normalized.slice(0, 2);
+      const driveRoot = `${drive}/`;
+      state.dirs.add(driveRoot);
+      const rest = normalized.slice(3);
+      if (!rest) return normalized;
+      const parts = rest.split("/");
+      let current = drive;
+      for (const part of parts) {
+        if (!part) continue;
+        current = `${current}/${part}`;
+        state.dirs.add(current);
+      }
+      return normalized;
+    }
     const parts = normalized.slice(1).split("/");
     let current = "";
     for (const part of parts) {
@@ -11486,8 +11503,8 @@ const __pi_vfs = (() => {
   }
 
   function resolveSymlinkPath(linkPath, target) {
-    const raw = String(target ?? "");
-    if (raw.startsWith("/")) {
+    const raw = String(target ?? "").replace(/\\/g, "/");
+    if (raw.startsWith("/") || /^[A-Za-z]:\//.test(raw)) {
       return normalizePath(raw);
     }
     return normalizePath(`${dirname(linkPath)}/${raw}`);
@@ -18249,9 +18266,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             )?;
 
                             std::fs::remove_file(&checked_path).map_err(|e| {
+                                let prefix = if e.kind() == std::io::ErrorKind::NotFound {
+                                    "host unlink: ENOENT: "
+                                } else {
+                                    "host unlink: "
+                                };
                                 rquickjs::Error::new_loading_message(
                                     &path,
-                                    format!("host unlink: {e}"),
+                                    format!("{prefix}{e}"),
                                 )
                             })?;
 
@@ -18295,9 +18317,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 std::fs::remove_dir(&checked_path)
                             };
                             result.map_err(|e| {
+                                let prefix = if e.kind() == std::io::ErrorKind::NotFound {
+                                    "host rmdir: ENOENT: "
+                                } else {
+                                    "host rmdir: "
+                                };
                                 rquickjs::Error::new_loading_message(
                                     &path,
-                                    format!("host rmdir: {e}"),
+                                    format!("{prefix}{e}"),
                                 )
                             })?;
 
@@ -18355,9 +18382,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 std::fs::remove_file(&checked_path)
                             };
                             result.map_err(|e| {
+                                let prefix = if e.kind() == std::io::ErrorKind::NotFound {
+                                    "host rm: ENOENT: "
+                                } else {
+                                    "host rm: "
+                                };
                                 rquickjs::Error::new_loading_message(
                                     &path,
-                                    format!("host rm: {e}"),
+                                    format!("{prefix}{e}"),
                                 )
                             })?;
 
@@ -18415,9 +18447,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 std::fs::symlink_metadata(&requested_abs)
                             }
                             .map_err(|err| {
+                                let prefix = if err.kind() == std::io::ErrorKind::NotFound {
+                                    "host stat: ENOENT: "
+                                } else {
+                                    "host stat: "
+                                };
                                 rquickjs::Error::new_loading_message(
                                     &path,
-                                    format!("host stat: {err}"),
+                                    format!("{prefix}{err}"),
                                 )
                             })?;
 
@@ -18483,9 +18520,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                             let mut entries = Vec::new();
                             for entry in std::fs::read_dir(&checked_path).map_err(|err| {
+                                let prefix = if err.kind() == std::io::ErrorKind::NotFound {
+                                    "host readdir: ENOENT: "
+                                } else {
+                                    "host readdir: "
+                                };
                                 rquickjs::Error::new_loading_message(
                                     &path,
-                                    format!("host readdir: {err}"),
+                                    format!("{prefix}{err}"),
                                 )
                             })? {
                                 let entry = entry.map_err(|err| {
@@ -18645,9 +18687,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         return apply_missing_asset_fallback(&checked_path, &err.to_string());
                                     }
                                     Err(err) => {
+                                        let prefix = if err.kind() == std::io::ErrorKind::NotFound {
+                                            "host read open: ENOENT: "
+                                        } else {
+                                            "host read open: "
+                                        };
                                         return Err(rquickjs::Error::new_loading_message(
                                             &path,
-                                            format!("host read open: {err}"),
+                                            format!("{prefix}{err}"),
                                         ));
                                     }
                                 };
@@ -18731,9 +18778,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         if err.kind() == std::io::ErrorKind::NotFound && in_ext_root && configured_repair_mode.should_apply() {
                                             return apply_missing_asset_fallback(&checked_path, &err.to_string());
                                         }
+                                        let prefix = if err.kind() == std::io::ErrorKind::NotFound {
+                                            "host read: ENOENT: "
+                                        } else {
+                                            "host read: "
+                                        };
                                         return Err(rquickjs::Error::new_loading_message(
                                             &path,
-                                            format!("host read: {err}"),
+                                            format!("{prefix}{err}"),
                                         ));
                                     }
                                 };
