@@ -650,7 +650,29 @@ impl AmacBatchExecutor {
 
     /// Decide whether a group should use interleaved or sequential dispatch.
     fn decide_toggle(&self, key: &AmacGroupKey, group_size: usize) -> AmacToggleDecision {
-        // Rule 1: Too small to benefit from interleaving.
+        // Rule 0: Exec deterministic interleave — subprocess concurrency is
+        // second-scale blocking, so 2 concurrent children are strictly faster
+        // than serial. Bypass the generic `min_batch_size=4` (Rule 1) and the
+        // stall-telemetry gates (Rules 3-4) which are statistical proxies for
+        // microsecond LLC-miss parallelism and carry no information for Exec.
+        // No env var needed: `Exec 2 → Interleave(2)` on the default config.
+        if matches!(key, AmacGroupKey::Exec) {
+            if !self.config.exec_interleave {
+                return AmacToggleDecision::Sequential {
+                    reason: "exec_interleave_disabled",
+                };
+            }
+            let width = group_size.min(self.config.max_interleave_width);
+            if width < 2 {
+                return AmacToggleDecision::Sequential {
+                    reason: "computed_width_too_low",
+                };
+            }
+            return AmacToggleDecision::Interleave { width };
+        }
+
+        // Rule 1: Too small to benefit from interleaving (generic threshold
+        // for Http/Tool/etc.; Exec already returned above).
         if group_size < self.config.min_batch_size {
             return AmacToggleDecision::Sequential {
                 reason: "batch_too_small",
@@ -662,33 +684,6 @@ impl AmacBatchExecutor {
             return AmacToggleDecision::Sequential {
                 reason: "ordering_dependency",
             };
-        }
-
-        // Rule 2b: Exec interleave escape hatch — Exec calls have side effects
-        // and may depend on serialized execution, so honor an explicit opt-out
-        // (PI_HOSTCALL_AMAC_EXEC_INTERLEAVE=0).
-        if matches!(key, AmacGroupKey::Exec) && !self.config.exec_interleave {
-            return AmacToggleDecision::Sequential {
-                reason: "exec_interleave_disabled",
-            };
-        }
-
-        // Rule 2c: Exec groups interleave with deterministic width. Subprocess
-        // execution is second-scale blocking: launching n independent
-        // processes concurrently is strictly faster than serial, so stall
-        // telemetry (a statistical proxy designed for microsecond memory-level
-        // parallelism) carries no information for Exec. Skipping Rules 3-4
-        // also prevents the cold-start guard from locking Exec to serial in
-        // TUI sessions, where QuickJS hostcall volume never reaches the
-        // telemetry window (native tools bypass the hostcall queue).
-        if matches!(key, AmacGroupKey::Exec) {
-            let width = group_size.min(self.config.max_interleave_width);
-            if width < 2 {
-                return AmacToggleDecision::Sequential {
-                    reason: "computed_width_too_low",
-                };
-            }
-            return AmacToggleDecision::Interleave { width };
         }
 
         // Rule 3: Insufficient telemetry history → conservative sequential.
@@ -1125,6 +1120,45 @@ mod tests {
             plan.decisions[0],
             AmacToggleDecision::Interleave { width: 4 },
             "width = min(batch, max_width) without stall inference"
+        );
+    }
+
+    #[test]
+    fn plan_interleaves_exec_with_small_batch_bypassing_generic_threshold() {
+        // Regression for #58: Exec 2~3 must interleave on the default
+        // `min_batch_size=4` — deterministic subprocess concurrency bypasses
+        // the generic threshold (Rule 0 / Rule 1 ordering).
+        let mut executor = AmacBatchExecutor::new(AmacBatchExecutorConfig::new(true, 4, 16));
+        assert_eq!(executor.telemetry().snapshot().total_calls, 0);
+
+        for size in [2_usize, 3] {
+            let requests: Vec<HostcallRequest> = (0..size).map(|_| exec_request()).collect();
+            let plan = executor.plan_batch(requests);
+            assert_eq!(plan.groups.len(), 1);
+            assert_eq!(
+                plan.decisions[0],
+                AmacToggleDecision::Interleave { width: size },
+                "Exec size={size} must interleave despite min_batch=4"
+            );
+        }
+
+        // Single Exec stays sequential (computed_width_too_low).
+        let plan = executor.plan_batch(vec![exec_request()]);
+        assert_eq!(
+            plan.decisions[0],
+            AmacToggleDecision::Sequential {
+                reason: "computed_width_too_low"
+            }
+        );
+
+        // Http with the same generic threshold must stay sequential (negative control).
+        let plan = executor.plan_batch(vec![http_request(), http_request()]);
+        assert_eq!(
+            plan.decisions[0],
+            AmacToggleDecision::Sequential {
+                reason: "batch_too_small"
+            },
+            "Http 2 must stay sequential at min_batch=4"
         );
     }
 
