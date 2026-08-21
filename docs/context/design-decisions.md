@@ -469,3 +469,16 @@
 **不选 B 的原因**：一次性全量 merge（引入不需要的发布管道噪音 + 依赖漂移灾难）；放弃追上游（失去安全修复与上游生态演进）。
 
 **何时重新考虑**：extensions 架构迁移完成后，冻结面消失，可回归普通周频 merge；上游发大版本（0.x.0）时评估一次是否继续追。
+
+---
+
+## D48: Exec AMAC 阈值 — 通用 min_batch=4 前置为 Rule 0 直通
+
+**决策**：decide_toggle 将 Exec 分支提至最前（Rule 0），无视通用 min_batch_size=4 阈值（零新增配置/字段/env）；2 即 Interleave(width=2)，1 仍 Sequential(computed_width_too_low)，Http/Tool 等仍受 min_batch=4 守门。
+
+**理由**：Exec 是秒级阻塞子进程，并发收益确定（2×6s 并行≈6s 串行≈12s），不应套用为 Http/Tool LLC-miss 统计模型设的 4 阈值；原 Rule1 在 Rule2c 之前导致 2~3 被 batch_too_small 强制串行（实测 2× ratio2.8/3× ratio7.3 vs 4× ratio1.4）。
+
+**不选 B 的原因**：全局改 min_batch=2——会让 Http 2× 也无条件 buffered(2)，在低 stall 下负优化；新增 PI_HOSTCALL_AMAC_EXEC_MIN_BATCH=2——把配置负担丢给用户，且 Issue 对照已证 2 即该并行，无需阈值可调。
+
+**何时重新考虑**：若 Exec 出现顺序依赖需调优 2 阈值，再评估可配置化；否则保持零配置直通。
+

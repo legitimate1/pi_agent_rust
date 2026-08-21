@@ -241,14 +241,14 @@ pi --tools read,write,edit,grep,find,ls,hashline_edit,pwsh
 批量 hostcall 按类型分组，stall 遥测（EMA）驱动每组选择**并发（interleave）或串行（sequential）**。interleave 组的并发宽度、阈值与逃生开关均可调：
 
 - `PI_HOSTCALL_AMAC` — 全局开关（`0|false|off|disabled` 禁用 → 全部串行）；默认开
-- `PI_HOSTCALL_AMAC_MIN_BATCH` — 考虑并发的最小批量（默认 4）；低于此值恒串行
+- `PI_HOSTCALL_AMAC_MIN_BATCH` — 考虑并发的最小批量（默认 4）；低于此值恒串行，**但 Exec 组自 D48 起无视此阈值**（Rule 0 直通，`2` 即并发，见下）
 - `PI_HOSTCALL_AMAC_MAX_WIDTH` — 单组最大并发宽度（默认 16）
 - `PI_HOSTCALL_AMAC_STALL_THRESHOLD_NS` — 单次调用视为 stall 的耗时阈值（默认 100_000ns）
 - `PI_HOSTCALL_AMAC_STALL_RATIO_THRESHOLD` — 允许并发的最低 stall 占比（0..1000，默认 200）
 - `PI_HOSTCALL_AMAC_MIN_TELEMETRY` — 冷启动保护门槛：遥测观察数低于此值 → 非 Exec 组保守串行（默认 64；`0` 关闭保护，信任稀疏观测）
 - `PI_HOSTCALL_AMAC_EXEC_INTERLEAVE` — **Exec 组逃生开关**（`0|false|off|disabled` 强制 exec 串行）；默认开。Exec 有副作用，若调用方依赖 exec 顺序依赖，用它回退
 
-冷启动注意：**Exec 组不受遥测门槛限制**——子进程并发是确定性收益（秒级阻塞，stall 检测无信息量），冷启动即并发，宽度 = min(batch, max_width)。其他组（Http/Tool 等）需积累 64 次观察后才允许并发（首轮 batch 仍保守串行）；TUI 场景 QuickJS hostcall 量少难解锁时，可设 `PI_HOSTCALL_AMAC_MIN_TELEMETRY=0` 关闭保护。
+冷启动注意：**Exec 组不受遥测门槛限制**——子进程并发是确定性收益（秒级阻塞，stall 检测无信息量），冷启动即并发，宽度 = min(batch, max_width)，且**无视 `PI_HOSTCALL_AMAC_MIN_BATCH` 阈值**（见 D48 Rule 0）。其他组（Http/Tool 等）需积累 64 次观察后才允许并发（首轮 batch 仍保守串行）；TUI 场景 QuickJS hostcall 量少难解锁时，可设 `PI_HOSTCALL_AMAC_MIN_TELEMETRY=0` 关闭保护。
 
 ## RPC 协议
 
