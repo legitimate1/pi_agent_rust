@@ -88,6 +88,20 @@ New-Item -ItemType File -Force -Path $PROFILE
 # 将本机已验证的 profile 内容写入（示例路径见仓库内同名 profile 模板/当前机器的 $PROFILE）
 ```
 
+### 6. 安装 cargo 扩展工具（cargo-edit / cargo-sweep）
+
+`AGENTS.md` 的构建/部署流程依赖这两个扩展：`cargo set-version` 用于 `cargo set-version --bump patch -p pi_agent_rust` 升版，`cargo sweep` 用于 `deploy-release.ps1` 的 `cargo sweep --file` / `--stamp` 清理。
+
+```pwsh
+cargo install cargo-edit --locked   # 提供 cargo-set-version / cargo-add / cargo-rm / cargo-upgrade
+cargo install cargo-sweep --locked  # 提供 cargo sweep（target/ 清理）
+cargo set-version --help            # 预期：Change a package's version ...
+cargo sweep --version               # 预期：cargo-sweep-sweep 0.8.x
+cargo --list | Select-String "sweep|set-version"  # 预期两行命中
+```
+
+> 说明：`cargo-edit` / `cargo-sweep` 安装到 `~\.cargo\bin`，需该目录在用户 `PATH`（`rustup` 默认已加入；若 `where.exe cargo-set-version` 无结果，重开 shell 或检查 `PATH`）。
+
 ## 验证
 
 ```pwsh
