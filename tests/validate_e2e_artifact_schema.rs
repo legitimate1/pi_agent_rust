@@ -1567,18 +1567,28 @@ fn artifact_index_cross_validation_detects_missing_paths() {
     let existing_file = dir.path().join("output.log");
     std::fs::write(&existing_file, "test output").expect("write test file");
 
-    let existing = existing_file.display();
-    let missing = dir.path().join("nonexistent.log").display().to_string();
-
     let artifact_index = format!(
-        concat!(
-            r#"{{"schema":"pi.test.artifact.v1","type":"artifact","seq":1,"ts":"x","t_ms":100,"name":"output","path":"{existing}"}}"#,
-            "\n",
-            r#"{{"schema":"pi.test.artifact.v1","type":"artifact","seq":2,"ts":"x","t_ms":200,"name":"missing_artifact","path":"{missing}"}}"#,
-            "\n",
-        ),
-        existing = existing,
-        missing = missing,
+        "{}\n{}\n",
+        serde_json::json!({
+            "schema": "pi.test.artifact.v1",
+            "type": "artifact",
+            "seq": 1,
+            "ts": "x",
+            "t_ms": 100,
+            "name": "output",
+            "path": existing_file.display().to_string().replace('\\', "/")
+        })
+        .to_string(),
+        serde_json::json!({
+            "schema": "pi.test.artifact.v1",
+            "type": "artifact",
+            "seq": 2,
+            "ts": "x",
+            "t_ms": 200,
+            "name": "missing_artifact",
+            "path": dir.path().join("nonexistent.log").display().to_string().replace('\\', "/")
+        })
+        .to_string(),
     );
 
     let warnings = common::logging::validate_artifact_index_paths(&artifact_index, dir.path());
@@ -1600,14 +1610,27 @@ fn artifact_index_cross_validation_passes_when_all_paths_exist() {
     std::fs::write(&file_b, "").expect("write file b");
 
     let artifact_index = format!(
-        concat!(
-            r#"{{"schema":"pi.test.artifact.v1","type":"artifact","seq":1,"ts":"x","t_ms":0,"name":"result","path":"{a}"}}"#,
-            "\n",
-            r#"{{"schema":"pi.test.artifact.v1","type":"artifact","seq":2,"ts":"x","t_ms":0,"name":"test_log","path":"{b}"}}"#,
-            "\n",
-        ),
-        a = file_a.display(),
-        b = file_b.display(),
+        "{}\n{}\n",
+        serde_json::json!({
+            "schema": "pi.test.artifact.v1",
+            "type": "artifact",
+            "seq": 1,
+            "ts": "x",
+            "t_ms": 0,
+            "name": "result",
+            "path": file_a.display().to_string().replace('\\', "/")
+        })
+        .to_string(),
+        serde_json::json!({
+            "schema": "pi.test.artifact.v1",
+            "type": "artifact",
+            "seq": 2,
+            "ts": "x",
+            "t_ms": 0,
+            "name": "test_log",
+            "path": file_b.display().to_string().replace('\\', "/")
+        })
+        .to_string(),
     );
 
     let warnings = common::logging::validate_artifact_index_paths(&artifact_index, dir.path());

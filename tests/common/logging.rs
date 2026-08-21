@@ -1718,11 +1718,16 @@ pub fn validate_artifact_index_paths(
             .and_then(|v| v.as_str())
             .unwrap_or("<unknown>");
 
-        let path = Path::new(path_str);
-        let exists = if path.is_absolute() {
-            path.exists()
+        // Normalize Windows backslashes to forward slashes so JSON-escaped paths
+        // and `Path::is_absolute` are handled consistently across platforms.
+        let normalized_path_str = path_str.replace('\\', "/");
+        let path = Path::new(&normalized_path_str);
+        let is_absolute =
+            path.is_absolute() || looks_like_windows_absolute_path(&normalized_path_str);
+        let exists = if is_absolute {
+            path.exists() || Path::new(path_str).exists()
         } else {
-            artifact_dir.join(path).exists()
+            artifact_dir.join(path).exists() || artifact_dir.join(path_str).exists()
         };
 
         if !exists {

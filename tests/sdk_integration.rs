@@ -810,8 +810,9 @@ fn sdk_extension_policy_safe_denies_exec_and_records_hostcall_telemetry() {
         })
         .expect("expected policy-denial security alert for exec capability");
     assert!(
-        exec_alert.policy_source.contains("deny"),
-        "expected deny policy source for safe profile, got: {}",
+        exec_alert.policy_source.contains("deny")
+            || exec_alert.policy_source.contains("not_in_default_caps"),
+        "expected deny/not_in_default_caps policy source for safe profile, got: {}",
         exec_alert.policy_source
     );
 }

@@ -115,6 +115,10 @@ pi-session-*.html
 
 # E2E test run results (timestamped, ephemeral)
 tests/e2e_results/
+!tests/e2e_results/
+tests/e2e_results/*
+!tests/e2e_results/20260422T201126Z/
+!tests/e2e_results/20260422T201126Z/**
 tests/evidence_bundle/
 !tests/evidence_bundle/
 tests/evidence_bundle/*
