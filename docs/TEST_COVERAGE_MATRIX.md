@@ -40,6 +40,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/agent.rs` | Agent loop | Unit; `tests/agent_loop_vcr.rs`, `tests/agent_loop_reliability.rs`, `tests/e2e_agent_loop.rs`, `tests/rpc_mode.rs`. |
 | `src/agent_cx.rs` | Agent context | Unit; covered through agent/RPC suites. |
 | `src/app.rs` | App orchestration | Unit; `tests/e2e_cli.rs`, `tests/e2e_rpc.rs`, `tests/main_cli_selection.rs`. |
+| `src/ast_tools.rs` | AST structural tools (ast_grep) | Unit; `tests/ast_tools_comprehensive.rs`, `tests/ast_tools_partitioned.rs`. |
 | `src/auth.rs` | Auth and OAuth | Unit; `tests/auth_oauth_refresh_vcr.rs`, `tests/extensions_provider_oauth.rs`. |
 | `src/autocomplete.rs` | Prompt autocomplete | Unit; interactive coverage via `tests/tui_state.rs`. |
 | `src/bin/pi_legacy_capture.rs` | Legacy capture utility | Unit; opt-in capture utility, not a default user path. |
@@ -165,6 +166,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/tools/write.rs` | Write tool | Unit; `tests/tools_conformance.rs`, `tests/tools_hardened.rs`. |
 | `src/validation_broker.rs` | Validation broker | Unit; `tests/validation_broker_cli.rs`, `tests/validation_broker_e2e.rs`. |
 | `src/tui.rs` | Terminal renderer | Unit; `tests/tui_snapshot.rs`, `tests/tui_state.rs`, `tests/e2e_tui.rs`. |
+| `src/tool_overrides.rs` | Tool override policy | Unit; tool policy suites; `tests/tools_conformance.rs`. |
 | `src/vcr.rs` | VCR playback/record | Unit; `tests/vcr_parity_validation.rs`, `tests/vcr_redaction_scan.rs`, provider/RPC VCR suites. |
 | `src/version_check.rs` | Version checks | Unit; cross-platform and release-readiness tests exercise the surrounding behavior. |
 

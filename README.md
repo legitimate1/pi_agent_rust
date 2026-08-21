@@ -197,6 +197,8 @@ A: 12 native provider modules (Anthropic, OpenAI Chat/Responses/Codex, Gemini, C
 **Q: How do sessions work?**
 A: JSONL v3 files with parent references for branching, compaction metadata, a SQLite session index sidecar for fast resume, and an optional V2 segmented-log sidecar for large histories. SQLite-backed storage is available via the default-enabled `sqlite-sessions` feature.
 
+Provider-count rule: Pi has 12 native provider implementation modules, counted as the Rust files under `src/providers/` excluding `mod.rs`: `anthropic`, `openai`, `openai_responses`, `gemini`, `cohere`, `azure`, `bedrock`, `vertex`, `copilot`, `gitlab`, `cursor`, and `model_fetch`. Those modules are `anthropic`, `openai`, `openai_responses`, `gemini`, `cohere`, `azure`, `bedrock`, `vertex`, `copilot`, `gitlab`, `cursor`, and `model_fetch`. User-visible canonical IDs, aliases, OpenAI-compatible presets, VCR coverage families, and extension-provided providers are separate counts.
+
 **Q: Why is unsafe forbidden?**
 A: Memory safety is non-negotiable for a tool that executes arbitrary commands. The performance cost is negligible here.
 
@@ -216,7 +218,11 @@ cargo build --release                    # Build (binary at target/release/pi)
 - Default features: `sqlite-sessions` + `tui`; `--features full` adds image-resize/jemalloc/clipboard/wasm-host/syntax-highlighting; jemalloc stays opt-in (opt-in jemalloc benchmark variants), never enabled by default
 - Releases are tag-driven (`vX.Y.Z` must match `Cargo.toml` version); publish order: `asupersync` → `rich_rust` → `charmed-*` → `pi_agent_rust`
 
-For contributors and maintainers: development workflow, full command reference, architecture notes, and debugging playbooks live in `AGENTS.md` and `docs/context/` (`features.md`, `architecture.md`, `commands.md`, `conventions.md`, `design-decisions.md`, `debugging.md`). Extended docs index: [docs/](docs/) — session, tree, TUI, RPC, SDK, settings, models, providers, extension architecture, security, and swarm operations runbooks. Fourth-wave self-healing closeout gate: evidence schema `pi.swarm.fourth_wave_self_healing.closeout_gate.v1`, governed by [contract](docs/contracts/fourth-wave-self-healing-closeout-gate-contract.json) with evidence at [docs/evidence/fourth-wave-self-healing-closeout-gate.json](docs/evidence/fourth-wave-self-healing-closeout-gate.json).
+For contributors and maintainers: development workflow, full command reference, architecture notes, and debugging playbooks live in `AGENTS.md` and `docs/context/` (`features.md`, `architecture.md`, `commands.md`, `conventions.md`, `design-decisions.md`, `debugging.md`). Extended docs index: [docs/](docs/) — session, tree, TUI, RPC, SDK, settings, models, providers, extension architecture, security, and swarm operations runbooks.
+
+Contracts & evidence (must-link): [validation broker closeout contract](docs/contracts/validation-broker-closeout-gate-contract.json) · [validation broker closeout evidence](docs/evidence/validation-broker-closeout-gate.json) · [swarm progress SLO closeout contract](docs/contracts/swarm-progress-slo-closeout-gate-contract.json) · [swarm progress SLO closeout evidence](docs/evidence/swarm-progress-slo-closeout-gate.json) · [remote validation proof ledger contract](docs/contracts/remote-validation-proof-ledger-contract.json) · [proof-carrying swarm test fabric closeout contract](docs/contracts/proof-carrying-swarm-test-fabric-closeout-gate-contract.json) · [proof-carrying swarm test fabric closeout evidence](docs/evidence/proof-carrying-swarm-test-fabric-closeout-gate.json) · [runtime intelligence closeout contract](docs/contracts/runtime-intelligence-closeout-gate-contract.json) · [runtime intelligence closeout evidence](docs/evidence/runtime-intelligence-closeout-gate.json) · validation broker operator workflow: [docs/swarm-operations-runbook.md#validation-broker-operator-workflow](docs/swarm-operations-runbook.md#validation-broker-operator-workflow).
+
+Fourth-wave self-healing closeout gate: evidence schema `pi.swarm.fourth_wave_self_healing.closeout_gate.v1`, governed by [contract](docs/contracts/fourth-wave-self-healing-closeout-gate-contract.json) with evidence at [docs/evidence/fourth-wave-self-healing-closeout-gate.json](docs/evidence/fourth-wave-self-healing-closeout-gate.json).
 
 ## License
 
