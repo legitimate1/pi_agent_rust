@@ -180,9 +180,14 @@ fn interrupt_budget_preserves_state_after_trip() {
 #[test]
 fn memory_limit_prevents_large_allocation() {
     futures::executor::block_on(async {
+        // Windows + MSVC + rquickjs: PI_BRIDGE_JS init exceeds 1MB, 2MB still validates OOM (1GB >> 2MB)
+        let memory_limit_bytes = if cfg!(windows) {
+            2 * 1024 * 1024
+        } else {
+            1024 * 1024
+        };
         let config = config_with_limits(PiJsRuntimeLimits {
-            // 1MB memory limit
-            memory_limit_bytes: Some(1024 * 1024),
+            memory_limit_bytes: Some(memory_limit_bytes),
             ..Default::default()
         });
 
