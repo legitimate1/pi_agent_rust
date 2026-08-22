@@ -3,7 +3,6 @@ use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 // ============================================================================
@@ -158,7 +157,7 @@ impl Tool for WriteTool {
         .await
         .map_err(|e| Error::tool("write", format!("Failed to write file: {e}")))?;
 
-        let mut details: Option<serde_json::Value> = None;
+        let details: Option<serde_json::Value> = None;
         let mut output_text = format!(
             "Successfully wrote {} bytes to {}",
             bytes_written, input.path
@@ -168,36 +167,15 @@ impl Tool for WriteTool {
         // Verification only applies to known syntax/format-checkable types;
         // plain files (`.txt`, no extension, …) are skipped so the output
         // stays free of spurious "unsupported type" errors.
+        // Verify diagnostics are appended to `output_text` (content), not `details`.
         if input.verify && crate::tools::verify::is_supported_file_type(&path) {
             let verify_path = path.clone();
             match crate::tools::verify::verify_file(verify_path, abort).await {
                 Ok(result) => {
-                    let mut details_map = serde_json::Map::new();
-                    let verify_json = crate::tools::verify::verify_result_to_json(&result);
-                    details_map.insert("verify".to_string(), verify_json);
-                    details = Some(serde_json::Value::Object(details_map));
-
-                    let status = if result.passed { "PASSED" } else { "FAILED" };
-                    let _ = write!(
-                        output_text,
-                        "\n[verify:{status}|{checker}|{time_ms}ms]",
-                        checker = result.checker,
-                        time_ms = result.time_ms,
-                    );
+                    crate::tools::verify::append_verify_to_output(&mut output_text, &result);
                 }
                 Err(e) => {
-                    let mut details_map = serde_json::Map::new();
-                    details_map.insert(
-                        "verify".to_string(),
-                        serde_json::json!({
-                            "passed": false,
-                            "checker": "verify",
-                            "message": format!("Verification error: {e}"),
-                        }),
-                    );
-                    details = Some(serde_json::Value::Object(details_map));
-
-                    let _ = write!(output_text, "\n[verify:ERROR|{e}]");
+                    crate::tools::verify::append_verify_error_to_output(&mut output_text, &e);
                 }
             }
         }

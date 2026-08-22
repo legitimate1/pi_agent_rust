@@ -11,8 +11,11 @@
 //! | `.rs`     | `rustfmt --check` | external process | ≤1MB |
 //! | `.json`   | `serde_json::from_str` | process-internal | unlimited |
 //! | `.toml`   | `toml::from_str` | process-internal | unlimited |
-//! | `.ts`     | `prettier --check` (global install; `npx --no-install` fallback) | external process | ≤1MB |
-//! | `.md`     | `prettier --check` (same checker as `.ts`) | external process | ≤1MB |
+//! | `.ts` `.tsx` | `oxfmt --check` + `oxlint --deny-warnings` (parallel) | external processes | ≤1MB |
+//! | `.js` `.jsx` `.mjs` `.cjs` | `oxfmt --check` + `oxlint --deny-warnings` (parallel) | external processes | ≤1MB |
+//! | `.py` `.pyi` | `ruff format --check` + `ruff check` (parallel) | external processes | ≤1MB |
+//! | `.go`     | `gofmt -l` (diff via `gofmt`) | external process | ≤1MB |
+//! | `.md`     | `prettier --check` (global install; `npx --no-install` fallback) | external process | ≤1MB |
 //!
 //! # Architecture
 //!
@@ -55,6 +58,9 @@ pub enum FileType {
     Json,
     Toml,
     TypeScript,
+    JavaScript,
+    Python,
+    Go,
     Markdown,
 }
 
@@ -85,6 +91,9 @@ fn detect_file_type(path: &Path) -> Option<FileType> {
         "json" => Some(FileType::Json),
         "toml" => Some(FileType::Toml),
         "ts" | "tsx" => Some(FileType::TypeScript),
+        "js" | "jsx" | "mjs" | "cjs" => Some(FileType::JavaScript),
+        "py" | "pyi" => Some(FileType::Python),
+        "go" => Some(FileType::Go),
         "md" | "markdown" => Some(FileType::Markdown),
         _ => None,
     }
@@ -182,6 +191,100 @@ static RUSTFMT_CHECKER: ExternalChecker = ExternalChecker {
     not_found_hint: "rustfmt not found in PATH. Run `rustup component add rustfmt` to install.",
     check_args: &["--check", "--edition", "2024"],
     fix_hint: "Run `rustfmt <file>` to fix.",
+    format_args: None,
+    classify_failure: None,
+    fallback: None,
+};
+
+/// oxfmt --check (Rust-native formatter, replaces prettier for JS/TS).
+/// No formatter stdout — we synthesize diff via `format_args` is None and rely
+/// on stderr + fix hint. Falls back to npx wrapper when no global install.
+static OXFMT_CHECKER: ExternalChecker = ExternalChecker {
+    name: "oxfmt",
+    program: "oxfmt",
+    version_args: &["--version"],
+    not_found_hint: "oxfmt not found in PATH. Install globally (`npm i -g oxfmt`) or locally. Falls back to npx when absent.",
+    check_args: &["--check"],
+    fix_hint: "Run `oxfmt <file>` to fix.",
+    format_args: None,
+    classify_failure: None,
+    fallback: Some(&NPX_OXFMT_CHECKER),
+};
+
+static NPX_OXFMT_CHECKER: ExternalChecker = ExternalChecker {
+    name: "npx-oxfmt",
+    program: "npx",
+    version_args: &["--version"],
+    not_found_hint: "npx not found in PATH. Skipping oxfmt check. Install Node.js to enable JS/TS formatting verification.",
+    check_args: &["--yes", "oxfmt", "--check"],
+    fix_hint: "Run `npx --yes oxfmt <file>` to fix.",
+    format_args: None,
+    classify_failure: None,
+    fallback: None,
+};
+
+/// oxlint --deny-warnings (Rust-native linter). Warnings become errors so
+/// `passed` reflects lint health.
+static OXLINT_CHECKER: ExternalChecker = ExternalChecker {
+    name: "oxlint",
+    program: "oxlint",
+    version_args: &["--version"],
+    not_found_hint: "oxlint not found in PATH. Install globally (`npm i -g oxlint`) or locally. Falls back to npx when absent.",
+    check_args: &["--deny-warnings"],
+    fix_hint: "Run `oxlint <file>` to see lint details.",
+    format_args: None,
+    classify_failure: None,
+    fallback: Some(&NPX_OXLINT_CHECKER),
+};
+
+static NPX_OXLINT_CHECKER: ExternalChecker = ExternalChecker {
+    name: "npx-oxlint",
+    program: "npx",
+    version_args: &["--version"],
+    not_found_hint: "npx not found in PATH. Skipping oxlint check. Install Node.js to enable JS/TS lint verification.",
+    check_args: &["--yes", "oxlint", "--deny-warnings"],
+    fix_hint: "Run `npx --yes oxlint <file>` to see lint details.",
+    format_args: None,
+    classify_failure: None,
+    fallback: None,
+};
+
+/// ruff format --check (Python formatter, Rust-native, standalone exe).
+static RUFF_FORMAT_CHECKER: ExternalChecker = ExternalChecker {
+    name: "ruff-format",
+    program: "ruff",
+    version_args: &["--version"],
+    not_found_hint: "ruff not found in PATH. Place ruff.exe in C:\\Users\\m\\.pi\\agent\\bin or install via `pip install ruff`.",
+    check_args: &["format", "--check"],
+    fix_hint: "Run `ruff format <file>` to fix.",
+    format_args: None,
+    classify_failure: None,
+    fallback: None,
+};
+
+/// ruff check (Python linter, Rust-native).
+static RUFF_CHECKER: ExternalChecker = ExternalChecker {
+    name: "ruff",
+    program: "ruff",
+    version_args: &["--version"],
+    not_found_hint: "ruff not found in PATH. Place ruff.exe in C:\\Users\\m\\.pi\\agent\\bin or install via `pip install ruff`.",
+    check_args: &["check"],
+    fix_hint: "Run `ruff check <file>` to see lint details.",
+    format_args: None,
+    classify_failure: None,
+    fallback: None,
+};
+
+/// gofmt -l (Go formatter, standalone exe from Go toolchain).
+/// gofmt exits 0 even when formatting differs; it prints the file path on stdout.
+/// We treat non-empty stdout as "needs format" and synthesize diff via `gofmt <file>`.
+static GOFMT_CHECKER: ExternalChecker = ExternalChecker {
+    name: "gofmt",
+    program: "gofmt",
+    version_args: &["--help"],
+    not_found_hint: "gofmt not found in PATH. Place gofmt.exe in C:\\Users\\m\\.pi\\agent\\bin or ensure Go is installed.",
+    check_args: &["-l"],
+    fix_hint: "Run `gofmt -w <file>` to fix.",
     format_args: None,
     classify_failure: None,
     fallback: None,
@@ -320,9 +423,12 @@ pub async fn verify_file(path: PathBuf, abort: Option<AbortSignal>) -> Result<Ve
         FileType::Json => verify_json(&path)?,
         FileType::Toml => verify_toml(&path)?,
         FileType::Rust => verify_external(&RUSTFMT_CHECKER, &path, abort).await?,
-        FileType::TypeScript | FileType::Markdown => {
-            verify_external(&PRETTIER_CHECKER, &path, abort).await?
+        FileType::JavaScript | FileType::TypeScript => {
+            verify_js_ts_parallel(path.clone(), abort).await?
         }
+        FileType::Python => verify_python_parallel(path.clone(), abort).await?,
+        FileType::Go => verify_go(path.clone(), abort).await?,
+        FileType::Markdown => verify_external(&PRETTIER_CHECKER, &path, abort).await?,
     };
 
     #[allow(clippy::cast_possible_truncation)]
@@ -382,6 +488,136 @@ async fn verify_external(
     })
     .await
     .map_err(|e| Error::tool("verify", format!("spawn_blocking_io failed: {e}")))
+}
+
+/// Verify JS/TS via oxfmt (format) + oxlint (lint) in parallel.
+///
+/// Architecture: Language → ToolSet[Format|Lint] (`docs/context/verify-tool.md`).
+/// The two checkers are independent, read-only, and share no state, so they
+/// run concurrently via `futures::future::join`.  Output is merged with a
+/// fixed order (format → lint) so the message is deterministic; `passed` is
+/// the conjunction.
+async fn verify_js_ts_parallel(
+    path: PathBuf,
+    abort: Option<AbortSignal>,
+) -> Result<(bool, Option<String>, &'static str)> {
+    let p1 = path.clone();
+    let p2 = path.clone();
+    let a1 = abort.clone();
+    let a2 = abort.clone();
+    let fut1 = verify_external(&OXFMT_CHECKER, &p1, a1);
+    let fut2 = verify_external(&OXLINT_CHECKER, &p2, a2);
+    let (r1, r2) = futures::future::join(fut1, fut2).await;
+    let (passed1, msg1, _) = r1?;
+    let (passed2, msg2, _) = r2?;
+    let passed = passed1 && passed2;
+    let message = match (msg1, msg2) {
+        (None, None) => None,
+        (Some(m), None) | (None, Some(m)) => Some(m),
+        (Some(m1), Some(m2)) => Some(format!("{m1}\n\n--- oxlint ---\n{m2}")),
+    };
+    Ok((passed, message, "oxfmt+oxlint"))
+}
+
+/// Verify Python via ruff format --check + ruff check in parallel.
+/// Both are standalone Rust-native exes (ruff.exe), independent and read-only.
+async fn verify_python_parallel(
+    path: PathBuf,
+    abort: Option<AbortSignal>,
+) -> Result<(bool, Option<String>, &'static str)> {
+    let p1 = path.clone();
+    let p2 = path.clone();
+    let a1 = abort.clone();
+    let a2 = abort.clone();
+    let fut1 = verify_external(&RUFF_FORMAT_CHECKER, &p1, a1);
+    let fut2 = verify_external(&RUFF_CHECKER, &p2, a2);
+    let (r1, r2) = futures::future::join(fut1, fut2).await;
+    let (passed1, msg1, _) = r1?;
+    let (passed2, msg2, _) = r2?;
+    let passed = passed1 && passed2;
+    let message = match (msg1, msg2) {
+        (None, None) => None,
+        (Some(m), None) | (None, Some(m)) => Some(m),
+        (Some(m1), Some(m2)) => Some(format!("{m1}\n\n--- ruff check ---\n{m2}")),
+    };
+    Ok((passed, message, "ruff"))
+}
+
+/// Verify Go via `gofmt -l` (lists files needing format).
+/// gofmt exits 0 even when formatting differs — it prints the file path on stdout.
+/// We treat non-empty stdout as failure and synthesize a unified diff via `gofmt <file>`.
+async fn verify_go(
+    path: PathBuf,
+    abort: Option<AbortSignal>,
+) -> Result<(bool, Option<String>, &'static str)> {
+    let abort2 = abort.clone();
+    asupersync::runtime::spawn_blocking_io(move || {
+        verify_go_blocking(&path, abort2.as_ref()).map_err(|e| std::io::Error::other(e.to_string()))
+    })
+    .await
+    .map_err(|e| Error::tool("verify", format!("spawn_blocking_io failed: {e}")))
+}
+
+fn verify_go_blocking(
+    path: &Path,
+    abort: Option<&AbortSignal>,
+) -> Result<(bool, Option<String>, &'static str)> {
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        Error::tool(
+            "verify",
+            format!("Cannot read metadata for {}: {e}", path.display()),
+        )
+    })?;
+    if metadata.len() > VERIFY_MAX_EXTERNAL_BYTES {
+        return Ok((
+            true,
+            Some(format!("Skipped: file > 1MB ({} bytes)", metadata.len())),
+            GOFMT_CHECKER.name,
+        ));
+    }
+    let program = resolve_program(GOFMT_CHECKER.program);
+    if std::process::Command::new(&program)
+        .args(GOFMT_CHECKER.version_args)
+        .output()
+        .is_err()
+    {
+        return Ok((
+            false,
+            Some(GOFMT_CHECKER.not_found_hint.to_string()),
+            GOFMT_CHECKER.name,
+        ));
+    }
+    let path_str = path.to_string_lossy().into_owned();
+    let mut args: Vec<&str> = GOFMT_CHECKER.check_args.to_vec();
+    args.push(&path_str);
+    let output = run_external_process(&program, &args, abort)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let mut msg = strip_ansi(&stderr);
+        if msg.trim().is_empty() {
+            msg = format!("gofmt failed with exit code {:?}", output.status.code());
+        }
+        msg.push_str("\n\n");
+        msg.push_str(&GOFMT_CHECKER.fix_hint.replace("<file>", &path_str));
+        msg = truncate_message(msg);
+        return Ok((false, Some(msg), GOFMT_CHECKER.name));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if stdout.trim().is_empty() {
+        return Ok((true, None, GOFMT_CHECKER.name));
+    }
+    let mut msg = format!("File {} needs formatting", path.display());
+    if let Some(formatted) = run_formatter(&program, &[], path, abort) {
+        if let Ok(original) = std::fs::read_to_string(path) {
+            msg.push_str("\n\n");
+            msg.push_str(&format_diff(&original, &formatted));
+        }
+    }
+    msg.push_str("\n\n");
+    msg.push_str(&GOFMT_CHECKER.fix_hint.replace("<file>", &path_str));
+    msg = truncate_message(msg);
+    Ok((false, Some(msg), GOFMT_CHECKER.name))
 }
 
 /// Shared execution path for all external-process checkers:
@@ -621,11 +857,10 @@ fn terminate_process_tree(child: &mut std::process::Child) {
 }
 
 // ---------------------------------------------------------------------------
-// JSON serialization for embedding in tool output details
+// Content helpers — VerifyResult directly to Markdown (no JSON intermediate)
 // ---------------------------------------------------------------------------
 
-/// Serialize a [`VerifyResult`] into a JSON Value suitable for
-/// `ToolOutput.details.verify`.
+/// Serialize a [`VerifyResult`] into a JSON Value (kept for tests/docs).
 pub fn verify_result_to_json(result: &VerifyResult) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     map.insert("passed".to_string(), serde_json::Value::Bool(result.passed));
@@ -648,6 +883,31 @@ pub fn verify_result_to_json(result: &VerifyResult) -> serde_json::Value {
         );
     }
     serde_json::Value::Object(map)
+}
+
+/// Append a verify result to `output_text` as human-visible content.
+///
+/// Writes `[verify:STATUS|checker|timeMs]` and, if present, appends `message`
+/// (parse error / diff / fix hint) verbatim — no JSON, no Markdown list —
+/// so the agent sees the diagnostic in one turn without redundancy.
+pub fn append_verify_to_output(output_text: &mut String, result: &VerifyResult) {
+    use std::fmt::Write as _;
+    let status = if result.passed { "PASSED" } else { "FAILED" };
+    let _ = write!(
+        output_text,
+        "\n[verify:{status}|{}|{}ms]",
+        result.checker, result.time_ms
+    );
+    if let Some(msg) = &result.message {
+        let _ = write!(output_text, "\n{msg}");
+    }
+}
+
+/// Append a verify execution error to `output_text` as human-visible content.
+pub fn append_verify_error_to_output(output_text: &mut String, err: &crate::error::Error) {
+    use std::fmt::Write as _;
+    let _ = write!(output_text, "\n[verify:ERROR|{err}]");
+    let _ = write!(output_text, "\nVerification error: {err}");
 }
 
 #[cfg(test)]
@@ -682,7 +942,24 @@ mod tests {
             detect_file_type(Path::new("foo.markdown")),
             Some(FileType::Markdown)
         );
-        assert_eq!(detect_file_type(Path::new("foo.py")), None);
+        assert_eq!(
+            detect_file_type(Path::new("foo.py")),
+            Some(FileType::Python)
+        );
+        assert_eq!(
+            detect_file_type(Path::new("foo.pyi")),
+            Some(FileType::Python)
+        );
+        assert_eq!(
+            detect_file_type(Path::new("foo.js")),
+            Some(FileType::JavaScript)
+        );
+        assert_eq!(
+            detect_file_type(Path::new("foo.jsx")),
+            Some(FileType::JavaScript)
+        );
+        assert_eq!(detect_file_type(Path::new("foo.go")), Some(FileType::Go));
+        assert_eq!(detect_file_type(Path::new("foo.unknown")), None);
         assert_eq!(detect_file_type(Path::new("foo")), None);
     }
 

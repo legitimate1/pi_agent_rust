@@ -4,7 +4,6 @@ use crate::model::{ContentBlock, TextContent};
 use asupersync::io::AsyncReadExt;
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 // ============================================================================
 // Write Tool
@@ -889,31 +888,15 @@ impl Tool for EditTool {
         // Verification only applies to known syntax/format-checkable types;
         // plain files (`.txt`, no extension, …) are skipped so the output
         // stays free of spurious "unsupported type" errors.
+        // Verify diagnostics are appended to `output_text` (content), not `details`.
         if input.verify && crate::tools::verify::is_supported_file_type(&absolute_path) {
             let verify_path = absolute_path.clone();
             match crate::tools::verify::verify_file(verify_path, abort).await {
                 Ok(result) => {
-                    let verify_json = crate::tools::verify::verify_result_to_json(&result);
-                    details.insert("verify".to_string(), verify_json);
-
-                    let status = if result.passed { "PASSED" } else { "FAILED" };
-                    let _ = write!(
-                        output_text,
-                        "\n[verify:{status}|{checker}|{time_ms}ms]",
-                        checker = result.checker,
-                        time_ms = result.time_ms,
-                    );
+                    crate::tools::verify::append_verify_to_output(&mut output_text, &result);
                 }
                 Err(e) => {
-                    details.insert(
-                        "verify".to_string(),
-                        serde_json::json!({
-                            "passed": false,
-                            "checker": "verify",
-                            "message": format!("Verification error: {e}"),
-                        }),
-                    );
-                    let _ = write!(output_text, "\n[verify:ERROR|{e}]");
+                    crate::tools::verify::append_verify_error_to_output(&mut output_text, &e);
                 }
             }
         }

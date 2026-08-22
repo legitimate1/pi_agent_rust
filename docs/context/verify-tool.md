@@ -6,12 +6,10 @@
 
 **verify** 是 `edit` / `hashline_edit` / `write` 工具的 `verify` 参数触发的**编辑后轻量语法/格式检查**：文件写入后自动检测文件类型并运行对应 checker，结果附在工具输出 `details.verify`，**不阻断流程**（失败只报告，不阻止写入）。
 
-| 入口                  | 位置                                                                                                           |
-| :-------------------- | :------------------------------------------------------------------------------------------------------------- |
-| 唯一实现              | `src/tools/verify.rs`                                                                                          |
-| 调用方（verify=true） | `src/tools/edit.rs`、`src/tools/hashline.rs`、`src/tools/write.rs`                                             |
-| 结果序列化            | `verify_result_to_json()` → `details.verify`（字段：`passed` / `checker` / `fileType` / `timeMs` / `message`） |
-| 功能清单条目          | `docs/context/features.md` → "编辑后轻量验证"                                                                  |
+- **唯一实现**：`src/tools/verify.rs`
+- **调用方（verify=true）**：`src/tools/edit.rs`、`src/tools/hashline.rs`、`src/tools/write.rs`
+- **结果序列化**：`verify_result_to_json()` → `details.verify`（字段：`passed` / `checker` / `fileType` / `timeMs` / `message`）
+- **功能清单条目**：`docs/context/features.md` → "编辑后轻量验证"
 
 ## 2. 架构
 
@@ -25,10 +23,12 @@ verify_file(path, abort)
 
 ### 两类 checker
 
-| 类别                     | 例子                                                          | 特点                                                                                                      |
-| :----------------------- | :------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------- |
-| **进程内**（internal）   | `.json` → serde_json、`.toml` → toml                          | 无子进程、无超时、错误自带行列号、无限大小                                                                |
-| **外部进程**（external） | `.rs` → rustfmt、`.ts`/`.md` → prettier（全局直调，npx 回退） | 1MB 阈值、10s 超时、程序名经 `resolve_program` 解析、失败消息规范化（ANSI 剥离 + diff + fix hint + 截断） |
+- **进程内（internal）**
+  - 例子：`.json` → serde_json、`.toml` → toml
+  - 特点：无子进程、无超时、错误自带行列号、无限大小
+- **外部进程（external）**
+  - 例子：`.rs` → rustfmt、`.ts`/`.md` → prettier（全局直调，npx 回退）
+  - 特点：1MB 阈值、10s 超时、程序名经 `resolve_program` 解析、失败消息规范化（ANSI 剥离 + diff + fix hint + 截断）
 
 ### 外部进程 checker 是表驱动声明式的
 
@@ -57,6 +57,19 @@ struct ExternalChecker {
 3. **diff 追加** — 若 checker 声明了 `format_args`，失败时多跑一次 `<program> <format_args> <path>` 拿规范化文本，用 `similar` 库生成 unified diff（`format_diff()`，上限 6000 字符）
 4. **fix hint** — `<file>` 替换为实际路径
 5. **截断** — 总 message 上限 8192 字符（`truncate_message()`，UTF-8 边界安全）
+
+### 为什么不需要为格式化工具写忽略文件（如 `.prettierignore`）
+
+- **verify 是单文件直调**：`verify_file(path)` 对给定绝对路径跑 `<program> <check_args> <path>`（如 `prettier --check <file>`），不走 `prettier .` 批量扫描；是否校验只看 `detect_file_type`（扩展名），不看 ignore 文件
+- **Agent 只动源码**：Agent 的编辑范围是 `src/` / `docs/` / `scripts/` 等源码，不会动 `target/` / `node_modules/` / `dist/` 等构建产物
+  - 实测：`prettier 3.x` 默认 `--ignore-path=[.gitignore,.prettierignore]`，`prettier --check target/...` 会被 `.gitignore` 的 `/target/` 静默跳过（exit 0 误通过）
+  - 但该路径永远不会被 `edit` / `write` / `hashline_edit` 的 `verify` 触发，故无需修复
+- **不要额外维护 `.prettierignore` / `.rustfmt.toml` 等**：
+  - 单写 `!target/` / `!target/**` 否定不生效（需先有肯定才有否定，且默认两份 ignore 叠加）
+  - 空 `.prettierignore` 仍会读 `.gitignore`（`prettier --file-info` 仍 `ignored:true`）
+  - 要绕过需显式 `prettier --check --ignore-path=.prettierignore <file>` / `--ignore-path=NUL` 等参数 —— 为单文件模型引入额外复杂度不值得
+  - 结论：verify 保持零配置，不在仓库根添加仅为 verify 服务的忽略文件
+- **何时再考虑**：只有当 verify 改为批量扫描（如 `prettier --check .`）或确实需要在构建产物上校验时，再评估 `check_args` 中追加 `--ignore-path` / `--no-ignore` 等选项
 
 ## 3. 如何新增一个静态检查工具（checker）
 
@@ -87,25 +100,45 @@ struct ExternalChecker {
 
 ### 新增 checker 时必须人工判断的固有差异（无法表驱动）
 
-| 维度           | 例子                                                      | 影响                       |
-| :------------- | :-------------------------------------------------------- | :------------------------- |
-| 退出码语义     | prettier exit 2 = 模块未缓存（软失败）；exit 1 = 格式问题 | `classify_failure`         |
-| diff 输出位置  | rustfmt → stdout；prettier `--check` → 无 diff            | `looks_like_diff` 合并逻辑 |
-| ANSI 色码      | rustfmt diff 带色码                                       | `strip_ansi`（自动）       |
-| 规范化文本来源 | prettier 无 `--check` 时输出 stdout                       | `format_args`              |
-| 探测命令       | rustfmt `--version`；npx `--version`                      | `version_args`             |
+- **退出码语义**
+  - 例子：prettier exit 2 = 模块未缓存（软失败）；exit 1 = 格式问题
+  - 影响：`classify_failure`
+- **diff 输出位置**
+  - 例子：rustfmt → stdout；prettier `--check` → 无 diff
+  - 影响：`looks_like_diff` 合并逻辑
+- **ANSI 色码**
+  - 例子：rustfmt diff 带色码
+  - 影响：`strip_ansi`（自动）
+- **规范化文本来源**
+  - 例子：prettier 无 `--check` 时输出 stdout
+  - 影响：`format_args`
+- **探测命令**
+  - 例子：rustfmt `--version`；npx `--version`
+  - 影响：`version_args`
 
 ## 4. 已知坑（遇到类似症状先查这里）
 
-| 坑                                                                             | 症状                                                                  | 原因/处理                                                                                                                                                                                                                                                                                                                                     |
-| :----------------------------------------------------------------------------- | :-------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Windows 上 prettier/rustfmt verify 恒失败                                      | `[verify:FAILED\|prettier\|0ms]`，message "npx not found"             | npm 只装 `npx.cmd` 无 `npx.exe`，CreateProcess 不解析裸 `.cmd`。已由 `resolve_program` 修复（PATH 扫 `name.exe`→`name.cmd`→`name.bat`）                                                                                                                                                                                                       |
-| prettier verify 偶发 10s 超时（Windows）                                       | `[verify:ERROR\|...npx.cmd timed out after 10s]`                      | **npx 包装触网**（npm registry 探测，`fetch-timeout=300s` + retries=2 → 一次网络挂起即超 10s）。已改**直调全局 prettier.cmd**（纯本地 ~270ms，无网络依赖），无全局安装时自动回退 npx。超时/abort 杀进程树（taskkill /T），避免 node 孤儿                                                                                                      |
-| 宿主内（Obsidian）verify 稳定 10s 超时，.ts/.md 均复现，rustfmt .exe 不受影响  | `[verify:ERROR\|...prettier.cmd timed out after 10s]`（3 次连续复现） | **cmd shim 检查器 + stdin 继承宿主管道**：`prettier.cmd`/`npx.cmd` 经 cmd.exe 包装，而 verify 子进程 stdin 未设置 = 继承宿主的 JSONL 管道（Obsidian 持有活跃写端）→ cmd 等待管道不退出。修复：`run_external_process` spawn 显式 `stdin=null`（#34）。注：#32 的 npx 超时根因实为此（网络只是放大因素）；rustfmt 是 .exe 直连无 cmd 层，故不挂 |
-| prettier 对某文件恒返回 exit 0（"All matched files use Prettier code style!"） | verify 误通过                                                         | **prettier 3.x 无 `.prettierignore` 时回退用 `.gitignore`**，gitignored 路径（如 `target/`）下的文件被静默跳过。验证时文件要放在非 gitignore 路径                                                                                                                                                                                             |
-| rustfmt 失败但 message 只有 fix hint 没有 diff                                 | 旧版行为                                                              | 已修复：rustfmt diff 在 stdout，`looks_like_diff` 合并                                                                                                                                                                                                                                                                                        |
-| message 超长                                                                   | 工具输出刷屏                                                          | `truncate_message` 8192 字符上限，UTF-8 边界安全                                                                                                                                                                                                                                                                                              |
-| 程序探测失败误报                                                               | 恒 "not found"                                                        | 探测用 `version_args`，失败才报 not_found_hint；确认程序在 PATH                                                                                                                                                                                                                                                                               |
+- **坑：Windows 上 prettier/rustfmt verify 恒失败**
+  - 症状：`[verify:FAILED|prettier|0ms]`，message "npx not found"
+  - 原因/处理：npm 只装 `npx.cmd` 无 `npx.exe`，CreateProcess 不解析裸 `.cmd`。已由 `resolve_program` 修复（PATH 扫 `name.exe`→`name.cmd`→`name.bat`）
+- **坑：prettier verify 偶发 10s 超时（Windows）**
+  - 症状：`[verify:ERROR|...npx.cmd timed out after 10s]`
+  - 原因/处理：**npx 包装触网**（npm registry 探测，`fetch-timeout=300s` + retries=2 → 一次网络挂起即超 10s）。已改**直调全局 prettier.cmd**（纯本地 ~270ms，无网络依赖），无全局安装时自动回退 npx。超时/abort 杀进程树（taskkill /T），避免 node 孤儿
+- **坑：宿主内（Obsidian）verify 稳定 10s 超时，.ts/.md 均复现，rustfmt .exe 不受影响**
+  - 症状：`[verify:ERROR|...prettier.cmd timed out after 10s]`（3 次连续复现）
+  - 原因/处理：**cmd shim 检查器 + stdin 继承宿主管道**：`prettier.cmd`/`npx.cmd` 经 cmd.exe 包装，而 verify 子进程 stdin 未设置 = 继承宿主的 JSONL 管道（Obsidian 持有活跃写端）→ cmd 等待管道不退出。修复：`run_external_process` spawn 显式 `stdin=null`（#34）。注：#32 的 npx 超时根因实为此（网络只是放大因素）；rustfmt 是 .exe 直连无 cmd 层，故不挂
+- **坑：prettier 对某文件恒返回 exit 0（"All matched files use Prettier code style!"）**
+  - 症状：verify 误通过
+  - 原因/处理：**prettier 3.x 默认 `--ignore-path=[.gitignore,.prettierignore]`**，gitignored 路径（如 `target/`）下的文件被静默跳过。**无需为此写 `.prettierignore`**（见 §2 末“为什么不需要为格式化工具写忽略文件”）：Agent 不会编辑 `target/` 等构建产物；要校验 `target/` 需改 `check_args` 追加 `--ignore-path` / `--no-ignore` 等选项，而非维护忽略文件。验证时文件要放在非 gitignore 路径
+- **坑：rustfmt 失败但 message 只有 fix hint 没有 diff**
+  - 症状：旧版行为
+  - 原因/处理：已修复：rustfmt diff 在 stdout，`looks_like_diff` 合并
+- **坑：message 超长**
+  - 症状：工具输出刷屏
+  - 原因/处理：`truncate_message` 8192 字符上限，UTF-8 边界安全
+- **坑：程序探测失败误报**
+  - 症状：恒 "not found"
+  - 原因/处理：探测用 `version_args`，失败才报 not_found_hint；确认程序在 PATH
 
 ## 5. 输出格式示例（details.verify）
 
