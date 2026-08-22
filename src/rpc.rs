@@ -22,8 +22,8 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::error_hints;
 use crate::extensions::{
-    EXTENSION_EVENT_TIMEOUT_MS, ExtensionEventName, ExtensionManager, ExtensionUiRequest,
-    ExtensionUiResponse,
+    EXTENSION_COMMAND_BUDGET_MS, EXTENSION_EVENT_TIMEOUT_MS, ExtensionEventName, ExtensionManager,
+    ExtensionUiRequest, ExtensionUiResponse,
 };
 use crate::model::{
     ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
@@ -3039,7 +3039,7 @@ async fn run_extension_command(
             .execute_extension_command_with_abort(
                 &command_name,
                 &args,
-                EXTENSION_EVENT_TIMEOUT_MS,
+                EXTENSION_COMMAND_BUDGET_MS,
                 Some(abort_signal),
                 event_handler,
             )
