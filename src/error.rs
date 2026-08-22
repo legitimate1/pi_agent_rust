@@ -1108,7 +1108,7 @@ pub fn is_retryable_error(
 
     let re = RETRYABLE_RE.get_or_init(|| {
         regex::Regex::new(
-            r"overloaded|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server error|internal error|connection.?error|connection.?refused|connection.?reset|connection.?aborted|connection.?closed|connection.?dropped|other side closed|closed before headers|closed before message|close_notify|broken pipe|unexpected eof|unexpected end of file|transient connection|fetch failed|upstream.?connect|reset before headers|terminated|retry delay",
+            r"overloaded|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server error|internal error|connection.?error|connection.?refused|connection.?reset|connection.?aborted|connection.?closed|connection.?dropped|other side closed|closed before headers|closed before message|close_notify|broken pipe|unexpected eof|unexpected end of file|transient connection|fetch failed|upstream.?connect|reset before headers|terminated|retry delay|stream ended without done",
         )
         .expect("retryable regex")
     });
