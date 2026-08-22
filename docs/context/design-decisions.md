@@ -493,3 +493,16 @@
 **不选 B 的原因**：不新增 `Error::Transient` 变体/flag（破坏 dropin 错误契约）；不在 `is_transient()` 加 `Api` 特判（仅覆盖 `Err` 路径，`Ok(Error)` 的 `is_retryable_prompt_result` 仍漏）；不在 provider 内做流内重试（流已断无 Done，重试应在 turn 级 `run_continue` 语义）。
 
 **何时重新考虑**：若上游网关永久不发 Done（兼容实现缺失）导致 3 次重试仍失败，或 compaction 链路需独立重试策略，再评估是否对 compaction 加重试或对该文案加独立退避。
+
+---
+
+## D50: RPC 斜杠命令超时 — EXTENSION_COMMAND_BUDGET_MS (30s) 替代 EXTENSION_EVENT_TIMEOUT_MS (5s)
+
+**决策**：run_extension_command（pi --mode rpc 的 prompt 分支）在调用 JsExtensionRuntimeHandle::execute_command 时传入 EXTENSION_COMMAND_BUDGET_MS（30s），而非 EXTENSION_EVENT_TIMEOUT_MS（5s）。
+
+**理由**：交互式斜杠命令的等待时间包含 await ctx.ui.select/confirm/input/custom 的用户思考时间；5s 预算使用户 5s 内未完成选择即抛 JS extension runtime command timed out after 5000ms 并以 agent_end{error} 回 pidian。30s 与 extensions.rs:16057 设计一致，覆盖正常交互时长。
+
+**不选 B 的原因**：继续用 5s 事件预算会导致所有带 UI 交互的 RPC 斜杠命令在思考>5s 时 100% 复现，custom 类因 pidian 白名单丢弃更是必超时；30s 仅放宽 RPC 命令路径，不影响 TUI/事件路径，且 rpc_parse_extension_ui_response 对未知 custom 回包格式已做 error 兜底，不会再挂起。
+
+**何时重新考虑**：若 pidian 补齐 custom 等 expects_response 方法的全量转发并提供兜底 Modal，或交互 UI 改为按请求生命周期驱动取消（effective_timeout_ms=None 无限等待），可评估进一步放宽或改为 UI 驱动的取消模型。
+

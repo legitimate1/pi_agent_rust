@@ -11,6 +11,7 @@
 - **扩展策略/运行时故障** → `cargo test extension -- --nocapture`；`rg -n "policy|hostcall|capability|quickjs|deny|allow" src/extensions.rs src/extensions_js.rs src/extension_*.rs`；`cargo test conformance`
 - **安装器/卸载器/技能问题** → `bash tests/installer_regression.sh`；`rg -n "AGENT_SKILL_STATUS|CHECKSUM_STATUS|SIGSTORE_STATUS|COMPLETIONS_STATUS" install.sh`；`rg -n "managed skill|expected skill directory|PIAR_AGENT_SKILL" uninstall.sh`
 - **交互式与 RPC 行为分歧** → `cargo test e2e_rpc -- --nocapture`；`rg -n "interactive|rpc|stdin|event|session" src/main.rs src/interactive.rs src/rpc.rs`；`cargo test conformance`
+- **RPC 斜杠命令交互超时（`JS extension runtime command timed out after 5000ms`）** → `rg -n "EXTENSION_COMMAND_BUDGET_MS|EXTENSION_EVENT_TIMEOUT_MS|run_extension_command|await_js_task" src/rpc.rs src/extensions.rs`；核 `run_extension_command` 是否用 `EXTENSION_COMMAND_BUDGET_MS`(30s) 而非 `EXTENSION_EVENT_TIMEOUT_MS`(5s)；RPC UI 请求含 `await ctx.ui.*` 时 5s 必超时（D50）。
 
 > `cargo test <词>` 是子串匹配，`session` 会覆盖 session_index_tests / session_sqlite / session_store_v2 等，`extension` 会覆盖 ext_conformance 等，命中面比字面更宽，属预期。
 

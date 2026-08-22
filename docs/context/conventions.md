@@ -27,6 +27,7 @@
 - **Windows 上 bash 解析走 `resolve_bash_shell()`，不假设 Unix 路径** — Unix 查找 `/bin/bash` 家族；Windows 查找 Git Bash 安装位（`%ProgramFiles%\Git`、`%LOCALAPPDATA%\Programs\Git`、`~\\scoop\\apps\\git`），找不到 fallback `"sh"`。**不要**在 Windows 上写死 `/bin/bash`（WSL 的 `bash.exe` 不经由 `where bash` 暴露给子进程 spawn 的常规路径）。`bash_available()`（`src/tools/mod.rs`）镜像同一解析，bash 依赖的测试用它门控——无 bash 环境跳过而非失败（曾因 fallback `sh` 不存在导致 spawn 失败）。
 - **Windows 上 `std::fs::canonicalize` 返回 `\\?\C:\...` verbatim 形式** — 该形式**不** `starts_with` 普通 `C:\` 路径/挂载点，不能用于盘符匹配（doctor `disk_available_kb` 的 Windows 分支因此手动解析：root-relative 路径（`/data/...`，无盘符）取当前目录的 Prefix 组件补盘符，再与 sysinfo 挂载点比较）。同理，`Path::is_absolute()` 对 `/tmp/x` 这类 root-relative 路径在 Windows 返回 false（见上方反模式）。
 - **中断/错误消息必须 strip 未完成的 tool_call** — `build_abort_message`/`build_error_message`（`src/agent.rs`）克隆 partial 后 `retain` 掉 `ContentBlock::ToolCall`：流式中断时 tool_call 没有对应 tool 响应，持久化后下次请求会被 provider 拒绝（`assistant message with tool_calls must be followed by tool messages` 400）。迭代上限路径（`max_tool_iterations`）与 abort/error 路径都必须遵守——新加中断收尾逻辑时检查是否遗漏 strip。
+- **RPC 扩展命令超时预算是 30s（`EXTENSION_COMMAND_BUDGET_MS`），不是 5s 事件预算** — `src/rpc.rs::run_extension_command` → `JsExtensionRuntimeHandle::execute_command` 的 `timeout_ms` 包含 `await ctx.ui.*` 的用户等待时间；误用 `EXTENSION_EVENT_TIMEOUT_MS` 会让带交互的斜杠命令在 pidian/RPC 模式 5s 即抛 `JS extension runtime command timed out after 5000ms` 并以 `agent_end{error}` 回客户端（D50）。各执行路径预算独立（command/tool/event/info/provider/ui/query），新增调用方时按 `src/extensions.rs:16043~16070` 选对应常量，切勿复用事件预算。
 
 ## 子进程管理约定
 
