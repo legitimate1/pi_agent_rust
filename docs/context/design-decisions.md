@@ -482,3 +482,14 @@
 
 **何时重新考虑**：若 Exec 出现顺序依赖需调优 2 阈值，再评估可配置化；否则保持零配置直通。
 
+---
+
+## D49: Stream 断流自动重试 — Stream ended without Done 归入 is_retryable_error 正则
+
+**决策**：将 `Stream ended without Done event` 归入 `is_retryable_error` 正则白名单（`src/error.rs` + `crates/pi-provider-core/src/error.rs` 末尾追加 `|stream ended without done`），命中后走现有 `run_prompt_with_retry` 指数退避重试（`revert_incomplete_response` + `run_continue_with_abort`，最多 `retry.maxRetries=3` 次，已执行 tool_call 不重放）。
+
+**理由**：网络抖动/代理掐流导致 SSE 未发 Done 即 FIN，此前为 `Error::Api` 既不走 `is_transient` 也不在正则中，直接 `agent_end{error}`。正则兜底在 `Ok(Error)` 与 `Err` 双路径均生效，且受 `is_context_overflow` 前置排除约束。
+
+**不选 B 的原因**：不新增 `Error::Transient` 变体/flag（破坏 dropin 错误契约）；不在 `is_transient()` 加 `Api` 特判（仅覆盖 `Err` 路径，`Ok(Error)` 的 `is_retryable_prompt_result` 仍漏）；不在 provider 内做流内重试（流已断无 Done，重试应在 turn 级 `run_continue` 语义）。
+
+**何时重新考虑**：若上游网关永久不发 Done（兼容实现缺失）导致 3 次重试仍失败，或 compaction 链路需独立重试策略，再评估是否对 compaction 加重试或对该文案加独立退避。
