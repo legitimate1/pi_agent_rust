@@ -68,7 +68,7 @@ abort 信号（`src/abort.rs` 共享原语）沿 Agent 循环 → 工具执行 �
 - **`app.rs`** → 系统提示词构建（SYSTEM.md 加载、default_system_prompt、project context files、date/cwd/temp 运行时事实注入）
 - **`tool_overrides.rs`** → tools.toml 覆盖加载：合并用户级 `~/.pi/agent/tools.toml` + 项目级 `.pi/tools.toml`（项目 key 优先），产出 description / parameters 覆盖表
 - **`tools/` 模块目录** → ToolRegistry + 内置工具模块 + verify 内部验证引擎
-- **`tools/verify.rs`** → 编辑后轻量验证引擎：文件类型检测→检查器映射（.rs/.json/.toml/.ts/.md）→进程内/外部进程执行
+- **`tools/verify.rs`** → 编辑后轻量验证引擎：文件类型检测→检查器映射（.rs/.json/.toml/.ts/.js/.py/.go/.md）→进程内/外部进程执行，支持 Format+Lint 并行（oxfmt+oxlint/ruff），诊断直写 content 正文
 - **`agent.rs`** → Agent 循环（工具迭代、扩展合并、ToolDef 构建）
 - **`extensions.rs`** → 扩展管理器、能力策略、生命周期
 - **`extensions_js.rs`** → QuickJS 运行时、虚拟模块、HostcallKind
