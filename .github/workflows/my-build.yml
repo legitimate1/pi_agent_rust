@@ -27,6 +27,8 @@ jobs:
     env:
       CI: "true"
       RUST_BACKTRACE: "1"
+      RUSTC_WRAPPER: ""
+      SCCACHE_ERROR_LOG: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v4

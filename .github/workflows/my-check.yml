@@ -21,6 +21,9 @@ jobs:
       RUST_BACKTRACE: "1"
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      # Disable sccache wrapper in CI (it's set in .cargo/config.toml for local Windows builds)
+      RUSTC_WRAPPER: ""
+      SCCACHE_ERROR_LOG: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v4
