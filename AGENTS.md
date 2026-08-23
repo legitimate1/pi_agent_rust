@@ -12,7 +12,10 @@
 - **我的话优先** — 即使与下文冲突，听我的。
 - **删文件前先问** — 包括你自己创建的文件。你说过你删错过东西，所以这条不破。
 - **禁止危险命令** — `git reset --hard`、`git clean -fd`、`rm -rf` 必须由我明确手写命令才能执行。不确定就问。
-- **分支用 `custom`** — 这是当前推送的主要分支。`main` 是 upstream 跟踪的分支，不做直接推送。
+- **分支策略（Fork 专用）** —
+  - `main` — 上游镜像分支，**禁止直接提交业务代码**，只用于同步 `upstream`：`git checkout main && git fetch upstream && git merge upstream/main && git push origin main`。`upstream` = `https://github.com/Dicklesworthstone/pi_agent_rust.git`
+  - `custom` — 个人二开主分支，所有功能/修复都在此，推送到 `origin/custom` 自动触发 `.github/workflows/my-check.yml`
+  - 新分支从 `custom` 切出，合回 `custom`；需要同步上游时先合到 `main` 再 `git checkout custom && git merge main`
 
 ## 工具链
 
@@ -80,6 +83,16 @@ cargo test -- --nocapture                # 带输出
 ```
 
 > 一致性测试夹具格式（JSON schema）见 `docs/context/commands.md`「测试与验证」。
+
+## CI 策略（本 Fork 专用）
+
+- **分工**：本地快速验证，云端跑全量
+  - 本地 Windows `pwsh`：`cargo fmt --check` + `cargo clippy --lib -- -D warnings` + `cargo test --lib` / `cargo test --test <单文件>`（秒级，不跑 `--all-targets`）
+  - 云端 `my-check.yml`：`cargo fmt` + `cargo clippy --all-targets` + `cargo test --all-targets`（`VCR_MODE=playback`，`ubuntu-latest`）
+- **工作流**：
+  - `.github/workflows/ci.yml` — 上游重型 CI（3 OS 矩阵 + 12 shard + coverage + release gate），**本 Fork 不改不碰**，其 `on.push.branches: [main]` 仅在 `main` 同步上游后才可能触发
+  - `.github/workflows/my-check.yml` — 本 Fork 轻量全量 CI，触发条件 `push: [custom]` / `pull_request: [custom,main]` / `workflow_dispatch`，公有库无限额度，`concurrency.cancel-in-progress: true`
+- **Agent 约束**：日常开发不准在本地跑 `cargo test --all-targets` / `cargo clippy --all-targets`（产物 ~30GB），改完推 `custom` 让 `my-check` 去跑；急需本地验证单模块用 `cargo test --test <stem>` 针对性跑
 
 ## 第三方库使用
 

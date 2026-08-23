@@ -1,0 +1,51 @@
+name: my-check
+
+on:
+  push:
+    branches: [custom]
+  pull_request:
+    branches: [custom, main]
+  workflow_dispatch:
+
+concurrency:
+  group: my-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+      VCR_MODE: "playback"
+      VCR_CASSETTE_DIR: "tests/fixtures/vcr"
+      RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system deps (fd, rg, xcb)
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y fd-find ripgrep libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-05
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked --all-targets
