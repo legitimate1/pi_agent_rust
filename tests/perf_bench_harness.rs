@@ -24,9 +24,15 @@
 mod common;
 
 use std::fmt::Write as _;
+#[cfg(unix)]
+use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use pi::extensions::{
     ExtensionEventName, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
