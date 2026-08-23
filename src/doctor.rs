@@ -10461,9 +10461,7 @@ fn disk_available_kb(path: &Path) -> Option<u64> {
     }
     #[cfg(not(windows))]
     {
-        if which_tool("df").is_none() {
-            return None;
-        }
+        which_tool("df")?;
         let path_arg = path.display().to_string();
         let outcome = run_tool_with_timeout(
             SwarmProbeCommand::Df,
