@@ -1,0 +1,93 @@
+name: my-build
+
+on:
+  push:
+    tags: ["my-v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: my-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.asset }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: pi-linux-amd64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: pi-windows-amd64
+    env:
+      CI: "true"
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system deps (xcb) [linux]
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-05
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: my-build-${{ matrix.target }}-release-max
+
+      # Linux: max performance with fat LTO + jemalloc
+      - name: Build release-max (linux + jemalloc)
+        if: runner.os == 'Linux'
+        run: cargo build --profile release-max --locked --bin pi --target ${{ matrix.target }} --features jemalloc
+
+      # Windows: max performance with fat LTO (jemalloc unsupported on Windows)
+      - name: Build release-max (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cargo build --profile release-max --locked --bin pi --target ${{ matrix.target }}
+
+      - name: Verify binary exists
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ls -lh "target/${{ matrix.target }}/release-max/pi.exe"
+            "target/${{ matrix.target }}/release-max/pi.exe" --version || true
+          else
+            ls -lh "target/${{ matrix.target }}/release-max/pi"
+            "target/${{ matrix.target }}/release-max/pi" --version || true
+          fi
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release-max/pi.exe" "dist/${{ matrix.asset }}.exe"
+          else
+            cp "target/${{ matrix.target }}/release-max/pi" "dist/${{ matrix.asset }}"
+          fi
+          ls -lh dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error

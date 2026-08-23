@@ -382,6 +382,14 @@ lto = "thin"
 panic = "abort"
 strip = true
 
+[profile.release-max]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+# inherits opt-level = 3, panic = abort, strip = true from release
+# Full LTO + single codegen unit = slowest build, best runtime performance
+# Use only in CI (my-build.yml) with --profile release-max [--features jemalloc on Linux]
+
 [profile.dev]
 opt-level = 0
 debug = "line-tables-only"

@@ -53,17 +53,21 @@
 1. 每次构建前升版本号：`cargo set-version --bump patch -p pi_agent_rust`（`-p pi_agent_rust` 限仅升主 crate，避免 workspace 成员全部跳版本）
 2. 构建和部署分离 — 构建后等用户指令再部署
 3. 不得私自构建或部署
+4. **构建策略（本 Fork 专用）**：本地要快、云上要狠
+   - 本地 `pwsh` 只跑 `--profile dev` / `cargo build --release`（`lto=thin`，约 2 分钟）
+   - 要发版才用 `--profile release-max`（`lto=fat + codegen-units=1 + jemalloc`，约 15~20 分钟），**必须交给 `my-build.yml` 在云上跑**，本地不准跑 `release-max`
 
 ### 流程
 
 ```
 用户说「构建」→ cargo set-version --bump patch -p pi_agent_rust → git add + commit → cargo build --release → 停下
 用户说「部署」→ .\scripts\deploy-release.ps1
+用户说「云构建/发包」→ git tag my-v0.x.y && git push origin my-v0.x.y → 触发 my-build.yml（或网页 workflow_dispatch）
 ```
 
 > 构建前**不**重复跑全量测试 — 收尾门禁已验证过。若用户中途要求构建（改动未收尾），先跑针对性测试确认无误再构建。部署脚本自动执行 `cargo sweep --file` + `--stamp` 清理旧产物，无需手动清理。
 >
-> Release profile 契约（`Cargo.toml` 的 `[profile.release]`：`opt-level = 3` + `lto = "thin"` + `panic = "abort"` + `strip = true`，+ 校验 + 预算门禁）见 `docs/context/commands.md`「构建与部署配置」。release 二进制大小预算由 `BINARY_SIZE_RELEASE_BUDGET_MB` 定义。jemalloc is opt-in via `--features jemalloc`，不要默认启用。
+> Release profile 契约（`Cargo.toml` 的 `[profile.release]`：`opt-level = 3` + `lto = "thin"` + `panic = "abort"` + `strip = true`，+ 校验 + 预算门禁）见 `docs/context/commands.md`「构建与部署配置」。`[profile.release-max]` 继承 `release` 并覆盖 `lto = "fat"` + `codegen-units = 1`，专供 CI 满血构建。release 二进制大小预算由 `BINARY_SIZE_RELEASE_BUDGET_MB` 定义。jemalloc is opt-in via `--features jemalloc`，不要默认启用（`my-build.yml` 仅在 `ubuntu-latest` 启用）。
 
 ## 测试
 
@@ -92,7 +96,9 @@ cargo test -- --nocapture                # 带输出
 - **工作流**：
   - `.github/workflows/ci.yml` — 上游重型 CI（3 OS 矩阵 + 12 shard + coverage + release gate），**本 Fork 不改不碰**，其 `on.push.branches: [main]` 仅在 `main` 同步上游后才可能触发
   - `.github/workflows/my-check.yml` — 本 Fork 轻量全量 CI，触发条件 `push: [custom]` / `pull_request: [custom,main]` / `workflow_dispatch`，公有库无限额度，`concurrency.cancel-in-progress: true`
-- **Agent 约束**：日常开发不准在本地跑 `cargo test --all-targets` / `cargo clippy --all-targets`（产物 ~30GB），改完推 `custom` 让 `my-check` 去跑；急需本地验证单模块用 `cargo test --test <stem>` 针对性跑
+  - `.github/workflows/my-build.yml` — 本 Fork 满血构建，触发条件 `push: tags[my-v*]` / `workflow_dispatch`，矩阵 `ubuntu-latest + windows-latest`，`--profile release-max`（`lto=fat + codegen-units=1`，Linux 额外 `--features jemalloc`），产物上传为 `pi-linux-amd64` / `pi-windows-amd64`
+  - `.github/workflows/release.yml` — 上游 5 平台正式发布流（`v*` tag + `release` 环境审批），**本 Fork 不改不碰**
+- **Agent 约束**：日常开发不准在本地跑 `cargo test --all-targets` / `cargo clippy --all-targets`（产物 ~30GB）及 `cargo build --profile release-max`（~15 分钟），改完推 `custom` 让 `my-check` 去验，`git tag my-v*` 让 `my-build` 去压性能；急需本地验证单模块用 `cargo test --test <stem>` 针对性跑
 
 ## 第三方库使用
 
