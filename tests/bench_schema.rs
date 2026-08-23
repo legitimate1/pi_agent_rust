@@ -20,6 +20,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::Command;
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ─── Schema Definitions ──────────────────────────────────────────────────────
 
