@@ -1576,9 +1576,8 @@ fn artifact_index_cross_validation_detects_missing_paths() {
             "ts": "x",
             "t_ms": 100,
             "name": "output",
-            "path": existing_file.display().to_string().replace('\\', "/")
-        })
-        .to_string(),
+            "path": existing_file.to_string_lossy().replace('\\', "/")
+        }),
         serde_json::json!({
             "schema": "pi.test.artifact.v1",
             "type": "artifact",
@@ -1586,9 +1585,8 @@ fn artifact_index_cross_validation_detects_missing_paths() {
             "ts": "x",
             "t_ms": 200,
             "name": "missing_artifact",
-            "path": dir.path().join("nonexistent.log").display().to_string().replace('\\', "/")
-        })
-        .to_string(),
+            "path": dir.path().join("nonexistent.log").to_string_lossy().replace('\\', "/")
+        }),
     );
 
     let warnings = common::logging::validate_artifact_index_paths(&artifact_index, dir.path());
@@ -1618,9 +1616,8 @@ fn artifact_index_cross_validation_passes_when_all_paths_exist() {
             "ts": "x",
             "t_ms": 0,
             "name": "result",
-            "path": file_a.display().to_string().replace('\\', "/")
-        })
-        .to_string(),
+            "path": file_a.to_string_lossy().replace('\\', "/")
+        }),
         serde_json::json!({
             "schema": "pi.test.artifact.v1",
             "type": "artifact",
@@ -1628,9 +1625,8 @@ fn artifact_index_cross_validation_passes_when_all_paths_exist() {
             "ts": "x",
             "t_ms": 0,
             "name": "test_log",
-            "path": file_b.display().to_string().replace('\\', "/")
-        })
-        .to_string(),
+            "path": file_b.to_string_lossy().replace('\\', "/")
+        }),
     );
 
     let warnings = common::logging::validate_artifact_index_paths(&artifact_index, dir.path());

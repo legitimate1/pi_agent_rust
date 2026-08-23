@@ -3222,7 +3222,7 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
         return Ok(());
     };
 
-    File::open(parent)?.sync_all()
+    std::fs::File::open(parent)?.sync_all()
 }
 
 #[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]

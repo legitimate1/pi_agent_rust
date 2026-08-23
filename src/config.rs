@@ -1423,7 +1423,7 @@ fn sync_settings_parent_dir(path: &Path) -> std::io::Result<()> {
     if parent.as_os_str().is_empty() {
         return Ok(());
     }
-    File::open(parent)?.sync_all()
+    std::fs::File::open(parent)?.sync_all()
 }
 
 #[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]

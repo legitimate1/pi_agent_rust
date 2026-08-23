@@ -2165,6 +2165,7 @@ fn test_bash_cancelled_context_kills_process_tree() {
             "(sleep 3; echo leaked > leaked_child.txt) & sleep 10",
             Some(30),
             None,
+            None,
         )
         .await
         .expect("cancelled bash should return a result");

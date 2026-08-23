@@ -45,6 +45,7 @@ pub(crate) use hashline::{
     NIBBLE_STR, compute_line_hash, hashline_tag_regex, parse_hashline_tag, strip_hashline_prefix,
 };
 #[cfg(test)]
+#[allow(unused_imports)]
 pub(crate) use pwsh::run_pwsh_command;
 
 #[cfg(test)]
@@ -64,6 +65,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -3677,7 +3680,6 @@ pub(crate) fn resolve_executable_for_shell_trampoline(
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::PermissionsExt as _;
 
-    use std::ffi::OsString;
     fn executable_candidate(path: &Path) -> std::io::Result<bool> {
         let metadata = std::fs::metadata(path)?;
         Ok(metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
@@ -3881,7 +3883,10 @@ pub fn persist_with_readonly_handling(
                 return Err(err);
             }
 
+            #[cfg(windows)]
             let temp_file = e.file;
+            #[cfg(not(windows))]
+            let _ = e.file;
 
             #[cfg(windows)]
             {

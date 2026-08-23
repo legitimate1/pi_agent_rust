@@ -487,9 +487,9 @@ fn tool_bash_nonexistent_working_directory() {
 #[test]
 fn tool_bash_timeout_kills_process() {
     asupersync::test_utils::run_test(|| async {
-        let _h = TestHarness::new("bash_timeout_kills");
+        let h = TestHarness::new("bash_timeout_kills");
         let cwd = if cfg!(windows) {
-            _h.temp_dir().to_path_buf()
+            h.temp_dir().to_path_buf()
         } else {
             std::path::PathBuf::from("/tmp")
         };
@@ -868,9 +868,9 @@ fn tool_write_missing_content() {
 #[test]
 fn tool_bash_missing_command() {
     asupersync::test_utils::run_test(|| async {
-        let _h = TestHarness::new("bash_missing_command");
+        let h = TestHarness::new("bash_missing_command");
         let cwd = if cfg!(windows) {
-            _h.temp_dir().to_path_buf()
+            h.temp_dir().to_path_buf()
         } else {
             std::path::PathBuf::from("/tmp")
         };
@@ -1496,9 +1496,9 @@ fn agent_event_lifecycle_with_tools() {
 #[test]
 fn tool_bash_exit_code_capture() {
     asupersync::test_utils::run_test(|| async {
-        let _h = TestHarness::new("bash_exit_code");
+        let h = TestHarness::new("bash_exit_code");
         let cwd = if cfg!(windows) {
-            _h.temp_dir().to_path_buf()
+            h.temp_dir().to_path_buf()
         } else {
             std::path::PathBuf::from("/tmp")
         };
@@ -1520,9 +1520,9 @@ fn tool_bash_exit_code_capture() {
 #[test]
 fn tool_bash_stdout_stderr_capture() {
     asupersync::test_utils::run_test(|| async {
-        let _h = TestHarness::new("bash_stderr");
+        let h = TestHarness::new("bash_stderr");
         let cwd = if cfg!(windows) {
-            _h.temp_dir().to_path_buf()
+            h.temp_dir().to_path_buf()
         } else {
             std::path::PathBuf::from("/tmp")
         };

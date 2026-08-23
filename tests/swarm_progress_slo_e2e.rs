@@ -847,16 +847,16 @@ fn scenarios() -> Vec<Scenario> {
     ]
 }
 
-fn live_repo_guard_bytes() -> TestResult<(Vec<u8>, Vec<u8>)> {
+fn live_repo_guard_bytes() -> (Vec<u8>, Vec<u8>) {
     let root = repo_root();
     // 容错：.beads/issues.jsonl 在未接入 beads 的本机不存在属合法基线，缺失视为空基线而非错误；.git/HEAD 同理容错 bare 环境
     let head = fs::read(root.join(".git").join("HEAD")).unwrap_or_default();
     let beads = fs::read(root.join(".beads").join("issues.jsonl")).unwrap_or_default();
-    Ok((head, beads))
+    (head, beads)
 }
 
 fn assert_live_repo_unchanged(before: &(Vec<u8>, Vec<u8>)) -> TestResult {
-    let after = live_repo_guard_bytes()?;
+    let after = live_repo_guard_bytes();
     if &after != before {
         return Err(test_error(
             "live repo git HEAD or Beads ledger changed during E2E",
@@ -933,7 +933,7 @@ fn assert_summary(summary: &Value, expected_count: usize) -> TestResult {
 
 #[test]
 fn progress_slo_no_mock_e2e_emits_summary_and_jsonl_events() -> TestResult {
-    let live_repo_before = live_repo_guard_bytes()?;
+    let live_repo_before = live_repo_guard_bytes();
     let root = test_workspace("progress-slo-e2e")?;
     let event_log = root.join("progress-slo-e2e-events.jsonl");
     let mut evidences = Vec::new();
