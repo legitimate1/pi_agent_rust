@@ -23,6 +23,8 @@
   <img src="https://img.shields.io/badge/unsafe-forbidden-brightgreen" alt="No Unsafe Code">
 </p>
 
+> **Fork Notice / 声明** — 本仓库是 [Dicklesworthstone/pi_agent_rust](https://github.com/Dicklesworthstone/pi_agent_rust) 的个人 Fork，用于个人学习 / Windows 环境适配 / CI 实验。原作版权归 Jeffrey Emanuel 及贡献者所有，遵循 `MIT + Rider` 协议。 This is a personal fork of the upstream project for learning and experimentation.
+
 ```bash
 # Install latest release
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash
