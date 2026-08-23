@@ -465,7 +465,7 @@ fn read_output_for_sample(cwd: &Path, path: &str) -> String {
     let tool = ReadTool::new(cwd);
     let path = path.to_string();
     let output = run_async(async move {
-        tool.execute("tool-call", json!({ "path": path }), None)
+        tool.execute("tool-call", json!({ "path": path }), None, None)
             .await
             .expect("read tool output")
     });
