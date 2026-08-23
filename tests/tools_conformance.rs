@@ -3693,6 +3693,7 @@ mod security_environment {
                 .unwrap()
                 .to_string_lossy()
                 .to_string();
+            #[allow(unused_mut)]
             let mut actual = text.trim().to_string();
             // On Windows the bash tool runs under MSYS, where `pwd` prints a
             // POSIX-style path (e.g. /tmp/xyz). Convert it back to the

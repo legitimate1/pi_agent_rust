@@ -754,6 +754,7 @@ mod bash_hardened {
             h.log().info("verify", format!("pwd={text}"));
             // The pwd output should match or be within the temp dir
             let temp_dir_str = h.temp_dir().to_string_lossy();
+            #[allow(unused_mut)]
             let mut actual = text.trim().to_string();
             // On Windows the bash tool runs under MSYS, where `pwd` prints a
             // POSIX-style path (e.g. /tmp/xyz); convert it back to the
