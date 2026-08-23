@@ -1259,6 +1259,7 @@ fn bash_process_tree_cleanup_on_timeout() {
                 "timeout": 2
             }),
             None,
+            None,
         )
         .await
     });
