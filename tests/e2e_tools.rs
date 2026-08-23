@@ -1158,6 +1158,7 @@ fn bash_cwd_propagation() {
 
     // MSYS bash prints POSIX-style paths on Windows; convert pwd output back
     // to the Windows form before comparing with the expected temp dir.
+    #[allow(unused_mut)]
     let mut normalized = text.trim().to_string();
     #[cfg(windows)]
     if let Ok(converted) = std::process::Command::new("cygpath")
