@@ -54,50 +54,50 @@ jobs:
         run: cargo test --locked --all-targets
 
   # 回联到本地 pidian（Watchdog×pi-tag）：需本机 Self-hosted Runner（Windows）常驻才能直写 C:\Users\m\.pi\tasks.db
-  # 本 Fork 当前未配置 self-hosted runner，故此 job 暂以 `if: false` 禁用，避免整条 workflow 因找不到 runner 而失败；
-  # 启用时将 `if: false` 改为 `if: always()` 并确保 runner 在线即可恢复自动回联（见 AGENTS.md 的 Watchdog 說明）。
-  notify:
-    needs: check
-    if: false
-    runs-on: self-hosted
-    steps:
-      - name: Notify Agent
-        if: always()
-        shell: pwsh
-        run: |
-          $repo = "${{ github.repository }}" -replace "[*_`#]","\$0"
-          $wf = "${{ github.workflow }}" -replace "[*_`#]","\$0"
-          $sha = "${{ github.sha }}".Substring(0,7)
-          if ($sha -notmatch "^[0-9a-f]{7}$") { $sha = "unknown" }
-          @"
-          **仓库**: $repo
-          **工作流**: $wf
-          **Commit**: $sha
-          **结果**: ${{ needs.check.result }}
-          **Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          "@ | Set-Content body.md -Encoding utf8
-          $title = "CI ${{ needs.check.result }}: $repo#$sha".Substring(0,200)
-          pi-tag task create $title --body-file body.md --project pi_agent_rust --requester github-actions --labels "notify,ci"
-
-      - name: Report CI failure as ticket
-        if: ${{ needs.check.result == 'failure' }}
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh run view ${{ github.run_id }} --repo ${{ github.repository }} --log-failed 2>&1 `
-            | ForEach-Object { $_ -replace "\x1b\[[0-9;]*m","" -replace "^\d{4}-\d{2}-\d{2}T\S+\s*","" } `
-            | ForEach-Object { $_ -replace "(?i)(token|password|secret|key)\s*[:=]\s*\S+","`$1=***" } `
-            | Where-Object { $_ -notmatch "^\s*(Downloading|Checking|Compiling|Downloaded|Cache\b|Updating crates)" } `
-            | Select-Object -Last 80 | Set-Content err-tail.md -Encoding utf8
-          @"
-          **仓库**: ${{ github.repository }}
-          **工作流**: ${{ github.workflow }}
-          **Commit**: ${{ github.sha }}
-          **结果**: failure
-          **Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-          --- 错误摘要（已过滤，完整见 Run 链接） ---
-          "@ | Set-Content body.md -Encoding utf8
-          Get-Content err-tail.md | Add-Content body.md
-          pi-tag task create "CI 失败: ${{ github.repository }}#${{ github.sha.substring(0,7) }}" --body-file body.md --project pi_agent_rust --requester github-actions --labels "ticket,ci"
+  # 本 Fork 当前未配置 self-hosted runner，故此 job 暂禁用（注释掉），避免解析期因 runs-on: self-hosted 而失败；
+  # 启用时取消注释并确保 runner 在线即可恢复自动回联（见 AGENTS.md 的 Watchdog 說明和 docs/design/pidian-pitag-linkage-design.md §4 模板）。
+  # notify:
+  #   needs: check
+  #   if: always()
+  #   runs-on: self-hosted
+  #   steps:
+  #     - name: Notify Agent
+  #       if: always()
+  #       shell: pwsh
+  #       run: |
+  #         $repo = "${{ github.repository }}" -replace "[*_`#]","\$0"
+  #         $wf = "${{ github.workflow }}" -replace "[*_`#]","\$0"
+  #         $sha = "${{ github.sha }}".Substring(0,7)
+  #         if ($sha -notmatch "^[0-9a-f]{7}$") { $sha = "unknown" }
+  #         @"
+  #         **仓库**: $repo
+  #         **工作流**: $wf
+  #         **Commit**: $sha
+  #         **结果**: ${{ needs.check.result }}
+  #         **Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  #         "@ | Set-Content body.md -Encoding utf8
+  #         $title = "CI ${{ needs.check.result }}: $repo#$sha".Substring(0,200)
+  #         pi-tag task create $title --body-file body.md --project pi_agent_rust --requester github-actions --labels "notify,ci"
+  #
+  #     - name: Report CI failure as ticket
+  #       if: ${{ needs.check.result == 'failure' }}
+  #       shell: pwsh
+  #       env:
+  #         GH_TOKEN: ${{ github.token }}
+  #       run: |
+  #         gh run view ${{ github.run_id }} --repo ${{ github.repository }} --log-failed 2>&1 `
+  #           | ForEach-Object { $_ -replace "\x1b\[[0-9;]*m","" -replace "^\d{4}-\d{2}-\d{2}T\S+\s*","" } `
+  #           | ForEach-Object { $_ -replace "(?i)(token|password|secret|key)\s*[:=]\s*\S+","`$1=***" } `
+  #           | Where-Object { $_ -notmatch "^\s*(Downloading|Checking|Compiling|Downloaded|Cache\b|Updating crates)" } `
+  #           | Select-Object -Last 80 | Set-Content err-tail.md -Encoding utf8
+  #         @"
+  #         **仓库**: ${{ github.repository }}
+  #         **工作流**: ${{ github.workflow }}
+  #         **Commit**: ${{ github.sha }}
+  #         **结果**: failure
+  #         **Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  #
+  #         --- 错误摘要（已过滤，完整见 Run 链接） ---
+  #         "@ | Set-Content body.md -Encoding utf8
+  #         Get-Content err-tail.md | Add-Content body.md
+  #         pi-tag task create "CI 失败: ${{ github.repository }}#${{ github.sha.substring(0,7) }}" --body-file body.md --project pi_agent_rust --requester github-actions --labels "ticket,ci"
