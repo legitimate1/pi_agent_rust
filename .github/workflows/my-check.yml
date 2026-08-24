@@ -74,7 +74,8 @@ jobs:
           **结果**: ${{ needs.check.result }}
           **Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           "@ | Set-Content body.md -Encoding utf8
-          $title = "CI ${{ needs.check.result }}: $repo#$sha".Substring(0,200)
+          $title = "CI ${{ needs.check.result }}: $repo#$sha"
+          if ($title.Length -gt 200) { $title = $title.Substring(0,200) }
           pi-tag task create $title --body-file body.md --project pi_agent_rust --requester github-actions --labels "notify,ci"
 
       - name: Report CI failure as ticket
