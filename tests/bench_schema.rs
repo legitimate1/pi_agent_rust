@@ -439,6 +439,17 @@ fn install_fake_orchestrate_staging_artifacts(target_dir: &Path) {
         target_dir.join("criterion/ext_load_init/load_init_cold/hello/new/estimates.json"),
         target_dir.join("criterion/ext_policy/evaluate/hello/new/estimates.json"),
         target_dir.join("criterion/ext_protocol/parse_and_validate/hello/new/estimates.json"),
+        target_dir
+            .join("criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json"),
+        target_dir
+            .join("criterion/semantic_context/graph_build_warm/large_workspace/new/estimates.json"),
+        target_dir.join(
+            "criterion/semantic_context/incremental_update/large_workspace/new/estimates.json",
+        ),
+        target_dir.join("criterion/semantic_context/planning/large_workspace/new/estimates.json"),
+        target_dir.join(
+            "criterion/semantic_context/bundle_serialization/large_workspace/new/estimates.json",
+        ),
     ] {
         write_json(&path, criterion_estimate);
     }
@@ -455,6 +466,10 @@ fn install_fake_orchestrate_staging_artifacts(target_dir: &Path) {
     write_json(
         &target_dir.join("perf/results/phase1_matrix_validation.json"),
         r#"{"schema":"pi.perf.phase1_matrix_validation.v1"}"#,
+    );
+    write_json(
+        &target_dir.join("perf/context_intelligence/perf_budget.json"),
+        r#"{"schema":"pi.semantic_context.performance_budget.v1","environment":{"cargo_target_dir":"/tmp","tmpdir":"/tmp"},"host":{"os":"linux","arch":"x86_64"},"determinism":{"randomized_file_order_checked":true,"matched":true},"cache_hit_miss":{"cold_graph_build":"fresh","warm_graph_build":"same","incremental_update":"single"},"metrics":{"context_graph_build_cold_ms":{"p95_ms":1.0},"context_graph_build_warm_ms":{"p95_ms":1.0},"context_incremental_update_ms":{"p95_ms":1.0},"context_planning_ms":{"p95_ms":1.0},"context_bundle_serialization_ms":{"p95_ms":1.0},"context_bundle_estimated_bytes":{"bytes":1024.0}}}"#,
     );
 }
 
