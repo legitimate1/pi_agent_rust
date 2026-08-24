@@ -251,6 +251,11 @@ impl GoldenTestHarness {
             .current_dir(self.harness.temp_dir())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Suppress backtrace noise in child `pi` that would false-positive
+        // `stderr_not_contains: ["panic"]` (backtrace frames contain
+        // `panicking.rs`). Keep test-harness `RUST_BACKTRACE=1` for diagnostics.
+        command.env("RUST_BACKTRACE", "0");
+        command.env("RUST_LIB_BACKTRACE", "0");
 
         if stdin.is_some() {
             command.stdin(Stdio::piped());
@@ -385,11 +390,18 @@ fn assert_golden(harness: &TestHarness, fixture: &GoldenFixture, output: &CliOut
         );
     }
 
-    // stderr not contains.
+    // stderr not contains — precise for `panic` to avoid
+    // `RUST_BACKTRACE=1` false positives (`panicking.rs` in backtrace).
     for needle in &fixture.expected.stderr_not_contains {
         let lower = output.stderr.to_lowercase();
+        let needle_lower = needle.to_lowercase();
+        let matched = if needle_lower == "panic" {
+            stderr_contains_panic_signal(&lower)
+        } else {
+            lower.contains(&needle_lower)
+        };
         assert!(
-            !lower.contains(&needle.to_lowercase()),
+            !matched,
             "[{scenario}] stderr should NOT contain '{needle}'.\nstderr:\n{}",
             output.stderr,
         );
@@ -572,6 +584,52 @@ fn count_jsonl_files(dir: &Path) -> usize {
         }
     }
     count
+}
+
+fn stderr_contains_panic_signal(lower: &str) -> bool {
+    // True panic signals (case-insensitive, `lower` is already lowercase):
+    // - "panicked at" (Rust panic header)
+    // - "thread '...' panicked"
+    // - isolated word "panic" not inside "panicking" / "panicked".
+    if lower.contains("panicked at") || lower.contains("panicked") {
+        return true;
+    }
+    // Word-boundary search for literal "panic" without treating
+    // "panicking"/"panicked" as a hit (those appear in `RUST_BACKTRACE=1`
+    // frames like `std::panicking::begin_panic` / `panicking.rs`).
+    let bytes = lower.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = lower[start..].find("panic") {
+        let abs = start + pos;
+        let before_ok = abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric();
+        let after = abs + 5;
+        let after_ok = if after >= bytes.len() {
+            true
+        } else {
+            let ch = bytes[after] as char;
+            // Treat "panicking"/"panicked" continuations as not-a-signal.
+            // Any other boundary (space/punct/eol) counts as a signal.
+            // We check by peeking whether the match is a prefix of those words.
+            if lower[abs..].starts_with("panicking") || lower[abs..].starts_with("panicked") {
+                false
+            } else {
+                !ch.is_ascii_alphanumeric()
+            }
+        };
+        if before_ok && after_ok {
+            // Already handled panicked above; this branch still returns true
+            // for bare "panic" / "panics" etc., which is intentionally strict.
+            // We already filtered the two known backtrace false positives.
+            // So any remaining word-boundary "panic" is a real signal.
+            return true;
+        }
+        // False positive (inside panicking/panicked span) — skip past it.
+        start = abs + 5;
+        if start >= lower.len() {
+            break;
+        }
+    }
+    false
 }
 
 // ═══════════════════════════════════════════════════════════════════════
