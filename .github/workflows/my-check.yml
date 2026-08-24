@@ -98,4 +98,4 @@ jobs:
           --- 错误摘要（已过滤，完整见 Run 链接） ---
           "@ | Set-Content body.md -Encoding utf8
           Get-Content err-tail.md | Add-Content body.md
-          pi-tag task create "CI 失败: ${{ github.repository }}#${{ github.sha.substring(0,7) }}" --body-file body.md --project pi_agent_rust --requester github-actions --labels "ticket,ci"
+          pi-tag task create "CI 失败: ${{ github.repository }}#${{ github.sha }}" --body-file body.md --project pi_agent_rust --requester github-actions --labels "ticket,ci"
