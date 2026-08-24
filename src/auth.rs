@@ -1649,10 +1649,9 @@ where
             if path.starts_with('\\') || path.starts_with('/') {
                 Some(PathBuf::from(format!("{drive}{path}")))
             } else {
-                // HOMEPATH without a leading separator (e.g. `Users\foo`):
-                // join with an explicit separator — PathBuf::push on a drive
-                // root (`C:`) does not insert one.
-                Some(PathBuf::from(format!("{drive}\\{path}")))
+                let mut combined = PathBuf::from(drive);
+                combined.push(path);
+                Some(combined)
             }
         })
 }
@@ -3079,10 +3078,9 @@ where
             if path.starts_with('\\') || path.starts_with('/') {
                 Some(PathBuf::from(format!("{drive}{path}")))
             } else {
-                // HOMEPATH without a leading separator (e.g. `Users\foo`):
-                // join with an explicit separator — PathBuf::push on a drive
-                // root (`C:`) does not insert one.
-                Some(PathBuf::from(format!("{drive}\\{path}")))
+                let mut combined = PathBuf::from(drive);
+                combined.push(path);
+                Some(combined)
             }
         })
 }
@@ -7590,7 +7588,7 @@ mod tests {
             "HOMEPATH" => Some("Users\\tester".to_string()),
             _ => None,
         });
-        assert_eq!(home, Some(PathBuf::from("C:/Users\\tester")));
+        assert_eq!(home, Some(PathBuf::from("C:").join("Users\\tester")));
     }
 
     #[test]
