@@ -56,11 +56,11 @@ jobs:
   # 回联到本地 pidian（Watchdog×pi-tag）：本机 Self-hosted Runner（C:\actions-runner\pidian-win）已上线，直写 C:\Users\m\.pi\tasks.db
   notify:
     needs: check
-    if: always()
+    if: ${{ always() }}
     runs-on: self-hosted
     steps:
       - name: Notify Agent
-        if: always()
+        if: ${{ always() }}
         shell: pwsh
         run: |
           $repo = "${{ github.repository }}" -replace "[*_`#]","\$0"
