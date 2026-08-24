@@ -53,11 +53,12 @@ jobs:
       - name: cargo test
         run: cargo test --locked --all-targets
 
-  # 回联到本地 pidian：需本机 Self-hosted Runner（Windows）常驻，DB 即 inbox
-  # ubuntu-latest 写不到 C:\Users\m\.pi\tasks.db，故单拆一 job 跑在 self-hosted
+  # 回联到本地 pidian（Watchdog×pi-tag）：需本机 Self-hosted Runner（Windows）常驻才能直写 C:\Users\m\.pi\tasks.db
+  # 本 Fork 当前未配置 self-hosted runner，故此 job 暂以 `if: false` 禁用，避免整条 workflow 因找不到 runner 而失败；
+  # 启用时将 `if: false` 改为 `if: always()` 并确保 runner 在线即可恢复自动回联（见 AGENTS.md 的 Watchdog 說明）。
   notify:
     needs: check
-    if: always()
+    if: false
     runs-on: self-hosted
     steps:
       - name: Notify Agent
