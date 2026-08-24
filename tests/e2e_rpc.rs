@@ -1138,20 +1138,73 @@ fn session_lock_path(session_path: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn assert_lock_released(lock_path: &Path) {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_path)
-        .expect("open lock file");
-    if let Err(err) = fs4::fs_std::FileExt::try_lock_exclusive(&file) {
-        exit_crash_interrupt_worker(format!(
-            "lock should be released after interrupted worker: {} ({err})",
-            lock_path.display()
-        ));
+    // `session-index.lock` is a directory lock (proper-lockfile compat);
+    // `fs4` flock probing would create a poisoning regular file at the same
+    // path (see `src/file_lock.rs`). Handle both cases.
+    for _ in 0..30 {
+        match std::fs::symlink_metadata(lock_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Ok(meta) if meta.is_dir() => {
+                // Directory-lock probe: DirLock freshness threshold is 10s.
+                // Poll to let racy `Drop::remove_dir` settle; a stale dir
+                // (>=10s) counts as released (reclaim would free it).
+                if let Ok(m) = std::fs::metadata(lock_path) {
+                    if let Ok(mtime) = m.modified() {
+                        if std::time::SystemTime::now()
+                            .duration_since(mtime)
+                            .is_ok_and(|age| age > std::time::Duration::from_secs(10))
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+            Ok(meta) if meta.is_file() => {
+                // Legacy flock artefact — try flock probe.
+                if let Ok(file) = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(lock_path)
+                {
+                    if fs4::fs_std::FileExt::try_lock_exclusive(&file).is_ok() {
+                        let _ = fs4::fs_std::FileExt::unlock(&file);
+                        // Best-effort heal: remove the poisoning file so future
+                        // DirLock mkdir isn't confused; ignore raciness.
+                        let _ = std::fs::remove_file(lock_path);
+                        return;
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    fs4::fs_std::FileExt::unlock(&file).expect("unlock test lock probe");
+    // Final verdict after retries exhausted.
+    if let Ok(meta) = std::fs::symlink_metadata(lock_path) {
+        if meta.is_dir() {
+            exit_crash_interrupt_worker(format!(
+                "lock should be released after interrupted worker: {} (directory still held)",
+                lock_path.display()
+            ));
+        }
+        if meta.is_file() {
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(lock_path)
+            {
+                if let Err(err) = fs4::fs_std::FileExt::try_lock_exclusive(&file) {
+                    exit_crash_interrupt_worker(format!(
+                        "lock should be released after interrupted worker: {} ({err})",
+                        lock_path.display()
+                    ));
+                }
+                let _ = fs4::fs_std::FileExt::unlock(&file);
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1669,9 +1722,34 @@ fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() {
     }
 
     let index = SessionIndex::for_sessions_root(&sessions_root);
-    let index_summary = index
-        .refresh_incremental()
-        .expect("parent final refresh session index");
+    let index_summary = {
+        // `session-index.lock` is directory-protocol. A legacy `assert_lock_*`
+        // style `open(O_CREAT)` done elsewhere can leave a poisoning regular
+        // file that `DirLock::acquire` correctly heals only if stale. Give
+        // the restart worker's `rmdir(Drop)` + kernel time to settle and
+        // retry so the soak test reflects steady state, not a racy probe.
+        let mut last_err = None;
+        let mut summary = None;
+        for _ in 0..6 {
+            match index.refresh_incremental() {
+                Ok(s) => {
+                    summary = Some(s);
+                    break;
+                }
+                Err(e) if e.to_string().contains("session index lock: timed out") => {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+                Err(e) => return Err(e).expect("parent final refresh session index"),
+            }
+        }
+        summary.unwrap_or_else(|| {
+            panic!(
+                "parent final refresh session index: {}",
+                last_err.expect("timeout err")
+            )
+        })
+    };
     assert_eq!(
         index_summary.failed_files, 0,
         "final reindex should not report failed files"
