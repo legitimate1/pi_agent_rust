@@ -1175,8 +1175,7 @@ fn assert_lock_released(lock_path: &Path) {
                     }
                 }
             }
-            Ok(_) => {}
-            Err(_) => {}
+            Ok(_) | Err(_) => {}
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -1201,7 +1200,6 @@ fn assert_lock_released(lock_path: &Path) {
                     ));
                 }
                 let _ = fs4::fs_std::FileExt::unlock(&file);
-                return;
             }
         }
     }
@@ -1740,7 +1738,7 @@ fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() {
                     last_err = Some(e);
                     std::thread::sleep(std::time::Duration::from_millis(400));
                 }
-                Err(e) => return Err(e).expect("parent final refresh session index"),
+                Err(e) => panic!("parent final refresh session index: {e:?}"),
             }
         }
         summary.unwrap_or_else(|| {
