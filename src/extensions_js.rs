@@ -5092,6 +5092,16 @@ fn path_is_in_registered_extension_root(
         .any(|root| path.starts_with(root))
 }
 
+fn path_is_in_workspace_or_registered_extension_root(
+    path: &Path,
+    workspace_root: &Path,
+    module_state: &Rc<RefCell<PiJsModuleState>>,
+) -> bool {
+    let checked = crate::extensions::safe_canonicalize(path);
+    checked.starts_with(workspace_root)
+        || path_is_in_registered_extension_root(&checked, module_state)
+}
+
 fn path_is_in_leaf_allowed_extension_root(
     path: &Path,
     extension_id: Option<&str>,
@@ -11233,6 +11243,16 @@ const __pi_vfs = (() => {
     }
   }
 
+  function checkReadAccess(resolved) {
+    const normalized = normalizePath(resolved);
+    if (isCurrentExtensionTempPath(normalized)) {
+      return;
+    }
+    if (typeof globalThis.__pi_host_check_read_access === "function") {
+      globalThis.__pi_host_check_read_access(normalized);
+    }
+  }
+
   function checkWorkspaceWriteAccess(resolved) {
     const normalized = normalizePath(resolved);
     if (isCurrentExtensionTempPath(normalized)) {
@@ -11282,6 +11302,15 @@ const __pi_vfs = (() => {
   }
 
   function mapExtensionTempPath(input, normalized) {
+    // Do not virtualize real extension roots that happen to live under /tmp
+    // (e.g. tempfile::tempdir() used in tests: /tmp/.tmpXXX/ext-a/...).
+    // Those are registered host paths and must remain addressable on disk.
+    if (
+      typeof globalThis.__pi_host_is_registered_fs_path === "function" &&
+      globalThis.__pi_host_is_registered_fs_path(normalized)
+    ) {
+      return normalized;
+    }
     const root = currentExtensionTempRoot();
     if (!root || !isAbsoluteTmpInput(input)) {
       return normalized;
@@ -18029,6 +18058,65 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             Ok(())
                         },
                     ),
+                )?;
+
+                // __pi_host_is_registered_fs_path(path) -> bool
+                // Distinguishes real workspace/extension paths from generic
+                // extension-private /tmp paths before the node:fs VFS remaps them.
+                global.set(
+                    "__pi_host_is_registered_fs_path",
+                    Func::from({
+                        let workspace_root =
+                            crate::extensions::safe_canonicalize(Path::new(&process_cwd));
+                        let module_state = Rc::clone(&module_state);
+                        move |_ctx: Ctx<'_>, path: String| -> bool {
+                            path_is_in_workspace_or_registered_extension_root(
+                                Path::new(&path),
+                                &workspace_root,
+                                &module_state,
+                            )
+                        }
+                    }),
+                )?;
+
+                // __pi_host_check_read_access(path) -> void (throws on denied read)
+                global.set(
+                    "__pi_host_check_read_access",
+                    Func::from({
+                        let process_cwd = process_cwd.clone();
+                        let allowed_read_roots = Arc::clone(&allowed_read_roots);
+                        let module_state = Rc::clone(&module_state);
+                        move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<()> {
+                            let extension_id = current_extension_id(&ctx);
+                            if extension_id.is_none() {
+                                return Ok(());
+                            }
+                            let workspace_root =
+                                crate::extensions::safe_canonicalize(Path::new(&process_cwd));
+                            let requested = PathBuf::from(&path);
+                            let requested_abs = if requested.is_absolute() {
+                                requested
+                            } else {
+                                workspace_root.join(requested)
+                            };
+                            let checked_path =
+                                crate::extensions::safe_canonicalize(&requested_abs);
+                            let allowed = path_is_in_allowed_extension_root(
+                                &checked_path,
+                                extension_id.as_deref(),
+                                &module_state,
+                                &allowed_read_roots,
+                            ) || checked_path.starts_with(&workspace_root);
+                            if allowed {
+                                Ok(())
+                            } else {
+                                Err(rquickjs::Error::new_loading_message(
+                                    &path,
+                                    "host read denied: path outside extension root".to_string(),
+                                ))
+                            }
+                        }
+                    }),
                 )?;
 
                 // __pi_host_check_write_access(path) -> void (throws on denied path)
