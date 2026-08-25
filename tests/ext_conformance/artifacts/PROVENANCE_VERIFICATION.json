@@ -2465,9 +2465,9 @@
         "directory_exists": true,
         "id_naming_valid": true,
         "directory_layout_valid": true,
-        "on_disk_checksum": "70c002e831bd43a0c22540b2b8ce0885d3aaff780140abc0217a4f6a79648824",
-        "master_catalog_checksum": "70c002e831bd43a0c22540b2b8ce0885d3aaff780140abc0217a4f6a79648824",
-        "provenance_checksum": "70c002e831bd43a0c22540b2b8ce0885d3aaff780140abc0217a4f6a79648824",
+        "on_disk_checksum": "a5a45c18ab6b231f8f1f98e584a253353e57c2cd2ff2a3f23a2dca9a6b68a15a",
+        "master_catalog_checksum": "a5a45c18ab6b231f8f1f98e584a253353e57c2cd2ff2a3f23a2dca9a6b68a15a",
+        "provenance_checksum": "a5a45c18ab6b231f8f1f98e584a253353e57c2cd2ff2a3f23a2dca9a6b68a15a",
         "checksums_consistent": true,
         "has_source_url": true,
         "has_license": true
