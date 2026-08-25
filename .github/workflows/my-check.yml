@@ -13,6 +13,10 @@ concurrency:
 
 jobs:
   check:
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: ["1/4", "2/4", "3/4", "4/4"]
     runs-on: ubuntu-latest
     env:
       CI: "true"
@@ -44,14 +48,21 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: cargo fmt
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: cargo fmt (partition ${{ matrix.partition }})
+        if: matrix.partition == '1/4'
         run: cargo fmt --check
 
-      - name: cargo clippy
+      - name: cargo clippy (partition ${{ matrix.partition }})
+        if: matrix.partition == '1/4'
         run: cargo clippy --locked --all-targets -- -D warnings
 
-      - name: cargo test
-        run: cargo test --locked --all-targets
+      - name: cargo test (nextest, partition ${{ matrix.partition }})
+        run: cargo nextest run --locked --all-targets --partition count:${{ matrix.partition }}
 
   # 回联到本地 pidian（Watchdog×pi-tag）：本机 Self-hosted Runner（C:\actions-runner / C:\actions-runner-pidian）直写 C:\Users\m\.pi\tasks.db
   # C 方案直达：从 commit Trailer 提取 Pidian-Tab → labels 透传；failure 错误摘要合并进同一条 notify，不另起 ticket
