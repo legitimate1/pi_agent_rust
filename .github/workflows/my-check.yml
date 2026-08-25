@@ -53,50 +53,69 @@ jobs:
       - name: cargo test
         run: cargo test --locked --all-targets
 
-  # 回联到本地 pidian（Watchdog×pi-tag）：本机 Self-hosted Runner（C:\actions-runner\pidian-win）已上线，直写 C:\Users\m\.pi\tasks.db
+  # 回联到本地 pidian（Watchdog×pi-tag）：本机 Self-hosted Runner（C:\actions-runner / C:\actions-runner-pidian）直写 C:\Users\m\.pi\tasks.db
+  # C 方案直达：从 commit Trailer 提取 Pidian-Tab → labels 透传；failure 错误摘要合并进同一条 notify，不另起 ticket
   notify:
     needs: check
     if: ${{ always() }}
     runs-on: self-hosted
     steps:
+      - name: Checkout (for commit trailer)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
       - name: Notify Agent
         if: ${{ always() }}
         shell: pwsh
         run: |
+          # NOTE: git log 在 pwsh 会按行拆成数组，必须 Out-String 后再正则（否则 Cannot index into a null array）
+          $raw = (git log -1 --format=%B 2>&1 | Out-String)
+          if (-not $raw) { $raw = "" }
+          $pidianTab = $null
+          $m = [regex]::Match($raw, "^Pidian-Tab:\s*([A-Za-z0-9_\-]+)", [System.Text.RegularExpressions.RegexOptions]::Multiline)
+          if ($m.Success) { $pidianTab = $m.Groups[1].Value.Trim() }
+          $labels = "notify,ci"
+          if ($pidianTab) { $labels += ",pidian-tab:$pidianTab" }
+          Write-Host "commit msg trailer: pidianTab=$pidianTab labels=$labels"
+
           $repo = "${{ github.repository }}" -replace "[*_`#]","\$0"
           $wf = "${{ github.workflow }}" -replace "[*_`#]","\$0"
-          $sha = "${{ github.sha }}".Substring(0,7)
+          $shaFull = "${{ github.sha }}"
+          $sha = if ($shaFull.Length -ge 7) { $shaFull.Substring(0,7) } else { $shaFull }
           if ($sha -notmatch "^[0-9a-f]{7}$") { $sha = "unknown" }
+
+          $result = "${{ needs.check.result }}"
+          if ([string]::IsNullOrWhiteSpace($result)) { $result = "unknown" }
+
           @"
           **仓库**: $repo
           **工作流**: $wf
           **Commit**: $sha
-          **结果**: ${{ needs.check.result }}
+          **结果**: $result
           **Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           "@ | Set-Content body.md -Encoding utf8
-          $title = "CI ${{ needs.check.result }}: $repo#$sha"
-          if ($title.Length -gt 200) { $title = $title.Substring(0,200) }
-          pi-tag task create $title --body-file body.md --project pi_agent_rust --requester github-actions --labels "notify,ci"
 
-      - name: Report CI failure as ticket
-        if: ${{ needs.check.result == 'failure' }}
-        shell: pwsh
+          # failure 时错误摘要合并进同一条 notify，不另起 ticket（C 方案一轮一条）
+          if ($result -eq "failure") {
+            try {
+              gh run view ${{ github.run_id }} --repo ${{ github.repository }} --log-failed 2>&1 `
+                | ForEach-Object { $_ -replace "\x1b\[[0-9;]*m","" -replace "^\d{4}-\d{2}-\d{2}T\S+\s*","" } `
+                | ForEach-Object { $_ -replace "(?i)(token|password|secret|key)\s*[:=]\s*\S+","`$1=***" } `
+                | Where-Object { $_ -notmatch "^\s*(Downloading|Checking|Compiling|Downloaded|Cache\b|Updating crates)" } `
+                | Select-Object -Last 80 | Set-Content err-tail.md -Encoding utf8
+              if (Test-Path err-tail.md) {
+                "" | Add-Content body.md
+                "--- 错误摘要（已过滤，完整见 Run 链接） ---" | Add-Content body.md
+                Get-Content err-tail.md | Add-Content body.md
+              }
+            } catch { Write-Host "collect err-tail failed: $_" }
+          }
+
+          $title = "CI $result`: $repo#$sha"
+          if ($title.Length -gt 200) { $title = $title.Substring(0,200) }
+
+          Write-Host "pi-tag task create: title=$title labels=$labels"
+          pi-tag task create $title --body-file body.md --project pi_agent_rust --requester github-actions --labels $labels
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh run view ${{ github.run_id }} --repo ${{ github.repository }} --log-failed 2>&1 `
-            | ForEach-Object { $_ -replace "\x1b\[[0-9;]*m","" -replace "^\d{4}-\d{2}-\d{2}T\S+\s*","" } `
-            | ForEach-Object { $_ -replace "(?i)(token|password|secret|key)\s*[:=]\s*\S+","`$1=***" } `
-            | Where-Object { $_ -notmatch "^\s*(Downloading|Checking|Compiling|Downloaded|Cache\b|Updating crates)" } `
-            | Select-Object -Last 80 | Set-Content err-tail.md -Encoding utf8
-          @"
-          **仓库**: ${{ github.repository }}
-          **工作流**: ${{ github.workflow }}
-          **Commit**: ${{ github.sha }}
-          **结果**: failure
-          **Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-          --- 错误摘要（已过滤，完整见 Run 链接） ---
-          "@ | Set-Content body.md -Encoding utf8
-          Get-Content err-tail.md | Add-Content body.md
-          pi-tag task create "CI 失败: ${{ github.repository }}#${{ github.sha }}" --body-file body.md --project pi_agent_rust --requester github-actions --labels "ticket,ci"
