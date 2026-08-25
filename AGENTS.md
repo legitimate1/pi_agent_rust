@@ -99,12 +99,6 @@ cargo test -- --nocapture                # 带输出
   - `.github/workflows/my-build.yml` — 本 Fork 满血构建，触发条件 `push: tags[my-v*]` / `workflow_dispatch`，矩阵 `ubuntu-latest + windows-latest`，`--profile release-max`（`lto=fat + codegen-units=1`，Linux 额外 `--features jemalloc`），产物上传为 `pi-linux-amd64` / `pi-windows-amd64`
   - `.github/workflows/release.yml` — 上游 5 平台正式发布流（`v*` tag + `release` 环境审批），**本 Fork 不改不碰**
 - **Agent 约束**：日常开发不准在本地跑 `cargo test --all-targets` / `cargo clippy --all-targets`（产物 ~30GB）及 `cargo build --profile release-max`（~15 分钟），改完推 `custom` 让 `my-check` 去验，`git tag my-v*` 让 `my-build` 去压性能；急需本地验证单模块用 `cargo test --test <stem>` 针对性跑
-- **CI 结果回联到本地 pidian（Watchdog × pi-tag，0.30.12+）**：
-  - 链路：`git push custom → my-check.yml → pi-tag task create --labels notify/ticket → ~/.pi/tasks.db (WAL) → pidian Watchdog (fs.watch 2s debounce + 5s 冷却) → 📁 pi_agent_rust 聚合 Tab → Agent 收到 Markdown`。典型 2–3s、最坏 7s；Obsidian 关闭期间写入的下次 `start()` 首轮扫描补发
-  - 标签约定：`notify` 阅后即焚（`claim→send成功→pi-tag task close`，不进 `taskToTabMap/轮询`） vs `ticket` 常驻工单（`claim→常驻`，Agent 处理完须 `pi-tag task close #id`）。互斥，`notify+ticket` 共存按 `ticket+warn`；归一化 `trim().toLowerCase()`
-  - Runner 约束：`~/.pi/tasks.db` 在本机 `C:\Users\m\.pi\tasks.db`，`ubuntu-latest` 写不到。需 **Self-hosted Runner（本机 Windows 常驻）**才能直写 DB；纯 `ubuntu-latest` 的 `my-check.yml` 无法自动回联，需另起 `self-hosted` job 或本地 `pi-tag task create` 手动模拟
-  - Workflow 模板（加到 `my-check.yml` 末尾，Windows Runner 用 `pwsh`）：见 `C:\Users\m\Project\pidian\docs\design\pidian-pitag-linkage-design.md §4`（`Notify Agent if: always()` 5字段 + `Report failure if: failure()` 追加 `gh --log-failed | 脱敏token/password/secret/key | 去噪 Downloading/Checking/Compiling | tail 80`）。`title` 单限 200 字符，`body` 限 8000 字符 tail（Watchdog 侧 `Array.from` 按码点，DB 永保完整）
-  - Agent 守则：收到 `ticket` 后修完必 `pi-tag task close #id`（可附 `comment`），`notify` 无需操作；投递已带 `> 来源: CI 通知/工单（非用户指令…）` + ` ```log ` 围栏隔离（` ``` → \` `` \` 转义`），无需 `JSON.parse`。本地冒烟：`echo hello > body.md && pi-tag task create "CI success: x#abc" --body-file body.md --project pi_agent_rust --requester github-actions --labels "notify,ci"`
 
 ## 第三方库使用
 
