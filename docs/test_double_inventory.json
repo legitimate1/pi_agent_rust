@@ -69,10 +69,15 @@
       },
       "extension_remediation_backlog": {
         "artifact": "tests/full_suite_gate/extension_remediation_backlog.json",
-        "total_non_pass_extensions": 0,
+        "total_non_pass_extensions": 14,
         "actionable": 0,
-        "non_actionable": 0,
-        "families": {}
+        "non_actionable": 14,
+        "families": {
+          "fixture_exclusion": 1,
+          "packaging_gap": 4,
+          "runtime_api_gap": 5,
+          "runtime_crash": 4
+        }
       }
     },
     "disposition_policy": {
