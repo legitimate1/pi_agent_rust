@@ -99,19 +99,6 @@ impl ReadTool {
         tool_call_id: &str,
     ) -> Result<ToolOutput> {
         let resolved = resolve_read_path(path, &self.cwd);
-        // Only reject symlink escapes: if the requested path itself is a
-        // symlink whose canonical target is outside cwd, fail closed.
-        if let Ok(sym_meta) = std::fs::symlink_metadata(&resolved)
-            && sym_meta.file_type().is_symlink()
-        {
-            let canonical_target = crate::extensions::safe_canonicalize(&resolved);
-            let canonical_cwd = crate::extensions::safe_canonicalize(&self.cwd);
-            if !canonical_target.starts_with(&canonical_cwd) {
-                return Err(Error::validation(format!(
-                    "Cannot read outside the working directory: {path}"
-                )));
-            }
-        }
 
         let meta = asupersync::fs::metadata(&resolved).await.ok();
         if let Some(meta) = &meta {

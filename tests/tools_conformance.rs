@@ -3450,7 +3450,7 @@ mod security_path_traversal {
         });
     }
 
-    /// Read tool rejects symlinks that resolve outside CWD.
+    /// Read tool follows symlinks that resolve outside CWD (unrestricted).
     #[test]
     #[cfg(unix)]
     fn read_symlink_escape() {
@@ -3467,19 +3467,27 @@ mod security_path_traversal {
             let input = serde_json::json!({
                 "path": link.to_string_lossy()
             });
-            let err = tool
+            let output = tool
                 .execute("sec-read-03", input, None, None)
                 .await
-                .expect_err("symlink escape should be rejected");
-            let text = err.to_string();
+                .expect("symlink outside should be followed");
+            assert!(!output.is_error);
+            let text = output
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    pi::model::ContentBlock::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
             assert!(
-                text.contains("Cannot read outside the working directory"),
-                "expected outside-cwd rejection: {text}"
+                text.contains("SYMLINK_OUTSIDE"),
+                "expected symlink target content: {text}"
             );
         });
     }
 
-    /// Write tool rejects symlinks that resolve outside CWD.
+    /// Write tool follows symlinks that resolve outside CWD (unrestricted).
     #[test]
     #[cfg(unix)]
     fn write_replaces_symlink_with_regular_file() {
@@ -3497,21 +3505,16 @@ mod security_path_traversal {
                 "path": link.to_string_lossy(),
                 "content": "NEW_CONTENT"
             });
-            let err = tool
-                .execute("sec-write-02", input, None, None)
-                .await
-                .expect_err("write at symlink path should be rejected");
-            let text = err.to_string();
+            let result = tool.execute("sec-write-02", input, None, None).await;
             assert!(
-                text.contains("Cannot write outside the working directory"),
-                "expected outside-cwd rejection: {text}"
+                !result.as_ref().map_or(true, |o| o.is_error),
+                "write at symlink outside cwd should succeed"
             );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW_CONTENT");
             assert!(
                 link.symlink_metadata().unwrap().file_type().is_symlink(),
                 "symlink should remain intact"
             );
-            let target_content = std::fs::read_to_string(&target).unwrap();
-            assert_eq!(target_content, "ORIGINAL");
         });
     }
 

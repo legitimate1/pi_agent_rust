@@ -88,27 +88,10 @@ impl Tool for WriteTool {
 
         let path = resolve_path(&input.path, &self.cwd);
 
-        // Symlink policy (tools_hardened):
-        // - If the requested path itself is a symlink, follow it.
-        // - If the resolved target is inside cwd: follow (overwrite target, keep symlink).
-        // - If outside cwd: reject.
-        let symlink_meta = std::fs::symlink_metadata(&path).ok();
-        let is_symlink = symlink_meta
-            .as_ref()
-            .is_some_and(|m| m.file_type().is_symlink());
-        let canonical_cwd = crate::extensions::safe_canonicalize(&self.cwd);
-        let symlink_target: Option<PathBuf> = if is_symlink {
-            let canonical_target = crate::extensions::safe_canonicalize(&path);
-            if !canonical_target.starts_with(&canonical_cwd) {
-                return Err(Error::validation(format!(
-                    "Cannot write outside the working directory: {}",
-                    input.path
-                )));
-            }
-            Some(canonical_target)
-        } else {
-            None
-        };
+        let symlink_target: Option<PathBuf> = std::fs::symlink_metadata(&path)
+            .ok()
+            .filter(|m| m.file_type().is_symlink())
+            .map(|_| crate::extensions::safe_canonicalize(&path));
         // For permission/mode checks and for atomic write, operate on the
         // actual file that will be overwritten: symlink target when following.
         let effective_path: PathBuf = symlink_target.clone().unwrap_or_else(|| path.clone());
