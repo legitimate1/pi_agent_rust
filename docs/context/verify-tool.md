@@ -59,7 +59,8 @@ struct ExternalChecker {
     not_found_hint: &'static str,          // 程序缺失时的提示
     check_args: &'static [&'static str],   // check 命令参数（路径由执行器追加）
     fix_hint: &'static str,                // 失败修复提示（<file> 占位符自动替换）
-    format_args: Option<&'static [&'static str]>, // 能输出规范化文本→失败自动生成 diff
+    format_args: Option<&'static [&'static str]>, // 能输出规范化文本→失败自动生成 diff（prettier --write 语义）
+    in_place_format_args: Option<&'static [&'static str]>, // 原地写格式化器→失败时复制到临时文件再就地格式化后合成 diff（oxfmt 等）
     classify_failure: Option<fn(i32, &str) -> Option<String>>, // 软失败分类
     fallback: Option<&'static ExternalChecker>, // 主程序缺失时回退的 checker（如 prettier → npx）
 }
@@ -68,9 +69,9 @@ struct ExternalChecker {
 现有实例（均在 `src/tools/verify.rs` 静态区）：
 
 - `RUSTFMT_CHECKER`（无回退，`rustfmt --check --edition 2024`）
-- `OXFMT_CHECKER` → `NPX_OXFMT_CHECKER`（`oxfmt --check` → `npx --yes oxfmt --check`）
+- `OXFMT_CHECKER` → `NPX_OXFMT_CHECKER`（`oxfmt --check` → `npx --yes oxfmt --check`，原地写格式化器：失败时通过 `in_place_format_args` 复制原文件到临时文件再就地格式化后合成 diff）
 - `OXLINT_CHECKER` → `NPX_OXLINT_CHECKER`（`oxlint --deny-warnings` → `npx --yes oxlint --deny-warnings`）
-- `RUFF_FORMAT_CHECKER`（`ruff format --check`）/ `RUFF_CHECKER`（`ruff check`，无回退，`bin/ruff.exe` 直调）
+- `RUFF_FORMAT_CHECKER`（`ruff format --check --diff`，`--diff` 直接在 stdout 打印 unified diff 供自包含诊断）/ `RUFF_CHECKER`（`ruff check`，无回退，`bin/ruff.exe` 直调）
 - `GOFMT_CHECKER`（`gofmt -l`，`version_args=--help`，特殊：`exit 0` 仍需判 `stdout` 非空，diff 由 `gofmt <file>` 合成）
 - `PRETTIER_CHECKER`（**直调全局 prettier**，`fallback: NPX_PRETTIER_CHECKER`）、`NPX_PRETTIER_CHECKER`（npx 包装，仅作回退，仅用于 `.md`）
 
@@ -89,9 +90,9 @@ pub fn append_verify_to_output(output: &mut String, r: &VerifyResult) {
 
 ### 失败消息规范化（`run_external_checker` 硬失败路径）
 
-1. **ANSI 剥离** — `strip_ansi()`（`\x1b\[[0-9;]*[A-Za-z]`，OnceLock 缓存正则）
-2. **stdout/stderr 合并** — stderr 总是保留；stdout 仅当 `looks_like_diff()`（含 `Diff in` / `@@` / `-`/`+` 行）时追加（rustfmt 的 diff 在 stdout，prettier 的 warning 在 stderr）
-3. **diff 追加** — 若 checker 声明了 `format_args`，失败时多跑一次 `<program> <format_args> <path>` 拿规范化文本，用 `similar` 库生成 unified diff（`format_diff()`，上限 6000 字符）；`gofmt` 固定用 `run_formatter(&[], path)` 合成 diff
+1. **ANSI 剥离** — `strip_ansi()`（`\x1b\[[0-9;]*[A-Za-z]`，OnceLock 缓存正则），对 stderr/stdout 分别剥离
+2. **stdout/stderr 合并（自包含诊断）** — stderr 总是保留；stdout 在 `trim 非空 && != stderr` 时按诊断完整性合并：`looks_like_diff()`（`Diff in` / `@@` / `-/+` 行）为强信号，另保留 `would be reformatted` / `Format issues` / `Checking formatting` 等格式化统计，或当 `message.trim().is_empty()` 时必定追加；否则对非重复的 stdout 做回退追加（目标：无需二次 bash 调用即可自包含诊断；ruff `--diff` 的 diff 与 oxfmt 的统计均在 stdout，不能仅凭 `looks_like_diff` 过滤）
+3. **diff 追加（双路径二选一）** — 若 checker 声明了 `format_args`，失败时多跑一次 `<program> <format_args> <path>` 拿 stdout 规范化文本，用 `similar` 库生成 unified diff（`format_diff()`，上限 6000 字符）；否则若声明了 `in_place_format_args`，走 `run_formatter_in_place`：复制原文件到临时文件后跑 `<program> <in_place_args> <temp>` 就地格式化再读回合成 diff（oxfmt / npx-oxfmt 专用，原地写不走 stdout，仅当 `original != formatted` 时追加）；`gofmt` 固定用 `run_formatter(&[], path)` 合成 diff
 4. **fix hint** — `<file>` 替换为实际路径
 5. **截断** — 总 message 上限 8192 字符（`truncate_message()`，UTF-8 边界安全）
 

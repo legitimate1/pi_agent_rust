@@ -172,6 +172,10 @@ struct ExternalChecker {
     /// must print normalized text on stdout. When set, failures append a
     /// unified diff between the original and the formatted text.
     format_args: Option<&'static [&'static str]>,
+    /// Optional in-place formatter args: running `<program> <in_place_args> <temp>`
+    /// formats the temp file in place (e.g. `oxfmt`). When set, failures copy
+    /// the original to a temp file, format the temp, then diff against original.
+    in_place_format_args: Option<&'static [&'static str]>,
     /// Optional failure classifier: `Some(warning)` means "soft failure"
     /// (report as passed with a warning, e.g. prettier module not cached);
     /// `None` means every non-zero exit is a hard failure.
@@ -192,6 +196,7 @@ static RUSTFMT_CHECKER: ExternalChecker = ExternalChecker {
     check_args: &["--check", "--edition", "2024"],
     fix_hint: "Run `rustfmt <file>` to fix.",
     format_args: None,
+    in_place_format_args: None,
     classify_failure: None,
     fallback: None,
 };
@@ -207,6 +212,7 @@ static OXFMT_CHECKER: ExternalChecker = ExternalChecker {
     check_args: &["--check"],
     fix_hint: "Run `oxfmt <file>` to fix.",
     format_args: None,
+    in_place_format_args: Some(&[]),
     classify_failure: None,
     fallback: Some(&NPX_OXFMT_CHECKER),
 };
@@ -219,6 +225,7 @@ static NPX_OXFMT_CHECKER: ExternalChecker = ExternalChecker {
     check_args: &["--yes", "oxfmt", "--check"],
     fix_hint: "Run `npx --yes oxfmt <file>` to fix.",
     format_args: None,
+    in_place_format_args: Some(&["--yes", "oxfmt"]),
     classify_failure: None,
     fallback: None,
 };
@@ -233,6 +240,7 @@ static OXLINT_CHECKER: ExternalChecker = ExternalChecker {
     check_args: &["--deny-warnings"],
     fix_hint: "Run `oxlint <file>` to see lint details.",
     format_args: None,
+    in_place_format_args: None,
     classify_failure: None,
     fallback: Some(&NPX_OXLINT_CHECKER),
 };
@@ -245,19 +253,23 @@ static NPX_OXLINT_CHECKER: ExternalChecker = ExternalChecker {
     check_args: &["--yes", "oxlint", "--deny-warnings"],
     fix_hint: "Run `npx --yes oxlint <file>` to see lint details.",
     format_args: None,
+    in_place_format_args: None,
     classify_failure: None,
     fallback: None,
 };
 
-/// ruff format --check (Python formatter, Rust-native, standalone exe).
+/// ruff format --check --diff (Python formatter, Rust-native, standalone exe).
+/// `--diff` makes the formatter print a unified diff on failure, which
+/// `run_external_checker` merges into the failure message for self-repair.
 static RUFF_FORMAT_CHECKER: ExternalChecker = ExternalChecker {
     name: "ruff-format",
     program: "ruff",
     version_args: &["--version"],
     not_found_hint: "ruff not found in PATH. Place ruff.exe in C:\\Users\\m\\.pi\\agent\\bin or install via `pip install ruff`.",
-    check_args: &["format", "--check"],
+    check_args: &["format", "--check", "--diff"],
     fix_hint: "Run `ruff format <file>` to fix.",
     format_args: None,
+    in_place_format_args: None,
     classify_failure: None,
     fallback: None,
 };
@@ -271,6 +283,7 @@ static RUFF_CHECKER: ExternalChecker = ExternalChecker {
     check_args: &["check"],
     fix_hint: "Run `ruff check <file>` to see lint details.",
     format_args: None,
+    in_place_format_args: None,
     classify_failure: None,
     fallback: None,
 };
@@ -286,6 +299,7 @@ static GOFMT_CHECKER: ExternalChecker = ExternalChecker {
     check_args: &["-l"],
     fix_hint: "Run `gofmt -w <file>` to fix.",
     format_args: None,
+    in_place_format_args: None,
     classify_failure: None,
     fallback: None,
 };
@@ -306,6 +320,7 @@ static PRETTIER_CHECKER: ExternalChecker = ExternalChecker {
     check_args: &["--check"],
     fix_hint: "Run `prettier --write <file>` to fix.",
     format_args: Some(&[]),
+    in_place_format_args: None,
     classify_failure: Some(prettier_classify_failure),
     fallback: Some(&NPX_PRETTIER_CHECKER),
 };
@@ -324,6 +339,7 @@ static NPX_PRETTIER_CHECKER: ExternalChecker = ExternalChecker {
     check_args: &["--no-install", "prettier", "--check"],
     fix_hint: "Run `npx prettier --write <file>` to fix.",
     format_args: Some(&["--no-install", "prettier"]),
+    in_place_format_args: None,
     classify_failure: Some(prettier_classify_failure),
     fallback: None,
 };
@@ -635,6 +651,7 @@ fn run_external_checker(
 /// can simulate missing/available programs without touching the real PATH.
 /// When the primary program cannot be spawned, the checker's `fallback`
 /// chain is tried before reporting not-found.
+#[allow(clippy::too_many_lines)]
 fn run_external_checker_resolved(
     checker: &'static ExternalChecker,
     path: &Path,
@@ -704,19 +721,56 @@ fn run_external_checker_resolved(
             }
         }
 
-        // Hard failure: normalize stderr, append diff if available, add hint
-        let mut message = strip_ansi(&stderr);
-        if looks_like_diff(&stdout) {
-            if !message.trim().is_empty() {
-                message.push('\n');
+        // Hard failure: normalize and merge stderr/stdout, append diff if available, add hint.
+        // Goal: self-contained diagnosis without a second bash call. Preserve both streams.
+        let stderr_stripped = strip_ansi(&stderr);
+        let stdout_stripped = strip_ansi(&stdout);
+        let mut message = String::new();
+        let stderr_trimmed = stderr_stripped.trim();
+        let stdout_trimmed = stdout_stripped.trim();
+        if !stderr_trimmed.is_empty() {
+            message.push_str(&stderr_stripped);
+        }
+        if !stdout_trimmed.is_empty() && stdout_trimmed != stderr_trimmed {
+            // Always surface stdout when it carries diagnostics (diff, stats, lint).
+            // `looks_like_diff` is retained as a strong signal, but we also surface
+            // plain stats like "Format issues found" / "would be reformatted" which
+            // were previously swallowed.
+            let should_include_stdout = looks_like_diff(&stdout_stripped)
+                || stdout_trimmed.contains("would be reformatted")
+                || stdout_trimmed.contains("Format issues")
+                || stdout_trimmed.contains("Checking formatting")
+                || message.trim().is_empty();
+            if should_include_stdout {
+                if !message.is_empty() && !message.ends_with('\n') {
+                    message.push('\n');
+                }
+                message.push_str(&stdout_stripped);
+            } else if !message.contains(stdout_trimmed) {
+                // Fallback: include any non-duplicate stdout that isn't empty.
+                if !message.is_empty() && !message.ends_with('\n') {
+                    message.push('\n');
+                }
+                message.push_str(&stdout_stripped);
             }
-            message.push_str(&strip_ansi(&stdout));
+        }
+        if message.trim().is_empty() {
+            message = format!("{} check failed with exit code {:?}", checker.name, code);
         }
         if let Some(format_args) = checker.format_args {
             if let Some(formatted) = run_formatter(&program, format_args, path, abort) {
                 if let Ok(original) = std::fs::read_to_string(path) {
                     message.push_str("\n\n");
                     message.push_str(&format_diff(&original, &formatted));
+                }
+            }
+        } else if let Some(in_place_args) = checker.in_place_format_args {
+            if let Some(formatted) = run_formatter_in_place(&program, in_place_args, path, abort) {
+                if let Ok(original) = std::fs::read_to_string(path) {
+                    if original != formatted {
+                        message.push_str("\n\n");
+                        message.push_str(&format_diff(&original, &formatted));
+                    }
                 }
             }
         }
@@ -760,6 +814,33 @@ fn run_formatter(
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Run an in-place formatter `<program> <in_place_args> <temp>` and return the formatted text.
+/// Needed for formatters like `oxfmt` which write in place instead of to stdout.
+/// Copies the original file to a temp file, runs the formatter on the temp, then reads it back.
+fn run_formatter_in_place(
+    program: &str,
+    in_place_args: &[&str],
+    path: &Path,
+    abort: Option<&AbortSignal>,
+) -> Option<String> {
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("tmp");
+    let tmp = tempfile::Builder::new()
+        .suffix(&format!(".{extension}"))
+        .tempfile()
+        .ok()?;
+    if std::fs::copy(path, tmp.path()).is_err() {
+        return None;
+    }
+    let tmp_str = tmp.path().to_string_lossy().into_owned();
+    let mut args: Vec<&str> = in_place_args.to_vec();
+    args.push(&tmp_str);
+    let output = run_external_process(program, &args, abort).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    std::fs::read_to_string(tmp.path()).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1318,5 +1399,68 @@ mod tests {
         ));
         assert!(!looks_like_diff(""));
         assert!(!looks_like_diff("error: something happened"));
+    }
+
+    #[test]
+    fn test_ruff_format_failed_contains_diff() {
+        let mut tmp = tempfile::Builder::new().suffix(".py").tempfile().unwrap();
+        std::io::Write::write_all(tmp.as_file_mut(), b"def hello(  name  ):\n    pass\n").unwrap();
+        let (passed, msg, _checker) =
+            run_external_checker_resolved(&RUFF_FORMAT_CHECKER, tmp.path(), None, &resolve_program)
+                .unwrap();
+        let msg_str = msg.unwrap_or_default();
+        // not_found scenario: ruff not installed -> skip (do not fail test)
+        if msg_str.contains("not found in PATH") || msg_str.contains("not found") {
+            eprintln!("ruff not found, skipping: {}", msg_str);
+            return;
+        }
+        assert!(!passed, "ruff format should fail for bad.py: {:?}", msg_str);
+        assert!(
+            msg_str.contains("@@") || msg_str.contains("-def hello"),
+            "diff missing (expected @@ or -def hello): {}",
+            msg_str
+        );
+        assert!(
+            msg_str.contains("Run `ruff format"),
+            "fix hint missing (Run `ruff format): {}",
+            msg_str
+        );
+        assert!(
+            msg_str.contains("would be reformatted"),
+            "would be reformatted missing: {}",
+            msg_str
+        );
+    }
+
+    #[test]
+    fn test_oxfmt_failed_contains_diff() {
+        let mut tmp = tempfile::Builder::new().suffix(".ts").tempfile().unwrap();
+        std::io::Write::write_all(
+            tmp.as_file_mut(),
+            b"function hello( name : string ){ return name; }",
+        )
+        .unwrap();
+        let (passed, msg, _checker) =
+            run_external_checker_resolved(&OXFMT_CHECKER, tmp.path(), None, &resolve_program)
+                .unwrap();
+        let msg_str = msg.unwrap_or_default();
+        if msg_str.contains("not found in PATH")
+            || msg_str.contains("npx not found")
+            || msg_str.contains("not found")
+        {
+            eprintln!("oxfmt not found, skipping: {}", msg_str);
+            return;
+        }
+        assert!(!passed, "oxfmt should fail for bad.ts: {:?}", msg_str);
+        assert!(
+            msg_str.contains("@@") || msg_str.contains("-function hello"),
+            "diff missing (expected @@ or -function hello): {}",
+            msg_str
+        );
+        assert!(
+            msg_str.contains("oxfmt") && msg_str.contains("to fix"),
+            "fix hint missing (oxfmt fix hint): {}",
+            msg_str
+        );
     }
 }

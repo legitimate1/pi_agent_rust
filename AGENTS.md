@@ -14,7 +14,7 @@
 - **禁止危险命令** — `git reset --hard`、`git clean -fd`、`rm -rf` 必须由我明确手写命令才能执行。不确定就问。
 - **分支策略（Fork 专用）** —
   - `main` — 上游镜像分支，**禁止直接提交业务代码**，只用于同步 `upstream`：`git checkout main && git fetch upstream && git merge upstream/main && git push origin main`。`upstream` = `https://github.com/Dicklesworthstone/pi_agent_rust.git`
-  - `custom` — 个人二开主分支，所有功能/修复都在此，推送到 `origin/custom` 自动触发 `.github/workflows/my-check.yml`
+  - `custom` — 个人二开主分支，所有功能/修复都在此，推送到 `origin/custom` **不自动触发** CI，全量校验需手动 `gh workflow run my-check.yml --ref custom`（无需查看 `my-check.yml`）
   - 新分支从 `custom` 切出，合回 `custom`；需要同步上游时先合到 `main` 再 `git checkout custom && git merge main`
 
 ## 工具链
@@ -92,13 +92,20 @@ cargo test -- --nocapture                # 带输出
 
 - **分工**：本地快速验证，云端跑全量
   - 本地 Windows `pwsh`：`cargo fmt --check` + `cargo clippy --lib -- -D warnings` + `cargo test --lib` / `cargo test --test <单文件>`（秒级，不跑 `--all-targets`）
-  - 云端 `my-check.yml`：`cargo fmt` + `cargo clippy --all-targets` + `cargo test --all-targets`（`VCR_MODE=playback`，`ubuntu-latest`）
+  - 云端 `my-check.yml`：`cargo fmt` + `cargo clippy --all-targets` + `cargo test --all-targets`（`VCR_MODE=playback`，`ubuntu-latest`）—— **仅 `workflow_dispatch` 手动触发，不随 `push` 自动跑；无需查看 `my-check.yml`，直接 `gh workflow run` 即可**
 - **工作流**：
   - `.github/workflows/ci.yml` — 上游重型 CI（3 OS 矩阵 + 12 shard + coverage + release gate），**本 Fork 不改不碰**，其 `on.push.branches: [main]` 仅在 `main` 同步上游后才可能触发
-  - `.github/workflows/my-check.yml` — 本 Fork 轻量全量 CI，触发条件 `push: [custom]` / `pull_request: [custom,main]` / `workflow_dispatch`，公有库无限额度，`concurrency.cancel-in-progress: true`
+  - `.github/workflows/my-check.yml` — 本 Fork 轻量全量 CI，触发条件 `workflow_dispatch` 手动触发，公有库无限额度，`concurrency.cancel-in-progress: true`
   - `.github/workflows/my-build.yml` — 本 Fork 满血构建，触发条件 `push: tags[my-v*]` / `workflow_dispatch`，矩阵 `ubuntu-latest + windows-latest`，`--profile release-max`（`lto=fat + codegen-units=1`，Linux 额外 `--features jemalloc`），产物上传为 `pi-linux-amd64` / `pi-windows-amd64`
   - `.github/workflows/release.yml` — 上游 5 平台正式发布流（`v*` tag + `release` 环境审批），**本 Fork 不改不碰**
-- **Agent 约束**：日常开发不准在本地跑 `cargo test --all-targets` / `cargo clippy --all-targets`（产物 ~30GB）及 `cargo build --profile release-max`（~15 分钟），改完推 `custom` 让 `my-check` 去验，`git tag my-v*` 让 `my-build` 去压性能；急需本地验证单模块用 `cargo test --test <stem>` 针对性跑
+- **常用命令**：
+  ```pwsh
+  gh workflow run my-check.yml --ref custom          # 触发全量校验（本地改完推 custom 后执行）
+  gh run list --workflow=my-check.yml --limit 5      # 查看最近运行
+  gh run view <run-id> --log-failed                  # 失败时拉日志
+  gh run watch <run-id>                               # 跟踪进度
+  ```
+- **Agent 约束**：日常开发不准在本地跑 `cargo test --all-targets` / `cargo clippy --all-targets`（产物 ~30GB）及 `cargo build --profile release-max`（~15 分钟），改完推 `custom` 后 `gh workflow run my-check.yml` 让云端去验，`git tag my-v*` 让 `my-build` 去压性能；急需本地验证单模块用 `cargo test --test <stem>` 针对性跑
 
 ## 第三方库使用
 
