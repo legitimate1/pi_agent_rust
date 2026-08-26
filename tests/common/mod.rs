@@ -59,6 +59,13 @@ pub fn hermetic_interactive_config(mut config: pi::config::Config) -> pi::config
     if config.last_changelog_version.is_none() {
         config.last_changelog_version = Some(pi::platform::VERSION.to_string());
     }
+    // Prevent the startup "New version X available" banner from leaking into
+    // TUI snapshots via the global `~/.config/pi/.version_check_cache`.
+    // Snapshots must be deterministic across machines/CI; version checks are
+    // unrelated to rendering and should never appear in hermetic tests.
+    if config.check_for_updates.is_none() {
+        config.check_for_updates = Some(false);
+    }
     config
 }
 
