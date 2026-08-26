@@ -50,7 +50,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/x86_64-pc-windows-msvc/release-max/pi.exe dist/pi-windows-amd64.exe -Force
+          Copy-Item target/x86_64-pc-windows-msvc/release-max/pi.exe dist/pi.exe -Force
           Get-ChildItem dist | Format-Table Name, Length
           Get-ChildItem dist | ForEach-Object { "{0} {1:N2} MB" -f $_.Name, ($_.Length / 1MB) }
 

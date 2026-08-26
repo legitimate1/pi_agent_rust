@@ -61,14 +61,15 @@
 
 ```
 用户说「构建」→ cargo set-version --bump patch -p pi_agent_rust → git add + commit → cargo build --release → 停下
-用户说「部署」→ .\scripts\deploy-release.ps1
-用户说「云构建/发包（全平台）」→ git tag my-v0.x.y && git push origin my-v0.x.y → 触发 my-build.yml（或网页 workflow_dispatch）
-用户说「云构建/发包（仅 Windows）」→ git tag my-win-v0.x.y && git push origin my-win-v0.x.y → 触发 my-build-windows.yml（或 gh workflow run my-build-windows.yml --ref custom）
+用户说「部署」→ .\scripts\deploy-release.ps1（本地 release 产物部署）
+用户说「部署云产物」→ .\scripts\deploy-artifact.ps1（下载最新 my-build-windows 产物，重命名为 pi.exe，备份旧版后部署，支持 -Tag / -RunId）
+用户说「云构建/发包（全平台）」→ git tag my-v0.x.y && git push origin my-v0.x.y → 触发 my-build.yml（或网页 workflow_dispatch），产物 dist/pi.exe + dist/pi
+用户说「云构建/发包（仅 Windows）」→ git tag my-win-v0.x.y && git push origin my-win-v0.x.y → 触发 my-build-windows.yml（或 gh workflow run my-build-windows.yml --ref custom），产物 dist/pi.exe
 ```
 
 > 构建前**不**重复跑全量测试 — 收尾门禁已验证过。若用户中途要求构建（改动未收尾），先跑针对性测试确认无误再构建。部署脚本自动执行 `cargo sweep --file` + `--stamp` 清理旧产物，无需手动清理。
 >
-> Release profile 契约（`Cargo.toml` 的 `[profile.release]`：`opt-level = 3` + `lto = "thin"` + `panic = "abort"` + `strip = true`，+ 校验 + 预算门禁）见 `docs/context/commands.md`「构建与部署配置」。`[profile.release-max]` 继承 `release` 并覆盖 `lto = "fat"` + `codegen-units = 1`，专供 CI 满血构建（`my-build.yml` 双平台 / `my-build-windows.yml` 仅 Windows 原生 MSVC）。release 二进制大小预算由 `BINARY_SIZE_RELEASE_BUDGET_MB` 定义。jemalloc is opt-in via `--features jemalloc`，不要默认启用（`my-build.yml` 仅在 `ubuntu-latest` 启用，`my-build-windows.yml` 不启用）。
+> Release profile 契约（`Cargo.toml` 的 `[profile.release]`：`opt-level = 3` + `lto = "thin"` + `panic = "abort"` + `strip = true`，+ 校验 + 预算门禁）见 `docs/context/commands.md`「构建与部署配置」。`[profile.release-max]` 继承 `release` 并覆盖 `lto = "fat"` + `codegen-units = 1`，专供 CI 满血构建（`my-build.yml` 双平台 / `my-build-windows.yml` 仅 Windows 原生 MSVC，产物均为 `pi.exe`）。release 二进制大小预算由 `BINARY_SIZE_RELEASE_BUDGET_MB` 定义。jemalloc is opt-in via `--features jemalloc`，不要默认启用（`my-build.yml` 仅在 `ubuntu-latest` 启用，`my-build-windows.yml` 不启用）。
 
 ## 测试
 
