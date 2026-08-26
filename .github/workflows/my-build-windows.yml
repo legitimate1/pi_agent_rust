@@ -42,8 +42,9 @@ jobs:
       - name: Verify binary exists
         shell: pwsh
         run: |
-          ls -lh target/x86_64-pc-windows-msvc/release-max/pi.exe
-          target/x86_64-pc-windows-msvc/release-max/pi.exe --version
+          Get-ChildItem target/x86_64-pc-windows-msvc/release-max/pi.exe -Force | Format-List Name, Length, LastWriteTime
+          Get-Item target/x86_64-pc-windows-msvc/release-max/pi.exe | ForEach-Object { "{0:N2} MB" -f ($_.Length / 1MB) }
+          & target/x86_64-pc-windows-msvc/release-max/pi.exe --version
 
       - name: Package artifact
         shell: pwsh
@@ -51,7 +52,7 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/x86_64-pc-windows-msvc/release-max/pi.exe dist/pi-windows-amd64.exe -Force
           Get-ChildItem dist | Format-Table Name, Length
-          ls -lh dist/
+          Get-ChildItem dist | ForEach-Object { "{0} {1:N2} MB" -f $_.Name, ($_.Length / 1MB) }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
