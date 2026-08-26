@@ -88,16 +88,41 @@ impl Tool for WriteTool {
 
         let path = resolve_path(&input.path, &self.cwd);
 
-        if let Ok(meta) = asupersync::fs::metadata(&path).await {
+        // Symlink policy (tools_hardened):
+        // - If the requested path itself is a symlink, follow it.
+        // - If the resolved target is inside cwd: follow (overwrite target, keep symlink).
+        // - If outside cwd: reject.
+        let symlink_meta = std::fs::symlink_metadata(&path).ok();
+        let is_symlink = symlink_meta
+            .as_ref()
+            .is_some_and(|m| m.file_type().is_symlink());
+        let canonical_cwd = crate::extensions::safe_canonicalize(&self.cwd);
+        let symlink_target: Option<PathBuf> = if is_symlink {
+            let canonical_target = crate::extensions::safe_canonicalize(&path);
+            if !canonical_target.starts_with(&canonical_cwd) {
+                return Err(Error::validation(format!(
+                    "Cannot write outside the working directory: {}",
+                    input.path
+                )));
+            }
+            Some(canonical_target)
+        } else {
+            None
+        };
+        // For permission/mode checks and for atomic write, operate on the
+        // actual file that will be overwritten: symlink target when following.
+        let effective_path: PathBuf = symlink_target.clone().unwrap_or_else(|| path.clone());
+
+        if let Ok(meta) = asupersync::fs::metadata(&effective_path).await {
             if !meta.is_file() {
                 return Err(Error::tool(
                     "write",
-                    format!("Path {} is not a regular file", path.display()),
+                    format!("Path {} is not a regular file", effective_path.display()),
                 ));
             }
             if let Err(err) = asupersync::fs::OpenOptions::new()
                 .write(true)
-                .open(&path)
+                .open(&effective_path)
                 .await
             {
                 let message = match err.kind() {
@@ -110,8 +135,8 @@ impl Tool for WriteTool {
             }
         }
 
-        // Create parent directories if needed
-        if let Some(parent) = path.parent() {
+        // Create parent directories if needed (parents of the effective path).
+        if let Some(parent) = effective_path.parent() {
             asupersync::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| Error::tool("write", format!("Failed to create directories: {e}")))?;
@@ -120,8 +145,10 @@ impl Tool for WriteTool {
         // Parity with legacy pi-mono: report JS string length (UTF-16 code units) as "bytes".
         let bytes_written = input.content.encode_utf16().count();
 
-        // Write atomically using tempfile on a blocking thread
-        let path_clone = path.clone();
+        // Write atomically using tempfile on a blocking thread.
+        // When following a same-workspace symlink, write to the target path
+        // so the symlink itself is preserved (fixes write_same_workspace_symlink_target).
+        let path_clone = effective_path.clone();
         let content_bytes = input.content.into_bytes();
         asupersync::runtime::spawn_blocking_io(move || {
             // Capture original permissions before the file is replaced (new files get None).
