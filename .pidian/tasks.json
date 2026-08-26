@@ -6,6 +6,12 @@
       "content": "给我一个提示词,我交给下一个会话继续完成这个工作",
       "done": false,
       "createdAt": 1787669216455
+    },
+    {
+      "id": "pt_1787749410725_mcc4bh1",
+      "content": "!.\\scripts\\deploy-artifact.ps1",
+      "done": false,
+      "createdAt": 1787749410725
     }
   ]
 }
