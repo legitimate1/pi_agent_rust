@@ -653,7 +653,8 @@ fn execute_nonexistent_tool() {
 
 #[test]
 fn execute_tool_that_throws() {
-    let dir = tempfile::tempdir().unwrap();
+    let _ = std::fs::create_dir_all("/tmp/ext-neg-test");
+    let dir = tempfile::tempdir_in("/tmp/ext-neg-test").unwrap();
     let fixture = write_temp_fixture(
         dir.path(),
         "index.ts",
