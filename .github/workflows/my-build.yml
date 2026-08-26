@@ -27,18 +27,19 @@ jobs:
     env:
       CI: "true"
       RUST_BACKTRACE: "1"
-      RUSTC_WRAPPER: ""
+      SCCACHE_GHA_ENABLED: "on"
+      RUSTC_WRAPPER: sccache
       SCCACHE_ERROR_LOG: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system deps (xcb) [linux]
+      - name: Cache apt packages (xcb) [linux]
         if: runner.os == 'Linux'
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+          version: 1
 
       - name: Install Rust toolchain (nightly)
         uses: dtolnay/rust-toolchain@master
@@ -47,10 +48,14 @@ jobs:
           targets: ${{ matrix.target }}
           components: rustfmt, clippy
 
+      - name: Setup sccache (GHA cache)
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          key: my-build-${{ matrix.target }}-release-max
+          key: my-build-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          shared-key: my-build-${{ matrix.target }}
 
       # Linux: max performance with fat LTO + jemalloc
       - name: Build release-max (linux + jemalloc)
@@ -62,6 +67,11 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: cargo build --profile release-max --locked --bin pi --target ${{ matrix.target }}
+
+      - name: sccache stats
+        if: always()
+        shell: bash
+        run: sccache --show-stats || true
 
       - name: Verify binary exists
         shell: bash

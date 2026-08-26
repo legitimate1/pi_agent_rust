@@ -21,19 +21,21 @@ jobs:
       RUST_BACKTRACE: "1"
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
-      # Disable sccache wrapper in CI (it's set in .cargo/config.toml for local Windows builds)
-      RUSTC_WRAPPER: ""
+      SCCACHE_GHA_ENABLED: "on"
+      RUSTC_WRAPPER: sccache
       SCCACHE_ERROR_LOG: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system deps (fd, rg, xcb)
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y fd-find ripgrep libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
-          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+      - name: Cache apt packages (fd, rg, xcb)
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: fd-find ripgrep libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+          version: 1
+
+      - name: Link fd binary
+        run: sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd || true
 
       - name: Install Rust toolchain (nightly)
         uses: dtolnay/rust-toolchain@master
@@ -41,8 +43,14 @@ jobs:
           toolchain: nightly-2026-07-05
           components: rustfmt, clippy
 
+      - name: Setup sccache (GHA cache)
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: my-check-${{ hashFiles('Cargo.lock') }}
+          save-if: ${{ matrix.partition == '1/4' }}
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
@@ -62,6 +70,10 @@ jobs:
 
       - name: cargo test (nextest, partition ${{ matrix.partition }})
         run: cargo nextest run --locked --all-targets --partition count:${{ matrix.partition }} 2>&1 | tee -a /tmp/check.log; test ${PIPESTATUS[0]} -eq 0
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
 
       - name: Prepare artifact name
         if: failure()

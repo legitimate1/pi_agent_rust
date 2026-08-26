@@ -17,7 +17,8 @@ jobs:
     env:
       CI: "true"
       RUST_BACKTRACE: "1"
-      RUSTC_WRAPPER: ""
+      SCCACHE_GHA_ENABLED: "on"
+      RUSTC_WRAPPER: sccache
       SCCACHE_ERROR_LOG: ""
     steps:
       - name: Checkout
@@ -29,14 +30,23 @@ jobs:
           toolchain: nightly-2026-07-05
           targets: x86_64-pc-windows-msvc
 
+      - name: Setup sccache (GHA cache)
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          key: my-build-windows-x86_64-pc-windows-msvc-release-max
+          key: my-build-windows-x86_64-pc-windows-msvc-${{ hashFiles('Cargo.lock') }}
+          shared-key: my-build-windows-x86_64-pc-windows-msvc
 
       - name: Build release-max (windows, native MSVC)
         shell: pwsh
         run: cargo build --profile release-max --locked --bin pi --target x86_64-pc-windows-msvc
+
+      - name: sccache stats
+        if: always()
+        shell: pwsh
+        run: sccache --show-stats
 
       - name: Verify binary exists
         shell: pwsh
