@@ -53,19 +53,35 @@ jobs:
         with:
           tool: cargo-nextest
 
+      - name: Prepare check log
+        run: rm -f /tmp/check.log; touch /tmp/check.log
+
       - name: cargo fmt (partition ${{ matrix.partition }})
         if: matrix.partition == '1/4'
-        run: cargo fmt --check
+        run: cargo fmt --check 2>&1 | tee -a /tmp/check.log; test ${PIPESTATUS[0]} -eq 0
 
       - name: cargo clippy (partition ${{ matrix.partition }})
         if: matrix.partition == '1/4'
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings 2>&1 | tee -a /tmp/check.log; test ${PIPESTATUS[0]} -eq 0
 
       - name: cargo test (nextest, partition ${{ matrix.partition }})
-        run: cargo nextest run --locked --all-targets --partition count:${{ matrix.partition }}
+        run: cargo nextest run --locked --all-targets --partition count:${{ matrix.partition }} 2>&1 | tee -a /tmp/check.log; test ${PIPESTATUS[0]} -eq 0
 
-  # 回联到本地 pidian（Watchdog×pi-tag）：本机 Self-hosted Runner（C:\actions-runner / C:\actions-runner-pidian）直写 C:\Users\m\.pi\tasks.db
-  # C 方案直达：从 commit Trailer 提取 Pidian-Tab → labels 透传；failure 错误摘要合并进同一条 notify，不另起 ticket
+      - name: Prepare artifact name
+        if: failure()
+        run: echo "PART_SAFE=$(echo '${{ matrix.partition }}' | tr '/' '-')" >> $GITHUB_ENV
+
+      - name: Upload failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-${{ env.PART_SAFE }}
+          path: /tmp/check.log
+          retention-days: 2
+          if-no-files-found: warn
+
+  # 回联到本地 pidian（Watchdog×pi-tag）：本机 Self-hosted Runner 直写 C:\Users\m\.pi\tasks.db
+  # C 方案直达：从 commit Trailer 提取 Pidian-Tab → labels 透传；failure 错误摘要来自 Artifacts 直传（同 Run 内 check → notify，不经 gh run view）
   notify:
     needs: check
     if: ${{ always() }}
@@ -75,6 +91,15 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
+
+      - name: Download failure logs
+        if: ${{ needs.check.result == 'failure' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: failure-*
+          path: ./failures
+          merge-multiple: true
+        continue-on-error: true
 
       - name: Notify Agent
         if: ${{ always() }}
@@ -107,20 +132,33 @@ jobs:
           **Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           "@ | Set-Content body.md -Encoding utf8
 
-          # failure 时错误摘要合并进同一条 notify，不另起 ticket（C 方案一轮一条）
+          # failure 时错误摘要来自 Artifacts（check 侧 tee + upload），同 Run 内直传，不调 gh run view（同 Run 内拉日志永远 in_progress 占位）
           if ($result -eq "failure") {
-            try {
-              gh run view ${{ github.run_id }} --repo ${{ github.repository }} --log-failed 2>&1 `
-                | ForEach-Object { $_ -replace "\x1b\[[0-9;]*m","" -replace "^\d{4}-\d{2}-\d{2}T\S+\s*","" } `
-                | ForEach-Object { $_ -replace "(?i)(token|password|secret|key)\s*[:=]\s*\S+","`$1=***" } `
-                | Where-Object { $_ -notmatch "^\s*(Downloading|Checking|Compiling|Downloaded|Cache\b|Updating crates)" } `
-                | Select-Object -Last 80 | Set-Content err-tail.md -Encoding utf8
-              if (Test-Path err-tail.md) {
-                "" | Add-Content body.md
-                "--- 错误摘要（已过滤，完整见 Run 链接） ---" | Add-Content body.md
-                Get-Content err-tail.md | Add-Content body.md
+            $errText = ""
+            if (Test-Path ./failures) {
+              $files = Get-ChildItem ./failures -Recurse -File | Sort-Object FullName
+              $all = @()
+              foreach ($f in $files) {
+                $all += "── $($f.Directory.Name)/$($f.Name) ──"
+                $rawLines = Get-Content $f.FullName -ErrorAction SilentlyContinue | ForEach-Object { $_ -replace "\x1b\[[0-9;]*m","" }
+                $filtered = $rawLines `
+                  | Where-Object { $_ -notmatch "^\s*(Downloading|Downloaded|Compiling|Checking|Updating crates|Updating index|Finished|Blocking waiting|Fresh |Adding )" } `
+                  | Where-Object { $_ -match "(?i)(error\[|error:|FAILED|failures:|panicked|assertion failed|test result:|thread .* panicked|warning:|Diff |  left:| right:|expected|found)" } `
+                  | Select-Object -Last 50
+                if (-not $filtered -or $filtered.Count -eq 0) {
+                  $filtered = $rawLines | Where-Object { $_ -notmatch "^\s*(Downloading|Downloaded|Compiling)" -and $_.Trim() -ne "" } | Select-Object -Last 40
+                }
+                $all += $filtered
+                $all += ""
               }
-            } catch { Write-Host "collect err-tail failed: $_" }
+              $errText = ($all -join "`n").Trim()
+              if ($errText.Length -gt 4000) { $errText = $errText.Substring($errText.Length - 4000) }
+              # 脱敏（token/password 等），与旧逻辑保持一致
+              $errText = $errText -replace "(?i)(token|password|secret|key)\s*[:=]\s*\S+","`$1=***"
+            }
+            "" | Add-Content body.md
+            "--- 错误摘要（已过滤，完整见 Run 链接） ---" | Add-Content body.md
+            if ($errText) { $errText | Add-Content body.md } else { "(未捕获到精简日志，详见 Run 链接)" | Add-Content body.md }
           }
 
           $title = "CI $result`: $repo#$sha"
