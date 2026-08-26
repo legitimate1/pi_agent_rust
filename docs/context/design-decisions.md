@@ -506,3 +506,14 @@
 
 **何时重新考虑**：若 pidian 补齐 custom 等 expects_response 方法的全量转发并提供兜底 Modal，或交互 UI 改为按请求生命周期驱动取消（effective_timeout_ms=None 无限等待），可评估进一步放宽或改为 UI 驱动的取消模型。
 
+---
+
+## D51: verify 失败自包含诊断 — 以 rustfmt 为标杆 (2026-08-26)
+
+**决策**：`[verify:FAILED|checker|耗时]` 单条返回即自包含可修复：`stderr(去 ANSI) + 可诊断 stdout + 统一 Diff(@) + fix_hint`，无需二次 `bash oxfmt/oxlint/ruff`。实现分三点：(1) `ExternalChecker` 新增 `in_place_format_args: Option<&[&str]>` 与 `format_args` 正交——`format_args` 走 `run_formatter(program, args, path)` 读 stdout（如 prettier），`in_place_format_args` 走 `run_formatter_in_place` 复制原文件到临时文件后就地格式化再读回合成 diff（如 `oxfmt`/`npx-oxfmt` 的 `Some(&[])` / `Some(&["--yes","oxfmt"])`）；(2) `RUFF_FORMAT_CHECKER` 的 `check_args` 追加 `--diff` 使 ruff 原生在 stdout 吐 `---/+++ @` diff（`looks_like_diff` 自动合并）；(3) `run_external_checker_resolved` 硬失败分支重写为 `stderr+stdout` 分别 `strip_ansi` 后按诊断完整性合并：`looks_like_diff` / `would be reformatted` / `Format issues` / `Checking formatting` / `message 为空` 为强信号必追加，其余非重复 stdout 回退追加，空 message 兜底 `"{checker} check failed with exit code {code}"`；diff 合成双路径二选一（`format_args` vs `in_place_format_args`，仅 `original != formatted` 时追加，上限 6000/总 8192）+ 新增 `run_formatter_in_place(tempfile::Builder suffix 保留扩展名)`。
+
+**理由**：verify 本意「写完即知错」——拦截生效但 `oxfmt/ruff` 仅 `Run xxx to fix` 无 Diff/行号时，Agent 必须再 `bash oxfmt/ruff` 反查，违背设计初衷；`rustfmt` 已标杆式自包含（Diff + 行号），其余 checker 对齐即可把平均修复往返从 2 次降为 1 次。`--diff` 优先于合成（ruff 原生可信、零临时文件开销）；就地格式化器（oxfmt）只能合成 diff，`in_place_format_args` 是最小扩展。
+
+**不选 B 的原因**：仅保留 `looks_like_diff` 时追加 stdout（会丢弃 `would be reformatted / Format issues / Checking formatting` 等有效诊断）；保留二次 `bash` 反查（违背 verify 自包含铁律）；为 oxfmt 加 `format_args` 假 stdout 路径（oxfmt 不走 stdout，原地写语义不匹配，会误判）。
+
+**何时重新考虑**：若 oxfmt/ruff 后续提供稳定的 `--check --output-format=json` 等结构化诊断，可改走结构化合并；若 `prettier(md)` 脏格式 PASSED 漏报另案修复涉及同一合并路径，一并复核本 D 的 stdout 合并策略。

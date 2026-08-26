@@ -183,17 +183,37 @@ pub fn append_verify_to_output(output: &mut String, r: &VerifyResult) {
 
 ## 5. 输出格式示例（content 正文，非 details）
 
+自包含诊断（以 rustfmt 为标杆）：任意 `FAILED` 单条即含 `stderr(去 ANSI) + 诊断 stdout + Diff(@) + fix_hint`，无需二次 bash。
+
 ```text
-Successfully wrote 16 bytes to C:\path\to\bad.ts
-[verify:FAILED|oxfmt+oxlint|42ms]
+Successfully wrote 44 bytes to C:\path\to\bad-format.ts
+[verify:FAILED|oxfmt+oxlint|185ms]
 Checking formatting...
-C:/path/to/bad.ts (0ms)
+C:/path/to/bad-format.ts (0ms)
 Format issues found in above 1 files. Run without `--check` to fix.
 
 --- oxlint ---
-C:/path/to/bad.ts:1:7: warning eslint(no-unused-vars): Variable 'x' is declared but never used.
+C:/path/to/bad-format.ts:1:7: warning eslint(no-unused-vars): Variable 'x' is declared but never used.
 
-Run `oxfmt C:\path\to\bad.ts` to fix.
+--- Diff (run oxfmt to apply) ---
+@@ -1 +1 @@
+-function hello( name : string ){ return name; }
++function hello(name: string) { return name; }
+
+Run `oxfmt C:\path\to\bad-format.ts` to fix.
+```
+
+```text
+Successfully wrote 22 bytes to C:\path\to\bad-format.py
+[verify:FAILED|ruff|120ms]
+--- C:/path/to/bad-format.py
++++ C:/path/to/bad-format.py
+@@ -1 +1 @@
+-def hello(  name  ):
++def hello(name):
+1 file would be reformatted.
+
+Run `ruff format C:\path\to\bad-format.py` to fix.
 ```
 
 ```text
@@ -202,5 +222,5 @@ Successfully wrote 15 bytes to C:\path\to\bad.json
 JSON parse error: key must be a string at line 1 column 2
 ```
 
-- `content` 中 ` [verify:FAILED|...]` 下一行即 `message` 原样（`JSON parse error` / `Diff in` / `[warn]` + `fix hint`），Agent 无需翻 `details` 即可直接按 diff 修正
+- `content` 中 ` [verify:FAILED|...]` 下一行即 `message` 原样（`JSON parse error` / `Diff in` / `[warn]` + `fix hint`），Agent 无需翻 `details` 即可直接按 diff 修正；前两例的 `@ -/+` Diff 即自包含修复依据（oxfmt 走 `in_place_format_args` 合成，ruff 走 `--diff` 原生）
 - `write` 的 `details` 为 `None`，`edit`/`hashline_edit` 的 `details` 仅含 `diff`/`firstChangedLine`，不再有 `details.verify`（`verify_result_to_json()` 仅保留供单测）
