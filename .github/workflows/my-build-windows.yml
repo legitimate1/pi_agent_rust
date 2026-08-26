@@ -1,0 +1,60 @@
+name: my-build-windows
+
+on:
+  push:
+    tags: ["my-win-v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: my-build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (pi-windows-amd64)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      CI: "true"
+      RUST_BACKTRACE: "1"
+      RUSTC_WRAPPER: ""
+      SCCACHE_ERROR_LOG: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-05
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: my-build-windows-x86_64-pc-windows-msvc-release-max
+
+      - name: Build release-max (windows, native MSVC)
+        shell: pwsh
+        run: cargo build --profile release-max --locked --bin pi --target x86_64-pc-windows-msvc
+
+      - name: Verify binary exists
+        shell: pwsh
+        run: |
+          ls -lh target/x86_64-pc-windows-msvc/release-max/pi.exe
+          target/x86_64-pc-windows-msvc/release-max/pi.exe --version
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release-max/pi.exe dist/pi-windows-amd64.exe -Force
+          Get-ChildItem dist | Format-Table Name, Length
+          ls -lh dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-windows-amd64
+          path: dist/*
+          if-no-files-found: error

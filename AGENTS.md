@@ -62,12 +62,13 @@
 ```
 用户说「构建」→ cargo set-version --bump patch -p pi_agent_rust → git add + commit → cargo build --release → 停下
 用户说「部署」→ .\scripts\deploy-release.ps1
-用户说「云构建/发包」→ git tag my-v0.x.y && git push origin my-v0.x.y → 触发 my-build.yml（或网页 workflow_dispatch）
+用户说「云构建/发包（全平台）」→ git tag my-v0.x.y && git push origin my-v0.x.y → 触发 my-build.yml（或网页 workflow_dispatch）
+用户说「云构建/发包（仅 Windows）」→ git tag my-win-v0.x.y && git push origin my-win-v0.x.y → 触发 my-build-windows.yml（或 gh workflow run my-build-windows.yml --ref custom）
 ```
 
 > 构建前**不**重复跑全量测试 — 收尾门禁已验证过。若用户中途要求构建（改动未收尾），先跑针对性测试确认无误再构建。部署脚本自动执行 `cargo sweep --file` + `--stamp` 清理旧产物，无需手动清理。
 >
-> Release profile 契约（`Cargo.toml` 的 `[profile.release]`：`opt-level = 3` + `lto = "thin"` + `panic = "abort"` + `strip = true`，+ 校验 + 预算门禁）见 `docs/context/commands.md`「构建与部署配置」。`[profile.release-max]` 继承 `release` 并覆盖 `lto = "fat"` + `codegen-units = 1`，专供 CI 满血构建。release 二进制大小预算由 `BINARY_SIZE_RELEASE_BUDGET_MB` 定义。jemalloc is opt-in via `--features jemalloc`，不要默认启用（`my-build.yml` 仅在 `ubuntu-latest` 启用）。
+> Release profile 契约（`Cargo.toml` 的 `[profile.release]`：`opt-level = 3` + `lto = "thin"` + `panic = "abort"` + `strip = true`，+ 校验 + 预算门禁）见 `docs/context/commands.md`「构建与部署配置」。`[profile.release-max]` 继承 `release` 并覆盖 `lto = "fat"` + `codegen-units = 1`，专供 CI 满血构建（`my-build.yml` 双平台 / `my-build-windows.yml` 仅 Windows 原生 MSVC）。release 二进制大小预算由 `BINARY_SIZE_RELEASE_BUDGET_MB` 定义。jemalloc is opt-in via `--features jemalloc`，不要默认启用（`my-build.yml` 仅在 `ubuntu-latest` 启用，`my-build-windows.yml` 不启用）。
 
 ## 测试
 
@@ -96,7 +97,8 @@ cargo test -- --nocapture                # 带输出
 - **工作流**：
   - `.github/workflows/ci.yml` — 上游重型 CI（3 OS 矩阵 + 12 shard + coverage + release gate），**本 Fork 不改不碰**，其 `on.push.branches: [main]` 仅在 `main` 同步上游后才可能触发
   - `.github/workflows/my-check.yml` — 本 Fork 轻量全量 CI，触发条件 `workflow_dispatch` 手动触发，公有库无限额度，`concurrency.cancel-in-progress: true`
-  - `.github/workflows/my-build.yml` — 本 Fork 满血构建，触发条件 `push: tags[my-v*]` / `workflow_dispatch`，矩阵 `ubuntu-latest + windows-latest`，`--profile release-max`（`lto=fat + codegen-units=1`，Linux 额外 `--features jemalloc`），产物上传为 `pi-linux-amd64` / `pi-windows-amd64`
+  - `.github/workflows/my-build.yml` — 本 Fork 满血构建（双平台），触发条件 `push: tags[my-v*]` / `workflow_dispatch`，矩阵 `ubuntu-latest + windows-latest`，`--profile release-max`（`lto=fat + codegen-units=1`，Linux 额外 `--features jemalloc`），产物上传为 `pi-linux-amd64` / `pi-windows-amd64`
+  - `.github/workflows/my-build-windows.yml` — 本 Fork 仅 Windows 快速构建，原生 `MSVC`（`windows-latest`，`x86_64-pc-windows-msvc`，`lld-link`），触发条件 `push: tags[my-win-v*]` / `workflow_dispatch`，`--profile release-max`（`lto=fat + codegen-units=1`），产物仅 `pi-windows-amd64.exe`
   - `.github/workflows/release.yml` — 上游 5 平台正式发布流（`v*` tag + `release` 环境审批），**本 Fork 不改不碰**
 - **常用命令**：
   ```pwsh
@@ -104,6 +106,7 @@ cargo test -- --nocapture                # 带输出
   gh run list --workflow=my-check.yml --limit 5      # 查看最近运行
   gh run view <run-id> --log-failed                  # 失败时拉日志
   gh run watch <run-id>                               # 跟踪进度
+  gh workflow run my-build-windows.yml --ref custom  # 仅 Windows 快速构建（原生 MSVC，约 10~12 分钟）
   ```
 - **Agent 约束**：日常开发不准在本地跑 `cargo test --all-targets` / `cargo clippy --all-targets`（产物 ~30GB）及 `cargo build --profile release-max`（~15 分钟），改完推 `custom` 后 `gh workflow run my-check.yml` 让云端去验，`git tag my-v*` 让 `my-build` 去压性能；急需本地验证单模块用 `cargo test --test <stem>` 针对性跑
 
