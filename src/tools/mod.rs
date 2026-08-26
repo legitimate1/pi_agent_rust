@@ -15,6 +15,7 @@ mod hashline;
 mod ls;
 mod pwsh;
 mod read;
+mod shell;
 pub(crate) mod verify;
 mod write;
 
@@ -27,6 +28,7 @@ pub use hashline::HashlineEditTool;
 pub use ls::LsTool;
 pub use pwsh::{PwshRunResult, PwshTool};
 pub use read::ReadTool;
+pub use shell::ShellTool;
 pub use write::WriteTool;
 
 pub(crate) use bash::BashPipeFrame;
@@ -2809,6 +2811,15 @@ pub struct ToolRegistry {
     parameter_overrides: HashMap<String, serde_json::Value>,
 }
 
+pub(crate) fn is_legacy_shell_enabled() -> bool {
+    std::env::var("PI_ENABLE_LEGACY_SHELL").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 impl ToolRegistry {
     /// Create a new registry with the specified tools enabled.
     pub fn new(enabled: &[&str], cwd: &Path, config: Option<ToolConfig>) -> Self {
@@ -2826,8 +2837,13 @@ impl ToolRegistry {
                     image_auto_resize,
                     block_images,
                 ))),
-                "pwsh" => tools.push(Box::new(PwshTool::new(cwd))),
-                "bash" => tools.push(Box::new(BashTool::with_shell(
+                "shell" => tools.push(Box::new(ShellTool::with_shell(
+                    cwd,
+                    shell_path.clone(),
+                    shell_command_prefix.clone(),
+                ))),
+                "pwsh" if is_legacy_shell_enabled() => tools.push(Box::new(PwshTool::new(cwd))),
+                "bash" if is_legacy_shell_enabled() => tools.push(Box::new(BashTool::with_shell(
                     cwd,
                     shell_path.clone(),
                     shell_command_prefix.clone(),

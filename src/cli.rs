@@ -417,10 +417,10 @@ pub struct Cli {
     #[arg(long)]
     pub no_tools: bool,
 
-    /// Specific tools to enable (comma-separated: read,write,edit,bash,grep,find,ls,hashline_edit,pwsh)
+    /// Specific tools to enable (comma-separated: read,write,edit,shell,grep,find,ls,hashline_edit)
     #[arg(
         long,
-        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit,pwsh"
+        default_value = "read,shell,edit,write,grep,find,ls,hashline_edit"
     )]
     pub tools: String,
 
@@ -1033,14 +1033,13 @@ mod tests {
             cli.enabled_tools(),
             vec![
                 "read",
-                "bash",
+                "shell",
                 "edit",
                 "write",
                 "grep",
                 "find",
                 "ls",
                 "hashline_edit",
-                "pwsh",
             ]
         );
     }
@@ -1059,14 +1058,14 @@ mod tests {
 
     #[test]
     fn tools_with_spaces_trimmed() {
-        let cli = Cli::parse_from(["pi", "--tools", "read, bash, edit"]);
-        assert_eq!(cli.enabled_tools(), vec!["read", "bash", "edit"]);
+        let cli = Cli::parse_from(["pi", "--tools", "read, shell, edit"]);
+        assert_eq!(cli.enabled_tools(), vec!["read", "shell", "edit"]);
     }
 
     #[test]
     fn tools_ignore_empty_entries_and_duplicates() {
-        let cli = Cli::parse_from(["pi", "--tools", "read,, bash,read, ,grep,bash"]);
-        assert_eq!(cli.enabled_tools(), vec!["read", "bash", "grep"]);
+        let cli = Cli::parse_from(["pi", "--tools", "read,, shell,read, ,grep,shell"]);
+        assert_eq!(cli.enabled_tools(), vec!["read", "shell", "grep"]);
     }
 
     // ── 7. Invalid inputs ────────────────────────────────────────────
@@ -1390,7 +1389,7 @@ mod tests {
         assert!(cli.args.is_empty());
         assert_eq!(
             cli.tools,
-            "read,bash,edit,write,grep,find,ls,hashline_edit,pwsh"
+            "read,shell,edit,write,grep,find,ls,hashline_edit"
         );
     }
 
@@ -1504,7 +1503,7 @@ mod tests {
             "--verbose",
             "--no-tools",
             "--tools",
-            "read,bash",
+            "read,shell",
             "--thinking",
             "high",
             "--extension",
@@ -1538,7 +1537,7 @@ mod tests {
         assert!(cli.print);
         assert!(cli.verbose);
         assert!(cli.no_tools);
-        assert_eq!(cli.tools, "read,bash");
+        assert_eq!(cli.tools, "read,shell");
         assert_eq!(cli.thinking.as_deref(), Some("high"));
         assert_eq!(cli.extension, vec!["ext.js"]);
         assert!(cli.no_extensions);

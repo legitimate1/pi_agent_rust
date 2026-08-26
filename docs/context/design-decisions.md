@@ -517,3 +517,15 @@
 **不选 B 的原因**：仅保留 `looks_like_diff` 时追加 stdout（会丢弃 `would be reformatted / Format issues / Checking formatting` 等有效诊断）；保留二次 `bash` 反查（违背 verify 自包含铁律）；为 oxfmt 加 `format_args` 假 stdout 路径（oxfmt 不走 stdout，原地写语义不匹配，会误判）。
 
 **何时重新考虑**：若 oxfmt/ruff 后续提供稳定的 `--check --output-format=json` 等结构化诊断，可改走结构化合并；若 `prettier(md)` 脏格式 PASSED 漏报另案修复涉及同一合并路径，一并复核本 D 的 stdout 合并策略。
+
+---
+
+## D52: 单一 shell 抽象（显式方言 + Flag 逃生） (2026-08-27)
+
+**决策**：将 `bash`/`pwsh` 双工具收口为单一 `shell(shell, command, timeout?)` 薄转发工具：`shell` 参数 `enum["bash","pwsh"]` 必填无默认值、中文极简描述“执行 shell 命令，需显式指定方言。在当前工作目录执行，返回输出文本。”，`command: string` 必填，`timeout: integer minimum:0` 可选（`None→120s，0→禁用`）；`shell.rs` 仅参数校验（`command.trim().is_empty()`/`shell` 非枚举/`timeout<0` 均 `validation` 拒绝）+ `match { bash => run_bash_command(&cwd,...), pwsh => run_pwsh_command(&cwd,...) }` 透传 `cwd`+`command`+`timeout`+`abort`，不重写 `ProcessGuard`/`vsenv`/`resolve_bash_shell`/`stdin null`/截断；`ToolRegistry::new` 常驻 `shell`，`bash`/`pwsh` 仅 `PI_ENABLE_LEGACY_SHELL=1|true|yes|on`（`trim+to_ascii_lowercase`）时追加注册；`bash.rs`/`pwsh.rs` 保留为内部实现；CLI 默认 `--tools` 与 `BUILTIN_TOOL_NAMES`/`create_all_tools` 对齐为 `read,shell,edit,write,grep,find,ls,hashline_edit`。
+
+**理由**：双工具暴露让 LLM 带入对方方言（`| cat` 在 pwsh 为 `Get-Content` 导致 `cannot be bound`；`cargo` 在 bash 恒 `build-script-build exit 1`）；平台差异是确定性路由，不应由 LLM 记忆 `AGENTS.md` 约束。薄转发复用使 `shell` bug 面 = `1 match + 1 enum + 校验`，底层 `ProcessGuard` 已被覆盖；带外 `env` 逃生与 `shell` 分发隔离，保证 `shell` 薄转发挂时无需改代码重编译即可救活。
+
+**不选 B 的原因**：保留 `auto` 自动路由——启发式按命令猜方言脆弱，排障链路变暗（已定 V1 不做 `auto`，后续加法 `enum` 非破坏）；保留 `workdir` 参数——LLM 路径幻觉且与 `command` 内 `cd` 二义，薄转发应保持 `Agent cwd == shell cwd`；保留双工具并存——列表冗余且未解决选错壳（单用户下洁癖 > 过渡期冗余）。
+
+**何时重新考虑**：`shell` 上线后 `bash` 占比 `<5%` 且无混用管线时评估 `auto = 平台默认（Windows→pwsh, Unix→bash）`；跨仓批处理频繁时评估 `workdir?: string` 可选；新会话首条 `cargo` 仍选 `bash` 时补 `.pi/tools.toml [tools.shell] description` 1 行（观测期 1-2 会话或首次 `cargo→bash` 错即补）。

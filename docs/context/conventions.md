@@ -126,6 +126,7 @@ loop {
 - **❌ 使用不安全的 `unsafe` 代码** → 纯 safe Rust（原因：项目 `forbid(unsafe_code)`）
 - **❌ 放任 `target/` 无限膨胀** → 定期 `cargo sweep --file` 清理旧产物（原因：Cargo 永不删除旧文件，debug .pdb 和增量缓存可累积到数百 GB）
 - **❌ 用裸 `std::process::Child`** → 用 `ProcessGuard` 封装（原因：Drop 时不 kill 子进程，abort 后变孤儿）
+- **❌ 选错 shell 工具（bash vs pwsh）** → 统一用 `shell(shell="bash"|"pwsh", ...)`，显式方言，当前 cwd 薄转发（原因：双工具暴露让 LLM 带入对方方言 `| cat` 在 pwsh 为 `Get-Content` 且 `cargo` 在 bash 恒 `build-script-build exit 1`；`shell` 收口后仅 1 工具，`PI_ENABLE_LEGACY_SHELL` 带外恢复双工具）
 - **❌ 扩展 sibling 发现逻辑忽略 auto-discovery 根（`extensions/`）** → 发现函数先检查 parent/cluster_root 目录名是否为 `extensions`，是则跳过 sibling 发现（原因：根下每个目录是独立扩展，不是 bundle 多入口；漏查会把全部独立扩展误判为同一包，多文件扩展的相对 import 因 root 检查失败报 `Unsupported module specifier`（#35，`discover_sibling_index_entries` 曾漏掉 cluster_root 层检查））
 - **❌ 对带 `extension.json` 的扩展做 sibling 启发式发现** → 有 manifest 时只加载声明 entrypoint（`discover_related_extension_entries` guard，D28）（原因：目录内模块文件（含 `pi.registerCommand`）和子目录门面（`fusion/index.ts`）会被误判为额外入口，逐个加载超 hostcall budget；子目录被注册为 root 导致扩展内合法相对 import 误判逃逸（#35 follow-up））
 - **❌ 包收集逻辑在发现资源子目录后忽略包根扩展入口** → has_any_dir 时仍复用 `resolve_extension_entries(package_root)` 收集根扩展入口（原因：`-e <目录>` 静默成功是假象：`prompts/` 等资源目录存在时根 `index.ts` 扩展根本没加载（#35 follow-up，`collect_package_resources`））

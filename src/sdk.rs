@@ -70,7 +70,7 @@ use crate::tools::{
 /// All built-in tool names.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "read",
-    "bash",
+    "shell",
     "edit",
     "write",
     "grep",
@@ -87,6 +87,11 @@ pub fn create_read_tool(cwd: &Path) -> Box<dyn Tool> {
 /// Create a bash tool configured for `cwd`.
 pub fn create_bash_tool(cwd: &Path) -> Box<dyn Tool> {
     Box::new(BashTool::new(cwd))
+}
+
+/// Create a shell tool configured for `cwd`.
+pub fn create_shell_tool(cwd: &Path) -> Box<dyn Tool> {
+    Box::new(crate::tools::ShellTool::new(cwd))
 }
 
 /// Create an edit tool configured for `cwd`.
@@ -123,7 +128,7 @@ pub fn create_hashline_edit_tool(cwd: &Path) -> Box<dyn Tool> {
 pub fn create_all_tools(cwd: &Path) -> Vec<Box<dyn Tool>> {
     vec![
         create_read_tool(cwd),
-        create_bash_tool(cwd),
+        create_shell_tool(cwd),
         create_edit_tool(cwd),
         create_write_tool(cwd),
         create_grep_tool(cwd),
@@ -2747,7 +2752,7 @@ mod tests {
         let tools = super::create_all_tools(tmp.path());
         let registry = ToolRegistry::from_tools(tools);
         assert!(registry.get("read").is_some());
-        assert!(registry.get("bash").is_some());
+        assert!(registry.get("shell").is_some());
         assert!(registry.get("nonexistent").is_none());
     }
 

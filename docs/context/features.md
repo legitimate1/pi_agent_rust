@@ -40,15 +40,14 @@
 ## 工具系统
 
 - **工具注册表** — 内置/扩展工具统一注册、JSON Schema 定义、按名路由 | `src/tools/mod.rs`
-- **内置 9 工具** — read/bash/pwsh/edit/write/grep/find/ls/hashline | `src/tools/` 各子模块
-- **子进程统一生命周期管理** — spawn 子进程受控清理（abort/超时/Drop），杀整棵进程树防孤儿 | `src/tools/mod.rs` + `src/abort.rs` + `src/tools/bash.rs` + `src/tools/pwsh.rs` + `src/tools/grep.rs` + `src/tools/find.rs`
+- **内置 8 工具** — read/shell/edit/write/grep/find/ls/hashline（shell 统一 bash/pwsh 为单一 `shell(shell, command, timeout?)`，显式方言 `bash|pwsh`，当前 cwd，薄转发复用；`bash`/`pwsh` 仅 `PI_ENABLE_LEGACY_SHELL=1|true|yes|on` 时带外恢复） | `src/tools/` 各子模块
+- **子进程统一生命周期管理** — spawn 子进程受控清理（abort/超时/Drop），杀整棵进程树防孤儿 | `src/tools/mod.rs` + `src/abort.rs` + `src/tools/shell.rs` + `src/tools/bash.rs` + `src/tools/pwsh.rs` + `src/tools/grep.rs` + `src/tools/find.rs`
 - **工具可取消执行** — abort 信号穿透到工具层，长任务循环检查并主动终止 | `src/tools/mod.rs` + `src/abort.rs`
 - **ReadTool** — 任意路径读取，head/tail/info/diff 参数，编码自动检测 | `src/tools/read.rs`
 - **Write/Edit/HashlineEdit** — 任意绝对路径写入与编辑 | `src/tools/write.rs` + `src/tools/edit.rs` + `src/tools/hashline.rs`
 - **@file CLI 参数** — `pi @路径` 读取任意目录文件，带大小上限与截断 | `src/tools/mod.rs`
 - **Find/Grep/Ls** — 任意绝对路径下搜索与列出 | `src/tools/find.rs` + `src/tools/grep.rs` + `src/tools/ls.rs`
-- **内置 pwsh 工具** — PowerShell 命令执行，长输出尾部截断，exit 0 时过滤 stderr | `src/tools/pwsh.rs`
-- **bash 工具 Windows 支持** — 自动定位 Git Bash 安装，缺失时优雅降级 | `src/tools/bash.rs` + `src/tools/mod.rs` + `src/rpc.rs`
+- **shell 统一执行（薄转发）** — PowerShell/bash 统一 `shell(shell, command, timeout?)`，按方言分发到底层 `BashTool`/`PwshTool`（`ProcessGroupTree` 清理、长输出截断、abort/超时透传、`vsenv` 懒注入复用），`command` 空串/`shell` 非枚举/`timeout<0` validation 拒绝 | `src/tools/shell.rs` + `src/tools/bash.rs` + `src/tools/pwsh.rs` + `src/tools/mod.rs`（`PI_ENABLE_LEGACY_SHELL` 带外恢复 `bash`/`pwsh`）
 - **扩展工具收集与覆盖** — 收集扩展注册工具，同名覆盖内置工具 | `src/extension_tools.rs` + `src/tools/mod.rs` + `src/agent.rs`
 - **扩展工具流式进度推送** — 工具执行中实时推送 content/details 进度 | `src/extensions.rs` + `src/extensions_js.rs` + `src/extension_tools.rs`
 - **运行时禁用内置工具** — `disabledTools` 配置启动时过滤 | `src/config.rs` + `src/main.rs`
