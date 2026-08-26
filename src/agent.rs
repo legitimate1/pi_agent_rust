@@ -6253,7 +6253,7 @@ mod extensions_integration_tests {
                 export default function init(pi) {
                   pi.on("tool_call", async (event) => {
                     const name = event && event.toolName ? String(event.toolName) : "";
-                    if (name === "bash") return { block: true, reason: "blocked bash in test" };
+                    if (name === "shell") return { block: true, reason: "blocked bash in test" };
                     return {};
                   });
                 }
@@ -6262,21 +6262,21 @@ mod extensions_integration_tests {
             .expect("write extension entry");
 
             let provider = Arc::new(NoopProvider);
-            let tools = ToolRegistry::new(&["bash"], temp_dir.path(), None);
+            let tools = ToolRegistry::new(&["shell"], temp_dir.path(), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
             let mut agent_session =
                 AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             agent_session
-                .enable_extensions(&["bash"], temp_dir.path(), None, &[entry_path])
+                .enable_extensions(&["shell"], temp_dir.path(), None, &[entry_path])
                 .await
                 .expect("enable extensions");
 
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
-                name: "bash".to_string(),
-                arguments: json!({ "command": "printf 'hi' > blocked.txt" }),
+                name: "shell".to_string(),
+                arguments: json!({ "shell": "bash", "command": "printf 'hi' > blocked.txt" }),
                 thought_signature: None,
             };
 
@@ -6323,8 +6323,8 @@ mod extensions_integration_tests {
                 export default function init(pi) {
                   pi.on("tool_call", (event) => {
                     const name = event && event.toolName ? String(event.toolName) : "";
-                    if (name === "bash") {
-                      return { replaceInput: { command: "echo replaced" } };
+                    if (name === "shell") {
+                      return { replaceInput: { shell: "bash", command: "echo replaced" } };
                     }
                     return undefined;
                   });
@@ -6334,21 +6334,21 @@ mod extensions_integration_tests {
             .expect("write extension entry");
 
             let provider = Arc::new(NoopProvider);
-            let tools = ToolRegistry::new(&["bash"], temp_dir.path(), None);
+            let tools = ToolRegistry::new(&["shell"], temp_dir.path(), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
             let mut agent_session =
                 AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             agent_session
-                .enable_extensions(&["bash"], temp_dir.path(), None, &[entry_path])
+                .enable_extensions(&["shell"], temp_dir.path(), None, &[entry_path])
                 .await
                 .expect("enable extensions");
 
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
-                name: "bash".to_string(),
-                arguments: json!({ "command": "printf 'original' > original.txt" }),
+                name: "shell".to_string(),
+                arguments: json!({ "shell": "bash", "command": "printf 'original' > original.txt" }),
                 thought_signature: None,
             };
 
@@ -6394,11 +6394,11 @@ mod extensions_integration_tests {
                 export default function init(pi) {
                   pi.on("tool_call", (event) => {
                     const name = event && event.toolName ? String(event.toolName) : "";
-                    if (name === "bash") {
+                    if (name === "shell") {
                       return {
                         block: true,
                         reason: "blocked bash in test",
-                        replaceInput: { command: "echo should-not-run" },
+                        replaceInput: { shell: "bash", command: "echo should-not-run" },
                       };
                     }
                     return {};
@@ -6409,21 +6409,21 @@ mod extensions_integration_tests {
             .expect("write extension entry");
 
             let provider = Arc::new(NoopProvider);
-            let tools = ToolRegistry::new(&["bash"], temp_dir.path(), None);
+            let tools = ToolRegistry::new(&["shell"], temp_dir.path(), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
             let mut agent_session =
                 AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             agent_session
-                .enable_extensions(&["bash"], temp_dir.path(), None, &[entry_path])
+                .enable_extensions(&["shell"], temp_dir.path(), None, &[entry_path])
                 .await
                 .expect("enable extensions");
 
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
-                name: "bash".to_string(),
-                arguments: json!({ "command": "printf 'hi' > blocked.txt" }),
+                name: "shell".to_string(),
+                arguments: json!({ "shell": "bash", "command": "printf 'hi' > blocked.txt" }),
                 thought_signature: None,
             };
 

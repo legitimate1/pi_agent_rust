@@ -36355,7 +36355,7 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let manager = ExtensionManager::new();
             let tools =
-                crate::tools::ToolRegistry::new(&["read", "bash", "edit"], Path::new("."), None);
+                crate::tools::ToolRegistry::new(&["read", "shell", "edit"], Path::new("."), None);
 
             let outcome =
                 dispatch_hostcall_events("call-1", &manager, &tools, "getActiveTools", json!({}))
@@ -36384,7 +36384,7 @@ mod tests {
                 .filter_map(Value::as_str)
                 .map(ToString::to_string)
                 .collect();
-            assert_eq!(tool_names, vec!["read", "bash", "edit"]);
+            assert_eq!(tool_names, vec!["read", "shell", "edit"]);
         });
     }
 
@@ -36393,9 +36393,9 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let manager = ExtensionManager::new();
             let tools =
-                crate::tools::ToolRegistry::new(&["read", "bash", "edit"], Path::new("."), None);
+                crate::tools::ToolRegistry::new(&["read", "shell", "edit"], Path::new("."), None);
 
-            manager.set_active_tools(vec!["read".to_string(), "bash".to_string()]);
+            manager.set_active_tools(vec!["read".to_string(), "shell".to_string()]);
 
             let outcome =
                 dispatch_hostcall_events("call-1", &manager, &tools, "get_active_tools", json!({}))
@@ -36424,7 +36424,7 @@ mod tests {
                 .filter_map(Value::as_str)
                 .map(ToString::to_string)
                 .collect();
-            assert_eq!(tool_names, vec!["read", "bash"]);
+            assert_eq!(tool_names, vec!["read", "shell"]);
         });
     }
 
@@ -36432,7 +36432,7 @@ mod tests {
     fn events_get_all_tools_returns_builtin_tools() {
         asupersync::test_utils::run_test(|| async {
             let manager = ExtensionManager::new();
-            let tools = crate::tools::ToolRegistry::new(&["read", "bash"], Path::new("."), None);
+            let tools = crate::tools::ToolRegistry::new(&["read", "shell"], Path::new("."), None);
 
             let outcome =
                 dispatch_hostcall_events("call-1", &manager, &tools, "getAllTools", json!({}))
@@ -36461,7 +36461,7 @@ mod tests {
                 .filter_map(|t| t.get("name").and_then(Value::as_str))
                 .collect();
             assert!(names.contains(&"read"));
-            assert!(names.contains(&"bash"));
+            assert!(names.contains(&"shell"));
 
             // Each tool should have a description
             for tool in tool_list {
@@ -36531,7 +36531,7 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let manager = ExtensionManager::new();
             let tools =
-                crate::tools::ToolRegistry::new(&["read", "bash", "edit"], Path::new("."), None);
+                crate::tools::ToolRegistry::new(&["read", "shell", "edit"], Path::new("."), None);
 
             // Set active tools via hostcall
             let outcome = dispatch_hostcall_events(
