@@ -108,6 +108,7 @@ function Find-BinaryInDownload {
         (Get-ChildItem -Path $Dir -Recurse -File -Filter "pi-windows-amd64.exe" -ErrorAction SilentlyContinue | Select-Object -First 1)
     ) | Where-Object { $_ }
 
+    $candidates = @($candidates)
     if ($candidates.Count -eq 0) {
         Write-Error "下载目录未找到 pi.exe / pi-windows-amd64.exe。目录内容：`n$(Get-ChildItem -Path $Dir -Recurse | Format-Table | Out-String)"
         exit 1
@@ -164,9 +165,9 @@ if (Test-Path $Destination) {
     Write-Host "    -> $backupLatest" -ForegroundColor DarkGray
 
     # 滚动保留：仅 KeepBackups 份带时间戳备份
-    $oldBackups = Get-ChildItem -Path $destDir -File -Filter "pi.exe.bak.*" -ErrorAction SilentlyContinue |
+    $oldBackups = @(Get-ChildItem -Path $destDir -File -Filter "pi.exe.bak.*" -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -ne "pi.exe.bak.latest" } |
-        Sort-Object LastWriteTime -Descending
+        Sort-Object LastWriteTime -Descending)
     if ($oldBackups.Count -gt $KeepBackups) {
         $toRemove = $oldBackups | Select-Object -Skip $KeepBackups
         foreach ($f in $toRemove) {
