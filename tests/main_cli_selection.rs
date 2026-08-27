@@ -966,7 +966,7 @@ fn cli_enabled_tools_default() {
     let cli = cli::Cli::parse_from(["pi"]);
     let tools = cli.enabled_tools();
     assert!(tools.contains(&"read"));
-    assert!(tools.contains(&"bash"));
+    assert!(tools.contains(&"shell"));
     assert!(tools.contains(&"edit"));
     assert!(tools.contains(&"write"));
 }

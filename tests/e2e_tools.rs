@@ -1264,6 +1264,7 @@ fn bash_process_tree_cleanup_on_timeout() {
         tool.execute(
             "bash-tree",
             json!({
+                "shell": "bash",
                 "command": format!(
                     "bash -c 'echo $$ > {pid_file_str}; sleep 300' & wait"
                 ),
