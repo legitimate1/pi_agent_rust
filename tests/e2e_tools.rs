@@ -25,7 +25,7 @@ use std::path::Path;
 
 fn make_registry(cwd: &Path) -> ToolRegistry {
     ToolRegistry::new(
-        &["read", "write", "edit", "bash", "grep", "find", "ls"],
+        &["read", "write", "edit", "shell", "grep", "find", "ls"],
         cwd,
         None,
     )
@@ -486,9 +486,14 @@ fn bash_simple_command() {
     let registry = make_registry(h.temp_dir());
 
     let output = common::run_async(async move {
-        let tool = registry.get("bash").unwrap();
-        tool.execute("call-13", json!({"command": "echo hello"}), None, None)
-            .await
+        let tool = registry.get("shell").unwrap();
+        tool.execute(
+            "call-13",
+            json!({"shell": "bash", "command": "echo hello"}),
+            None,
+            None,
+        )
+        .await
     });
 
     let result = output.unwrap();
@@ -544,10 +549,10 @@ fn bash_nonzero_exit() {
     let registry = make_registry(h.temp_dir());
 
     let output = common::run_async(async move {
-        let tool = registry.get("bash").unwrap();
+        let tool = registry.get("shell").unwrap();
         tool.execute(
             "call-14",
-            json!({"command": "echo stderr_msg >&2; exit 42"}),
+            json!({"shell": "bash", "command": "echo stderr_msg >&2; exit 42"}),
             None,
             None,
         )
@@ -569,10 +574,10 @@ fn bash_timeout() {
     let registry = make_registry(h.temp_dir());
 
     let output = common::run_async(async move {
-        let tool = registry.get("bash").unwrap();
+        let tool = registry.get("shell").unwrap();
         tool.execute(
             "call-15",
-            json!({"command": "sleep 300", "timeout": 1}),
+            json!({"shell": "bash", "command": "sleep 300", "timeout": 1}),
             None,
             None,
         )
@@ -594,10 +599,10 @@ fn bash_timeout_reports_partial_output_for_repro() {
     let registry = make_registry(h.temp_dir());
 
     let output = common::run_async(async move {
-        let tool = registry.get("bash").unwrap();
+        let tool = registry.get("shell").unwrap();
         tool.execute(
             "call-15b",
-            json!({"command": "printf 'before-timeout\\n'; sleep 300", "timeout": 1}),
+            json!({"shell": "bash", "command": "printf 'before-timeout\\n'; sleep 300", "timeout": 1}),
             None,
             None,
         )
@@ -624,10 +629,15 @@ fn bash_large_output_truncation() {
     let registry = make_registry(h.temp_dir());
 
     let output = common::run_async(async move {
-        let tool = registry.get("bash").unwrap();
+        let tool = registry.get("shell").unwrap();
         // Generate >50KB of output (each line ~11 bytes x 6000 > 60KB)
-        tool.execute("call-16", json!({"command": "seq 1 6000"}), None, None)
-            .await
+        tool.execute(
+            "call-16",
+            json!({"shell": "bash", "command": "seq 1 6000"}),
+            None,
+            None,
+        )
+        .await
     });
 
     let result = output.unwrap();
@@ -1104,10 +1114,10 @@ fn bash_stderr_only_exit_zero() {
     let start = std::time::Instant::now();
 
     let output = common::run_async(async move {
-        let tool = registry.get("bash").unwrap();
+        let tool = registry.get("shell").unwrap();
         tool.execute(
             "bash-stderr-0",
-            json!({"command": "echo stderr_output >&2"}),
+            json!({"shell": "bash", "command": "echo stderr_output >&2"}),
             None,
             None,
         )
@@ -1121,7 +1131,7 @@ fn bash_stderr_only_exit_zero() {
         &h,
         "bash",
         "bash-stderr-0",
-        &json!({"command": "echo stderr_output >&2"}),
+        &json!({"shell": "bash", "command": "echo stderr_output >&2"}),
         elapsed,
         &format!("ok: {}", text.len()),
     );
@@ -1142,10 +1152,10 @@ fn bash_cwd_propagation() {
     let expected_dir = h.temp_dir().to_path_buf();
 
     let output = common::run_async(async move {
-        let tool = registry.get("bash").unwrap();
+        let tool = registry.get("shell").unwrap();
         tool.execute(
             "bash-cwd",
-            json!({"command": "pwd && ls marker_file.txt"}),
+            json!({"shell": "bash", "command": "pwd && ls marker_file.txt"}),
             None,
             None,
         )
@@ -1188,10 +1198,10 @@ fn bash_mixed_stdout_stderr() {
     let registry = make_registry(h.temp_dir());
 
     let output = common::run_async(async move {
-        let tool = registry.get("bash").unwrap();
+        let tool = registry.get("shell").unwrap();
         tool.execute(
             "bash-mixed",
-            json!({"command": "echo stdout_first; echo stderr_middle >&2; echo stdout_last"}),
+            json!({"shell": "bash", "command": "echo stdout_first; echo stderr_middle >&2; echo stdout_last"}),
             None,
             None,
         )
@@ -1217,11 +1227,11 @@ fn bash_timeout_zero_disables_limit() {
     let registry = make_registry(h.temp_dir());
 
     let output = common::run_async(async move {
-        let tool = registry.get("bash").unwrap();
+        let tool = registry.get("shell").unwrap();
         // timeout=0 should not kill a fast command
         tool.execute(
             "bash-t0",
-            json!({"command": "echo still_running", "timeout": 0}),
+            json!({"shell": "bash", "command": "echo still_running", "timeout": 0}),
             None,
             None,
         )
@@ -1249,7 +1259,7 @@ fn bash_process_tree_cleanup_on_timeout() {
     let pid_file_str = pid_file.display().to_string();
 
     let output = common::run_async(async move {
-        let tool = registry.get("bash").unwrap();
+        let tool = registry.get("shell").unwrap();
         // Spawn a background child that writes its PID, then sleep
         tool.execute(
             "bash-tree",
@@ -1304,12 +1314,17 @@ fn bash_process_tree_cleanup_on_timeout() {
 fn bash_nonexistent_cwd_error() {
     let h = TestHarness::new("bash_nonexistent_cwd_error");
     let bad_cwd = h.temp_path("does_not_exist_dir");
-    let registry = ToolRegistry::new(&["bash"], &bad_cwd, None);
+    let registry = ToolRegistry::new(&["shell"], &bad_cwd, None);
 
     let output = common::run_async(async move {
-        let tool = registry.get("bash").unwrap();
-        tool.execute("bash-badcwd", json!({"command": "echo test"}), None, None)
-            .await
+        let tool = registry.get("shell").unwrap();
+        tool.execute(
+            "bash-badcwd",
+            json!({"shell": "bash", "command": "echo test"}),
+            None,
+            None,
+        )
+        .await
     });
 
     let err = output.unwrap_err();
@@ -1328,10 +1343,10 @@ fn bash_special_characters() {
     let registry = make_registry(h.temp_dir());
 
     let output = common::run_async(async move {
-        let tool = registry.get("bash").unwrap();
+        let tool = registry.get("shell").unwrap();
         tool.execute(
             "bash-special",
-            json!({"command": "echo 'single quotes' && echo \"double quotes\" && echo $HOME"}),
+            json!({"shell": "bash", "command": "echo 'single quotes' && echo \"double quotes\" && echo $HOME"}),
             None,
             None,
         )
@@ -1354,10 +1369,10 @@ fn bash_pipe_command() {
     let registry = make_registry(h.temp_dir());
 
     let output = common::run_async(async move {
-        let tool = registry.get("bash").unwrap();
+        let tool = registry.get("shell").unwrap();
         tool.execute(
             "bash-pipe",
-            json!({"command": "cat data.txt | grep 'ap' | sort"}),
+            json!({"shell": "bash", "command": "cat data.txt | grep 'ap' | sort"}),
             None,
             None,
         )
@@ -1382,10 +1397,10 @@ fn bash_exit_code_captured() {
     for code in [1, 2, 127, 255] {
         let reg = make_registry(h.temp_dir());
         let output = common::run_async(async move {
-            let tool = reg.get("bash").unwrap();
+            let tool = reg.get("shell").unwrap();
             tool.execute(
                 "bash-exit",
-                json!({"command": format!("exit {code}")}),
+                json!({"shell": "bash", "command": format!("exit {code}")}),
                 None,
                 None,
             )
@@ -2183,10 +2198,11 @@ fn cross_tool_bash_find_read() {
     // Step 1: Bash creates files
     let bash_reg = make_registry(h.temp_dir());
     let bash_result = common::run_async(async move {
-        let tool = bash_reg.get("bash").unwrap();
+        let tool = bash_reg.get("shell").unwrap();
         tool.execute(
             "xb-1",
             json!({
+                "shell": "bash",
                 "command": "mkdir -p generated && echo 'auto_content_A' > generated/a.txt && echo 'auto_content_B' > generated/b.txt"
             }),
             None,
