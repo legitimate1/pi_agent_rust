@@ -716,7 +716,7 @@ mod tests {
             ..Default::default()
         };
         let details = serde_json::json!({
-            "tools": "read,bash,edit,write,grep,find,ls,hashline_edit,pwsh",
+            "tools": "read,shell,edit,write,grep,find,ls,hashline_edit",
             "extension": [],
             "extension_flags": [],
             "theme_path": [],

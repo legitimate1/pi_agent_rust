@@ -3748,14 +3748,13 @@ fn e2e_cli_default_tools_when_no_flag() {
     let system_prompt = "Test default tools.";
     let expected_tools = [
         "read",
-        "bash",
+        "shell",
         "edit",
         "write",
         "grep",
         "find",
         "ls",
         "hashline_edit",
-        "pwsh",
     ];
 
     let request_body = json!({

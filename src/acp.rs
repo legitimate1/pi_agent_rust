@@ -1267,12 +1267,13 @@ fn build_acp_system_prompt(
 
     let default_tool_descriptions = [
         ("read", "Read file contents"),
-        ("bash", "Execute bash commands"),
+        ("shell", "Execute shell commands (bash or pwsh)"),
         ("edit", "Make surgical edits to files"),
         ("write", "Write file contents"),
         ("grep", "Search file contents with regex"),
         ("find", "Find files by name pattern"),
         ("ls", "List directory contents"),
+        ("hashline_edit", "Edit files with hashline tags"),
     ];
 
     let mut prompt = String::from(
@@ -1349,7 +1350,16 @@ fn handle_session_new(
     let session_id = session.header.id.clone();
 
     // Set up the enabled tools (all standard tools).
-    let enabled_tools: Vec<&str> = vec!["read", "bash", "edit", "write", "grep", "find", "ls"];
+    let enabled_tools: Vec<&str> = vec![
+        "read",
+        "shell",
+        "edit",
+        "write",
+        "grep",
+        "find",
+        "ls",
+        "hashline_edit",
+    ];
     let tools = ToolRegistry::new(
         &enabled_tools,
         &cwd,

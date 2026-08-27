@@ -297,9 +297,9 @@ impl Provider for ScriptedProvider {
                     return Ok(self.stream_done(self.assistant_message(
                         StopReason::ToolUse,
                         vec![ContentBlock::ToolCall(ToolCall {
-                            id: "bash-1".to_string(),
-                            name: "bash".to_string(),
-                            arguments: json!({ "command": "echo hello-agent-loop" }),
+                            id: "shell-1".to_string(),
+                            name: "shell".to_string(),
+                            arguments: json!({ "shell": "bash", "command": "echo hello-agent-loop" }),
                             thought_signature: None,
                         })],
                         32,
@@ -311,9 +311,9 @@ impl Provider for ScriptedProvider {
                         .iter()
                         .rev()
                         .copied()
-                        .find(|r| r.tool_call_id == "bash-1")
+                        .find(|r| r.tool_call_id == "shell-1")
                     else {
-                        return Err(Error::api("bash_tool_e2e expected bash-1 tool result"));
+                        return Err(Error::api("bash_tool_e2e expected shell-1 tool result"));
                     };
                     let text = result
                         .content
@@ -500,7 +500,7 @@ fn assistant_text(message: &AssistantMessage) -> String {
 }
 
 const fn tool_names() -> [&'static str; 7] {
-    ["read", "write", "edit", "bash", "grep", "find", "ls"]
+    ["read", "write", "edit", "shell", "grep", "find", "ls"]
 }
 
 fn total_assistant_tokens(messages: &[Message]) -> u64 {

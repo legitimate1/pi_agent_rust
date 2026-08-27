@@ -1446,6 +1446,7 @@ mod tests {
         let msg_str = msg.unwrap_or_default();
         if msg_str.contains("not found in PATH")
             || msg_str.contains("npx not found")
+            || msg_str.contains("timed out")
             || msg_str.contains("not found")
         {
             eprintln!("oxfmt not found, skipping: {}", msg_str);

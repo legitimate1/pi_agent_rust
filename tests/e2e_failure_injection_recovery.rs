@@ -47,7 +47,7 @@ use std::sync::{Arc, Mutex};
 // ─── Shared helpers ─────────────────────────────────────────────────────────
 
 const fn tool_names() -> [&'static str; 7] {
-    ["read", "write", "edit", "bash", "grep", "find", "ls"]
+    ["read", "write", "edit", "shell", "grep", "find", "ls"]
 }
 
 fn assistant_text(message: &AssistantMessage) -> String {
@@ -935,8 +935,8 @@ impl Provider for ToolFailurePropagationProvider {
                         vec![
                             ContentBlock::ToolCall(ToolCall {
                                 id: "good-1".to_string(),
-                                name: "bash".to_string(),
-                                arguments: json!({ "command": "echo success" }),
+                                name: "shell".to_string(),
+                                arguments: json!({ "shell": "bash", "command": "echo success" }),
                                 thought_signature: None,
                             }),
                             ContentBlock::ToolCall(ToolCall {
@@ -1001,8 +1001,8 @@ impl Provider for ToolFailurePropagationProvider {
                         StopReason::ToolUse,
                         vec![ContentBlock::ToolCall(ToolCall {
                             id: "recover-1".to_string(),
-                            name: "bash".to_string(),
-                            arguments: json!({ "command": "echo recovered" }),
+                            name: "shell".to_string(),
+                            arguments: json!({ "shell": "bash", "command": "echo recovered" }),
                             thought_signature: None,
                         })],
                         10,
