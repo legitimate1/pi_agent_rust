@@ -29,7 +29,6 @@ jobs:
       RUST_BACKTRACE: "1"
       SCCACHE_GHA_ENABLED: "on"
       RUSTC_WRAPPER: sccache
-      SCCACHE_ERROR_LOG: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v4

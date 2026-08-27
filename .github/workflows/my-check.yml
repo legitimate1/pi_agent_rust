@@ -23,7 +23,6 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
       SCCACHE_GHA_ENABLED: "on"
       RUSTC_WRAPPER: sccache
-      SCCACHE_ERROR_LOG: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v4
