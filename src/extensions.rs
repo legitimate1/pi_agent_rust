@@ -22269,7 +22269,6 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
         );
 
         let batch_start = Instant::now();
-        let mut completions = Vec::with_capacity(total);
 
         for (group, decision) in plan.groups.into_iter().zip(plan.decisions) {
             tracing::debug!(
@@ -22282,22 +22281,28 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
 
             match decision {
                 crate::hostcall_amac::AmacToggleDecision::Interleave { width } => {
-                    // Truly concurrent dispatch: run up to `width` requests in
-                    // flight at once. `buffered` preserves stream order, so
-                    // completions land in original request order.
+                    // Exec groups are fully independent: unordered delivery
+                    // minimizes latency (early completion is enqueued immediately).
+                    // Previously this used `buffered(width).collect()` which
+                    // held every outcome until the slowest member finished,
+                    // causing subagent 2s/5s/8s sleeps to all report ~16s.
+                    // `buffer_unordered` + per-ready complete+tick delivers
+                    // each child's stdout/close as soon as it finishes.
                     use futures::StreamExt as _;
-                    let results = futures::stream::iter(
+                    let mut unordered = futures::stream::iter(
                         group
                             .requests
                             .into_iter()
                             .map(|req| dispatch_one(runtime, host, req)),
                     )
-                    .buffered(width)
-                    .collect::<Vec<_>>()
-                    .await;
-                    for (call_id, outcome, elapsed_ns) in results.into_iter().flatten() {
-                        AMAC_EXECUTOR.with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
-                        completions.push((call_id, outcome));
+                    .buffer_unordered(width);
+                    while let Some(maybe) = unordered.next().await {
+                        if let Some((call_id, outcome, elapsed_ns)) = maybe {
+                            AMAC_EXECUTOR.with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
+                            runtime.complete_hostcall(call_id, outcome);
+                            let _ = runtime.tick().await;
+                            let _ = runtime.drain_microtasks().await;
+                        }
                     }
                 }
                 crate::hostcall_amac::AmacToggleDecision::Sequential { .. } => {
@@ -22306,7 +22311,9 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
                             dispatch_one(runtime, host, req).await
                         {
                             AMAC_EXECUTOR.with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
-                            completions.push((call_id, outcome));
+                            runtime.complete_hostcall(call_id, outcome);
+                            let _ = runtime.tick().await;
+                            let _ = runtime.drain_microtasks().await;
                         }
                     }
                 }
@@ -22316,14 +22323,10 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
         let batch_elapsed_ms = u64::try_from(batch_start.elapsed().as_millis()).unwrap_or(u64::MAX);
         tracing::debug!(
             event = "pijs.amac.batch_complete",
-            total_dispatched = completions.len(),
+            total_dispatched = total,
             batch_elapsed_ms,
             "AMAC batch dispatch complete"
         );
-
-        if !completions.is_empty() {
-            runtime.complete_hostcalls_batch(completions);
-        }
     }
 
     // Process any hostcalls already queued before we advance the event loop.

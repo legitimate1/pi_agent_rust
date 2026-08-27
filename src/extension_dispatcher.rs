@@ -2725,20 +2725,29 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             // dispatch is safe within the single-threaded async executor.
             if let crate::hostcall_amac::AmacToggleDecision::Interleave { width } = decision {
                 let width = (*width).clamp(1, group.requests.len().max(1));
-                for chunk in group.requests.chunks(width) {
-                    let elapsed = futures::future::join_all(chunk.iter().map(|request| {
-                        let request = request.clone();
-                        let req_start = Instant::now();
+                // Previously: `chunks(width) + join_all` waited for the slowest
+                // member of each chunk before observing/ticking, so a 2s/5s/8s
+                // Exec group still batched to ~8s per chunk. Use
+                // `buffer_unordered` + per-ready tick so each child's
+                // `complete_hostcall` (inside `dispatch_and_complete`) is
+                // delivered to JS immediately without waiting for siblings.
+                #[allow(clippy::items_after_statements)]
+                let mut unordered = {
+                    use futures::StreamExt as _;
+                    futures::stream::iter(group.requests.into_iter().map(|request| {
+                        let req = request;
                         async move {
-                            self.dispatch_and_complete(request).await;
+                            let req_start = Instant::now();
+                            self.dispatch_and_complete(req).await;
                             u64::try_from(req_start.elapsed().as_nanos()).unwrap_or(u64::MAX)
                         }
                     }))
-                    .await;
-                    let mut executor = self.amac_executor.borrow_mut();
-                    for elapsed_ns in elapsed {
-                        executor.observe_call(elapsed_ns);
-                    }
+                    .buffer_unordered(width)
+                };
+                while let Some(elapsed_ns) = futures::StreamExt::next(&mut unordered).await {
+                    self.amac_executor.borrow_mut().observe_call(elapsed_ns);
+                    let _ = self.js_runtime().tick().await;
+                    let _ = self.js_runtime().drain_microtasks().await;
                 }
             } else {
                 for request in group.requests {
@@ -2747,6 +2756,8 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     let elapsed_ns =
                         u64::try_from(req_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                     self.amac_executor.borrow_mut().observe_call(elapsed_ns);
+                    let _ = self.js_runtime().tick().await;
+                    let _ = self.js_runtime().drain_microtasks().await;
                 }
             }
 
