@@ -224,14 +224,16 @@ pi migrate ~/.pi/agent/sessions
 
 ```json
 {
-  "disabledTools": ["bash"]
+  "disabledTools": ["shell"]
 }
 ```
 
-`--tools` CLI 参数覆盖启用的工具列表（逗号分隔）：
+Single Shell 收口后对外仅 `shell` 1 工具（`bash`/`pwsh` 仅 `PI_ENABLE_LEGACY_SHELL=1|true|yes|on` 时带外恢复，不对外宣传）。
+
+`--tools` CLI 参数覆盖启用的工具列表（逗号分隔，默认 8 工具）：
 
 ```bash
-pi --tools read,write,edit,grep,find,ls,hashline_edit,pwsh
+pi --tools read,shell,edit,write,grep,find,ls,hashline_edit
 ```
 
 ## 运行环境变量

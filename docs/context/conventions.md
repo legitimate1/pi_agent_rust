@@ -2,11 +2,16 @@
 
 ## 命名规范
 
-- **内置工具名** → 小写（示例：`read` `write` `edit` `bash`）
+- **内置工具名** → 小写（示例：`read` `write` `edit` `shell`）；Single Shell 收口后对外仅 `shell(shell=bash|pwsh)` 1 工具，`bash`/`pwsh` 不再是对外工具名（仅 `PI_ENABLE_LEGACY_SHELL=1|true|yes|on` 时带外恢复，禁止直接 `new BashTool`/`new PwshTool` 对外暴露）
 - **Provider 名** → 小写（示例：`anthropic` `openai`）
 - **扩展 ID** → `ext.*` 前缀（示例：`ext.tools_fs`）
 - **Rust 源码** → `snake_case`（示例：`extension_tools.rs`）
 - **测试函数** → `snake_case`（示例：`test_tool_override`）
+
+## Single Shell 约束
+
+- 对外仅 `shell(shell=bash|pwsh)` 1 工具为 Single Shell 统一入口（`src/tools/shell.rs`）；`bash`/`pwsh` 为内部实现（`src/tools/bash.rs`/`pwsh.rs`），禁止直接 `new BashTool`/`new PwshTool` 对外暴露或注册（`PI_ENABLE_LEGACY_SHELL` gated 带外恢复除外）
+- 任何 shell 相关变更（`shell.rs` 契约、`ToolRegistry::new` 注册与 `is_legacy_shell_enabled()`、`src/cli.rs` 默认 `--tools`、`disabledTools` 示例、`ProcessGuard` 复用）必须同步更新 `docs/context/{features.md,architecture.md,conventions.md,design-decisions.md,commands.md}`，保持文档与代码一致
 
 ## 隐含假设
 
@@ -47,10 +52,10 @@ guard.wait_with_cancellation(timeout_secs, abort.as_ref()).await?;
 
 ### 清理模式：统一 ProcessGroupTree
 
-所有 spawn 子进程的工具（bash/pwsh/grep/find）统一使用 `ProcessGroupTree`：
+所有 spawn 子进程的工具（shell→bash/pwsh/grep/find）统一使用 `ProcessGroupTree`：
 
-- **bash** → `ProcessGroupTree` + `isolate_command_process_group`（说明：shell 启动的后台进程一律被 `taskkill /F /T` 终止）
-- **pwsh** → `ProcessGroupTree` + `isolate_command_process_group`（说明：PowerShell 命令的子进程树被完整清理）
+- **shell→bash** → `ProcessGroupTree` + `isolate_command_process_group`（说明：`shell(shell="bash")` 薄转发到底层 `run_bash_command`，后台进程被 `taskkill /F /T` 终止）
+- **shell→pwsh** → `ProcessGroupTree` + `isolate_command_process_group`（说明：`shell(shell="pwsh")` 薄转发到底层 `run_pwsh_command`，PowerShell 子进程树被完整清理；`bash.rs`/`pwsh.rs` 保留为内部实现，禁止对外直接 `new BashTool`/`new PwshTool`）
 - **grep** → `ProcessGroupTree` + `isolate_command_process_group`（说明：ripgrep 及其子进程被清理）
 - **find** → `ProcessGroupTree` + `isolate_command_process_group`（说明：fd 及其子进程被清理）
 

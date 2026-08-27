@@ -46,17 +46,33 @@ Session persistence + index (JSONL, optional SQLite)
     │    • 超时 kill                                │
     │  Drop → spawn 线程 kill + wait 回收子进程     │
     │                                              │
-    │  被 pwsh / bash / grep / find 使用            │
+    │  被 shell(→bash/pwsh)/ grep / find 使用          │
     │  全部使用 ProcessGroupTree + isolate 进程组   │
     └──────────────────────────────────────────────┘
 ```
 
 abort 信号（`src/abort.rs` 共享原语）沿 Agent 循环 → 工具执行 → 子进程全链路传播：Rust 工具循环检查后 kill 进程树；扩展工具先通知 JS 侧 `AbortController` 优雅退出，仍挂起则硬中断兜底。
 
+### Single Shell 调度（显式方言 + Flag 逃生）
+
+CLI `--tools` 默认 `read,shell,edit,write,grep,find,ls,hashline_edit`（8 工具）→ `ToolRegistry::new`（`src/tools/mod.rs:2823`）常驻 `ShellTool`（`src/tools/shell.rs`）；`shell(shell, command, timeout?)` 仅做参数校验（`command.trim().is_empty()`/`shell` 非枚举/`timeout<0` 均 `validation` 拒绝）+ `match { bash => run_bash_command(&cwd,...), pwsh => run_pwsh_command(&cwd,...) }` 薄转发透传 `cwd`+`command`+`timeout`+`abort`，`ProcessGuard`/`vsenv`/`resolve_bash_shell`/`stdin null`/截断等底层复用 `bash.rs`/`pwsh.rs` 不重写。`bash`/`pwsh` 不再直接对外注册，仅 `PI_ENABLE_LEGACY_SHELL=1|true|yes|on`（`trim+to_ascii_lowercase`，`is_legacy_shell_enabled()`）时 gated 追加注册为兼容逃生，默认不暴露、不宣传、不写进 CLI 默认值。
+
+```
+CLI --tools read,shell,edit,write,grep,find,ls,hashline_edit
+        ↓
+  ToolRegistry (shell 常驻)
+        ↓
+    ShellTool (shell.rs: validation + match)
+      ├─ shell=bash ─→ run_bash_command (bash.rs: ProcessGroupTree + vsenv + resolve_bash_shell)
+      └─ shell=pwsh ─→ run_pwsh_command (pwsh.rs: ProcessGroupTree)
+        ↑
+        └─ PI_ENABLE_LEGACY_SHELL=1 时额外直注册 BashTool/PwshTool（带外逃生，与 shell 分发隔离）
+```
+
 ## 扩展加载流程
 
 1. `main.rs` → 获取默认工具列表
-2. 过滤 `disabledTools` 配置中列出的工具（如 `bash`）
+2. 过滤 `disabledTools` 配置中列出的工具（如 `shell`，legacy 模式下 `bash`/`pwsh` 同理）
 3. 创建 `ToolRegistry` 内置工具（`tool_config_with_overrides` 合并 settings.json `toolDescriptions` + `tools.toml` 覆盖，tools.toml 优先）
 4. `enable_extensions_with_policy()` 按能力策略加载扩展
 5. 收集扩展工具包装器
@@ -67,7 +83,7 @@ abort 信号（`src/abort.rs` 共享原语）沿 Agent 循环 → 工具执行 �
 - **`abort.rs`** → 共享 AbortHandle/AbortSignal 原语，打破 agent ↔ tools 循环依赖
 - **`app.rs`** → 系统提示词构建（SYSTEM.md 加载、default_system_prompt、project context files、date/cwd/temp 运行时事实注入）
 - **`tool_overrides.rs`** → tools.toml 覆盖加载：合并用户级 `~/.pi/agent/tools.toml` + 项目级 `.pi/tools.toml`（项目 key 优先），产出 description / parameters 覆盖表
-- **`tools/` 模块目录** → ToolRegistry + 内置工具模块 + verify 内部验证引擎
+- **`tools/` 模块目录** → ToolRegistry + 内置工具模块 + verify 内部验证引擎（Single Shell：`shell.rs` 为 Single Shell 统一入口，薄转发 `bash.rs`/`pwsh.rs` 内部实现；`bash`/`pwsh` 仅 `PI_ENABLE_LEGACY_SHELL` 时 gated 注册）
 - **`tools/verify.rs`** → 编辑后轻量验证引擎：文件类型检测→检查器映射（.rs/.json/.toml/.ts/.js/.py/.go/.md）→进程内/外部进程执行，支持 Format+Lint 并行（oxfmt+oxlint/ruff），诊断直写 content 正文
 - **`agent.rs`** → Agent 循环（工具迭代、扩展合并、ToolDef 构建）
 - **`extensions.rs`** → 扩展管理器、能力策略、生命周期
