@@ -278,6 +278,9 @@ storage.sqlite3-wal.corrupt-*
 /ubs_findings.jsonl
 /ubs_findings.txt
 
+# Local check failure dumps (cargo test --all-targets / my-check logs)
+failures_tmp*/
+
 sweep.timestamp
 sweep.timestamp
 .env
