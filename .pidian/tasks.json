@@ -2,10 +2,22 @@
   "version": 1,
   "tasks": [
     {
+      "id": "pt_1787838587298_z04kxo9",
+      "content": "!git add .pidian/tasks.json && git commit -m \"chore: sync task board\"",
+      "done": false,
+      "createdAt": 1787838587298
+    },
+    {
       "id": "pt_1787669216455_2l5sxk8",
       "content": "给我一个提示词,我交给下一个会话继续完成这个工作",
       "done": false,
       "createdAt": 1787669216455
+    },
+    {
+      "id": "pt_1787834990853_9a3jbkr",
+      "content": "云构建（仅 Windows）",
+      "done": false,
+      "createdAt": 1787834990853
     },
     {
       "id": "pt_1787749410725_mcc4bh1",
