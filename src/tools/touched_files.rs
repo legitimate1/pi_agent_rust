@@ -9,7 +9,9 @@
 use indexmap::IndexMap;
 use pi_core::model::{FileStatus, FileTouch, TouchSource};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 // ============================================================================
 // Internal aggregated form (mirrors TS TouchedFile)
@@ -446,6 +448,10 @@ pub struct GitSnapshot {
 }
 
 /// Capture a snapshot of cwd.  Tries `gix` (if available) → `git` CLI → walk.
+///
+/// This is the **synchronous** core — it blocks on `gix`/`git`/walk and must
+/// not be called directly from an `asupersync` reactor task.  Use
+/// [`capture_snapshot_async`] from async contexts.
 pub fn capture_snapshot(cwd: &Path) -> Snapshot {
     if let Some(g) = capture_gix(cwd) {
         return Snapshot::Git(g);
@@ -454,6 +460,20 @@ pub fn capture_snapshot(cwd: &Path) -> Snapshot {
         return Snapshot::Git(g);
     }
     Snapshot::Walk(capture_walk(cwd))
+}
+
+/// Async wrapper that offloads [`capture_snapshot`] to the `asupersync`
+/// blocking pool so the reactor thread is not stalled.
+///
+/// `gix` can be 30-50ms (release) and `git status` is ~90-100ms; both would
+/// otherwise block `RuntimeBuilder::current_thread()`'s single reactor
+/// thread, freezing timers / `Cx::checkpoint()` cancellation.
+///
+/// Uses `asupersync::runtime::spawn_blocking` (not `tokio::task`) — `pi`
+/// has no `tokio` dependency; see `crates/pi-core/src/agent_cx.rs`.
+pub async fn capture_snapshot_async(cwd: PathBuf) -> Snapshot {
+    let cwd_for_blocking = cwd;
+    asupersync::runtime::spawn_blocking(move || capture_snapshot(&cwd_for_blocking)).await
 }
 
 fn capture_gix(cwd: &Path) -> Option<GitSnapshot> {
@@ -891,23 +911,45 @@ fn diff_walk_snapshots(
 // ============================================================================
 // Per-cwd bash window lock (prevents concurrent bash windows from interleaving)
 // ============================================================================
+//
+// Uses `asupersync::sync::Mutex` (not `std::sync::Mutex`, not `tokio::sync`).
+// `pi` has no `tokio` dependency — all async goes through `asupersync::Cx`
+// (see `crates/pi-core/src/agent_cx.rs`). `std::sync::Mutex` across `await`
+// is `!Send` and would also block the `current_thread` reactor.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Mutex as StdMutex;
 
-static BASH_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+static BASH_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Arc<asupersync::sync::Mutex<()>>>>> =
+    OnceLock::new();
 
-fn bash_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
-    BASH_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+fn bash_locks() -> &'static StdMutex<HashMap<PathBuf, Arc<asupersync::sync::Mutex<()>>>> {
+    BASH_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-pub fn bash_window_lock(cwd: &Path) -> Arc<Mutex<()>> {
-    let key = cwd.to_string_lossy().to_string();
+/// Get the per-cwd async mutex (sync, cheap). Caller must
+/// `asupersync::sync::OwnedMutexGuard::lock` it with a `Cx`.
+pub fn bash_window_mutex(cwd: &Path) -> Arc<asupersync::sync::Mutex<()>> {
+    let key = cwd.to_path_buf();
     let mut map = bash_locks()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     map.entry(key)
-        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .or_insert_with(|| Arc::new(asupersync::sync::Mutex::new(())))
         .clone()
+}
+
+/// Convenience: acquire the per-cwd window lock with the current `Cx`.
+pub async fn lock_bash_window(
+    cwd: &Path,
+) -> Result<asupersync::sync::OwnedMutexGuard<()>, asupersync::sync::LockError> {
+    let m = bash_window_mutex(cwd);
+    let cx = crate::agent_cx::AgentCx::for_current_or_request();
+    asupersync::sync::OwnedMutexGuard::lock(m, cx.cx()).await
+}
+
+/// Legacy name — returns the `asupersync` mutex (not `std`).
+pub fn bash_window_lock(cwd: &Path) -> Arc<asupersync::sync::Mutex<()>> {
+    bash_window_mutex(cwd)
 }
 
 #[cfg(test)]

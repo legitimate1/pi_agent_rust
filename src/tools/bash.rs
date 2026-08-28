@@ -553,6 +553,17 @@ impl Tool for BashTool {
         let input: BashInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
 
+        // Per-cwd window isolation (not a BARRIER replacement): hold the
+        // `asupersync::sync::Mutex` across before/after snapshots so two
+        // bash windows on the same `cwd` cannot interleave their diffs.
+        // `TOOL_EFFECTS::BARRIER` already serializes bash batches, this
+        // only guards cross-batch/steering races on the same directory.
+        let cwd_buf = self.cwd.clone();
+        let _window_guard = crate::tools::touched_files::lock_bash_window(&cwd_buf)
+            .await
+            .map_err(|e| Error::tool("bash", format!("bash window lock failed: {e}")))?;
+        let before = crate::tools::touched_files::capture_snapshot_async(cwd_buf.clone()).await;
+
         let result = run_bash_command(
             &self.cwd,
             self.shell_path.as_deref(),
@@ -562,7 +573,18 @@ impl Tool for BashTool {
             on_update.as_deref(),
             _abort.as_ref(),
         )
-        .await?;
+        .await;
+
+        // Drop window guard early on bash failure — don't require a diff.
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => return Err(e),
+        };
+        let after = crate::tools::touched_files::capture_snapshot_async(cwd_buf).await;
+        let mut bash_touches =
+            crate::tools::touched_files::diff_snapshots(before, after, tool_call_id, "bash");
+        bash_touches = crate::tools::touched_files::filter_bash_touches(bash_touches);
+        // `_window_guard` drops here, releasing per-cwd window.
 
         let mut details_map = serde_json::Map::new();
         if let Some(truncation) = result.truncation.as_ref() {
@@ -604,7 +626,7 @@ impl Tool for BashTool {
         let is_error = result.cancelled || result.exit_code != 0;
 
         Ok(ToolOutput {
-            touched_files: Vec::new(),
+            touched_files: bash_touches,
             content: vec![ContentBlock::Text(TextContent::new(output_text))],
             details,
             is_error,
