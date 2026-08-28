@@ -4518,6 +4518,7 @@ dependencies = [
  "fs4",
  "futures",
  "getrandom 0.4.2",
+ "gix",
  "glob",
  "hmac 0.12.1",
  "ignore",

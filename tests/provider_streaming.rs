@@ -911,6 +911,7 @@ pub(crate) fn tool_result_message(
     is_error: bool,
 ) -> Message {
     Message::ToolResult(std::sync::Arc::new(ToolResultMessage {
+        touched_files: Vec::new(),
         tool_call_id: tool_call_id.to_string(),
         tool_name: tool_name.to_string(),
         content: vec![ContentBlock::Text(pi::model::TextContent::new(
