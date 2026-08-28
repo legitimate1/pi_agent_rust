@@ -5,6 +5,9 @@ on:
     tags: ["my-v*"]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 concurrency:
   group: my-build-${{ github.ref }}
   cancel-in-progress: true
@@ -32,6 +35,35 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump version (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin custom 2>/dev/null || true
+          current_branch="$(git branch --show-current || true)"
+          if [ "$current_branch" != "custom" ]; then
+            git checkout custom 2>/dev/null || git checkout -b custom origin/custom
+          fi
+          git pull --rebase origin custom 2>/dev/null || echo "warn: pull --rebase failed"
+          cargo install cargo-edit --locked --quiet || true
+          cargo set-version --bump patch -p pi_agent_rust
+          v="$(grep -m1 '^version = "' Cargo.toml | sed -E 's/.*version = "([^"]+)".*/\1/')"
+          echo "Bumped to $v"
+          git add Cargo.toml Cargo.lock
+          if git diff --cached --quiet; then
+            echo "No version change to commit"
+            exit 0
+          fi
+          git commit -m "chore: bump version to $v [skip ci]"
+          git pull --rebase origin custom 2>/dev/null || true
+          git push origin HEAD:custom
+          echo "Pushed bump $v to origin/custom"
 
       - name: Cache apt packages (xcb) [linux]
         if: runner.os == 'Linux'

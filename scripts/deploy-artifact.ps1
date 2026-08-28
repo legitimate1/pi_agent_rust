@@ -214,9 +214,23 @@ if (-not $deployed) { exit 1 }
 # 校验
 Write-Host "==> 校验部署结果..." -ForegroundColor Cyan
 Get-Item $Destination | Format-List Name, Length, LastWriteTime | Out-String | Write-Host
+$beforeVer = $null
+if (Test-Path $backupLatest) {
+    try { $beforeVer = & $backupLatest --version 2>&1 | Out-String } catch {}
+    if ($beforeVer) { Write-Host "    部署前版本: $($beforeVer.Trim())" -ForegroundColor DarkGray }
+}
 try {
     $ver = & $Destination --version 2>&1 | Out-String
-    Write-Host $ver.Trim() -ForegroundColor Green
+    $verTrim = $ver.Trim()
+    Write-Host "    部署后版本: $verTrim" -ForegroundColor Green
+    if ($beforeVer) {
+        $beforeTrim = $beforeVer.Trim()
+        if ($verTrim -eq $beforeTrim) {
+            Write-Warning "版本未变化 ($verTrim) —— 可能命中缓存或版本号未递增，请确认 my-build-windows 已自动 bump 并检查 Run 的 Verify binary 步骤输出"
+        } else {
+            Write-Host "    版本已更新: $beforeTrim -> $verTrim" -ForegroundColor Green
+        }
+    }
 } catch {
     Write-Warning "执行 $Destination --version 失败: $($_.Exception.Message)"
 }
