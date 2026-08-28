@@ -1,6 +1,6 @@
 //! Built-in tool implementations.
 //!
-//! Pi provides 8 built-in tools: read, shell, edit, write, grep, find, ls, hashline_edit.
+//! Pi provides 10 built-in tools: read, shell, edit, write, grep, find, ls, hashline_edit, ast_grep, ast_edit.
 //!
 //! Tools are exposed to the model via JSON Schema (see [`crate::provider::ToolDef`]) and executed
 //! locally by the agent loop. Each tool returns structured [`ContentBlock`] output suitable for
@@ -2854,6 +2854,8 @@ impl ToolRegistry {
                 "find" => tools.push(Box::new(FindTool::new(cwd))),
                 "ls" => tools.push(Box::new(LsTool::new(cwd))),
                 "hashline_edit" => tools.push(Box::new(HashlineEditTool::new(cwd))),
+                "ast_grep" => tools.push(Box::new(crate::ast_tools::AstGrepTool::new(cwd))),
+                "ast_edit" => tools.push(Box::new(crate::ast_tools::AstEditTool::new(cwd))),
                 _ => {}
             }
         }

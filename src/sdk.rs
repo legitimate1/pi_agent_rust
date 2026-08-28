@@ -77,6 +77,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "find",
     "ls",
     "hashline_edit",
+    "ast_grep",
+    "ast_edit",
 ];
 
 /// Create a read tool configured for `cwd`.
@@ -124,6 +126,16 @@ pub fn create_hashline_edit_tool(cwd: &Path) -> Box<dyn Tool> {
     Box::new(HashlineEditTool::new(cwd))
 }
 
+/// Create an ast_grep tool configured for `cwd`.
+pub fn create_ast_grep_tool(cwd: &Path) -> Box<dyn Tool> {
+    Box::new(crate::ast_tools::AstGrepTool::new(cwd))
+}
+
+/// Create an ast_edit tool configured for `cwd`.
+pub fn create_ast_edit_tool(cwd: &Path) -> Box<dyn Tool> {
+    Box::new(crate::ast_tools::AstEditTool::new(cwd))
+}
+
 /// Create all built-in tools configured for `cwd`.
 pub fn create_all_tools(cwd: &Path) -> Vec<Box<dyn Tool>> {
     vec![
@@ -135,6 +147,8 @@ pub fn create_all_tools(cwd: &Path) -> Vec<Box<dyn Tool>> {
         create_find_tool(cwd),
         create_ls_tool(cwd),
         create_hashline_edit_tool(cwd),
+        create_ast_grep_tool(cwd),
+        create_ast_edit_tool(cwd),
     ]
 }
 
@@ -2699,7 +2713,7 @@ mod tests {
     fn create_all_tools_returns_eight() {
         let tmp = tempdir().expect("tempdir");
         let tools = super::create_all_tools(tmp.path());
-        assert_eq!(tools.len(), 8, "should create all 8 built-in tools");
+        assert_eq!(tools.len(), 10, "should create all 10 built-in tools");
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         for expected in BUILTIN_TOOL_NAMES {
@@ -2725,7 +2739,7 @@ mod tests {
     fn all_tool_definitions_returns_eight_schemas() {
         let tmp = tempdir().expect("tempdir");
         let defs = super::all_tool_definitions(tmp.path());
-        assert_eq!(defs.len(), 8);
+        assert_eq!(defs.len(), 10);
 
         for def in &defs {
             assert!(!def.name.is_empty());
