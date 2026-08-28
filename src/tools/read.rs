@@ -143,6 +143,7 @@ impl ReadTool {
 
             let size_str = format_file_size(meta.len());
             return Ok(ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new(format!(
                     "📄 {} | {} | {} | encoding: {}",
                     resolved.file_name().unwrap_or_default().to_string_lossy(),
@@ -285,6 +286,7 @@ impl ReadTool {
             }
 
             return Ok(ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![
                     ContentBlock::Text(TextContent::new(note)),
                     ContentBlock::Image(ImageContent {
@@ -323,6 +325,7 @@ impl ReadTool {
                 let lines = stats.lines().count().saturating_sub(1);
                 let changes = diff.ops().len();
                 return Ok(ToolOutput {
+                    touched_files: Vec::new(),
                     content: vec![ContentBlock::Text(TextContent::new(format!(
                         "Diff: {} ↔ {}\nChanges: {changes} diff hunks, {lines} lines",
                         resolved.file_name().unwrap_or_default().to_string_lossy(),
@@ -338,6 +341,7 @@ impl ReadTool {
                 .context_radius(ctx)
                 .to_string();
             return Ok(ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new(diff_output))],
                 details: None,
                 is_error: false,
@@ -428,6 +432,7 @@ impl ReadTool {
             }
 
             return Ok(ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new(output_text))],
                 details: None,
                 is_error: false,
@@ -529,6 +534,7 @@ impl ReadTool {
                 ));
             }
             let output = ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new(""))],
                 details: None,
                 is_error: false,
@@ -668,6 +674,7 @@ impl ReadTool {
         }
 
         let output = ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new(output_text))],
             details,
             is_error: false,
@@ -858,6 +865,7 @@ impl Tool for ReadTool {
         }
 
         Ok(ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new(all_text))],
             details: combined_details,
             is_error: had_error,

@@ -1035,6 +1035,7 @@ mod tests {
                     timestamp: 0,
                 }),
                 Message::tool_result(ToolResultMessage {
+                    touched_files: Vec::new(),
                     tool_call_id: "tool_1".to_string(),
                     tool_name: "search".to_string(),
                     content: vec![ContentBlock::Text(TextContent {
@@ -1198,6 +1199,7 @@ mod tests {
 
     fn make_bedrock_tool_result(content: Vec<ContentBlock>, is_error: bool) -> ToolResultMessage {
         ToolResultMessage {
+            touched_files: Vec::new(),
             tool_call_id: "tool_42".to_string(),
             tool_name: "test_tool".to_string(),
             content,

@@ -1050,6 +1050,7 @@ fn event_listeners_notify_with_no_subscribers_is_safe() {
     listeners.notify_tool_end(
         "bash",
         &ToolOutput {
+            touched_files: Vec::new(),
             content: vec![],
             details: None,
             is_error: false,
@@ -1198,11 +1199,13 @@ fn event_listeners_tool_end_hook_with_error() {
     }));
 
     let ok_output = ToolOutput {
+        touched_files: Vec::new(),
         content: vec![ContentBlock::Text(TextContent::new("ok"))],
         details: None,
         is_error: false,
     };
     let err_output = ToolOutput {
+        touched_files: Vec::new(),
         content: vec![ContentBlock::Text(TextContent::new("error"))],
         details: None,
         is_error: true,

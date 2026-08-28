@@ -2461,6 +2461,7 @@ mod tests {
         let args = serde_json::json!({"path": "/foo"});
         listeners.notify_tool_start("bash", &args);
         let output = ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new("ok"))],
             details: None,
             is_error: false,

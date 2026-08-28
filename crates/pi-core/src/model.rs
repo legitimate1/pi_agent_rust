@@ -10,6 +10,49 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
+// File Touches (persisted with ToolResultMessage / ToolOutput)
+// ============================================================================
+
+/// Status of a file touched by a tool execution.
+///
+/// Serialized as single-letter git-like codes: "M" / "A" / "D" / "R".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileStatus {
+    #[serde(rename = "M")]
+    Modified,
+    #[serde(rename = "A")]
+    Added,
+    #[serde(rename = "D")]
+    Deleted,
+    #[serde(rename = "R")]
+    Renamed,
+}
+
+/// How a file touch was detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TouchSource {
+    #[serde(rename = "structured")]
+    Structured,
+    #[serde(rename = "bash")]
+    Bash,
+}
+
+/// A file touched during a tool call, persisted for RPC / session replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTouch {
+    pub path: String,
+    pub status: FileStatus,
+    pub source: TouchSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_old_path: Option<String>,
+    pub tool_call_id: String,
+    pub tool_name: String,
+}
+
+// ============================================================================
 // Message Types
 // ============================================================================
 
@@ -72,6 +115,8 @@ pub struct AssistantMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolResultMessage {
+    #[serde(default)]
+    pub touched_files: Vec<FileTouch>,
     pub tool_call_id: String,
     pub tool_name: String,
     pub content: Vec<ContentBlock>,

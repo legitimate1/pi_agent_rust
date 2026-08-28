@@ -191,6 +191,7 @@ impl Tool for WriteTool {
         }
 
         Ok(ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new(output_text))],
             details,
             is_error: false,

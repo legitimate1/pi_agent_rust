@@ -1615,6 +1615,7 @@ mod tests {
 
     fn make_tool_result(content: Vec<ContentBlock>) -> Message {
         Message::tool_result(ToolResultMessage {
+            touched_files: Vec::new(),
             tool_call_id: "call_123".to_string(),
             tool_name: "test_tool".to_string(),
             content,

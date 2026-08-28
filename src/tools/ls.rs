@@ -171,6 +171,7 @@ impl Tool for LsTool {
 
         if emitted_entries == 0 {
             let output = ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new("(empty directory)"))],
                 details: None,
                 is_error: false,
@@ -237,6 +238,7 @@ impl Tool for LsTool {
         );
 
         let output = ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new(output))],
             details,
             is_error: false,

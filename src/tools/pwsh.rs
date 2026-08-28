@@ -97,6 +97,7 @@ impl Tool for PwshTool {
         let is_error = result.exit_code != 0;
 
         Ok(ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new(result.output))],
             details,
             is_error,

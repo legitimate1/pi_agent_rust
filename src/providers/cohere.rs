@@ -1648,6 +1648,7 @@ mod tests {
                     timestamp: 1,
                 }),
                 Message::tool_result(crate::model::ToolResultMessage {
+                    touched_files: Vec::new(),
                     tool_call_id: "call_1".to_string(),
                     tool_name: "read".to_string(),
                     content: vec![ContentBlock::Text(TextContent::new("file contents"))],

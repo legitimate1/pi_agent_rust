@@ -362,6 +362,7 @@ fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<()> {
 
 fn text_output(text: String, details: serde_json::Value) -> ToolOutput {
     ToolOutput {
+        touched_files: Vec::new(),
         content: vec![ContentBlock::Text(TextContent::new(text))],
         details: Some(details),
         is_error: false,

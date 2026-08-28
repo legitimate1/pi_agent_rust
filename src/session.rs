@@ -4504,6 +4504,7 @@ pub(crate) fn session_message_to_model(message: &SessionMessage) -> Option<Messa
             is_error,
             timestamp,
         } => Some(Message::tool_result(ToolResultMessage {
+            touched_files: Vec::new(),
             tool_call_id: tool_call_id.clone(),
             tool_name: tool_name.clone(),
             content: content.clone(),

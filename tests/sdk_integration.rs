@@ -986,9 +986,11 @@ fn sdk_conformance_agent_event_json_schema() {
             args: json!({"path": "/tmp/test"}),
         },
         AgentEvent::ToolExecutionEnd {
+            touched_files: Vec::new(),
             tool_call_id: "tc-1".to_string(),
             tool_name: "read".to_string(),
             result: pi::tools::ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new("file contents"))],
                 details: None,
                 is_error: false,

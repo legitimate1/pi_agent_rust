@@ -16,6 +16,7 @@ mod ls;
 mod pwsh;
 mod read;
 mod shell;
+pub(crate) mod touched_files;
 pub(crate) mod verify;
 mod write;
 
@@ -251,6 +252,8 @@ pub struct ToolOutput {
     pub details: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_error: bool,
+    #[serde(default)]
+    pub touched_files: Vec<pi_core::model::FileTouch>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde requires `fn(&bool) -> bool` for `skip_serializing_if`

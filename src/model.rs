@@ -72,7 +72,8 @@ pub struct AssistantMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolResultMessage {
-    pub tool_call_id: String,
+touched_files: Vec::new(),
+        pub tool_call_id: String,
     pub tool_name: String,
     pub content: Vec<ContentBlock>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -757,7 +758,8 @@ mod tests {
     #[test]
     fn message_tool_result_roundtrip() {
         let msg = Message::tool_result(ToolResultMessage {
-            tool_call_id: "call_1".to_string(),
+touched_files: Vec::new(),
+                        tool_call_id: "call_1".to_string(),
             tool_name: "read".to_string(),
             content: vec![ContentBlock::Text(TextContent::new("file contents"))],
             details: Some(json!({"path": "/tmp/test.txt"})),
@@ -1368,7 +1370,8 @@ mod tests {
     #[test]
     fn tool_result_details_skipped_when_none() {
         let tr = ToolResultMessage {
-            tool_call_id: "c1".to_string(),
+touched_files: Vec::new(),
+                        tool_call_id: "c1".to_string(),
             tool_name: "bash".to_string(),
             content: vec![],
             details: None,
@@ -1382,7 +1385,8 @@ mod tests {
     #[test]
     fn tool_result_is_error_roundtrip() {
         let tr = ToolResultMessage {
-            tool_call_id: "c1".to_string(),
+touched_files: Vec::new(),
+                        tool_call_id: "c1".to_string(),
             tool_name: "bash".to_string(),
             content: vec![ContentBlock::Text(TextContent::new("error output"))],
             details: None,
@@ -1630,7 +1634,8 @@ mod tests {
             .prop_map(
                 |(tool_call_id, tool_name, content, details, is_error, timestamp)| {
                     ToolResultMessage {
-                        tool_call_id,
+touched_files: Vec::new(),
+                                                tool_call_id,
                         tool_name,
                         content,
                         details,

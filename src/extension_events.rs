@@ -564,6 +564,7 @@ mod tests {
 
         fn sample_tool_result() -> ToolResultMessage {
             ToolResultMessage {
+                touched_files: Vec::new(),
                 tool_call_id: "call-1".to_string(),
                 tool_name: "read".to_string(),
                 content: vec![ContentBlock::Text(crate::model::TextContent::new("ok"))],

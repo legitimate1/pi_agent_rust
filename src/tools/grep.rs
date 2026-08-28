@@ -495,6 +495,7 @@ impl Tool for GrepTool {
 
         if match_count == 0 {
             let output = ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new("No matches found"))],
                 details: None,
                 is_error: false,
@@ -655,6 +656,7 @@ impl Tool for GrepTool {
         );
 
         let output = ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new(output))],
             details,
             is_error: false,

@@ -3388,6 +3388,7 @@ mod tests {
     #[test]
     fn serialize_conversation_tool_result() {
         let messages = vec![Message::tool_result(crate::model::ToolResultMessage {
+            touched_files: Vec::new(),
             tool_call_id: "c1".to_string(),
             tool_name: "read".to_string(),
             content: vec![ContentBlock::Text(TextContent::new("file contents"))],

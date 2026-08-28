@@ -35,9 +35,9 @@ use crate::extensions::{
 use crate::extensions::{WasmExtensionHost, WasmExtensionLoadSpec};
 use crate::extensions_js::{PiJsRuntimeConfig, RepairMode};
 use crate::model::{
-    AssistantMessage, AssistantMessageEvent, ContentBlock, CustomMessage, ImageContent, Message,
-    StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall, ToolResultMessage, Usage,
-    UserContent, UserMessage,
+    AssistantMessage, AssistantMessageEvent, ContentBlock, CustomMessage, FileTouch, ImageContent,
+    Message, StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall, ToolResultMessage,
+    Usage, UserContent, UserMessage,
 };
 use crate::models::{
     ModelEntry, ModelRegistry, model_requires_configured_credential, normalize_api_key_opt,
@@ -966,6 +966,8 @@ pub enum AgentEvent {
         tool_results: Vec<Message>,
         #[serde(rename = "latencyBreakdown", skip_serializing_if = "Option::is_none")]
         latency_breakdown: Option<Box<TurnLatencyBreakdown>>,
+        #[serde(default)]
+        touched_files: Vec<FileTouch>,
     },
     /// Message lifecycle start (user, assistant, or tool result).
     MessageStart { message: Message },
@@ -1004,6 +1006,8 @@ pub enum AgentEvent {
         result: ToolOutput,
         #[serde(rename = "isError")]
         is_error: bool,
+        #[serde(default)]
+        touched_files: Vec<FileTouch>,
     },
     /// Auto-compaction lifecycle start.
     AutoCompactionStart { reason: String },
@@ -1534,6 +1538,7 @@ impl Agent {
                     });
 
                     let turn_end_event = AgentEvent::TurnEnd {
+                        touched_files: Vec::new(),
                         session_id: session_id.clone(),
                         turn_index: current_turn_index,
                         message,
@@ -1596,6 +1601,7 @@ impl Agent {
                         });
 
                         let turn_end_event = AgentEvent::TurnEnd {
+                            touched_files: Vec::new(),
                             session_id: session_id.clone(),
                             turn_index: current_turn_index,
                             message: assistant_event_message,
@@ -1642,6 +1648,7 @@ impl Agent {
                     }
 
                     let turn_end_event = AgentEvent::TurnEnd {
+                        touched_files: Vec::new(),
                         session_id: session_id.clone(),
                         turn_index: current_turn_index,
                         message: assistant_event_message.clone(),
@@ -1740,6 +1747,7 @@ impl Agent {
                         }
 
                         let turn_end_event = AgentEvent::TurnEnd {
+                            touched_files: Vec::new(),
                             session_id: session_id.clone(),
                             turn_index: current_turn_index,
                             message: stop_event_message,
@@ -1787,6 +1795,7 @@ impl Agent {
                             }
 
                             let turn_end_event = AgentEvent::TurnEnd {
+                                touched_files: Vec::new(),
                                 session_id: session_id.clone(),
                                 turn_index: current_turn_index,
                                 message: assistant_event_message.clone(),
@@ -1820,6 +1829,7 @@ impl Agent {
                         new_messages.extend(tool_messages);
 
                         let turn_end_event = AgentEvent::TurnEnd {
+                            touched_files: Vec::new(),
                             session_id: session_id.clone(),
                             turn_index: current_turn_index,
                             message: assistant_event_message.clone(),
@@ -1848,7 +1858,16 @@ impl Agent {
                     .map(|r| Message::ToolResult(Arc::clone(r)))
                     .collect::<Vec<_>>();
 
+                let touched_files = {
+                    let flat: Vec<FileTouch> = tool_results
+                        .iter()
+                        .flat_map(|r| r.touched_files.clone())
+                        .collect();
+                    crate::tools::touched_files::aggregate_touched(flat)
+                };
+
                 let turn_end_event = AgentEvent::TurnEnd {
+                    touched_files,
                     session_id: session_id.clone(),
                     turn_index: current_turn_index,
                     message: assistant_event_message.clone(),
@@ -2880,6 +2899,7 @@ impl Agent {
             } else {
                 // Aborted or otherwise failed to run (e.g. abort signal).
                 let output = ToolOutput {
+                    touched_files: Vec::new(),
                     content: vec![ContentBlock::Text(TextContent::new(
                         "Tool execution aborted",
                     ))],
@@ -2895,6 +2915,7 @@ impl Agent {
                     tool_name: tool_call.name.clone(),
                     args: tool_call.arguments.clone(),
                     partial_result: ToolOutput {
+                        touched_files: output.touched_files.clone(),
                         content: output.content.clone(),
                         details: output.details.clone(),
                         is_error: true,
@@ -2902,9 +2923,11 @@ impl Agent {
                 });
 
                 on_event(AgentEvent::ToolExecutionEnd {
+                    touched_files: Vec::new(),
                     tool_call_id: tool_call.id.clone(),
                     tool_name: tool_call.name.clone(),
                     result: ToolOutput {
+                        touched_files: output.touched_files.clone(),
                         content: output.content.clone(),
                         details: output.details.clone(),
                         is_error: true,
@@ -2913,6 +2936,7 @@ impl Agent {
                 });
 
                 let tool_result = Arc::new(ToolResultMessage {
+                    touched_files: Vec::new(),
                     tool_call_id: tool_call.id.clone(),
                     tool_name: tool_call.name.clone(),
                     content: output.content,
@@ -2953,6 +2977,7 @@ impl Agent {
             tool_name: tool_call.name.clone(),
             args: tool_call.arguments.clone(),
             partial_result: ToolOutput {
+                touched_files: output.touched_files.clone(),
                 content: output.content.clone(),
                 details: output.details.clone(),
                 is_error,
@@ -2960,6 +2985,7 @@ impl Agent {
         });
 
         let tool_result = Arc::new(ToolResultMessage {
+            touched_files: Vec::new(),
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
             content: output.content,
@@ -2969,9 +2995,11 @@ impl Agent {
         });
 
         on_event(AgentEvent::ToolExecutionEnd {
+            touched_files: Vec::new(),
             tool_call_id: tool_result.tool_call_id.clone(),
             tool_name: tool_result.tool_name.clone(),
             result: ToolOutput {
+                touched_files: tool_result.touched_files.clone(),
                 content: tool_result.content.clone(),
                 details: tool_result.details.clone(),
                 is_error,
@@ -3083,6 +3111,7 @@ impl Agent {
                     tool_name: tool_call.name.clone(),
                     args: tool_call.arguments.clone(),
                     partial_result: ToolOutput {
+                        touched_files: Vec::new(),
                         content: Vec::new(),
                         details: Some(json!({
                             "schema": TOOL_APPROVAL_STATUS_SCHEMA_V1,
@@ -3131,6 +3160,7 @@ impl Agent {
                 tool_name: tool_name.clone(),
                 args: tool_args.clone(),
                 partial_result: ToolOutput {
+                    touched_files: Vec::new(),
                     content: update.content,
                     details: update.details,
                     is_error: false,
@@ -3162,6 +3192,7 @@ impl Agent {
             }
             Err(e) => (
                 ToolOutput {
+                    touched_files: Vec::new(),
                     content: vec![ContentBlock::Text(TextContent::new(format!("Error: {e}")))],
                     details: None,
                     is_error: true,
@@ -3173,6 +3204,7 @@ impl Agent {
 
     fn tool_not_found_output(tool_name: &str) -> ToolOutput {
         ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new(format!(
                 "Error: Tool '{tool_name}' not found"
             )))],
@@ -3232,6 +3264,7 @@ impl Agent {
         );
 
         ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new(message))],
             details: None,
             is_error: true,
@@ -3247,6 +3280,7 @@ impl Agent {
         };
 
         ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new(format!(
                 "Tool execution denied: {reason}"
             )))],
@@ -3289,6 +3323,7 @@ impl Agent {
         new_messages: &mut Vec<Message>,
     ) -> Arc<ToolResultMessage> {
         let output = ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new(
                 "Skipped due to queued user message.",
             ))],
@@ -3305,6 +3340,7 @@ impl Agent {
             partial_result: output.clone(),
         });
         on_event(AgentEvent::ToolExecutionEnd {
+            touched_files: Vec::new(),
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
             result: output.clone(),
@@ -3312,6 +3348,7 @@ impl Agent {
         });
 
         let tool_result = Arc::new(ToolResultMessage {
+            touched_files: Vec::new(),
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
             content: output.content,
@@ -4156,6 +4193,7 @@ mod tool_effect_batch_planning_tests {
             SyntheticOutcome::Error => (format!("error:{}", case.name), true),
         };
         ToolResultMessage {
+            touched_files: Vec::new(),
             tool_call_id: case.id.clone(),
             tool_name: case.name.clone(),
             content: vec![ContentBlock::Text(TextContent::new(content))],
@@ -4711,6 +4749,7 @@ mod extensions_integration_tests {
         ) -> Result<ToolOutput> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new("ok"))],
                 details: None,
                 is_error: false,
@@ -7741,6 +7780,7 @@ mod turn_event_tests {
             _abort: Option<AbortSignal>,
         ) -> Result<ToolOutput> {
             Ok(ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new("tool-ok"))],
                 details: None,
                 is_error: false,
@@ -11681,6 +11721,7 @@ mod tests {
                 timestamp: 0,
             })),
             Message::tool_result(ToolResultMessage {
+                touched_files: Vec::new(),
                 tool_call_id: "tc1".to_string(),
                 tool_name: "read".to_string(),
                 content: vec![

@@ -697,6 +697,7 @@ impl Tool for HashlineEditTool {
         }
 
         Ok(ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new(output_text))],
             details: Some(serde_json::Value::Object(details)),
             is_error: false,

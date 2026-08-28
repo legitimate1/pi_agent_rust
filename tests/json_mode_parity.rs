@@ -91,6 +91,7 @@ fn test_user_message() -> Message {
 
 fn test_tool_output() -> ToolOutput {
     ToolOutput {
+        touched_files: Vec::new(),
         content: vec![ContentBlock::Text(TextContent::new("tool output"))],
         details: None,
         is_error: false,
@@ -206,6 +207,7 @@ fn json_parity_turn_end_schema() {
     let harness = TestHarness::new("json_parity_turn_end_schema");
     let assistant_msg = Message::Assistant(Arc::new(test_assistant_message()));
     let event = AgentEvent::TurnEnd {
+        touched_files: Vec::new(),
         session_id: "session-abc".to_string().into(),
         turn_index: 0,
         message: assistant_msg,
@@ -235,6 +237,7 @@ fn json_parity_turn_end_schema() {
 fn json_parity_turn_end_latency_breakdown_schema() {
     let assistant_msg = Message::Assistant(Arc::new(test_assistant_message()));
     let event = AgentEvent::TurnEnd {
+        touched_files: Vec::new(),
         session_id: "session-latency".to_string().into(),
         turn_index: 7,
         message: assistant_msg,
@@ -429,6 +432,7 @@ fn json_parity_tool_execution_update_schema() {
 fn json_parity_tool_execution_end_schema() {
     let harness = TestHarness::new("json_parity_tool_execution_end_schema");
     let event = AgentEvent::ToolExecutionEnd {
+        touched_files: Vec::new(),
         tool_call_id: "tc-1".to_string(),
         tool_name: "read".to_string(),
         result: test_tool_output(),
@@ -448,9 +452,11 @@ fn json_parity_tool_execution_end_schema() {
 
     // With error
     let event_err = AgentEvent::ToolExecutionEnd {
+        touched_files: Vec::new(),
         tool_call_id: "tc-2".to_string(),
         tool_name: "bash".to_string(),
         result: ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new("error msg"))],
             details: None,
             is_error: true,
@@ -706,6 +712,7 @@ fn json_parity_complete_lifecycle_ordering() {
             message: Message::Assistant(Arc::clone(&partial)),
         },
         AgentEvent::TurnEnd {
+            touched_files: Vec::new(),
             session_id: session_id.to_string().into(),
             turn_index: 0,
             message: Message::Assistant(Arc::clone(&partial)),
@@ -919,6 +926,7 @@ fn json_parity_no_snake_case_leak() {
             timestamp: 0,
         },
         AgentEvent::TurnEnd {
+            touched_files: Vec::new(),
             session_id: "s".to_string().into(),
             turn_index: 0,
             message: test_user_message(),
@@ -951,6 +959,7 @@ fn json_parity_no_snake_case_leak() {
             partial_result: test_tool_output(),
         },
         AgentEvent::ToolExecutionEnd {
+            touched_files: Vec::new(),
             tool_call_id: "tc".to_string(),
             tool_name: "read".to_string(),
             result: test_tool_output(),
@@ -1103,6 +1112,7 @@ fn json_parity_all_event_type_strings() {
         ),
         (
             AgentEvent::TurnEnd {
+                touched_files: Vec::new(),
                 session_id: "s".to_string().into(),
                 turn_index: 0,
                 message: test_user_message(),
@@ -1151,6 +1161,7 @@ fn json_parity_all_event_type_strings() {
         ),
         (
             AgentEvent::ToolExecutionEnd {
+                touched_files: Vec::new(),
                 tool_call_id: "t".to_string(),
                 tool_name: "r".to_string(),
                 result: test_tool_output(),
@@ -1783,6 +1794,7 @@ fn json_parity_complete_lifecycle_with_extension_ui() {
         args: json!({"command": "echo hi"}),
     });
     let tool_end = event_to_json(&AgentEvent::ToolExecutionEnd {
+        touched_files: Vec::new(),
         tool_call_id: "tc-1".to_string(),
         tool_name: "bash".to_string(),
         result: test_tool_output(),
@@ -1847,6 +1859,7 @@ fn json_parity_extension_event_from_agent_mapping() {
         ),
         (
             AgentEvent::TurnEnd {
+                touched_files: Vec::new(),
                 session_id: "s".to_string().into(),
                 turn_index: 0,
                 message: test_user_message(),
@@ -1897,6 +1910,7 @@ fn json_parity_extension_event_from_agent_mapping() {
         ),
         (
             AgentEvent::ToolExecutionEnd {
+                touched_files: Vec::new(),
                 tool_call_id: "tc".to_string(),
                 tool_name: "read".to_string(),
                 result: test_tool_output(),
@@ -2039,9 +2053,11 @@ fn json_parity_tool_execution_extension_tool() {
 
     // Extension tool end with error.
     let event_end = AgentEvent::ToolExecutionEnd {
+        touched_files: Vec::new(),
         tool_call_id: "tc-ext-1".to_string(),
         tool_name: "my-extension__custom_tool".to_string(),
         result: ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new("extension error"))],
             details: None,
             is_error: true,
@@ -2073,9 +2089,11 @@ fn json_parity_tool_execution_extension_tool() {
 fn json_parity_tool_error_consistency() {
     let harness = TestHarness::new("json_parity_tool_error_consistency");
     let event = AgentEvent::ToolExecutionEnd {
+        touched_files: Vec::new(),
         tool_call_id: "tc-err".to_string(),
         tool_name: "bash".to_string(),
         result: ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new("command not found"))],
             details: Some(json!({"exitCode": 127})),
             is_error: true,
@@ -2130,9 +2148,11 @@ fn json_parity_all_builtin_tool_names() {
 fn json_parity_tool_result_no_details() {
     let harness = TestHarness::new("json_parity_tool_result_no_details");
     let event = AgentEvent::ToolExecutionEnd {
+        touched_files: Vec::new(),
         tool_call_id: "tc-nd".to_string(),
         tool_name: "write".to_string(),
         result: ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new("written"))],
             details: None,
             is_error: false,
@@ -2159,6 +2179,7 @@ fn json_parity_tool_result_no_details() {
 fn json_parity_tool_output_content_structure() {
     let harness = TestHarness::new("json_parity_tool_output_content_structure");
     let output = ToolOutput {
+        touched_files: Vec::new(),
         content: vec![
             ContentBlock::Text(TextContent::new("line 1")),
             ContentBlock::Text(TextContent::new("line 2")),
@@ -2382,9 +2403,11 @@ fn json_parity_tool_details_rich_data() {
 
     // Bash tool details include exitCode, timing, etc.
     let event = AgentEvent::ToolExecutionEnd {
+        touched_files: Vec::new(),
         tool_call_id: "tc-bash-det".to_string(),
         tool_name: "bash".to_string(),
         result: ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new("output"))],
             details: Some(json!({
                 "exitCode": 0,
@@ -2404,9 +2427,11 @@ fn json_parity_tool_details_rich_data() {
 
     // Read tool details include size, lineCount.
     let event_read = AgentEvent::ToolExecutionEnd {
+        touched_files: Vec::new(),
         tool_call_id: "tc-read-det".to_string(),
         tool_name: "read".to_string(),
         result: ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new("file contents"))],
             details: Some(json!({
                 "size": 1024,
@@ -2445,15 +2470,18 @@ fn json_parity_tool_lifecycle_ordering() {
             tool_name: "bash".to_string(),
             args: json!({"command": "sleep 1 && echo done"}),
             partial_result: ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new(""))],
                 details: None,
                 is_error: false,
             },
         },
         AgentEvent::ToolExecutionEnd {
+            touched_files: Vec::new(),
             tool_call_id: "tc-life".to_string(),
             tool_name: "bash".to_string(),
             result: ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new("done"))],
                 details: Some(json!({"exitCode": 0})),
                 is_error: false,
@@ -2507,9 +2535,11 @@ fn json_parity_empty_text_content() {
     let harness = TestHarness::new("json_parity_empty_text_content");
 
     let event = AgentEvent::ToolExecutionEnd {
+        touched_files: Vec::new(),
         tool_call_id: "tc-empty".to_string(),
         tool_name: "bash".to_string(),
         result: ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new(""))],
             details: None,
             is_error: false,
@@ -2547,9 +2577,11 @@ fn json_parity_unicode_content() {
 
     for (label, text) in &unicode_cases {
         let event = AgentEvent::ToolExecutionEnd {
+            touched_files: Vec::new(),
             tool_call_id: format!("tc-{label}"),
             tool_name: "bash".to_string(),
             result: ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new(*text))],
                 details: None,
                 is_error: false,
@@ -2621,9 +2653,11 @@ fn json_parity_tool_output_multiple_content_blocks() {
     let harness = TestHarness::new("json_parity_tool_output_multiple_content_blocks");
 
     let event = AgentEvent::ToolExecutionEnd {
+        touched_files: Vec::new(),
         tool_call_id: "tc-multi".to_string(),
         tool_name: "bash".to_string(),
         result: ToolOutput {
+            touched_files: Vec::new(),
             content: vec![
                 ContentBlock::Text(TextContent::new("stdout: hello")),
                 ContentBlock::Text(TextContent::new("stderr: warning")),
@@ -2663,9 +2697,11 @@ fn json_parity_tool_output_empty_content() {
     let harness = TestHarness::new("json_parity_tool_output_empty_content");
 
     let event = AgentEvent::ToolExecutionEnd {
+        touched_files: Vec::new(),
         tool_call_id: "tc-empty-content".to_string(),
         tool_name: "bash".to_string(),
         result: ToolOutput {
+            touched_files: Vec::new(),
             content: vec![],
             details: None,
             is_error: false,
@@ -3433,9 +3469,11 @@ fn json_parity_full_lifecycle_with_tool_turn() {
             args: json!({"command": "echo hello"}),
         },
         AgentEvent::ToolExecutionEnd {
+            touched_files: Vec::new(),
             tool_call_id: "tc-1".to_string(),
             tool_name: "bash".to_string(),
             result: ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new("hello\n"))],
                 details: Some(json!({"exitCode": 0})),
                 is_error: false,
@@ -3444,6 +3482,7 @@ fn json_parity_full_lifecycle_with_tool_turn() {
         },
         // Turn end with tool results.
         AgentEvent::TurnEnd {
+            touched_files: Vec::new(),
             session_id: sid.to_string().into(),
             turn_index: 0,
             message: Message::Assistant(Arc::clone(&partial)),
@@ -3560,6 +3599,7 @@ fn json_parity_lifecycle_with_retry() {
             message: Message::Assistant(Arc::new(test_assistant_message())),
         },
         AgentEvent::TurnEnd {
+            touched_files: Vec::new(),
             session_id: sid.to_string().into(),
             turn_index: 0,
             message: Message::Assistant(Arc::new(test_assistant_message())),
@@ -3619,6 +3659,7 @@ fn json_parity_lifecycle_with_compaction() {
             timestamp: 1_700_000_000,
         },
         AgentEvent::TurnEnd {
+            touched_files: Vec::new(),
             session_id: sid.to_string().into(),
             turn_index: 0,
             message: Message::Assistant(Arc::new(test_assistant_message())),
@@ -3646,6 +3687,7 @@ fn json_parity_lifecycle_with_compaction() {
             timestamp: 1_700_001_000,
         },
         AgentEvent::TurnEnd {
+            touched_files: Vec::new(),
             session_id: sid.to_string().into(),
             turn_index: 1,
             message: Message::Assistant(Arc::new(test_assistant_message())),
@@ -3717,6 +3759,7 @@ fn json_parity_turn_index_monotonic() {
             timestamp: 1_700_000_000 + (turn as i64),
         });
         events.push(AgentEvent::TurnEnd {
+            touched_files: Vec::new(),
             session_id: sid.to_string().into(),
             turn_index: turn,
             message: Message::Assistant(Arc::new(test_assistant_message())),
@@ -3775,9 +3818,11 @@ fn json_parity_ndjson_single_line() {
     let tricky_events: Vec<AgentEvent> = vec![
         // Multiline text in tool output.
         AgentEvent::ToolExecutionEnd {
+            touched_files: Vec::new(),
             tool_call_id: "tc-nl".to_string(),
             tool_name: "bash".to_string(),
             result: ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new(
                     "line1\nline2\nline3\n",
                 ))],
@@ -3829,6 +3874,7 @@ fn json_parity_turn_end_multiple_tool_results() {
     let harness = TestHarness::new("json_parity_turn_end_multiple_tool_results");
 
     let event = AgentEvent::TurnEnd {
+        touched_files: Vec::new(),
         session_id: "s".to_string().into(),
         turn_index: 0,
         message: Message::Assistant(Arc::new(test_assistant_message())),
@@ -3926,6 +3972,7 @@ fn json_parity_extension_event_payload_all_forwarded() {
         ),
         (
             AgentEvent::TurnEnd {
+                touched_files: Vec::new(),
                 session_id: "s123".to_string().into(),
                 turn_index: 3,
                 message: test_user_message(),
@@ -3976,6 +4023,7 @@ fn json_parity_extension_event_payload_all_forwarded() {
         ),
         (
             AgentEvent::ToolExecutionEnd {
+                touched_files: Vec::new(),
                 tool_call_id: "tc-1".to_string(),
                 tool_name: "read".to_string(),
                 result: test_tool_output(),
@@ -4082,9 +4130,11 @@ fn json_parity_tool_details_edge_cases() {
 
     for (details, label) in &detail_cases {
         let event = AgentEvent::ToolExecutionEnd {
+            touched_files: Vec::new(),
             tool_call_id: format!("tc-{label}"),
             tool_name: "bash".to_string(),
             result: ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new("output"))],
                 details: details.clone(),
                 is_error: false,
@@ -4170,6 +4220,7 @@ fn json_parity_multi_tool_turn() {
             args: args.clone(),
         }));
         all_events.push(event_to_json(&AgentEvent::ToolExecutionEnd {
+            touched_files: Vec::new(),
             tool_call_id: id.to_string(),
             tool_name: name.to_string(),
             result: test_tool_output(),

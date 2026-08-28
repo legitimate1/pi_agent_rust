@@ -6537,6 +6537,7 @@ mod tests {
             tool_name: "bash".to_string(),
             args: json!({ "cmd": "printf hi" }),
             partial_result: crate::tools::ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new(output.to_string()))],
                 details: None,
                 is_error: false,
@@ -6554,9 +6555,11 @@ mod tests {
 
     fn rpc_tool_end_event(output: &str) -> AgentEvent {
         AgentEvent::ToolExecutionEnd {
+            touched_files: Vec::new(),
             tool_call_id: "tool-1".to_string(),
             tool_name: "bash".to_string(),
             result: crate::tools::ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new(output.to_string()))],
                 details: None,
                 is_error: false,
@@ -7871,6 +7874,7 @@ export default function init(pi) {
             (
                 "turn_end",
                 AgentEvent::TurnEnd {
+                    touched_files: Vec::new(),
                     session_id: Arc::from("rpc-pressure-session"),
                     turn_index: 0,
                     message: assistant,

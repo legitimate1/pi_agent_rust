@@ -261,6 +261,7 @@ impl Tool for FindTool {
 
         if stdout.is_empty() {
             let output = ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new(
                     "No files found matching pattern",
                 ))],
@@ -326,6 +327,7 @@ impl Tool for FindTool {
 
         if entries.is_empty() {
             let output = ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![ContentBlock::Text(TextContent::new(
                     "No files found matching pattern",
                 ))],
@@ -395,6 +397,7 @@ impl Tool for FindTool {
         );
 
         let output = ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new(result_output))],
             details,
             is_error: false,

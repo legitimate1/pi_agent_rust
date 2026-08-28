@@ -1813,6 +1813,7 @@ fn build_acp_event_handler(
                 tool_name: _,
                 result,
                 is_error,
+                touched_files: _,
             } => {
                 let content_text = result
                     .content

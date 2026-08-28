@@ -604,6 +604,7 @@ impl Tool for BashTool {
         let is_error = result.cancelled || result.exit_code != 0;
 
         Ok(ToolOutput {
+            touched_files: Vec::new(),
             content: vec![ContentBlock::Text(TextContent::new(output_text))],
             details,
             is_error,

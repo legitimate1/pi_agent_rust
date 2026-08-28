@@ -15390,6 +15390,7 @@ mod wasm_host {
             ) -> Result<ToolOutput> {
                 sleep(wall_now(), Duration::from_millis(200)).await;
                 Ok(ToolOutput {
+                    touched_files: Vec::new(),
                     content: vec![],
                     details: None,
                     is_error: false,
@@ -54715,6 +54716,7 @@ mod tests {
                 thought_signature: None,
             };
             let output = crate::tools::ToolOutput {
+                touched_files: Vec::new(),
                 content: vec![],
                 details: Some(json!({})),
                 is_error: false,
