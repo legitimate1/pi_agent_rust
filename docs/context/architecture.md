@@ -55,10 +55,10 @@ abort 信号（`src/abort.rs` 共享原语）沿 Agent 循环 → 工具执行 �
 
 ### Single Shell 调度（显式方言 + Flag 逃生）
 
-CLI `--tools` 默认 `read,shell,edit,write,grep,find,ls,hashline_edit`（8 工具）→ `ToolRegistry::new`（`src/tools/mod.rs:2823`）常驻 `ShellTool`（`src/tools/shell.rs`）；`shell(shell, command, timeout?)` 仅做参数校验（`command.trim().is_empty()`/`shell` 非枚举/`timeout<0` 均 `validation` 拒绝）+ `match { bash => run_bash_command(&cwd,...), pwsh => run_pwsh_command(&cwd,...) }` 薄转发透传 `cwd`+`command`+`timeout`+`abort`，`ProcessGuard`/`vsenv`/`resolve_bash_shell`/`stdin null`/截断等底层复用 `bash.rs`/`pwsh.rs` 不重写。`bash`/`pwsh` 不再直接对外注册，仅 `PI_ENABLE_LEGACY_SHELL=1|true|yes|on`（`trim+to_ascii_lowercase`，`is_legacy_shell_enabled()`）时 gated 追加注册为兼容逃生，默认不暴露、不宣传、不写进 CLI 默认值。
+CLI `--tools` 默认 `read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit`（10 工具）→ `ToolRegistry::new`（`src/tools/mod.rs:2823`）常驻 `ShellTool`（`src/tools/shell.rs`）+ 结构化工具 `AstGrepTool`/`AstEditTool`（`src/ast_tools.rs`，tree-sitter 按扩展名选语言，stage/resolve 原子写入）；`shell(shell, command, timeout?)` 仅做参数校验（`command.trim().is_empty()`/`shell` 非枚举/`timeout<0` 均 `validation` 拒绝）+ `match { bash => run_bash_command(&cwd,...), pwsh => run_pwsh_command(&cwd,...) }` 薄转发透传 `cwd`+`command`+`timeout`+`abort`，`ProcessGuard`/`vsenv`/`resolve_bash_shell`/`stdin null`/截断等底层复用 `bash.rs`/`pwsh.rs` 不重写。`bash`/`pwsh` 不再直接对外注册，仅 `PI_ENABLE_LEGACY_SHELL=1|true|yes|on`（`trim+to_ascii_lowercase`，`is_legacy_shell_enabled()`）时 gated 追加注册为兼容逃生，默认不暴露、不宣传、不写进 CLI 默认值。
 
 ```
-CLI --tools read,shell,edit,write,grep,find,ls,hashline_edit
+CLI --tools read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit
         ↓
   ToolRegistry (shell 常驻)
         ↓

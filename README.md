@@ -38,7 +38,7 @@ Existing AI coding assistants are **slow to start** (Node/Python runtimes add 50
 
 ## The Solution
 
-**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by Mario Zechner (made with his blessing). Single static binary, instant startup (<100ms), stable streaming, and 9 built-in tools.
+**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by Mario Zechner (made with his blessing). Single static binary, instant startup (<100ms), stable streaming, and 10 built-in tools.
 
 It builds on two purpose-built Rust libraries:
 

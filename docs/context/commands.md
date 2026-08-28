@@ -230,10 +230,10 @@ pi migrate ~/.pi/agent/sessions
 
 Single Shell 收口后对外仅 `shell` 1 工具（`bash`/`pwsh` 仅 `PI_ENABLE_LEGACY_SHELL=1|true|yes|on` 时带外恢复，不对外宣传）。
 
-`--tools` CLI 参数覆盖启用的工具列表（逗号分隔，默认 8 工具）：
+`--tools` CLI 参数覆盖启用的工具列表（逗号分隔，默认 10 工具）：
 
 ```bash
-pi --tools read,shell,edit,write,grep,find,ls,hashline_edit
+pi --tools read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit
 ```
 
 ## 运行环境变量

@@ -40,7 +40,7 @@
 ## 工具系统
 
 - **工具注册表** — 内置/扩展工具统一注册、JSON Schema 定义、按名路由 | `src/tools/mod.rs`
-- **内置 8 工具** — read/shell/edit/write/grep/find/ls/hashline（shell 统一 bash/pwsh 为单一 `shell(shell, command, timeout?)`，显式方言 `bash|pwsh`，当前 cwd，薄转发复用；`bash`/`pwsh` 仅 `PI_ENABLE_LEGACY_SHELL=1|true|yes|on` 时带外恢复） | `src/tools/` 各子模块
+- **内置 10 工具** — read/shell/edit/write/grep/find/ls/hashline/ast_grep/ast_edit（shell 统一 bash/pwsh 为单一 `shell(shell, command, timeout?)`，显式方言 `bash|pwsh`，当前 cwd，薄转发复用；`bash`/`pwsh` 仅 `PI_ENABLE_LEGACY_SHELL=1|true|yes|on` 时带外恢复；ast_grep/ast_edit 按语法树搜索与分阶段重写） | `src/tools/` 各子模块 + `src/ast_tools.rs`
 - **子进程统一生命周期管理** — spawn 子进程受控清理（abort/超时/Drop），杀整棵进程树防孤儿 | `src/tools/mod.rs` + `src/abort.rs` + `src/tools/shell.rs` + `src/tools/bash.rs` + `src/tools/pwsh.rs` + `src/tools/grep.rs` + `src/tools/find.rs`
 - **工具可取消执行** — abort 信号穿透到工具层，长任务循环检查并主动终止 | `src/tools/mod.rs` + `src/abort.rs`
 - **ReadTool** — 任意路径读取，head/tail/info/diff 参数，编码自动检测 | `src/tools/read.rs`

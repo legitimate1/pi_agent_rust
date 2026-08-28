@@ -320,11 +320,11 @@ jobs:
             -e 'exercise all 7 tools' || true)"
           if [ -n "$stale_claims" ]; then
             echo "$stale_claims"
-            echo "Built-in tool count drift: Pi exposes 8 built-ins including hashline_edit."
+            echo "Built-in tool count drift: Pi exposes 10 built-ins including ast_grep/ast_edit."
             exit 1
           fi
-          rg -n --fixed-strings '### 8 Built-in Tools' README.md >/dev/null
-          rg -n --fixed-strings '`hashline_edit`' README.md AGENTS.md >/dev/null
+          rg -n --fixed-strings '10 built-in tools' README.md >/dev/null
+          rg -n --fixed-strings '`ast_grep`' README.md AGENTS.md >/dev/null
 
       - name: Provider count claim guard
         run: |

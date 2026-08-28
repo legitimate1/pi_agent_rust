@@ -36,42 +36,42 @@ be breaking for Rust consumers.
 
 ### Stability Annotations
 
-| Item | Stability | Notes |
-| --- | --- | --- |
-| `pi::Error` | Stable | Crate-root error type alias target. |
-| `pi::PiResult` | Stable | Crate-root result alias for `pi::Error`. |
-| `pi::sdk::{Error, Result}` | Stable | SDK error/result exports. |
-| `pi::sdk::{AbortHandle, AbortSignal}` | Stable | Prompt cancellation handles. |
-| `pi::sdk::{Agent, AgentConfig, AgentEvent, AgentSession, QueueMode}` | Stable | In-process agent/session integration exports. |
-| `pi::sdk::{AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, Message, StopDetails, StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage}` | Stable | Message, content, streaming, and accounting model types. |
-| `pi::sdk::{Config, ExtensionManager, ExtensionPolicy, ExtensionRegion, Session, ThinkingLevel}` | Stable | Configuration, extension, session, and thinking-control exports. |
-| `pi::sdk::{InputType, Model, ModelCost, Provider, ProviderContext, ProviderThinkingBudgets, StreamOptions, ToolDef}` | Stable | Provider integration exports. |
-| `pi::sdk::{ModelEntry, ModelRegistry}` | Stable | Model registry exports. |
-| `pi::sdk::{Tool, ToolDefinition, ToolOutput, ToolRegistry, ToolUpdate}` | Stable | Tool integration exports. |
-| `pi::sdk::BUILTIN_TOOL_NAMES` | Stable | Canonical default non-delegating tool-name inventory; opt-in `subagent` is separate. |
-| `pi::sdk::{create_read_tool, create_bash_tool, create_edit_tool, create_write_tool, create_grep_tool, create_find_tool, create_ls_tool, create_hashline_edit_tool, create_all_tools}` | Stable | Default non-delegating tool constructors. |
-| `pi::sdk::{tool_to_definition, all_tool_definitions}` | Stable | Default non-delegating tool schema helpers. |
-| `pi::sdk::{SubscriptionId, EventListeners, EventSubscriber, OnStreamEvent, OnToolEnd, OnToolStart}` | Stable | Event subscription and hook types. |
-| `pi::sdk::{SessionOptions, ToolFactory, default_tool_registry}` | Stable | In-process session construction and custom tool registry extension points. |
-| `pi::sdk::{AgentSessionHandle, AgentSessionState, create_agent_session}` | Stable | Primary in-process SDK entry point and state handle. |
-| `pi::sdk::{SessionPromptResult, SessionTransport, SessionTransportEvent, SessionTransportState}` | Stable | Unified in-process/RPC transport adapter. |
-| `pi::sdk::{RpcTransportClient, RpcTransportOptions}` | Stable | Subprocess RPC transport client. |
-| `pi::sdk::{RpcBashResult, RpcCancelledResult, RpcCommandInfo, RpcCompactionResult, RpcCycleModelResult, RpcExportHtmlResult, RpcExtensionUiResponse, RpcForkMessage, RpcForkResult, RpcLastAssistantText, RpcModelInfo, RpcSessionState, RpcSessionStats, RpcThinkingLevelResult, RpcTokenStats}` | Stable | RPC request/response payloads. |
+| Item                                                                                                                                                                                                                                                                                              | Stability | Notes                                                                                |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- | ------------------------------------------------------------------------------------ |
+| `pi::Error`                                                                                                                                                                                                                                                                                       | Stable    | Crate-root error type alias target.                                                  |
+| `pi::PiResult`                                                                                                                                                                                                                                                                                    | Stable    | Crate-root result alias for `pi::Error`.                                             |
+| `pi::sdk::{Error, Result}`                                                                                                                                                                                                                                                                        | Stable    | SDK error/result exports.                                                            |
+| `pi::sdk::{AbortHandle, AbortSignal}`                                                                                                                                                                                                                                                             | Stable    | Prompt cancellation handles.                                                         |
+| `pi::sdk::{Agent, AgentConfig, AgentEvent, AgentSession, QueueMode}`                                                                                                                                                                                                                              | Stable    | In-process agent/session integration exports.                                        |
+| `pi::sdk::{AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, Message, StopDetails, StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage}`                                                                         | Stable    | Message, content, streaming, and accounting model types.                             |
+| `pi::sdk::{Config, ExtensionManager, ExtensionPolicy, ExtensionRegion, Session, ThinkingLevel}`                                                                                                                                                                                                   | Stable    | Configuration, extension, session, and thinking-control exports.                     |
+| `pi::sdk::{InputType, Model, ModelCost, Provider, ProviderContext, ProviderThinkingBudgets, StreamOptions, ToolDef}`                                                                                                                                                                              | Stable    | Provider integration exports.                                                        |
+| `pi::sdk::{ModelEntry, ModelRegistry}`                                                                                                                                                                                                                                                            | Stable    | Model registry exports.                                                              |
+| `pi::sdk::{Tool, ToolDefinition, ToolOutput, ToolRegistry, ToolUpdate}`                                                                                                                                                                                                                           | Stable    | Tool integration exports.                                                            |
+| `pi::sdk::BUILTIN_TOOL_NAMES`                                                                                                                                                                                                                                                                     | Stable    | Canonical default non-delegating tool-name inventory; opt-in `subagent` is separate. |
+| `pi::sdk::{create_read_tool, create_bash_tool, create_edit_tool, create_write_tool, create_grep_tool, create_find_tool, create_ls_tool, create_hashline_edit_tool, create_ast_grep_tool, create_ast_edit_tool, create_all_tools}`                                                                 | Stable    | Default non-delegating tool constructors.                                            |
+| `pi::sdk::{tool_to_definition, all_tool_definitions}`                                                                                                                                                                                                                                             | Stable    | Default non-delegating tool schema helpers.                                          |
+| `pi::sdk::{SubscriptionId, EventListeners, EventSubscriber, OnStreamEvent, OnToolEnd, OnToolStart}`                                                                                                                                                                                               | Stable    | Event subscription and hook types.                                                   |
+| `pi::sdk::{SessionOptions, ToolFactory, default_tool_registry}`                                                                                                                                                                                                                                   | Stable    | In-process session construction and custom tool registry extension points.           |
+| `pi::sdk::{AgentSessionHandle, AgentSessionState, create_agent_session}`                                                                                                                                                                                                                          | Stable    | Primary in-process SDK entry point and state handle.                                 |
+| `pi::sdk::{SessionPromptResult, SessionTransport, SessionTransportEvent, SessionTransportState}`                                                                                                                                                                                                  | Stable    | Unified in-process/RPC transport adapter.                                            |
+| `pi::sdk::{RpcTransportClient, RpcTransportOptions}`                                                                                                                                                                                                                                              | Stable    | Subprocess RPC transport client.                                                     |
+| `pi::sdk::{RpcBashResult, RpcCancelledResult, RpcCommandInfo, RpcCompactionResult, RpcCycleModelResult, RpcExportHtmlResult, RpcExtensionUiResponse, RpcForkMessage, RpcForkResult, RpcLastAssistantText, RpcModelInfo, RpcSessionState, RpcSessionStats, RpcThinkingLevelResult, RpcTokenStats}` | Stable    | RPC request/response payloads.                                                       |
 
 ## Migration Map (TypeScript -> Rust)
 
-| TypeScript surface | Rust SDK surface |
-| --- | --- |
-| `createAgentSession(options)` | `pi::sdk::create_agent_session(SessionOptions)` |
-| `session.prompt(text, onEvent)` | `AgentSessionHandle::prompt(text, on_event)` |
-| `session.subscribe(listener)` | `AgentSessionHandle::subscribe(listener)` |
-| `unsubscribe()` | `AgentSessionHandle::unsubscribe(subscription_id)` |
-| `session.setModel(provider, model)` | `AgentSessionHandle::set_model(provider, model)` |
-| `session.setThinkingLevel(level)` | `AgentSessionHandle::set_thinking_level(level)` |
-| `session.compact()` | `AgentSessionHandle::compact(on_event)` |
-| `session.abort()` | `AgentSessionHandle::new_abort_handle()` + `prompt_with_abort(...)` |
+| TypeScript surface                            | Rust SDK surface                                                       |
+| --------------------------------------------- | ---------------------------------------------------------------------- |
+| `createAgentSession(options)`                 | `pi::sdk::create_agent_session(SessionOptions)`                        |
+| `session.prompt(text, onEvent)`               | `AgentSessionHandle::prompt(text, on_event)`                           |
+| `session.subscribe(listener)`                 | `AgentSessionHandle::subscribe(listener)`                              |
+| `unsubscribe()`                               | `AgentSessionHandle::unsubscribe(subscription_id)`                     |
+| `session.setModel(provider, model)`           | `AgentSessionHandle::set_model(provider, model)`                       |
+| `session.setThinkingLevel(level)`             | `AgentSessionHandle::set_thinking_level(level)`                        |
+| `session.compact()`                           | `AgentSessionHandle::compact(on_event)`                                |
+| `session.abort()`                             | `AgentSessionHandle::new_abort_handle()` + `prompt_with_abort(...)`    |
 | `session.steer(...)`, `session.followUp(...)` | `RpcTransportClient::steer(...)`, `RpcTransportClient::follow_up(...)` |
-| RPC bridge client | `RpcTransportClient` / `SessionTransport::RpcSubprocess` |
+| RPC bridge client                             | `RpcTransportClient` / `SessionTransport::RpcSubprocess`               |
 
 ## Recipe 1: Create In-Process Session and Prompt
 

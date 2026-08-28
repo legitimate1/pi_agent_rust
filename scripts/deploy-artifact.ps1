@@ -235,6 +235,66 @@ try {
     Write-Warning "执行 $Destination --version 失败: $($_.Exception.Message)"
 }
 
+# 同步 Cargo.toml 版本到已部署版本（避免本地落后于已部署二进制）
+$projectRootForSync = Resolve-Path (Join-Path $PSScriptRoot "..") -ErrorAction SilentlyContinue
+if ($projectRootForSync -and (Test-Path (Join-Path $projectRootForSync "Cargo.toml"))) {
+    try {
+        $verOutputForSync = & $Destination --version 2>&1 | Out-String
+        if ($verOutputForSync -match '(\d+\.\d+\.\d+)') {
+            $deployedVer = $Matches[1]
+            $cargoTomlPath = Join-Path $projectRootForSync "Cargo.toml"
+            $tomlContent = Get-Content $cargoTomlPath -Raw
+            $currentVer = $null
+            if ($tomlContent -match '(?m)^\[package\][\s\S]*?^\s*version\s*=\s*"([^"]+)"') {
+                $currentVer = $Matches[1]
+            }
+            if ($deployedVer -and $currentVer -and $deployedVer -ne $currentVer) {
+                Write-Host "==> 同步 Cargo.toml 版本: $currentVer -> $deployedVer" -ForegroundColor Cyan
+                Push-Location $projectRootForSync
+                try {
+                    $cargoSetOk = $false
+                    if (Get-Command cargo -ErrorAction SilentlyContinue) {
+                        $null = cargo set-version $deployedVer -p pi_agent_rust 2>&1
+                        if ($LASTEXITCODE -eq 0) { $cargoSetOk = $true }
+                    }
+                    if (-not $cargoSetOk) {
+                        Write-Host "    cargo set-version 不可用或失败，回退为直接编辑 Cargo.toml" -ForegroundColor DarkGray
+                        $newToml = $tomlContent -replace '(?m)(^\s*version\s*=\s*")[^"]+(")', "`$1$deployedVer`$2"
+                        # 只替换首个 [package] 后的 version，避免误改 workspace 成员
+                        Set-Content -Path $cargoTomlPath -Value $newToml -Encoding UTF8
+                        $lockPath = Join-Path $projectRootForSync "Cargo.lock"
+                        if (Test-Path $lockPath) {
+                            $lockContent = Get-Content $lockPath -Raw
+                            $newLock = $lockContent -replace '(?m)(^\[\[package\]\]\s*\r?\nname\s*=\s*"pi_agent_rust"\s*\r?\nversion\s*=\s*")[^"]+(")', "`$1$deployedVer`$2"
+                            Set-Content -Path $lockPath -Value $newLock -Encoding UTF8
+                        }
+                    }
+                    $newContent = Get-Content $cargoTomlPath -Raw
+                    if ($newContent -match '(?m)^\[package\][\s\S]*?^\s*version\s*=\s*"([^"]+)"') {
+                        $newVer = $Matches[1]
+                        if ($newVer -eq $deployedVer) {
+                            Write-Host "    已同步 Cargo.toml 到 $deployedVer" -ForegroundColor Green
+                            Write-Host "    提示: 请提交版本同步: git add Cargo.toml Cargo.lock && git commit -m 'chore: sync version to $deployedVer [skip ci]'" -ForegroundColor DarkGray
+                        } else {
+                            Write-Warning "版本同步后仍不一致: 期望 $deployedVer, 实际 $newVer"
+                        }
+                    }
+                } finally { Pop-Location }
+            } else {
+                if ($currentVer -eq $deployedVer) {
+                    Write-Host "    Cargo.toml 已是最新 ($currentVer)，无需同步" -ForegroundColor DarkGray
+                } else {
+                    Write-Host "    跳过版本同步（deployed=$deployedVer, current=$currentVer）" -ForegroundColor DarkGray
+                }
+            }
+        } else {
+            Write-Warning "无法从部署版本输出解析版本号: $($verOutputForSync.Trim())"
+        }
+    } catch {
+        Write-Warning "同步 Cargo.toml 版本失败: $($_.Exception.Message)"
+    }
+}
+
 # 清理 cargo 产物（复用 deploy-release 逻辑：先 --file 再 --stamp）
 $projectRoot = Resolve-Path (Join-Path $PSScriptRoot "..") -ErrorAction SilentlyContinue
 if ($projectRoot) {
