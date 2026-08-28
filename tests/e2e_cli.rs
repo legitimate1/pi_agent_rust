@@ -3755,6 +3755,8 @@ fn e2e_cli_default_tools_when_no_flag() {
         "find",
         "ls",
         "hashline_edit",
+        "ast_grep",
+        "ast_edit",
     ];
 
     let request_body = json!({
