@@ -22211,6 +22211,13 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
         }
 
         let amac_enabled = AMAC_EXECUTOR.with(|cell| cell.borrow().enabled());
+        let exec_interleave_env = std::env::var("PI_HOSTCALL_AMAC_EXEC_INTERLEAVE").ok();
+        let exec_interleave = exec_interleave_env.as_deref().is_none_or(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "disabled"
+            )
+        });
 
         // Check safety envelope veto — if any extension's conformal+PAC-Bayes
         // envelope is in a vetoing state, disable AMAC interleaving and fall
@@ -22219,9 +22226,28 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
             .manager()
             .is_some_and(|mgr| mgr.any_safety_envelope_vetoing());
 
+        tracing::debug!(
+            event = "pijs.amac.dispatch_requests",
+            pending_len = pending.len(),
+            amac_enabled,
+            safety_vetoed,
+            exec_interleave,
+            exec_interleave_env = ?exec_interleave_env,
+            "AMAC dispatch entry"
+        );
+
         if amac_enabled && !safety_vetoed {
             dispatch_requests_amac(runtime, host, pending).await;
         } else {
+            tracing::debug!(
+                event = "pijs.amac.dispatch_sequential_fallback",
+                reason = if amac_enabled {
+                    "safety_veto"
+                } else {
+                    "amac_disabled"
+                },
+                "Falling back to sequential dispatch"
+            );
             dispatch_requests_sequential(runtime, host, pending).await;
         }
     }
@@ -22276,6 +22302,11 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
                 group_key = ?group.key,
                 group_size = group.len(),
                 interleave = decision.is_interleave(),
+                decision = ?decision,
+                width = match decision {
+                    crate::hostcall_amac::AmacToggleDecision::Interleave { width } => width,
+                    crate::hostcall_amac::AmacToggleDecision::Sequential { .. } => 0,
+                },
                 "Dispatching AMAC group"
             );
 
@@ -22288,6 +22319,11 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
                     // causing subagent 2s/5s/8s sleeps to all report ~16s.
                     // `buffer_unordered` + per-ready complete+tick delivers
                     // each child's stdout/close as soon as it finishes.
+                    // However StreamChunk frames are enqueued *inside*
+                    // dispatch_hostcall_exec_ref while the Exec future is still
+                    // pending (rx.try_recv loop). If we only tick per-ready
+                    // (after the whole Exec completes), chunks batch to the
+                    // slowest child. Pump tick every 15ms while in-flight.
                     use futures::StreamExt as _;
                     let mut unordered = futures::stream::iter(
                         group
@@ -22296,12 +22332,32 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
                             .map(|req| dispatch_one(runtime, host, req)),
                     )
                     .buffer_unordered(width);
-                    while let Some(maybe) = unordered.next().await {
-                        if let Some((call_id, outcome, elapsed_ns)) = maybe {
-                            AMAC_EXECUTOR.with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
-                            runtime.complete_hostcall(call_id, outcome);
-                            let _ = runtime.tick().await;
-                            let _ = runtime.drain_microtasks().await;
+                    loop {
+                        let next_fut = unordered.next();
+                        futures::pin_mut!(next_fut);
+                        let sleep_fut = extension_wait_sleep(Duration::from_millis(15));
+                        futures::pin_mut!(sleep_fut);
+                        #[allow(clippy::ignored_unit_patterns)]
+                        match futures::future::select(next_fut, sleep_fut).await {
+                            futures::future::Either::Left((maybe, _)) => match maybe {
+                                Some(Some((call_id, outcome, elapsed_ns))) => {
+                                    AMAC_EXECUTOR.with(|cell| {
+                                        cell.borrow_mut().observe_call(elapsed_ns);
+                                    });
+                                    runtime.complete_hostcall(call_id, outcome);
+                                    let _ = runtime.tick().await;
+                                    let _ = runtime.drain_microtasks().await;
+                                }
+                                Some(None) => {
+                                    let _ = runtime.tick().await;
+                                    let _ = runtime.drain_microtasks().await;
+                                }
+                                None => break,
+                            },
+                            futures::future::Either::Right(((), _)) => {
+                                let _ = runtime.tick().await;
+                                let _ = runtime.drain_microtasks().await;
+                            }
                         }
                     }
                 }

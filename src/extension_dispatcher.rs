@@ -2669,6 +2669,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
     /// sequential one-by-one dispatch when AMAC is disabled or the batch is
     /// too small.
     #[allow(clippy::future_not_send)]
+    #[allow(clippy::too_many_lines)]
     pub async fn dispatch_batch_amac(&self, mut requests: VecDeque<HostcallRequest>) {
         if requests.is_empty() {
             return;
@@ -2713,10 +2714,28 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         }
 
         let request_vec: Vec<HostcallRequest> = requests.into();
+        let total = request_vec.len();
         let plan = self.amac_executor.borrow_mut().plan_batch(request_vec);
+        tracing::debug!(
+            event = "pi.extensions.amac.batch_planned",
+            total_requests = total,
+            groups = plan.groups.len(),
+            interleaved = plan.interleaved_groups,
+            sequential = plan.sequential_groups,
+            adaptation_mode = %adaptation_mode.as_str(),
+            "AMAC dispatcher batch plan created"
+        );
 
         for (group, decision) in plan.groups.into_iter().zip(plan.decisions.iter()) {
             let group_key = group.key.clone();
+            tracing::debug!(
+                event = "pi.extensions.amac.group_dispatch",
+                group_key = ?group_key,
+                group_size = group.requests.len(),
+                decision = ?decision,
+                adaptation_mode = %adaptation_mode.as_str(),
+                "Dispatching AMAC group"
+            );
             let start = Instant::now();
             // AMAC decision metadata is recorded for telemetry. Interleaved
             // groups run with bounded concurrency (up to `width` in flight);
@@ -2731,6 +2750,10 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 // `buffer_unordered` + per-ready tick so each child's
                 // `complete_hostcall` (inside `dispatch_and_complete`) is
                 // delivered to JS immediately without waiting for siblings.
+                // StreamChunk frames are enqueued *during* Exec (stdout
+                // streaming) while the future is still pending; per-ready
+                // tick alone batches them to the slowest close. Pump tick
+                // every 15ms while in-flight so chunks reach JS immediately.
                 #[allow(clippy::items_after_statements)]
                 let mut unordered = {
                     use futures::StreamExt as _;
@@ -2744,10 +2767,26 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     }))
                     .buffer_unordered(width)
                 };
-                while let Some(elapsed_ns) = futures::StreamExt::next(&mut unordered).await {
-                    self.amac_executor.borrow_mut().observe_call(elapsed_ns);
-                    let _ = self.js_runtime().tick().await;
-                    let _ = self.js_runtime().drain_microtasks().await;
+                loop {
+                    let next_fut = futures::StreamExt::next(&mut unordered);
+                    futures::pin_mut!(next_fut);
+                    let sleep_fut = sleep(wall_now(), Duration::from_millis(15));
+                    futures::pin_mut!(sleep_fut);
+                    #[allow(clippy::ignored_unit_patterns)]
+                    match futures::future::select(next_fut, sleep_fut).await {
+                        futures::future::Either::Left((maybe, _)) => match maybe {
+                            Some(elapsed_ns) => {
+                                self.amac_executor.borrow_mut().observe_call(elapsed_ns);
+                                let _ = self.js_runtime().tick().await;
+                                let _ = self.js_runtime().drain_microtasks().await;
+                            }
+                            None => break,
+                        },
+                        futures::future::Either::Right(((), _)) => {
+                            let _ = self.js_runtime().tick().await;
+                            let _ = self.js_runtime().drain_microtasks().await;
+                        }
+                    }
                 }
             } else {
                 for request in group.requests {
