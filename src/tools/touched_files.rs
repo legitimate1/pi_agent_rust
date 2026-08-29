@@ -425,7 +425,7 @@ pub fn filter_bash_touches(touches: Vec<FileTouch>) -> Vec<FileTouch> {
 }
 
 // ============================================================================
-// Bash window snapshot (gix → git CLI → walk)
+// Bash window snapshot (git CLI → walk)
 // ============================================================================
 
 #[derive(Debug, Clone)]
@@ -447,15 +447,12 @@ pub struct GitSnapshot {
     pub entries: HashMap<String, (FileStatus, Option<String>)>,
 }
 
-/// Capture a snapshot of cwd.  Tries `gix` (if available) → `git` CLI → walk.
+/// Capture a snapshot of cwd.  Tries `git` CLI → walk.
 ///
-/// This is the **synchronous** core — it blocks on `gix`/`git`/walk and must
+/// This is the **synchronous** core — it blocks on `git`/walk and must
 /// not be called directly from an `asupersync` reactor task.  Use
 /// [`capture_snapshot_async`] from async contexts.
 pub fn capture_snapshot(cwd: &Path) -> Snapshot {
-    if let Some(g) = capture_gix(cwd) {
-        return Snapshot::Git(g);
-    }
     if let Some(g) = capture_git_cli(cwd) {
         return Snapshot::Git(g);
     }
@@ -465,136 +462,15 @@ pub fn capture_snapshot(cwd: &Path) -> Snapshot {
 /// Async wrapper that offloads [`capture_snapshot`] to the `asupersync`
 /// blocking pool so the reactor thread is not stalled.
 ///
-/// `gix` can be 30-50ms (release) and `git status` is ~90-100ms; both would
-/// otherwise block `RuntimeBuilder::current_thread()`'s single reactor
-/// thread, freezing timers / `Cx::checkpoint()` cancellation.
+/// `git status` is ~90-100ms and would otherwise block
+/// `RuntimeBuilder::current_thread()`'s single reactor thread, freezing
+/// timers / `Cx::checkpoint()` cancellation.
 ///
 /// Uses `asupersync::runtime::spawn_blocking` (not `tokio::task`) — `pi`
 /// has no `tokio` dependency; see `crates/pi-core/src/agent_cx.rs`.
 pub async fn capture_snapshot_async(cwd: PathBuf) -> Snapshot {
     let cwd_for_blocking = cwd;
     asupersync::runtime::spawn_blocking(move || capture_snapshot(&cwd_for_blocking)).await
-}
-
-fn capture_gix(cwd: &Path) -> Option<GitSnapshot> {
-    // Discover repository from cwd (walks up to find .git). `ok()?` falls back to git CLI on
-    // non-git dirs or bare repos.
-    let repo = gix::discover(cwd).ok()?;
-    repo.workdir()?;
-    // Enable rename detection (50% similarity, no copy tracking) to match
-    // `git status --find-renames`.  Without rewrites every rename appears as D+A.
-    let rewrites = gix::diff::Rewrites {
-        percentage: Some(0.5),
-        limit: 1000,
-        track_empty: false,
-        copies: None,
-    };
-    let platform = repo
-        .status(gix::progress::Discard)
-        .ok()?
-        .untracked_files(gix::status::UntrackedFiles::Files)
-        .index_worktree_rewrites(Some(rewrites));
-    // `into_iter` yields both HEAD→index (TreeIndex) and index→worktree
-    // (IndexWorktree) items.  We merge them with worktree taking precedence
-    // (mirrors `git status` porcelain `XY` where Y wins).
-    let iter = platform.into_iter(Vec::new()).ok()?;
-    let mut staged: HashMap<String, (FileStatus, Option<String>)> = HashMap::new();
-    let mut worktree: HashMap<String, (FileStatus, Option<String>)> = HashMap::new();
-    for item in iter {
-        let item = item.ok()?;
-        match item {
-            gix::status::Item::IndexWorktree(iw) => {
-                match iw {
-                    gix::status::index_worktree::Item::Modification {
-                        rela_path, status, ..
-                    } => {
-                        let path = rela_path.to_string();
-                        // status is from gix_status (re-exported as gix::status::plumbing)
-                        #[allow(clippy::unnested_or_patterns)]
-                        let mapped = match status {
-                            gix::status::plumbing::index_as_worktree::EntryStatus::Change(
-                                gix::status::plumbing::index_as_worktree::Change::Removed,
-                            ) => Some((FileStatus::Deleted, None)),
-                            gix::status::plumbing::index_as_worktree::EntryStatus::Change(
-                                gix::status::plumbing::index_as_worktree::Change::Type { .. },
-                            )
-                            | gix::status::plumbing::index_as_worktree::EntryStatus::Change(
-                                gix::status::plumbing::index_as_worktree::Change::Modification {
-                                    ..
-                                },
-                            )
-                            | gix::status::plumbing::index_as_worktree::EntryStatus::Change(
-                                gix::status::plumbing::index_as_worktree::Change::SubmoduleModification(_),
-                            )
-                            | gix::status::plumbing::index_as_worktree::EntryStatus::Conflict {
-                                ..
-                            } => Some((FileStatus::Modified, None)),
-                            gix::status::plumbing::index_as_worktree::EntryStatus::NeedsUpdate(_)
-                            | gix::status::plumbing::index_as_worktree::EntryStatus::IntentToAdd => {
-                                None
-                            }
-                        };
-                        if let Some(v) = mapped {
-                            worktree.insert(path, v);
-                        }
-                    }
-                    gix::status::index_worktree::Item::DirectoryContents { entry, .. } => {
-                        // Only untracked entries matter here; ignored/pruned are skipped
-                        // to match `--ignored=no`.
-                        if entry.status == gix::dir::entry::Status::Untracked {
-                            let path = entry.rela_path.to_string();
-                            worktree.insert(path, (FileStatus::Added, None));
-                        }
-                    }
-                    gix::status::index_worktree::Item::Rewrite {
-                        source,
-                        dirwalk_entry,
-                        copy,
-                        ..
-                    } => {
-                        let dest = dirwalk_entry.rela_path.to_string();
-                        let old = source.rela_path().to_string();
-                        // Treat both rename and copy as Renamed so `old_path` is preserved;
-                        // diff logic already suppresses the source D for renames while
-                        // copies keep the source live (no D emitted).
-                        let _ = copy;
-                        worktree.insert(dest, (FileStatus::Renamed, Some(old)));
-                    }
-                }
-            }
-            gix::status::Item::TreeIndex(ti) => match ti {
-                gix::diff::index::Change::Addition { location, .. } => {
-                    let p = location.to_string();
-                    staged.insert(p, (FileStatus::Added, None));
-                }
-                gix::diff::index::Change::Deletion { location, .. } => {
-                    let p = location.to_string();
-                    staged.insert(p, (FileStatus::Deleted, None));
-                }
-                gix::diff::index::Change::Modification { location, .. } => {
-                    let p = location.to_string();
-                    staged.insert(p, (FileStatus::Modified, None));
-                }
-                gix::diff::index::Change::Rewrite {
-                    source_location,
-                    location,
-                    copy,
-                    ..
-                } => {
-                    let dest = location.to_string();
-                    let old = source_location.to_string();
-                    let _ = copy;
-                    staged.insert(dest, (FileStatus::Renamed, Some(old)));
-                }
-            },
-        }
-    }
-    // Merge with worktree precedence.
-    let mut entries = staged;
-    for (k, v) in worktree {
-        entries.insert(k, v);
-    }
-    Some(GitSnapshot { entries })
 }
 
 fn capture_git_cli(cwd: &Path) -> Option<GitSnapshot> {

@@ -215,7 +215,6 @@ fs4 = "0.13"
 glob = "0.3"
 ignore = "0.4"
 indexmap = "2"
-gix = { version = "0.77", default-features = false, features = ["status"] }
 crossbeam-queue = "0.3"
 sqlmodel-sqlite = { version = "0.2.2" }
 sqlmodel-core = { version = "0.2.2" }
