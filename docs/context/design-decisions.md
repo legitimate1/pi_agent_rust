@@ -529,3 +529,29 @@
 **不选 B 的原因**：保留 `auto` 自动路由——启发式按命令猜方言脆弱，排障链路变暗（已定 V1 不做 `auto`，后续加法 `enum` 非破坏）；保留 `workdir` 参数——LLM 路径幻觉且与 `command` 内 `cd` 二义，薄转发应保持 `Agent cwd == shell cwd`；保留双工具并存——列表冗余且未解决选错壳（单用户下洁癖 > 过渡期冗余）。
 
 **何时重新考虑**：`shell` 上线后 `bash` 占比 `<5%` 且无混用管线时评估 `auto = 平台默认（Windows→pwsh, Unix→bash）`；跨仓批处理频繁时评估 `workdir?: string` 可选；新会话首条 `cargo` 仍选 `bash` 时补 `.pi/tools.toml [tools.shell] description` 1 行（观测期 1-2 会话或首次 `cargo→bash` 错即补）。
+
+---
+
+## D53: 文件触达快照 — gix 0.77 → git porcelain -z → walk 三级链 + spawn_blocking 卸载
+
+**决策**：选三级快照：gix 0.77 status 为主，失败回退 git status --porcelain=v1 -z --find-renames，再失败回退 walk；同步 capture_snapshot 保留，异步 capture_snapshot_async 经 asupersync::runtime::spawn_blocking 卸载阻塞。
+
+**理由**：gix 纯 Rust 零进程派生最快；porcelain 兜底覆盖 gix 索引损坏/特性缺失；walk 保底无 git 时可用；spawn_blocking 避免阻塞 asupersync 调度器，符合 pi 全量 asupersync（Cx/checkpoint/Budget）无 tokio 的运行时真相。
+
+**不选 B 的原因**：不单走 gix（失陷时无兜底）；不单走 git CLI（常态多一次进程派生）；不同步阻塞主线程（会卡住工具执行流的 checkpoint/Budget 调度，导致取消/超时延迟）。
+
+**何时重新考虑**：若 gix 未来稳定覆盖全状态且性能持平，可收敛为单级；若 asupersync 提供同步快照原语，再评估去 spawn_blocking。
+
+
+---
+
+## D54: 快照窗口互斥 — per-cwd asupersync Mutex 替代 tokio 锁
+
+**决策**：选 per-cwd asupersync::sync::Mutex（OwnedMutexGuard）做 bash 前后快照窗口互斥，不选 tokio::sync::Mutex，不选全局锁。
+
+**理由**：pi 全量走 asupersync，无 tokio 依赖；per-cwd 粒度让不同目录的工具并发不串行，仅同 cwd 的 bash 快照窗口互斥，避免触达丢失。
+
+**不选 B 的原因**：不用 tokio Mutex（需拉 tokio 运行时，与 asupersync 双运行时混用）；不用全局锁（无必要串行化全 cwd，降低并发）；不用无锁（前后快照非原子会丢/重算增量）。
+
+**何时重新考虑**：若需跨 cwd 原子快照或 asupersync 锁语义变更，再评估全局锁或读写锁。
+

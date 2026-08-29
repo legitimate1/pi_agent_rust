@@ -83,8 +83,9 @@ CLI --tools read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit
 - **`abort.rs`** → 共享 AbortHandle/AbortSignal 原语，打破 agent ↔ tools 循环依赖
 - **`app.rs`** → 系统提示词构建（SYSTEM.md 加载、default_system_prompt、project context files、date/cwd/temp 运行时事实注入）
 - **`tool_overrides.rs`** → tools.toml 覆盖加载：合并用户级 `~/.pi/agent/tools.toml` + 项目级 `.pi/tools.toml`（项目 key 优先），产出 description / parameters 覆盖表
-- **`tools/` 模块目录** → ToolRegistry + 内置工具模块 + verify 内部验证引擎（Single Shell：`shell.rs` 为 Single Shell 统一入口，薄转发 `bash.rs`/`pwsh.rs` 内部实现；`bash`/`pwsh` 仅 `PI_ENABLE_LEGACY_SHELL` 时 gated 注册）
+- **`tools/` 模块目录** → ToolRegistry + 内置工具模块 + verify 内部验证引擎 + touched_files 触达追踪（Single Shell：`shell.rs` 为 Single Shell 统一入口，薄转发 `bash.rs`/`pwsh.rs` 内部实现；`bash`/`pwsh` 仅 `PI_ENABLE_LEGACY_SHELL` 时 gated 注册；全量 asupersync 运行时 Cx/checkpoint/Budget/spawn_blocking，无 tokio）
 - **`tools/verify.rs`** → 编辑后轻量验证引擎：文件类型检测→检查器映射（.rs/.json/.toml/.ts/.js/.py/.go/.md）→进程内/外部进程执行，支持 Format+Lint 并行（oxfmt+oxlint/ruff），诊断直写 content 正文
+- **`tools/touched_files.rs`** → 文件触达追踪：三级快照（gix 0.77 status → git status --porcelain=v1 -z --find-renames → walk）+ 结构化写入与 shell 触达过滤 + TurnEnd 聚合（R>D>A>M，firstOldPath 重命名链）+ per-cwd asupersync::sync::Mutex 窗口锁 + capture_snapshot_async 经 asupersync::runtime::spawn_blocking 卸载阻塞
 - **`agent.rs`** → Agent 循环（工具迭代、扩展合并、ToolDef 构建）
 - **`extensions.rs`** → 扩展管理器、能力策略、生命周期
 - **`extensions_js.rs`** → QuickJS 运行时、虚拟模块、HostcallKind

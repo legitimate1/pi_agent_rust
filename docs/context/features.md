@@ -55,6 +55,7 @@
 - **tools.toml 工具可见信息覆盖** — `~/.pi/agent/tools.toml` + `.pi/tools.toml`（项目优先）逐工具覆盖 description 与 parameters（JSON Schema），description 同时作用于提示词文字层与 API schema 层，未覆盖工具保持默认 | `src/tool_overrides.rs` + `src/config.rs` + `src/tools/mod.rs` + `src/agent.rs` + `src/app.rs` + `src/main.rs` + `src/sdk.rs` + `src/acp.rs`
 - **编辑后轻量验证（自包含诊断）** — edit/hashline_edit/write 可选 verify（默认 true），自动语法/格式检查；[verify:FAILED|checker|time] 单条即含可修复信息（stderr 去 ANSI + 诊断 stdout + 统一 Diff(@) + fix_hint，无需二次 bash，以 rustfmt 为标杆）—— ruff 用 `--diff` 原生吐 diff，oxfmt/npx-oxfmt 走 `in_place_format_args` 临时文件就地格式化合成 diff；诊断直写 content 正文（message 原样），details 无 verify | `src/tools/verify.rs` + `src/tools/edit.rs` + `src/tools/hashline.rs` + `src/tools/write.rs` + `C:\Users\m\.pi\agent\bin\oxfmt.exe/oxlint.exe/ruff.exe/gofmt.exe`
 - **AST 结构搜索与编辑** — `ast_grep`（按语法树模式搜索，注释/字符串不算匹配）与 `ast_edit`（分阶段 staged 重写：proposal + unified diff、回滚、32 个 proposal 淘汰），按文件扩展名自动选语言（rust/python/js/ts/tsx/bash/go/ruby）| `src/ast_tools.rs`
+- **文件触达追踪** — 自动记录结构化编辑与 shell 操作触达的文件变更，汇总增删改与重命名链 | `src/tools/touched_files.rs` + `src/tools/bash.rs`
 
 ## 扩展系统
 
