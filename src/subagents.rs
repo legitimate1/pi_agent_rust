@@ -2132,6 +2132,7 @@ mod tests {
                 "subagent-structured",
                 json!({"agent": "scout", "task": "inspect"}),
                 None,
+                None,
             ))
             .expect("execute returns tool output")
     }
@@ -2295,6 +2296,7 @@ printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"
                 "subagent-fixture",
                 json!({"agent": "scout", "task": "verify child protocol"}),
                 None,
+                None,
             ))
             .expect("child execution succeeds");
 
@@ -2449,6 +2451,7 @@ fi
                     }
                 }),
                 None,
+                None,
             ))
             .expect("typed subagent run");
 
@@ -2490,6 +2493,7 @@ fi
                         "outputSchema": {"type": "object"},
                         "schemaMode": mode
                     }),
+                    None,
                     None,
                 ))
                 .expect("typed subagent run");

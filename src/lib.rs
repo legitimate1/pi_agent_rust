@@ -18,7 +18,7 @@
 //! - [`sdk`] module
 
 #![forbid(unsafe_code)]
-#![feature(windows_by_handle)]
+#![cfg_attr(windows, feature(windows_by_handle))]
 // rch clippy probes without these allowances still expose broad, cross-module
 // dormant surfaces in extension/session/SDK paths. The no-allow inventory is
 // tracked in bd-63x3v.5.1; keep this crate-wide guard until the remaining
