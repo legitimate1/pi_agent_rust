@@ -560,6 +560,7 @@ fn lifecycle_lock() -> &'static Mutex<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::type_complexity)]
 #[derive(Clone, Default)]
 struct SpawnBackgroundTestHooks {
     owner_session_id: Option<String>,
