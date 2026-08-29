@@ -1,13 +1,13 @@
 ## Test Coverage Matrix (Current Source Inventory)
 
-> Last regenerated: 2026-05-10
+> Last regenerated: 2026-08-29
 > Owner bead: `bd-8t27h.1`
 
 This document is the current source-file coverage inventory for `src/**/*.rs`. It is not a drop-in certification artifact and does not override `docs/evidence/dropin-certification-verdict.json`.
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 111 current source files.
+- `rg --files src -g '*.rs' | sort` -> 142 current source files.
 - `rg --files tests -g '*.rs' | wc -l` -> 304 Rust test files under `tests/`.
 - `rg -n '#\\[cfg\\(test\\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
 - `python3 scripts/check_traceability_matrix.py` passes with 100.00% classified trace coverage and 100.00% E2E scenario coverage after the `e2e_swarm_flight_recorder` and `rch_artifact_sync_preflight` inventory refresh. Broader semantic traceability expansion remains tracked by `bd-8t27h.3`.
@@ -16,8 +16,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Current Drift Check
 
-- Current `src/` inventory: 111 files.
-- Source-file rows below: 111.
+- Current `src/` inventory: 142 files.
+- Source-file rows below: 142.
 - Source files omitted from this document: 0.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -39,6 +39,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/abort.rs`                         | Abort signal primitive                     | Unit.                                                                                                                                                           |
 | `src/agent.rs`                         | Agent loop                                 | Unit; `tests/agent_loop_vcr.rs`, `tests/agent_loop_reliability.rs`, `tests/e2e_agent_loop.rs`, `tests/rpc_mode.rs`.                                             |
 | `src/agent_cx.rs`                      | Agent context                              | Unit; covered through agent/RPC suites.                                                                                                                         |
+| `src/agent_hub.rs`                     | Agent hub                                | Unit; `tests/hub.rs`, exercised through hub/subagents suites. |
 | `src/app.rs`                           | App orchestration                          | Unit; `tests/e2e_cli.rs`, `tests/e2e_rpc.rs`, `tests/main_cli_selection.rs`.                                                                                    |
 | `src/ast_tools.rs`                     | AST structural tools (ast_grep)            | Unit; `tests/ast_tools_comprehensive.rs`, `tests/ast_tools_partitioned.rs`.                                                                                     |
 | `src/auth.rs`                          | Auth and OAuth                             | Unit; `tests/auth_oauth_refresh_vcr.rs`, `tests/extensions_provider_oauth.rs`.                                                                                  |
@@ -86,6 +87,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/http/test_api.rs`                 | HTTP test support                          | Waived test-only support module; compiled only for tests.                                                                                                       |
 | `src/http/test_asupersync.rs`          | HTTP test support                          | Waived test-only support module; compiled only for tests.                                                                                                       |
 | `src/http_shim.rs`                     | Node HTTP shim                             | `tests/node_http_shim.rs`; branch export baseline marks this as branch-SIGSEGV fallback.                                                                        |
+| `src/hub.rs`                           | Hub                                      | Unit; `tests/hub.rs`. |
 | `src/interactive.rs`                   | TUI root                                   | Unit test module wiring; `tests/tui_snapshot.rs`, `tests/tui_state.rs`, `tests/e2e_tui.rs`.                                                                     |
 | `src/interactive/agent.rs`             | TUI agent lane                             | Unit; `tests/e2e_tui.rs`, `tests/tui_state.rs`.                                                                                                                 |
 | `src/interactive/commands.rs`          | Interactive commands                       | Unit; `tests/interactive_commands_unit.rs`, `tests/interactive_extension_ui.rs`.                                                                                |
@@ -103,6 +105,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/interactive/tree.rs`              | Conversation tree                          | Covered through `tests/tui_state.rs` and session/navigation tests; direct trace should be expanded in `bd-8t27h.3`.                                             |
 | `src/interactive/tree_ui.rs`           | Tree UI                                    | Covered through `tests/tui_snapshot.rs` and `tests/tui_state.rs`.                                                                                               |
 | `src/interactive/view.rs`              | View rendering                             | Unit; `tests/tui_snapshot.rs`, `tests/e2e_tui.rs`.                                                                                                              |
+| `src/jobs.rs`                          | Background jobs                          | Unit; `tests/jobs.rs`. |
 | `src/keybindings.rs`                   | Keybinding config                          | Unit; interactive/TUI tests.                                                                                                                                    |
 | `src/lib.rs`                           | Crate exports                              | Waived glue: exported module surface is compiled by all targets; no behavior-only row.                                                                          |
 | `src/main.rs`                          | CLI entry                                  | Unit; `tests/e2e_cli.rs`, `tests/e2e_rpc.rs`, `tests/main_cli_selection.rs`; branch export baseline marks this as branch-SIGSEGV fallback.                      |
@@ -140,6 +143,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/rpc.rs`                           | RPC/stdin mode                             | Unit; `tests/rpc_mode.rs`, `tests/rpc_protocol.rs`, `tests/rpc_edge_cases.rs`, `tests/e2e_rpc.rs`.                                                              |
 | `src/scheduler.rs`                     | Scheduler/admission                        | Unit; `tests/scheduler_repro.rs`, `tests/cargo_headroom_admission.rs`; traceability lane `resource_scheduler_admission`.                                        |
 | `src/sdk.rs`                           | SDK API                                    | Unit; `tests/sdk_api.rs`, `tests/sdk_integration.rs`, `tests/sdk_unit.rs`.                                                                                      |
+| `src/secrets.rs`                       | Secret handling                          | Unit; `tests/secrets.rs`. |
 | `src/session.rs`                       | Session JSONL/tree                         | Unit; `tests/session_conformance.rs`, `tests/e2e_session_persistence.rs`; branch export baseline marks this as branch-SIGSEGV fallback.                         |
 | `src/session_index.rs`                 | Session index                              | Unit; `tests/session_index_tests.rs`, `tests/reproduce_index_gap.rs`.                                                                                           |
 | `src/session_metrics.rs`               | Session metrics                            | Unit; `tests/provider_session_coverage.rs` and session evidence suites.                                                                                         |
@@ -148,6 +152,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/session_store_v2.rs`              | Session store v2                           | Unit; `tests/session_store_v2.rs`, `tests/session_store_v2_contract.rs`.                                                                                        |
 | `src/session_test.rs`                  | Session test helpers                       | Waived test-support module; compiled by session tests.                                                                                                          |
 | `src/sse.rs`                           | SSE parser                                 | Unit; `tests/sse_strict_compliance.rs`, `tests/repro_sse_flush.rs`, `tests/repro_sse_newline.rs`.                                                               |
+| `src/subagents.rs`                     | Native isolated child-agent tool         | Unit tests in this module; opt-in registration coverage through built-in tool tests. |
 | `src/swarm_activity_ledger.rs`         | Swarm activity ledger                      | Unit; evidence docs in `docs/swarm-activity-ledger.md`, CI evidence bundle tests.                                                                               |
 | `src/swarm_flight_recorder.rs`         | Swarm flight recorder                      | Unit and E2E; `tests/e2e_swarm_flight_recorder.rs` covers deterministic multi-agent replay artifacts.                                                           |
 | `src/terminal_images.rs`               | Terminal images                            | Unit; interactive/TUI rendering tests.                                                                                                                          |
@@ -163,7 +168,6 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/tools/read.rs`                    | Read tool                                  | Unit; `tests/tools_conformance.rs`, `tests/tools_hardened.rs`.                                                                                                  |
 | `src/tools/shell.rs`                   | Shell tool (single-shell `shell(shell=bash | pwsh)`)                                                                                                                                                         | Unit; `tests/tools_conformance.rs`, `tests/tools_hardened.rs`, `tests/e2e_tools.rs`; in-source `mod tests` in `src/tools/shell.rs`. |
 | `src/tools/tests.rs`                   | Tool test utilities                        | Waived test-support module.                                                                                                                                     |
-| `src/tools/tests.rs`                   | Tool test utilities                        | Waived test-support module.                                                                                                                                     |
 | `src/tools/touched_files.rs`           | Touched-files hybrid reporting & merge     | Unit; `tests/tools_conformance.rs` via `ToolOutput.touched_files`, `tests/model_serialization.rs`, `tests/provider_streaming` touched-files suites; gix→git→walk tri-level snapshot validated via `cargo test --lib touched_files` (7 tests). |
 | `src/tools/verify.rs`                  | Syntax/format verify                       | Unit; `tests/tools_conformance.rs`, `tests/tools_hardened.rs`.                                                                                                  |
 | `src/tools/write.rs`                   | Write tool                                 | Unit; `tests/tools_conformance.rs`, `tests/tools_hardened.rs`.                                                                                                  |
@@ -172,6 +176,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/tool_overrides.rs`                | Tool override policy                       | Unit; tool policy suites; `tests/tools_conformance.rs`.                                                                                                         |
 | `src/vcr.rs`                           | VCR playback/record                        | Unit; `tests/vcr_parity_validation.rs`, `tests/vcr_redaction_scan.rs`, provider/RPC VCR suites.                                                                 |
 | `src/version_check.rs`                 | Version checks                             | Unit; cross-platform and release-readiness tests exercise the surrounding behavior.                                                                             |
+| `src/worktree_iso.rs`                | Worktree isolation                       | Unit; `tests/worktree_iso.rs`. |
 
 ---
 
