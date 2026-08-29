@@ -1166,8 +1166,8 @@ fn assert_lock_released(lock_path: &Path) {
                     .write(true)
                     .open(lock_path)
                 {
-                    if fs4::fs_std::FileExt::try_lock_exclusive(&file).is_ok() {
-                        let _ = fs4::fs_std::FileExt::unlock(&file);
+                    if fs4::FileExt::try_lock(&file).is_ok() {
+                        let _ = fs4::FileExt::unlock(&file);
                         // Best-effort heal: remove the poisoning file so future
                         // DirLock mkdir isn't confused; ignore raciness.
                         let _ = std::fs::remove_file(lock_path);
@@ -1193,13 +1193,13 @@ fn assert_lock_released(lock_path: &Path) {
                 .write(true)
                 .open(lock_path)
             {
-                if let Err(err) = fs4::fs_std::FileExt::try_lock_exclusive(&file) {
+                if let Err(err) = fs4::FileExt::try_lock(&file) {
                     exit_crash_interrupt_worker(format!(
                         "lock should be released after interrupted worker: {} ({err})",
                         lock_path.display()
                     ));
                 }
-                let _ = fs4::fs_std::FileExt::unlock(&file);
+                let _ = fs4::FileExt::unlock(&file);
             }
         }
     }
