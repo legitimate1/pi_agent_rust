@@ -1434,6 +1434,28 @@ mod tests {
 
     #[test]
     fn test_oxfmt_failed_contains_diff() {
+        // `my-check` CI on `ubuntu-latest` has no global `oxfmt`, so the
+        // checker falls back to `npx --yes oxfmt` which cold-fetches from
+        // the npm registry and breaches `VERIFY_TIMEOUT_SECS` (10s) flakily
+        // → log `npx timed out after 10s` after ~11s wall. The test already
+        // has a `timed out` soft-skip below, but that still burns 10s+ and
+        // fails `--no-fail-fast` partitioning. Prefer a fast `CI=true`
+        // early-skip when we'd actually take the network-bound fallback.
+        // Note: `resolve_program` is a no-op on Linux (returns the bare
+        // name), so we must probe via `Command --version` instead.
+        if std::env::var_os("CI").is_some() {
+            let has_oxfmt_path = std::env::var_os("OXFMT_PATH").is_some_and(|v| !v.is_empty());
+            let has_global_oxfmt = std::process::Command::new("oxfmt")
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if !has_oxfmt_path && !has_global_oxfmt {
+                eprintln!(
+                    "CI: skipping oxfmt npx fallback (network-bound, VERIFY_TIMEOUT_SECS 10s)"
+                );
+                return;
+            }
+        }
         let mut tmp = tempfile::Builder::new().suffix(".ts").tempfile().unwrap();
         std::io::Write::write_all(
             tmp.as_file_mut(),
