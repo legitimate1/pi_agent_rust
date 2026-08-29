@@ -18,6 +18,7 @@
 //! - [`sdk`] module
 
 #![forbid(unsafe_code)]
+#![feature(windows_by_handle)]
 // rch clippy probes without these allowances still expose broad, cross-module
 // dormant surfaces in extension/session/SDK paths. The no-allow inventory is
 // tracked in bd-63x3v.5.1; keep this crate-wide guard until the remaining
@@ -38,6 +39,7 @@
     )
 )]
 // Allow pedantic lints during early development - can tighten later
+#![allow(clippy::pedantic, clippy::nursery)]
 #![allow(
     clippy::must_use_candidate,
     clippy::doc_markdown,
@@ -67,6 +69,8 @@ pub mod acp;
 pub mod agent;
 #[doc(hidden)]
 pub use pi_core::agent_cx;
+#[doc(hidden)]
+pub mod agent_hub;
 #[doc(hidden)]
 pub mod app;
 pub mod ast_tools;
@@ -148,9 +152,13 @@ pub mod hostcall_trace_jit;
 pub mod http;
 #[doc(hidden)]
 pub mod http_shim;
+#[doc(hidden)]
+pub mod hub;
 #[cfg(feature = "tui")]
 #[doc(hidden)]
 pub mod interactive;
+#[doc(hidden)]
+pub mod jobs;
 #[doc(hidden)]
 pub mod keybindings;
 #[doc(hidden)]
@@ -191,6 +199,8 @@ pub mod rpc;
 pub mod scheduler;
 pub mod sdk;
 #[doc(hidden)]
+pub mod secrets;
+#[doc(hidden)]
 pub mod semantic_workspace_graph;
 #[doc(hidden)]
 pub mod session;
@@ -208,6 +218,8 @@ pub mod session_sqlite;
 pub mod session_store_v2;
 #[doc(hidden)]
 pub use pi_core::sse;
+#[doc(hidden)]
+pub mod subagents;
 #[doc(hidden)]
 pub mod subprocess_handle;
 #[doc(hidden)]
@@ -233,6 +245,8 @@ pub mod validation_broker;
 pub mod vcr;
 #[doc(hidden)]
 pub mod version_check;
+#[doc(hidden)]
+pub mod worktree_iso;
 
 pub use error::{Error, Result as PiResult};
 #[doc(hidden)]

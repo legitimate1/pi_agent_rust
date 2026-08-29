@@ -3938,3 +3938,108 @@ pub fn persist_with_readonly_handling(
         }
     }
 }
+
+pub(crate) fn attach_child_job_discipline(child: &std::process::Child) -> bool {
+    #[cfg(windows)]
+    return win_job::attach(child);
+    #[cfg(not(windows))]
+    {
+        let _ = child;
+        true
+    }
+}
+
+/// Terminate descendants still covered by an already-reaped root's platform
+/// discipline without walking a potentially recycled root PID.
+pub(crate) fn terminate_reaped_child_discipline(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = win_job::terminate(pid);
+    }
+    #[cfg(unix)]
+    if let Ok(raw_pid) = i32::try_from(pid)
+        && let Some(process_group) = rustix::process::Pid::from_raw(raw_pid)
+    {
+        let _ = rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
+}
+
+#[cfg(windows)]
+mod win_job {
+    //! Kill-on-close Job objects keyed by root pid (bd-9jgrt item 1).
+    //!
+    //! Windows has no process groups, so the parent-chain walk in
+    //! [`kill_process_tree_with`] races grandchildren spawned after its
+    //! process snapshot. A job closes that race: descendants cannot break
+    //! away (`JOB_OBJECT_LIMIT_BREAKAWAY_OK` is never set), and dropping the
+    //! job's handle terminates every current member in one shot.
+
+    use std::collections::HashMap;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+    use std::sync::{LazyLock, Mutex};
+
+    use win32job::{ExtendedLimitInfo, Job};
+
+    static REGISTRY: LazyLock<Mutex<HashMap<u32, Job>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Assign `child` to a fresh kill-on-close job and remember it by pid.
+    ///
+    /// Returns whether the child is now covered by a registered Job. Most
+    /// callers can retain the walk-based fallback on failure; subprocess
+    /// surfaces that cannot safely tolerate inherited handles can fail closed.
+    pub(crate) fn attach(child: &Child) -> bool {
+        let Ok(mut map) = REGISTRY.lock() else {
+            return false;
+        };
+        prune_dead_entries(&mut map);
+        let mut info = ExtendedLimitInfo::new();
+        info.limit_kill_on_job_close();
+        let Ok(job) = Job::create_with_limit_info(&info) else {
+            return false;
+        };
+        // RawHandle is *mut c_void; win32job takes the isize numeric handle.
+        if job.assign_process(child.as_raw_handle() as isize).is_err() {
+            // Never assigned, so closing harms nothing.
+            drop(job);
+            return false;
+        }
+        map.insert(child.id(), job);
+        true
+    }
+
+    /// Kill the tree rooted at `pid` via its job, returning whether one
+    /// existed. Dropping the stored `Job` closes the handle, and
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` does the actual termination.
+    pub(crate) fn terminate(pid: u32) -> bool {
+        REGISTRY
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&pid))
+            .is_some()
+    }
+
+    /// Drop entries whose root process no longer exists so the map (and its
+    /// kernel handles) stays proportional to live spawned children. Skipped
+    /// while small to avoid a process-table refresh per trivial spawn.
+    fn prune_dead_entries(map: &mut HashMap<u32, Job>) {
+        if map.len() < 8 {
+            return;
+        }
+        let pids: Vec<sysinfo::Pid> = map.keys().map(|&pid| sysinfo::Pid::from_u32(pid)).collect();
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
+        let dead: Vec<u32> = pids
+            .iter()
+            .filter(|pid| sys.process(**pid).is_none())
+            .map(|pid| pid.as_u32())
+            .collect();
+        for pid in dead {
+            // Jobs whose root died are empty; dropping just reclaims the handle.
+            map.remove(&pid);
+        }
+    }
+}

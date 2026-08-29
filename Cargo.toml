@@ -211,7 +211,9 @@ arboard = { version = "3.6.1", optional = true }
 # Filesystem
 dirs = "6"
 tempfile = "3.25.0"
-fs4 = "0.13"
+fs4 = "1.1"
+portable-pty = "0.9"
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 glob = "0.3"
 ignore = "0.4"
 indexmap = "2"
@@ -239,6 +241,7 @@ pbkdf2 = { version = "0.12.2", features = ["hmac"] }
 scrypt = { version = "0.11.0", default-features = false }
 getrandom = "0.4.1"
 regex = "1.12.3"
+jsonschema = { version = "0.42.0", default-features = false }
 ring = "0.17.14"
 semver = "1.0.27"
 crc32c = "0.6"
@@ -330,6 +333,12 @@ rquickjs = { version = "0.11", features = ["futures", "loader", "bindgen"] }
 # up automatically.
 [target.'cfg(target_os = "android")'.dependencies]
 rquickjs = { version = "0.11", features = ["futures", "loader", "bindgen"] }
+
+# Windows child-tree kill discipline (bd-9jgrt item 1): Job objects close the
+# snapshot-vs-kill race that the parent-chain walk cannot. win32job keeps our
+# crate unsafe-free while encapsulating the Win32 FFI.
+[target.'cfg(windows)'.dependencies]
+win32job = "2.0.3"
 
 [features]
 default = ["sqlite-sessions", "tui"]
