@@ -961,7 +961,7 @@ mod tests {
             path: path.to_string(),
             status,
             source: TouchSource::Structured,
-            old_path: old.map(|s| s.to_string()),
+            old_path: old.map(ToString::to_string),
             first_old_path: None,
             tool_call_id: "c1".to_string(),
             tool_name: "edit".to_string(),
