@@ -162,7 +162,9 @@
 | `src/tools/mod.rs` | 工具注册表与辅助 | 单元测试；`tests/tools_conformance.rs`、`tests/e2e_tools.rs`。 |
 | `src/tools/pwsh.rs` | PowerShell 工具 | 单元测试；`tests/tools_conformance.rs`。 |
 | `src/tools/read.rs` | Read 工具 | 单元测试；`tests/tools_conformance.rs`、`tests/tools_hardened.rs`。 |
+| `src/tools/shell.rs` | Shell 工具（单壳 `shell(shell=bash | pwsh)`） | 单元测试；`tests/tools_conformance.rs`、`tests/tools_hardened.rs`、`tests/e2e_tools.rs`；`src/tools/shell.rs` 内 `mod tests`。 |
 | `src/tools/tests.rs` | 工具测试工具 | 豁免测试支撑模块。 |
+| `src/tools/touched_files.rs` | 触达文件混合上报与合并 | 单元测试；`tests/tools_conformance.rs` 经 `ToolOutput.touched_files`、`tests/model_serialization.rs`、`tests/provider_streaming` 触达文件套件；gix→git→walk 三级快照经 `cargo test --lib touched_files`（7 项）校验。 |
 | `src/tools/verify.rs` | 语法/格式校验 | 单元测试；`tests/tools_conformance.rs`、`tests/tools_hardened.rs`。 |
 | `src/tools/write.rs` | Write 工具 | 单元测试；`tests/tools_conformance.rs`、`tests/tools_hardened.rs`。 |
 | `src/validation_broker.rs` | 校验经纪人 | 单元测试；`tests/validation_broker_cli.rs`、`tests/validation_broker_e2e.rs`。 |
