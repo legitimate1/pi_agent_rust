@@ -1,6 +1,8 @@
 # Hub 最小移植执行计划 — 2026-08-29
 
 > 输入：`probe-report-2026-08-29.md` (§6) + `fork-merge-sop.md`。决策：**不 `merge upstream/main`**，单文件 `git show` 移植 hub 闭包。
+> **状态：✅ 已完成 2026-08-29 — A1 全闭包落 custom `4eeb3bf7`，`cargo check --lib` 44→0 / `clippy --lib -D warnings` 33→0 / `cargo fmt` pass，已 `push origin/custom`。**
+> **实际闭包：`hub/jobs/agent_hub/subagents(8965行) + secrets(437)+worktree_iso(657) + Cargo 5增量 + tools 105行`，替代原计划 5-8k，实耗 8-10k，一次性拿齐 subagent 集群。**
 
 ## 1. 目标 / 非目标
 
@@ -57,3 +59,14 @@ cargo check --lib  # 目标 0 error, 替代 --all-targets 省 30GB
 - 时间：`hub 4` 覆盖 <5min, 注入点+shim <30min, 不触发 `my-check.yml` 云端全量。
 
 > 下一步：执行 §3 步骤 0→1，已就绪可直接 `worktree` 开干。
+
+## 7. 落地证据 (2026-08-29 17:00)
+
+- 提交：`4eeb3bf7 port: hub full closure A1 (...)` (rebase 过 `b55139dd` 的同名 bump，已 `push origin/custom`)
+- 隔离验证：`hub-port` (detached `ae3f4b78`) `cargo check --lib` 44→0 (33.92s) → `cargo clippy --lib -D warnings` 33→0 (0.62s) → `cargo fmt --check` pass → `cargo fmt` 收口 → 合回 `custom` 复验 `check 1m42s / clippy 36.59s` 双绿
+- 改动：`+11258 -78`，14 files — `src/hub.rs(1134) + jobs.rs(5354) + agent_hub.rs(585) + subagents.rs(2515) + secrets.rs(437) + worktree_iso.rs(657)` + `Cargo.toml/lock + lib.rs + permissions.rs + session.rs + tools/mod.rs`
+- Cargo 增量：`fs4 0.13→1.1`，`+portable-pty 0.9 / rustix 1.1.4 / win32job 2.0.3(windows) / jsonschema→[dependencies]`，`lib.rs +#![feature(windows_by_handle)]`
+- 适配：`permissions.rs` upstream 回灌、`session.rs lock_exclusive→FileExt::lock`、`hub.rs String+&String→format!`、`subagents.rs execute 4→5 _abort`、`tools/mod.rs +attach/terminate 105行`
+- 清理：`git worktree remove /tmp/hub-port --force` + `rm /tmp/up_tools.rs`，`hub-port` 已删，`custom` 零残留
+- 下次：该闭包 3 个月内无需再动；如需 `hub roster/jobs` 注入点 (`app/cli/config/rpc`) 另起小移植，不再 `merge upstream/main`
+
