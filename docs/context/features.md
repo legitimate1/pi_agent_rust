@@ -57,6 +57,15 @@
 - **AST 结构搜索与编辑** — `ast_grep`（按语法树模式搜索，注释/字符串不算匹配）与 `ast_edit`（分阶段 staged 重写：proposal + unified diff、回滚、32 个 proposal 淘汰），按文件扩展名自动选语言（rust/python/js/ts/tsx/bash/go/ruby）| `src/ast_tools.rs`
 - **文件触达追踪** — 自动记录结构化编辑与 shell 操作触达的文件变更，汇总增删改与重命名链 | `src/tools/touched_files.rs` + `src/tools/bash.rs`
 
+## 子代理与后台任务
+
+- **子代理并行执行** — 派生独立子代理完成指定任务，支持结构化输出与重试 | `src/subagents.rs`
+- **后台任务管理** — 后台执行命令并支持查询、等待与取消，完成通知在下一轮投递 | `src/jobs.rs`
+- **Hub 常驻服务** — 托管长驻进程与观察就绪条件，提供日志与生命周期管理 | `src/hub.rs`
+- **代理中心子进程登记** — 登记与管理子进程运行态、对话记录与消息投递 | `src/agent_hub.rs`
+- **凭据脱敏保险库** — 识别常见凭据形状并在外发前替换为占位符 | `src/secrets.rs`
+- **工作区隔离** — 为子代理创建临时工作树隔离改动，按策略合并或丢弃 | `src/worktree_iso.rs`
+
 ## 扩展系统
 
 - **JS/TS 扩展加载** — QuickJS 沙箱运行，无需 Node/Bun | `src/extensions_js.rs`

@@ -555,3 +555,16 @@
 
 **何时重新考虑**：若需跨 cwd 原子快照或 asupersync 锁语义变更，再评估全局锁或读写锁。
 
+
+---
+
+## D55: Hub 全闭包移植 — 单文件移植 hub 六件套而非全量 merge 上游
+
+**决策**：选单文件 `git show upstream/main:src/* > src/*` 移植 hub/jobs/agent_hub/subagents + secrets/worktree_iso 六件套 + Cargo 5 增量 (fs4 1.1/portable-pty/rustix/win32job/jsonschema) + tools 调度钩子，不选 `git merge --no-commit --no-ff upstream/main` 全量合流。
+
+**理由**：全量探针 121 冲突为纸老虎但 297 编译错为依赖漂移主成本，正面撞 hostcall/touched_files 重构区；单文件隔离 (hub-port) 44→0 可控，改动 14 文件 +11258 行。
+
+**不选 B 的原因**：不选全量合流，因 Cargo 自动合入 asupersync/rust/digest 大版本引 423 错，冻结面噪音需批量 --ours/rm，30k token 与定制区正面冲突。
+
+**何时重新考虑**：若需 hub Roster/Jobs UI 注入点 (app/cli/config/rpc) 或上游 0.2.x 发布需全特性同步时，再评估分阶段再移植或冻结面迁移项目。
+

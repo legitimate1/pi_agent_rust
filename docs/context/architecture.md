@@ -7,7 +7,7 @@ CLI (clap) → main/app/config/resources → Agent Session
                          ↓
 Provider Layer (native provider modules + extension providers)
                          ↓
-Tool Registry (built-ins + extension tools) ↔ Extension Runtime (QuickJS + capability policy)
+Tool Registry (built-ins + extension tools + subagents/hub/jobs) ↔ Extension Runtime (QuickJS + capability policy)
                          ↓
 Surfaces: Interactive TUI + RPC/stdin modes
                          ↓
@@ -84,6 +84,10 @@ CLI --tools read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit
 - **`app.rs`** → 系统提示词构建（SYSTEM.md 加载、default_system_prompt、project context files、date/cwd/temp 运行时事实注入）
 - **`tool_overrides.rs`** → tools.toml 覆盖加载：合并用户级 `~/.pi/agent/tools.toml` + 项目级 `.pi/tools.toml`（项目 key 优先），产出 description / parameters 覆盖表
 - **`tools/` 模块目录** → ToolRegistry + 内置工具模块 + verify 内部验证引擎 + touched_files 触达追踪（Single Shell：`shell.rs` 为 Single Shell 统一入口，薄转发 `bash.rs`/`pwsh.rs` 内部实现；`bash`/`pwsh` 仅 `PI_ENABLE_LEGACY_SHELL` 时 gated 注册；全量 asupersync 运行时 Cx/checkpoint/Budget/spawn_blocking，无 tokio）
+- **`hub.rs`** → Hub 常驻服务：PTY 托管、滚动日志与环、就绪观测（log 正则与端口探测）、生命周期与 detached 持久化
+- **`jobs.rs`** → 后台任务注册表：后台 bash 任务、完成通知队列、会话作用域与 shutdown 清理
+- **`subagents.rs`** → 子代理工具：派生 pi 子进程、任务与模式分发、结构化输出校验与重试
+- **`agent_hub.rs`** → 代理中心：子进程登记、对话记录分页、操控消息投递与转生
 - **`tools/verify.rs`** → 编辑后轻量验证引擎：文件类型检测→检查器映射（.rs/.json/.toml/.ts/.js/.py/.go/.md）→进程内/外部进程执行，支持 Format+Lint 并行（oxfmt+oxlint/ruff），诊断直写 content 正文
 - **`tools/touched_files.rs`** → 文件触达追踪：三级快照（gix 0.77 status → git status --porcelain=v1 -z --find-renames → walk）+ 结构化写入与 shell 触达过滤 + TurnEnd 聚合（R>D>A>M，firstOldPath 重命名链）+ per-cwd asupersync::sync::Mutex 窗口锁 + capture_snapshot_async 经 asupersync::runtime::spawn_blocking 卸载阻塞
 - **`agent.rs`** → Agent 循环（工具迭代、扩展合并、ToolDef 构建）
@@ -96,6 +100,9 @@ CLI --tools read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit
 - **`providers/`** → native provider 实现：anthropic/openai/openai_responses/gemini/cohere/azure/bedrock/vertex/copilot/gitlab/cursor/model_fetch
 - **`provider_metadata.rs`** → Provider 元数据：别名、认证键、本地 provider（ollama/llamacpp/mistralrs/lmstudio）
 - **`auth.rs`** → 凭据管理：API Key / OAuth / AWS / Bearer，auth.json 文件锁
+- **`secrets.rs`** → 凭据脱敏保险库：凭据形状检测、外发占位与回补、审计与拦截模式
+- **`worktree_iso.rs`** → 工作区隔离：临时 worktree 创建、脏工作树物化、补丁收集与按模式合入（keep/apply/drop）
+- **`models.rs`** → 内置 + models.json 模型注册表
 - **`models.rs`** → 内置 + models.json 模型注册表
 - **`session.rs`** → JSONL 会话持久化（+ SQLite 后端）
 - **`session_store_v2.rs`** → sidecar 分段日志：偏移索引 + 检查点回滚
