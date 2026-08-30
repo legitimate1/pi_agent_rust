@@ -3757,6 +3757,7 @@ fn e2e_cli_default_tools_when_no_flag() {
         "hashline_edit",
         "ast_grep",
         "ast_edit",
+        "subagent",
     ];
 
     let request_body = json!({
