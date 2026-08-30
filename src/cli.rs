@@ -417,10 +417,10 @@ pub struct Cli {
     #[arg(long)]
     pub no_tools: bool,
 
-    /// Specific tools to enable (comma-separated: read,write,edit,shell,grep,find,ls,hashline_edit,ast_grep,ast_edit)
+    /// Specific tools to enable (comma-separated: read,write,edit,shell,grep,find,ls,hashline_edit,ast_grep,ast_edit,subagent)
     #[arg(
         long,
-        default_value = "read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit"
+        default_value = "read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit,subagent"
     )]
     pub tools: String,
 
@@ -1042,6 +1042,7 @@ mod tests {
                 "hashline_edit",
                 "ast_grep",
                 "ast_edit",
+                "subagent",
             ]
         );
     }
@@ -1391,7 +1392,7 @@ mod tests {
         assert!(cli.args.is_empty());
         assert_eq!(
             cli.tools,
-            "read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit"
+            "read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit,subagent"
         );
     }
 
