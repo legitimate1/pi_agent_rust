@@ -20,10 +20,10 @@
       "createdAt": 1787669216455
     },
     {
-      "id": "pt_1787834990853_9a3jbkr",
-      "content": "云构建（仅 Windows）,不用跟云端进度",
+      "id": "pt_1788080146164_syww0z0",
+      "content": "!gh workflow run my-build-windows.yml --ref custom 2>&1",
       "done": false,
-      "createdAt": 1787834990853
+      "createdAt": 1788080146164
     },
     {
       "id": "pt_1787749410725_mcc4bh1",
