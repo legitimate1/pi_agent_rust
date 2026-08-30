@@ -1,6 +1,6 @@
 use super::*;
 use crate::error::{Error, Result};
-use crate::model::{ContentBlock, TextContent};
+use crate::model::{ContentBlock, FileStatus, TextContent};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::io::Write;
@@ -96,6 +96,9 @@ impl Tool for WriteTool {
         // actual file that will be overwritten: symlink target when following.
         let effective_path: PathBuf = symlink_target.clone().unwrap_or_else(|| path.clone());
 
+        let was_existing = asupersync::fs::metadata(&effective_path)
+            .await
+            .is_ok_and(|meta| meta.is_file());
         if let Ok(meta) = asupersync::fs::metadata(&effective_path).await {
             if !meta.is_file() {
                 return Err(Error::tool(
@@ -191,7 +194,17 @@ impl Tool for WriteTool {
         }
 
         Ok(ToolOutput {
-            touched_files: Vec::new(),
+            touched_files: vec![crate::tools::touched_files::structured_touch(
+                self.name(),
+                _tool_call_id,
+                &input.path,
+                if was_existing {
+                    FileStatus::Modified
+                } else {
+                    FileStatus::Added
+                },
+                &self.cwd,
+            )],
             content: vec![ContentBlock::Text(TextContent::new(output_text))],
             details,
             is_error: false,

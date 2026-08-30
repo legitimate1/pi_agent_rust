@@ -1,6 +1,6 @@
 use super::*;
 use crate::error::{Error, Result};
-use crate::model::{ContentBlock, TextContent};
+use crate::model::{ContentBlock, FileStatus, TextContent};
 use asupersync::io::AsyncReadExt;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -902,7 +902,13 @@ impl Tool for EditTool {
         }
 
         Ok(ToolOutput {
-            touched_files: Vec::new(),
+            touched_files: vec![crate::tools::touched_files::structured_touch(
+                self.name(),
+                _tool_call_id,
+                &input.path,
+                FileStatus::Modified,
+                &self.cwd,
+            )],
             content: vec![ContentBlock::Text(TextContent::new(output_text))],
             details: Some(serde_json::Value::Object(details)),
             is_error: false,

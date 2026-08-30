@@ -25,7 +25,7 @@
 
 use crate::abort::AbortSignal;
 use crate::error::{Error, Result};
-use crate::model::{ContentBlock, TextContent};
+use crate::model::{ContentBlock, FileStatus, FileTouch, TextContent};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
 use ast_grep_core::{AstGrep, Pattern};
 use ast_grep_language::SupportLang;
@@ -367,6 +367,25 @@ fn text_output(text: String, details: serde_json::Value) -> ToolOutput {
         details: Some(details),
         is_error: false,
     }
+}
+
+fn structured_touches_for_resolved_files(
+    files: &[StagedFile],
+    tool_call_id: &str,
+    cwd: &Path,
+) -> Vec<FileTouch> {
+    files
+        .iter()
+        .map(|file| {
+            crate::tools::touched_files::structured_touch(
+                "ast_edit",
+                tool_call_id,
+                &file.display,
+                FileStatus::Modified,
+                cwd,
+            )
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -959,7 +978,7 @@ impl AstEditTool {
         Ok(text_output(text, payload))
     }
 
-    fn resolve(&self, input: &AstEditInput) -> Result<ToolOutput> {
+    fn resolve(&self, tool_call_id: &str, input: &AstEditInput) -> Result<ToolOutput> {
         let proposal_id = input
             .proposal_id
             .as_deref()
@@ -1056,7 +1075,16 @@ impl AstEditTool {
         });
         let text = serde_json::to_string_pretty(&payload)
             .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".to_string());
-        Ok(text_output(text, payload))
+        Ok(ToolOutput {
+            touched_files: structured_touches_for_resolved_files(
+                &proposal.files,
+                tool_call_id,
+                &self.cwd,
+            ),
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: Some(payload),
+            is_error: false,
+        })
     }
 
     fn reject(&self, input: &AstEditInput) -> Result<ToolOutput> {
@@ -1171,7 +1199,7 @@ impl Tool for AstEditTool {
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
         match input.action.as_deref().unwrap_or("stage") {
             "stage" => self.stage(&input),
-            "resolve" => self.resolve(&input),
+            "resolve" => self.resolve(_tool_call_id, &input),
             "reject" => self.reject(&input),
             other => Err(Error::validation(format!(
                 "unknown action '{other}'; expected stage|resolve|reject"

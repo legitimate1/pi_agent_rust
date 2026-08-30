@@ -2985,7 +2985,9 @@ impl Agent {
         });
 
         let tool_result = Arc::new(ToolResultMessage {
-            touched_files: Vec::new(),
+            // Preserve the tool's authoritative touch list for session replay,
+            // TurnEnd aggregation, and RPC consumers.
+            touched_files: output.touched_files.clone(),
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
             content: output.content,
@@ -2995,7 +2997,7 @@ impl Agent {
         });
 
         on_event(AgentEvent::ToolExecutionEnd {
-            touched_files: Vec::new(),
+            touched_files: tool_result.touched_files.clone(),
             tool_call_id: tool_result.tool_call_id.clone(),
             tool_name: tool_result.tool_name.clone(),
             result: ToolOutput {

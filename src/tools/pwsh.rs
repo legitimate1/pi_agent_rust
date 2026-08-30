@@ -74,8 +74,21 @@ impl Tool for PwshTool {
         let input: PwshInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
 
+        // Keep the complete before/command/after window atomic with bash. Both
+        // tools may run in adjacent compatible batches, so a shared per-cwd
+        // lock is required to keep one tool from observing the other tool's
+        // filesystem changes.
+        let cwd_buf = self.cwd.clone();
+        let _window_guard = crate::tools::touched_files::lock_bash_window(&cwd_buf)
+            .await
+            .map_err(|e| Error::tool("pwsh", format!("pwsh window lock failed: {e}")))?;
+        let before = crate::tools::touched_files::capture_snapshot_async(cwd_buf.clone()).await;
         let result =
             run_pwsh_command(&self.cwd, &input.command, input.timeout, _abort.as_ref()).await?;
+        let after = crate::tools::touched_files::capture_snapshot_async(cwd_buf).await;
+        let pwsh_touches = crate::tools::touched_files::filter_bash_touches(
+            crate::tools::touched_files::diff_snapshots(before, after, _tool_call_id, self.name()),
+        );
 
         let mut details_map = serde_json::Map::new();
         if let Some(truncation) = result.truncation.as_ref() {
@@ -97,7 +110,7 @@ impl Tool for PwshTool {
         let is_error = result.exit_code != 0;
 
         Ok(ToolOutput {
-            touched_files: Vec::new(),
+            touched_files: pwsh_touches,
             content: vec![ContentBlock::Text(TextContent::new(result.output))],
             details,
             is_error,

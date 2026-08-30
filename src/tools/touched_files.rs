@@ -302,6 +302,43 @@ pub fn aggregate_touched(touches: Vec<FileTouch>) -> Vec<FileTouch> {
 }
 
 // ============================================================================
+// Structured touch construction (0ms, no IO)
+// ============================================================================
+
+/// Build one structured-tool touch with a cwd-relative display path when possible.
+///
+/// Structured tools already know exactly which path they mutate, so they do not
+/// need a before/after filesystem scan. Paths inside the tool cwd are emitted
+/// relative to that cwd; paths outside it remain absolute and are rejected by
+/// pidian's boundary validation.
+pub fn structured_touch(
+    tool_name: &str,
+    tool_call_id: &str,
+    path: &str,
+    status: FileStatus,
+    cwd: &Path,
+) -> FileTouch {
+    let raw_path = Path::new(path);
+    let display_path = if raw_path.is_absolute() {
+        raw_path.strip_prefix(cwd).map_or_else(
+            |_| path.to_string(),
+            |relative| relative.to_string_lossy().to_string(),
+        )
+    } else {
+        path.to_string()
+    };
+    FileTouch {
+        path: normalize_path(&display_path),
+        status,
+        source: TouchSource::Structured,
+        old_path: None,
+        first_old_path: None,
+        tool_call_id: tool_call_id.to_string(),
+        tool_name: tool_name.to_string(),
+    }
+}
+
+// ============================================================================
 // Structured extraction (0ms, no IO)
 // ============================================================================
 
@@ -428,7 +465,7 @@ pub fn filter_bash_touches(touches: Vec<FileTouch>) -> Vec<FileTouch> {
 // Bash window snapshot (git CLI → walk)
 // ============================================================================
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalkMeta {
     pub mtime_ms: i128,
     pub size: u64,
