@@ -603,3 +603,16 @@
 **何时重新考虑**：若 subagent 开销或限深/隔离开销需回收默认权限，再评估按配置或会话策略分级默认。
 
 **替代**：已由 D59 替代 D56。
+
+---
+
+## D60: subagent 网络瞬断重试 — 外进程重试环复用 is_retryable_error + Config.retry 指数退避
+
+**决策**：选 ChildRunner 外层网络重试环（扁平 error+output+stderr 喂 is_retryable_error + Config.retry_delay_ms 指数退避 + AgentCx::checkpoint 取消 + 每次重试新建进程/worktree），不选复用 rpc::run_prompt_with_retry 的 AgentSession 续跑。
+
+**理由**：subagent 为 pi --mode json --print --no-session 外进程，仅有 exit_code/stderr/output，无 AgentSession；瞬断重试需在子进程模型下重建隔离环境并支持取消，直接复用主链路重试语义错配。
+
+**不选 B 的原因**：复用主链路的 revert_incomplete_response + run_continue_with_abort 依赖 AgentSession 回退/续跑，在 subagent 外进程路径不存在对应状态，且无法处理 worktree 重建与 none 隔离幂等约束。
+
+**何时重新考虑**：若 subagent 改为基于 AgentSession 或统一瞬断错误分类为结构化信号，再评估收敛为共用重试器。
+
