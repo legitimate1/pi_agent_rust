@@ -647,6 +647,21 @@ impl Config {
             .unwrap_or(60000)
     }
 
+    /// Exponential backoff for retries: `base * 2^(attempt-1)` capped at `max`.
+    ///
+    /// Mirrors `rpc::retry_delay_ms` / `main::print_mode_retry_delay_ms`; kept
+    /// here so `subagents` can reuse the same schedule without duplicating the
+    /// formula (IMPLEMENT C2).
+    #[must_use]
+    pub fn retry_delay_ms(&self, attempt: u32) -> u32 {
+        let base = u64::from(self.retry_base_delay_ms());
+        let max = u64::from(self.retry_max_delay_ms());
+        let shift = attempt.saturating_sub(1);
+        let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+        let delay = base.saturating_mul(multiplier).min(max);
+        u32::try_from(delay).unwrap_or(u32::MAX)
+    }
+
     pub fn image_auto_resize(&self) -> bool {
         self.images
             .as_ref()
