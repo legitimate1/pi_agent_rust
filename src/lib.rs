@@ -194,6 +194,8 @@ pub mod resource_governor;
 #[doc(hidden)]
 pub mod resources;
 #[doc(hidden)]
+pub mod retry_state;
+#[doc(hidden)]
 pub mod rpc;
 #[doc(hidden)]
 pub mod scheduler;

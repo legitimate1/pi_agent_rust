@@ -2774,14 +2774,15 @@ async fn run_prompt_with_retry(
         break 'block RpcSessionPersister::new(path).ok();
     };
 
-    let max_retries = options.config.retry_max_retries();
-    let mut retry_count: u32 = 0;
+    let mut counters = crate::retry_state::RetryCounters::new(options.config.retry_max_retries());
+    let has_progress = crate::retry_state::RetryProgress::new();
     let mut success = false;
     let mut final_error: Option<String> = None;
     let mut final_error_hints: Option<Value> = None;
 
     loop {
-        if retry_count > 0 && cx.checkpoint().is_err() {
+        has_progress.clear();
+        if counters.total > 0 && cx.checkpoint().is_err() {
             final_error = Some("Retry aborted".to_string());
             final_error_hints = None;
             break;
@@ -2807,14 +2808,17 @@ async fn run_prompt_with_retry(
                 }
             };
             let extensions = guard.extensions.as_ref().map(|r| r.manager().clone());
-            let event_handler = rpc_agent_event_handler(
-                out_tx.clone(),
-                runtime_for_events,
-                extensions,
-                session_persister.clone(),
-            );
+            let event_handler = {
+                let base = rpc_agent_event_handler(
+                    out_tx.clone(),
+                    runtime_for_events,
+                    extensions,
+                    session_persister.clone(),
+                );
+                has_progress.wrap(base)
+            };
 
-            if retry_count == 0 {
+            if counters.is_first() {
                 // First attempt: add the user message and run the turn.
                 if images.is_empty() {
                     guard
@@ -2852,9 +2856,10 @@ async fn run_prompt_with_retry(
                         .or_else(|| Some("Request error".to_string()));
                     final_error_hints = None;
                     if message.stop_reason == StopReason::Aborted {
-                        // Agent loop already emitted agent_end via event_handler;
-                        // prevent the retry-loop fallback from sending a duplicate.
-                        success = true;
+                        // Unified with print mode: Aborted is NOT success; surface
+                        // as `Aborted` so the loop emits `AutoRetryEnd { success:false }`.
+                        success = false;
+                        final_error = Some("Aborted".to_string());
                         break;
                     }
                     // Check if this error is retryable. Context overflow and
@@ -2911,18 +2916,18 @@ async fn run_prompt_with_retry(
         let retry_enabled = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
             .await
             .is_ok_and(|state| state.auto_retry_enabled);
-        if !retry_enabled || retry_count >= max_retries {
+        if !retry_enabled || counters.exhausted() {
             break;
         }
 
-        retry_count += 1;
-        let delay_ms = retry_delay_ms(&options.config, retry_count);
+        let attempt = counters.advance(has_progress.has_progress());
+        let delay_ms = counters.delay_ms(&options.config);
         let error_message = final_error
             .clone()
             .unwrap_or_else(|| "Request error".to_string());
         let _ = out_tx.send(agent_event(AgentEvent::AutoRetryStart {
-            attempt: retry_count,
-            max_attempts: max_retries,
+            attempt,
+            max_attempts: counters.max_retries,
             delay_ms: u64::from(delay_ms),
             error_message,
         }));
@@ -2960,10 +2965,10 @@ async fn run_prompt_with_retry(
         }
     }
 
-    if retry_count > 0 {
+    if counters.has_retried() {
         let _ = out_tx.send(agent_event(AgentEvent::AutoRetryEnd {
             success,
-            attempt: retry_count,
+            attempt: counters.consecutive,
             final_error: if success { None } else { final_error.clone() },
         }));
     }
@@ -3586,15 +3591,6 @@ fn rpc_flatten_content_blocks(value: &mut Value) {
             block_obj.entry(key).or_insert(value);
         }
     }
-}
-
-fn retry_delay_ms(config: &Config, attempt: u32) -> u32 {
-    let base = u64::from(config.retry_base_delay_ms());
-    let max = u64::from(config.retry_max_delay_ms());
-    let shift = attempt.saturating_sub(1);
-    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
-    let delay = base.saturating_mul(multiplier).min(max);
-    u32::try_from(delay).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -8240,15 +8236,17 @@ export default function init(pi) {
     }
 
     // -----------------------------------------------------------------------
-    // retry_delay_ms
+    // retry_delay_ms — now covered by Config::retry_delay_ms; keep minimal
+    // smoke tests that delegate through the public API rather than duplicating
+    // the formula.
     // -----------------------------------------------------------------------
 
     #[test]
     fn retry_delay_first_attempt_is_base() {
         let config = Config::default();
         // attempt 0 and 1 should both use the base delay (shift = attempt - 1 saturating)
-        assert_eq!(retry_delay_ms(&config, 0), config.retry_base_delay_ms());
-        assert_eq!(retry_delay_ms(&config, 1), config.retry_base_delay_ms());
+        assert_eq!(config.retry_delay_ms(0), config.retry_base_delay_ms());
+        assert_eq!(config.retry_delay_ms(1), config.retry_base_delay_ms());
     }
 
     #[test]
@@ -8256,8 +8254,8 @@ export default function init(pi) {
         let config = Config::default();
         let base = config.retry_base_delay_ms();
         // attempt 2: base * 2, attempt 3: base * 4
-        assert_eq!(retry_delay_ms(&config, 2), base * 2);
-        assert_eq!(retry_delay_ms(&config, 3), base * 4);
+        assert_eq!(config.retry_delay_ms(2), base * 2);
+        assert_eq!(config.retry_delay_ms(3), base * 4);
     }
 
     #[test]
@@ -8265,7 +8263,7 @@ export default function init(pi) {
         let config = Config::default();
         let max = config.retry_max_delay_ms();
         // Large attempt number should be capped
-        let delay = retry_delay_ms(&config, 30);
+        let delay = config.retry_delay_ms(30);
         assert_eq!(delay, max);
     }
 
@@ -8273,7 +8271,7 @@ export default function init(pi) {
     fn retry_delay_saturates_on_overflow() {
         let config = Config::default();
         // u32::MAX attempt should not panic
-        let delay = retry_delay_ms(&config, u32::MAX);
+        let delay = config.retry_delay_ms(u32::MAX);
         assert!(delay <= config.retry_max_delay_ms());
     }
 

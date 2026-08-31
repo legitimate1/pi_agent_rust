@@ -14,6 +14,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
@@ -6815,16 +6816,6 @@ enum PromptInput {
     Content(Vec<ContentBlock>),
 }
 
-/// Compute retry delay with exponential backoff (mirrors RPC mode logic).
-fn print_mode_retry_delay_ms(config: &Config, attempt: u32) -> u32 {
-    let base = u64::from(config.retry_base_delay_ms());
-    let max = u64::from(config.retry_max_delay_ms());
-    let shift = attempt.saturating_sub(1);
-    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
-    let delay = base.saturating_mul(multiplier).min(max);
-    u32::try_from(delay).unwrap_or(u32::MAX)
-}
-
 async fn sleep_with_current_timer(duration: Duration) {
     let now = asupersync::Cx::current()
         .and_then(|cx| cx.timer_driver())
@@ -6866,14 +6857,33 @@ where
     H: Fn() -> EH + Sync,
     EH: Fn(AgentEvent) + Send + Sync + 'static,
 {
-    // First attempt.
+    // First attempt — use wrapped handler so progress within this attempt is observable.
+    let mut counters = pi::retry_state::RetryCounters::new(max_retries);
+    let has_progress = pi::retry_state::RetryProgress::new();
+    // Warm up has_progress closure capture before first attempt; actual reset
+    // per retry happens before run_continue_with_abort (see below).
+    let has_progress_for_handler = has_progress.inner();
+    let make_event_handler_wrapped = {
+        let inner = make_event_handler;
+        let has_progress = Arc::clone(&has_progress_for_handler);
+        move || {
+            let eh = inner();
+            let has_progress = Arc::clone(&has_progress);
+            move |event: AgentEvent| {
+                if pi::retry_state::is_progress_event(&event) {
+                    has_progress.store(true, Ordering::SeqCst);
+                }
+                eh(event);
+            }
+        }
+    };
     let first_result = match &input {
         PromptInput::Text(text) => {
             session
                 .run_text_with_abort(
                     text.clone(),
                     Some(abort_signal.clone()),
-                    make_event_handler(),
+                    make_event_handler_wrapped(),
                 )
                 .await
         }
@@ -6882,7 +6892,7 @@ where
                 .run_with_content_with_abort(
                     content.clone(),
                     Some(abort_signal.clone()),
-                    make_event_handler(),
+                    make_event_handler_wrapped(),
                 )
                 .await
         }
@@ -6893,16 +6903,15 @@ where
         return first_result.map_err(anyhow::Error::new);
     }
 
-    let mut retry_count: u32 = 0;
     let mut current_result = first_result;
 
     loop {
         match current_result {
             Ok(msg) if matches!(msg.stop_reason, StopReason::Aborted) => {
-                if retry_count > 0 && is_json {
+                if counters.has_retried() && is_json {
                     emit_json_event(&AgentEvent::AutoRetryEnd {
                         success: false,
-                        attempt: retry_count,
+                        attempt: counters.consecutive,
                         final_error: Some("Aborted".to_string()),
                     });
                 }
@@ -6910,7 +6919,7 @@ where
             }
             Ok(msg)
                 if is_retryable_prompt_result(&msg)
-                    && retry_count < max_retries
+                    && !counters.exhausted()
                     && snapshot_print_text_stream_state(text_stream_state).can_retry(is_json) =>
             {
                 let err_msg = msg
@@ -6918,11 +6927,11 @@ where
                     .clone()
                     .unwrap_or_else(|| "Request error".to_string());
 
-                retry_count += 1;
-                let delay_ms = print_mode_retry_delay_ms(config, retry_count);
+                let attempt = counters.advance(has_progress.has_progress());
+                let delay_ms = counters.delay_ms(config);
                 if is_json {
                     emit_json_event(&AgentEvent::AutoRetryStart {
-                        attempt: retry_count,
+                        attempt,
                         max_attempts: max_retries,
                         delay_ms: u64::from(delay_ms),
                         error_message: err_msg,
@@ -6939,17 +6948,21 @@ where
                 // are not re-run and prior work is not re-billed
                 // (pi_agent_rust#125). Matches RPC retry behaviour.
                 let _ = session.revert_incomplete_response().await;
+                has_progress.clear();
                 current_result = session
-                    .run_continue_with_abort(Some(abort_signal.clone()), make_event_handler())
+                    .run_continue_with_abort(
+                        Some(abort_signal.clone()),
+                        make_event_handler_wrapped(),
+                    )
                     .await;
             }
             Ok(msg) => {
                 // Success or non-retryable error or max retries reached.
                 let success = !matches!(msg.stop_reason, StopReason::Error);
-                if retry_count > 0 && is_json {
+                if counters.has_retried() && is_json {
                     emit_json_event(&AgentEvent::AutoRetryEnd {
                         success,
-                        attempt: retry_count,
+                        attempt: counters.consecutive,
                         final_error: if success {
                             None
                         } else {
@@ -6964,15 +6977,15 @@ where
                 // Classify from the TYPED error first (transient io::ErrorKind
                 // via the source chain), then fall back to message-text matching
                 // for prose-only errors (pi_agent_rust#118).
-                if retry_count < max_retries
+                if !counters.exhausted()
                     && (err.is_transient() || pi::error::is_retryable_error(&err_str, None, None))
                     && snapshot_print_text_stream_state(text_stream_state).can_retry(is_json)
                 {
-                    retry_count += 1;
-                    let delay_ms = print_mode_retry_delay_ms(config, retry_count);
+                    let attempt = counters.advance(has_progress.has_progress());
+                    let delay_ms = counters.delay_ms(config);
                     if is_json {
                         emit_json_event(&AgentEvent::AutoRetryStart {
-                            attempt: retry_count,
+                            attempt,
                             max_attempts: max_retries,
                             delay_ms: u64::from(delay_ms),
                             error_message: err_str,
@@ -6989,14 +7002,18 @@ where
                     // any already-completed tool cycles from earlier in the turn
                     // are preserved rather than re-executed.
                     let _ = session.revert_incomplete_response().await;
+                    has_progress.clear();
                     current_result = session
-                        .run_continue_with_abort(Some(abort_signal.clone()), make_event_handler())
+                        .run_continue_with_abort(
+                            Some(abort_signal.clone()),
+                            make_event_handler_wrapped(),
+                        )
                         .await;
                 } else {
-                    if retry_count > 0 && is_json {
+                    if counters.has_retried() && is_json {
                         emit_json_event(&AgentEvent::AutoRetryEnd {
                             success: false,
-                            attempt: retry_count,
+                            attempt: counters.consecutive,
                             final_error: Some(err_str),
                         });
                     }
@@ -8067,7 +8084,8 @@ mod tests {
     }
 
     // ================================================================
-    // Retry helper tests
+    // Retry helper tests — now delegate to Config::retry_delay_ms (single
+    // source of truth per config.rs:655).
     // ================================================================
 
     #[test]
@@ -8081,7 +8099,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        assert_eq!(print_mode_retry_delay_ms(&config, 1), 2000);
+        assert_eq!(config.retry_delay_ms(1), 2000);
     }
 
     #[test]
@@ -8095,8 +8113,8 @@ mod tests {
             }),
             ..Config::default()
         };
-        assert_eq!(print_mode_retry_delay_ms(&config, 2), 2000);
-        assert_eq!(print_mode_retry_delay_ms(&config, 3), 4000);
+        assert_eq!(config.retry_delay_ms(2), 2000);
+        assert_eq!(config.retry_delay_ms(3), 4000);
     }
 
     #[test]
@@ -8110,7 +8128,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        let delay = print_mode_retry_delay_ms(&config, 5);
+        let delay = config.retry_delay_ms(5);
         assert!(delay <= 10_000, "delay {delay} should be capped at 10000");
     }
 
