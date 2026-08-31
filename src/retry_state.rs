@@ -163,16 +163,14 @@ impl RetryProgress {
 #[must_use]
 pub fn is_progress_event(event: &AgentEvent) -> bool {
     if let AgentEvent::MessageUpdate {
-        assistant_message_event,
+        assistant_message_event:
+            AssistantMessageEvent::TextDelta { delta, .. }
+            | AssistantMessageEvent::ThinkingDelta { delta, .. }
+            | AssistantMessageEvent::ToolCallDelta { delta, .. },
         ..
     } = event
     {
-        match assistant_message_event {
-            AssistantMessageEvent::TextDelta { delta, .. }
-            | AssistantMessageEvent::ThinkingDelta { delta, .. }
-            | AssistantMessageEvent::ToolCallDelta { delta, .. } => !delta.is_empty(),
-            _ => false,
-        }
+        !delta.is_empty()
     } else {
         false
     }
