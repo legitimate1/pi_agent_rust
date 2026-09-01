@@ -720,9 +720,10 @@ mod tests {
         reg.dir = Some(temp.clone());
         let entry = reg.register("scout", "task").expect("register");
         reg.settle(&entry.id, ChildStatus::Done);
-        assert!(entry.status.is_continuable());
-        assert!(entry.status.settled());
-        assert!(!entry.status.is_terminal());
+        let settled = reg.get(&entry.id).expect("get");
+        assert!(settled.status.is_continuable());
+        assert!(settled.status.settled());
+        assert!(!settled.status.is_terminal());
         // Hub entry remains addressable for continue.
         assert!(reg.is_continuable(&entry.id));
         assert!(reg.can_reuse(&entry.id));
