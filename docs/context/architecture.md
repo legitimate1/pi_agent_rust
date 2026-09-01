@@ -86,8 +86,8 @@ CLI --tools read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit,s
 - **`tools/` 模块目录** → ToolRegistry + 内置工具模块 + verify 内部验证引擎 + touched_files 触达追踪（Single Shell：`shell.rs` 为 Single Shell 统一入口，薄转发 `bash.rs`/`pwsh.rs` 内部实现；`bash`/`pwsh` 仅 `PI_ENABLE_LEGACY_SHELL` 时 gated 注册；全量 asupersync 运行时 Cx/checkpoint/Budget/spawn_blocking，无 tokio）
 - **`hub.rs`** → Hub 常驻服务：PTY 托管、滚动日志与环、就绪观测（log 正则与端口探测）、生命周期与 detached 持久化
 - **`jobs.rs`** → 后台任务注册表：后台 bash 任务、完成通知队列、会话作用域与 shutdown 清理
-- **`subagents.rs`** → 子代理工具：派生 pi 子进程、任务与模式分发、结构化输出校验与网络瞬断自动重试（is_retryable_error 判定 + Config.retry 指数退避 + checkpoint 取消，每次重试新建进程/worktree）
-- **`agent_hub.rs`** → 代理中心：子进程登记、对话记录分页、操控消息投递与转生
+- **`subagents.rs`** → 子代理工具：派生 pi 子进程、任务与模式分发、结构化输出校验与网络瞬断自动重试；可续命持久会话 — 不再 `--no-session`，改 `--session <global>/sessions/subagents/<hubId>.jsonl` 落盘，`hubId==sessionId==worktreeId` 三位一体，`continue + hubId` 增量重放
+- **`agent_hub.rs`** → 代理中心：子进程登记、对话记录分页、操控消息投递与转生；Done 可续但进程已回收 — `Done` 标记可续命，下次 `continue + hubId` 重启新进程重放 `<global>/sessions/subagents/<hubId>.jsonl`
 - **`tools/verify.rs`** → 编辑后轻量验证引擎：文件类型检测→检查器映射（.rs/.json/.toml/.ts/.js/.py/.go/.md）→进程内/外部进程执行，支持 Format+Lint 并行（oxfmt+oxlint/ruff），诊断直写 content 正文
 - **`tools/touched_files.rs`** → 文件触达追踪：三级快照（gix 0.77 status → git status --porcelain=v1 -z --find-renames → walk）+ 结构化写入与 shell 触达过滤 + TurnEnd 聚合（R>D>A>M，firstOldPath 重命名链）+ per-cwd asupersync::sync::Mutex 窗口锁 + capture_snapshot_async 经 asupersync::runtime::spawn_blocking 卸载阻塞
 - **`agent.rs`** → Agent 循环（工具迭代、扩展合并、ToolDef 构建）
@@ -102,7 +102,7 @@ CLI --tools read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit,s
 - **`provider_metadata.rs`** → Provider 元数据：别名、认证键、本地 provider（ollama/llamacpp/mistralrs/lmstudio）
 - **`auth.rs`** → 凭据管理：API Key / OAuth / AWS / Bearer，auth.json 文件锁
 - **`secrets.rs`** → 凭据脱敏保险库：凭据形状检测、外发占位与回补、审计与拦截模式
-- **`worktree_iso.rs`** → 工作区隔离：临时 worktree 创建、脏工作树物化、补丁收集与按模式合入（keep/apply/drop）
+- **`worktree_iso.rs`** → 工作区隔离：临时 worktree 创建、脏工作树物化、补丁收集与按模式合入；持久隔离 — `<global>/worktrees/subagents/<hubId>` 可复用，`persistent` 标记，`pi-iso-` 前缀外不被 reap 误回收
 - **`models.rs`** → 内置 + models.json 模型注册表
 - **`models.rs`** → 内置 + models.json 模型注册表
 - **`session.rs`** → JSONL 会话持久化（+ SQLite 后端）

@@ -59,7 +59,7 @@
 
 ## 子代理与后台任务
 
-- **子代理并行执行** — 派生独立子代理完成指定任务，支持结构化输出校验、网络瞬断自动重试与工作区隔离 | `src/subagents.rs` + `src/config.rs` + `src/error.rs` + `src/worktree_iso.rs`
+- **子代理并行执行** — 派生独立子代理完成指定任务，支持结构化输出校验、网络瞬断自动重试与工作区隔离；可续命 — Done 后通过 `hubId` + 新任务在同一会话与同一 Worktree 上增量继续 | `src/subagents.rs` + `src/agent_hub.rs` + `src/worktree_iso.rs`
 - **后台任务管理** — 后台执行命令并支持查询、等待与取消，完成通知在下一轮投递 | `src/jobs.rs`
 - **Hub 常驻服务** — 托管长驻进程与观察就绪条件，提供日志与生命周期管理 | `src/hub.rs`
 - **代理中心子进程登记** — 登记与管理子进程运行态、对话记录与消息投递 | `src/agent_hub.rs`
