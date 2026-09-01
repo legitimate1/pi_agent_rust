@@ -627,3 +627,16 @@
 **不选 B 的原因**：保留两处内联计数器（语义重复且修复需改两地，易二次漂移）；`total` 无上限或仅靠 `consecutive` 限流（进展抖动下无限重试）；`Aborted` 保持 `success:true`（与错误语义矛盾，客户端难以区分取消与成功）；无条件发射 `AutoRetryEnd`（未重试的中断被误展示为重试结束）；保留本地 `retry_delay_ms`（退避策略分散，Config 统一指数退避失效）。
 
 **何时重新考虑**：若重试策略需要区分 provider/错误类型的差异化退避，或进展定义扩展到工具结果等更多事件，可扩展 `is_progress_event` 与 `RetryCounters` 的策略参数化；若 `AutoRetryEnd` 需要区分“重试后中断”与“中断后重试”的更细事件，再评估事件拆分。
+
+---
+
+## D62: 可续命 subagent — hubId==sessionId==worktreeId + --session 重放
+
+**决策**：选可续命持久会话（subagent 持久化子代理会话到 `<global>/sessions/subagents/<hubId>.jsonl`，Worktree 持久化到 `<global>/worktrees/subagents/<hubId>`，`hubId==sessionId==worktreeId` 三位一体，Done 后 `continue + hubId` 重启新进程以 `--session` 重放，Worktree 通过 `reopen_or_isolate` 增量复用），不选 16KiB transcript 尾部拼文本的 revive。
+
+**理由**：revive 仅在新任务字符串内内联旧 transcript 后缀，丢失工具调用中间态与文件触达集合且截断历史；--session 重放保留完整 SessionEntry 链并复用同一隔离目录，满足追加一条 user 消息继续 run 的核心语义且实现可收敛为 D60 外进程重试的变体。
+
+**不选 B 的原因**：revive 丢失结构化历史、分支链与脏工作区状态，预算外截断且需新 worktree，重试与合并语义与 D60 外进程模型不一致；Done 后进程常驻的替代方案增加 Idle 状态机与泄漏风险，实现复杂度不收敛。
+
+**何时重新考虑**：若需要真常驻 Idle 进程池或跨主会话 PID 恢复，且能承担显式泄漏防护与取消同步，则可在持久会话之上叠加 resident 复用，需扩展 hub 状态机与回收策略。
+
