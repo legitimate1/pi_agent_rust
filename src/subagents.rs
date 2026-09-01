@@ -1335,16 +1335,138 @@ impl ChildRunner {
         // Workspace isolation (bd-cv653.5.2): `worktree` runs the child in
         // a git worktree carrying the parent's uncommitted state; the patch
         // is collected and applied per `iso_apply` at completion.
+        // C3 persistent reuse: `continue=true` reopens the same
+        // `<global_dir>/worktrees/subagents/<hubId>` so edits accumulate
+        // incrementally (`hubId == worktreeId`). Fresh runs are also
+        // persistent so a later `continue` can find the same worktree.
         let isolation = task
             .isolation
             .as_deref()
             .unwrap_or("none")
             .to_ascii_lowercase();
-        let iso_handle = if isolation == "worktree" {
-            match crate::worktree_iso::isolate(&cwd, &task.task) {
-                Ok(handle) => Some(handle),
-                Err(err) => {
-                    return SubagentResult::failed(agent, task, step, err.to_string());
+        let iso_requested = isolation == "worktree";
+
+        // C1 session wiring: pick the child session path before launching.
+        //
+        // - `continue=true` + valid `hubId` → reuse `<global>/sessions/subagents/<hubId>.jsonl`
+        // - otherwise (fresh subagent) → allocated by hub id once hub registration
+        //   succeeds; we provisionally build `args` with `None` and patch after.
+        let continue_session_path: Option<PathBuf> = if task.is_continuation() {
+            let hub_id_owned = task.hub_id.clone().unwrap_or_default().trim().to_string();
+            let hub_id = hub_id_owned.as_str();
+            let path = task
+                .hub_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && is_valid_hub_id(s))
+                .map(|hub_id| subagent_session_path(&self.global_dir, hub_id));
+            // Fail closed when the caller claims `continue` but the session
+            // file is absent — likely a stale hubId after `global_dir` was
+            // wiped or the parent PID recycled.
+            if let Some(ref p) = path
+                && !p.exists()
+            {
+                return SubagentResult::failed(
+                    agent,
+                    task,
+                    step,
+                    format!(
+                        "hubId '{}' has no session file at {}; run a fresh subagent first to create it.",
+                        hub_id,
+                        p.display()
+                    ),
+                );
+            }
+            path
+        } else {
+            None
+        };
+        if let Some(path) = continue_session_path.as_deref()
+            && let Some(parent) = path.parent()
+        {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Hub registration determines the canonical hubId for fresh runs.
+        // We do this BEFORE worktree creation so fresh runs can allocate a
+        // persistent worktree at `global_dir/worktrees/subagents/<hubId>`.
+        let hub_entry: Option<crate::agent_hub::ChildEntry> =
+            if let Some(ref _path) = continue_session_path {
+                let hub_id = task
+                    .hub_id
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .to_string();
+                crate::agent_hub::registry()
+                    .lock()
+                    .ok()
+                    .and_then(|r| r.get(&hub_id))
+                    .or_else(|| {
+                        let dir = crate::config::Config::global_dir()
+                            .join("agent-hub")
+                            .join(std::process::id().to_string());
+                        let _ = std::fs::create_dir_all(&dir);
+                        Some(crate::agent_hub::ChildEntry {
+                            id: hub_id.clone(),
+                            name: agent.name.clone(),
+                            kind: self.hub_kind,
+                            task: task.task.clone(),
+                            pid: None,
+                            status: crate::agent_hub::ChildStatus::Starting,
+                            started_ms: 0,
+                            finished_ms: None,
+                            output_bytes: 0,
+                            transcript_path: dir.join(format!("{hub_id}.transcript.jsonl")),
+                            steer_path: dir.join(format!("{hub_id}.steer")),
+                            revived_from: None,
+                        })
+                    })
+            } else {
+                crate::agent_hub::registry()
+                    .lock()
+                    .ok()
+                    .and_then(|mut reg| {
+                        reg.register_kind(&agent.name, &task.task, self.hub_kind)
+                            .ok()
+                    })
+            };
+
+        // Determine the final session path (canonical hubId for fresh).
+        let mut final_session_path: Option<PathBuf> = continue_session_path.clone();
+        if final_session_path.is_none()
+            && let Some(entry) = hub_entry.as_ref()
+        {
+            let canonical = subagent_session_path(&self.global_dir, &entry.id);
+            let _ = std::fs::create_dir_all(canonical.parent().unwrap_or(Path::new(".")));
+            final_session_path = Some(canonical);
+        }
+
+        // Now create or reopen the worktree using the canonical hubId.
+        let iso_handle: Option<crate::worktree_iso::IsoHandle> = if iso_requested {
+            let hub_id = hub_entry.as_ref().map(|e| e.id.as_str()).or_else(|| {
+                task.hub_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && is_valid_hub_id(s))
+            });
+            if let Some(hub_id) = hub_id {
+                match crate::worktree_iso::reopen_or_isolate(
+                    &self.global_dir,
+                    &cwd,
+                    hub_id,
+                    &task.task,
+                ) {
+                    Ok(handle) => Some(handle),
+                    Err(err) => {
+                        return SubagentResult::failed(agent, task, step, err.to_string());
+                    }
+                }
+            } else {
+                match crate::worktree_iso::isolate(&cwd, &task.task) {
+                    Ok(handle) => Some(handle),
+                    Err(err) => {
+                        return SubagentResult::failed(agent, task, step, err.to_string());
+                    }
                 }
             }
         } else {
@@ -1355,35 +1477,14 @@ impl ChildRunner {
             .map_or_else(|| cwd.clone(), |handle| handle.path.clone());
         let iso_apply = task.iso_apply.clone();
 
-        // C1 session wiring: pick the child session path before launching.
-        //
-        // - `continue=true` + valid `hubId` → reuse `<global>/sessions/subagents/<hubId>.jsonl`
-        //   (validated earlier that the file already exists; we just re-derive here).
-        // - otherwise (fresh subagent) → allocated by hub id once hub registration
-        //   succeeds; we provisionally build `args` with `None` and patch after.
-        let continue_session_path: Option<PathBuf> = if task.is_continuation() {
-            task.hub_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && is_valid_hub_id(s))
-                .map(|hub_id| subagent_session_path(&self.global_dir, hub_id))
-        } else {
-            None
-        };
-        let initial_args = child_args(
+        let mut args = child_args(
             agent,
             &task.task,
             self.role_model_spec.as_deref(),
             output_schema,
-            continue_session_path.as_deref(),
+            final_session_path.as_deref(),
         );
-        if let Some(path) = continue_session_path.as_deref()
-            && let Some(parent) = path.parent()
-        {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let mut args = initial_args;
-        let mut pending_continue_session = continue_session_path.clone();
+        let mut pending_continue_session = final_session_path.clone();
         let mut result = SubagentResult::starting(
             agent,
             task.clone(),
@@ -1392,61 +1493,13 @@ impl ChildRunner {
             &run_cwd,
             &args,
         );
-        // Agent-hub registration (bd-cv653.5.3): every spawned child joins the
-        // session roster. Bookkeeping failure must never fail the run.
-        // For continuations, `pending_continue_session` already holds the
-        // reused hub id's session path. For fresh runs, we allocate a
-        // persistent session path once the hub id is known.
-        let hub_entry = if pending_continue_session.is_some() {
-            // Reuse: resolve hub entry by hubId so we don't mint a new id.
-            let hub_id = task
-                .hub_id
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("")
-                .to_string();
-            crate::agent_hub::registry()
-                .lock()
-                .ok()
-                .and_then(|r| r.get(&hub_id))
-                .or_else(|| {
-                    let dir = crate::config::Config::global_dir()
-                        .join("agent-hub")
-                        .join(std::process::id().to_string());
-                    let _ = std::fs::create_dir_all(&dir);
-                    Some(crate::agent_hub::ChildEntry {
-                        id: hub_id.clone(),
-                        name: agent.name.clone(),
-                        kind: self.hub_kind,
-                        task: result.task.clone(),
-                        pid: None,
-                        status: crate::agent_hub::ChildStatus::Starting,
-                        started_ms: 0,
-                        finished_ms: None,
-                        output_bytes: 0,
-                        transcript_path: dir.join(format!("{hub_id}.transcript.jsonl")),
-                        steer_path: dir.join(format!("{hub_id}.steer")),
-                        revived_from: None,
-                    })
-                })
-        } else {
-            crate::agent_hub::registry()
-                .lock()
-                .ok()
-                .and_then(|mut reg| {
-                    reg.register_kind(&agent.name, &result.task, self.hub_kind)
-                        .ok()
-                })
-        };
+        // Agent-hub registration already done above — wire result fields.
         if let Some(entry) = hub_entry.as_ref() {
             result.hub_id = Some(entry.id.clone());
-            if pending_continue_session.is_some() {
-                result.session_isolation = "persistent_session";
-            } else {
-                // Fresh: the hub id is the session id — ensure a persistent
-                // session file path exists and wire `--session` before spawn.
+            result.session_isolation = "persistent_session";
+            // Ensure args use the canonical session path (fresh case).
+            if continue_session_path.is_none() {
                 let canonical = subagent_session_path(&self.global_dir, &entry.id);
-                let _ = std::fs::create_dir_all(canonical.parent().unwrap_or(Path::new(".")));
                 let new_args = child_args(
                     agent,
                     &task.task,
@@ -1455,7 +1508,6 @@ impl ChildRunner {
                     Some(&canonical),
                 );
                 args = new_args;
-                result.session_isolation = "persistent_session";
                 pending_continue_session = Some(canonical);
             }
         } else {
