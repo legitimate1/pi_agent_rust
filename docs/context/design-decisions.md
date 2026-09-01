@@ -616,3 +616,14 @@
 
 **何时重新考虑**：若 subagent 改为基于 AgentSession 或统一瞬断错误分类为结构化信号，再评估收敛为共用重试器。
 
+---
+
+## D61: 重试双计数器与公共模块抽取 — consecutive 进展重置 + total 上限 + Aborted 统一 + retry_state（2026-08-30）
+
+**决策**：抽取 `src/retry_state.rs` 公共模块统一 `rpc::run_prompt_with_retry` 与 `main::run_print_prompt_with_retry` 的重试簿记；`RetryCounters{consecutive,total,max_retries,max_total}` 双计数器语义——`consecutive` 在检测到有效流式进展（`AgentEvent::MessageUpdate` 中 `TextDelta|ThinkingDelta|ToolCallDelta` 的 `delta` 非空）时先重置为 0 再递增，`total` 单调递增并以 `max_total = max_retries.saturating_mul(3).max(max_retries)` 封顶防无限循环；`RetryProgress(Arc<AtomicBool>)` + `is_progress_event` 集中非空 delta 判定，退避统一走 `Config::retry_delay_ms(consecutive)` 并删除两处本地 `retry_delay_ms` 函数；统一 Aborted 契约——`rpc.rs` 与 `main.rs` 的 `Aborted` 路径均改为 `success:false + final_error=Some("Aborted")`，仅当 `has_retried()` 为真才发射 `AutoRetryEnd`，未重试的直接中断不再误发重试结束事件。关联 commit `1e4cb8e`/`52c0664`/`8c455e4`/`761eaef`（`my-check 33399254118`），D60 相关。
+
+**理由**：此前 `consecutive` 在有进展时未重置，导致有效输出后仍被累计到 max 而过早耗尽；`total` 无上限时若进展反复重置 `consecutive` 可能无限循环；两处重试环各写一套 `retry_delay_ms` 与 `has_progress` 探针，语义漂移；`Aborted` 在 rpc/print 两路径 `success` 不一致且无条件发 `AutoRetryEnd` 误导前端横幅。
+
+**不选 B 的原因**：保留两处内联计数器（语义重复且修复需改两地，易二次漂移）；`total` 无上限或仅靠 `consecutive` 限流（进展抖动下无限重试）；`Aborted` 保持 `success:true`（与错误语义矛盾，客户端难以区分取消与成功）；无条件发射 `AutoRetryEnd`（未重试的中断被误展示为重试结束）；保留本地 `retry_delay_ms`（退避策略分散，Config 统一指数退避失效）。
+
+**何时重新考虑**：若重试策略需要区分 provider/错误类型的差异化退避，或进展定义扩展到工具结果等更多事件，可扩展 `is_progress_event` 与 `RetryCounters` 的策略参数化；若 `AutoRetryEnd` 需要区分“重试后中断”与“中断后重试”的更细事件，再评估事件拆分。

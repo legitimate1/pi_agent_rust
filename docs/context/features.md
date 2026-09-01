@@ -35,7 +35,7 @@
 - **认证与凭据管理** — API Key / OAuth（PKCE+刷新）/ AWS 凭据链 / Service Key / Bearer Token，支持环境变量与命令动态解析 | `src/auth.rs`
 - **Provider 运行时热切换** — 跨 provider 切换模型无需重启进程 | `src/agent.rs` + `src/providers/mod.rs`
 - **OpenAI 兼容网关方言识别** — 按网关声明识别 DeepSeek 思考参数方言并正确发送 | `src/provider_metadata.rs` + `src/providers/openai.rs`
-- **流式截断自动重试** — 上游 SSE 中途截断分类为瞬时错误自动重试，语法错误不重试 | `src/providers/openai.rs` + `src/rpc.rs`
+- **流式截断自动重试** — 上游 SSE 中途截断分类为瞬时错误自动重试，语法错误不重试；双计数器 `consecutive`（非空 `TextDelta|ThinkingDelta|ToolCallDelta` 时重置）/`total`（`max*3` 封顶防无限循环）+ `is_progress_event` 统一进展判定 + `Config::retry_delay_ms` 退避，`Aborted` 统一 `success:false` 且仅 `has_retried()` 发 `AutoRetryEnd` | `src/providers/openai.rs` + `src/rpc.rs` + `src/main.rs` + `src/retry_state.rs` + `src/config.rs`（D61）
 
 ## 工具系统
 
