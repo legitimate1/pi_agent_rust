@@ -86,6 +86,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "theme"
         | "theme-path"
         | "max-tool-iterations"
+        | "allowed-skills"
         | "export" => (true, false),
         "list-models" => (true, true),
         _ => return None,
@@ -457,6 +458,12 @@ pub struct Cli {
     /// Disable skill discovery
     #[arg(long)]
     pub no_skills: bool,
+
+    /// Allow only these skills in the prompt (comma-separated).
+    /// Used by subagent parent to enforce `allowed-skills` per agent definition.
+    /// `None` = full visibility. Empty treated as no filter.
+    #[arg(long, value_delimiter = ',')]
+    pub allowed_skills: Option<Vec<String>>,
 
     // === Prompt Templates ===
     /// Load prompt template file/directory (can use multiple times)

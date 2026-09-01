@@ -882,6 +882,7 @@ struct AgentDefinition {
     reasoning: Option<String>,
     tools: Option<Vec<String>>,
     skills: Vec<PathBuf>,
+    allowed_skills: Option<Vec<String>>,
     system_prompt: String,
     /// Default JSON Schema for the child's final output, from the definition's
     /// single-line `output_schema:` frontmatter field (bd-cv653.5.1). A task's
@@ -899,6 +900,7 @@ fn tan_agent_definition() -> AgentDefinition {
         reasoning: None,
         tools: None,
         skills: Vec::new(),
+        allowed_skills: None,
         system_prompt: TAN_SYSTEM_PROMPT.to_string(),
         output_schema: None,
         source: AgentSource::BuiltIn,
@@ -990,6 +992,7 @@ fn load_agent_dir(
                     .collect()
             })
             .unwrap_or_default();
+        let allowed_skills = parse_allowed_skills(&frontmatter);
         let output_schema = frontmatter
             .get("output_schema")
             .map(|raw| {
@@ -1016,6 +1019,7 @@ fn load_agent_dir(
                     .cloned(),
                 tools,
                 skills,
+                allowed_skills,
                 system_prompt: body,
                 output_schema,
                 source,
@@ -1055,6 +1059,21 @@ fn split_csv(value: &str) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn parse_allowed_skills(frontmatter: &BTreeMap<String, String>) -> Option<Vec<String>> {
+    let raw = frontmatter
+        .get("allowed-skills")
+        .or_else(|| frontmatter.get("allowed_skills"))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let items = split_csv(trimmed)
+        .into_iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if items.is_empty() { None } else { Some(items) }
 }
 
 fn parse_frontmatter(raw: &str) -> (BTreeMap<String, String>, String) {
@@ -1477,12 +1496,20 @@ impl ChildRunner {
             .map_or_else(|| cwd.clone(), |handle| handle.path.clone());
         let iso_apply = task.iso_apply.clone();
 
-        let mut args = child_args(
+        // Compute effective allowed-skills once (for both CLI + env propagation).
+        let inherited_allowed = allowed_skills_env();
+        let effective_allowed = effective_allowed_skills(
+            inherited_allowed.as_deref(),
+            agent.allowed_skills.as_deref(),
+        );
+
+        let mut args = child_args_inner(
             agent,
             &task.task,
             self.role_model_spec.as_deref(),
             output_schema,
             final_session_path.as_deref(),
+            inherited_allowed.as_deref(),
         );
         let mut pending_continue_session = final_session_path.clone();
         let mut result = SubagentResult::starting(
@@ -1500,12 +1527,13 @@ impl ChildRunner {
             // Ensure args use the canonical session path (fresh case).
             if continue_session_path.is_none() {
                 let canonical = subagent_session_path(&self.global_dir, &entry.id);
-                let new_args = child_args(
+                let new_args = child_args_inner(
                     agent,
                     &task.task,
                     self.role_model_spec.as_deref(),
                     output_schema,
                     Some(&canonical),
+                    inherited_allowed.as_deref(),
                 );
                 args = new_args;
                 pending_continue_session = Some(canonical);
@@ -1528,6 +1556,11 @@ impl ChildRunner {
             .env("PI_CODING_AGENT_DIR", &self.global_dir)
             .env("PI_SUBAGENT_PARENT_PID", std::process::id().to_string())
             .env("PI_SUBAGENT_DEPTH", child_depth().to_string());
+        if let Some(ref allowed) = effective_allowed {
+            command.env("PI_SUBAGENT_ALLOWED_SKILLS", allowed.join(","));
+        } else if let Some(ref inherited) = inherited_allowed {
+            command.env("PI_SUBAGENT_ALLOWED_SKILLS", inherited.join(","));
+        }
         // Hub steering channel (bd-cv653.5.3): the child drains this file
         // between turns via its print-mode steering fetcher.
         if let Some(entry) = hub_entry.as_ref() {
@@ -1765,6 +1798,61 @@ fn child_args(
     output_schema: Option<&Value>,
     session_path: Option<&Path>,
 ) -> Vec<OsString> {
+    child_args_inner(
+        agent,
+        task,
+        role_model_spec,
+        output_schema,
+        session_path,
+        allowed_skills_env().as_deref(),
+    )
+}
+
+fn allowed_skills_env() -> Option<Vec<String>> {
+    match std::env::var("PI_SUBAGENT_ALLOWED_SKILLS") {
+        Ok(raw) => {
+            let items: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            Some(items)
+        }
+        Err(_) => None,
+    }
+}
+
+fn effective_allowed_skills(
+    inherited: Option<&[String]>,
+    agent_allowed: Option<&[String]>,
+) -> Option<Vec<String>> {
+    match (inherited, agent_allowed) {
+        (None, None) => None,
+        (Some(env), None) => Some(env.to_vec()),
+        (None, Some(agent)) => Some(agent.to_vec()),
+        (Some(env), Some(agent)) => {
+            let agent_set: std::collections::HashSet<&str> =
+                agent.iter().map(|s| s.as_str()).collect();
+            let mut inter = Vec::new();
+            for name in env {
+                if agent_set.contains(name.as_str()) && !inter.contains(name) {
+                    inter.push(name.clone());
+                }
+            }
+            Some(inter)
+        }
+    }
+}
+
+fn child_args_inner(
+    agent: &AgentDefinition,
+    task: &str,
+    role_model_spec: Option<&str>,
+    output_schema: Option<&Value>,
+    session_path: Option<&Path>,
+    inherited: Option<&[String]>,
+) -> Vec<OsString> {
+    let effective_allowed = effective_allowed_skills(inherited, agent.allowed_skills.as_deref());
     let mut args = vec!["--mode".into(), "json".into(), "--print".into()];
     // C1a: persistent subagent sessions. `Some(path)` → `--session <path>`
     // so the child replays the same JSONL and the next user message is
@@ -1795,6 +1883,17 @@ fn child_args(
     }
     for skill in &agent.skills {
         args.extend(["--skill".into(), skill.clone().into_os_string()]);
+    }
+    // Child only emits --allowed-skills when the effective whitelist is
+    // non-empty. An empty INTERSECTION means exhaustive narrowing (no skills
+    // visible) so we emit `--allowed-skills ""` to let the child's prompt
+    // stage render an empty `<available_skills>` block.
+    if let Some(ref allowed) = effective_allowed {
+        args.extend(["--allowed-skills".into(), allowed.join(",").into()]);
+    } else if inherited.is_some() {
+        // Inherited but no agent narrowing: keep child's current allowlist via
+        // env propagation (no extra CLI flag needed). The Env path below still
+        // forwards PI_SUBAGENT_ALLOWED_SKILLS so grandchildren stay bounded.
     }
     // The schema directive rides the same appended system prompt as the
     // definition body (bd-cv653.5.1): one --append-system-prompt carrying
@@ -2372,6 +2471,7 @@ mod tests {
             reasoning: None,
             tools: None,
             skills: Vec::new(),
+            allowed_skills: None,
             system_prompt: String::new(),
             output_schema: None,
             source: AgentSource::User,
@@ -2427,6 +2527,7 @@ mod tests {
             reasoning: Some("high".to_string()),
             tools: Some(vec!["read".to_string(), "grep".to_string()]),
             skills: vec![PathBuf::from("/tmp/skill.md")],
+            allowed_skills: None,
             system_prompt: "be precise".to_string(),
             output_schema: None,
             source: AgentSource::User,

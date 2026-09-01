@@ -609,6 +609,10 @@ impl ResourceLoader {
         format_skills_for_prompt(&self.skills)
     }
 
+    pub fn format_skills_for_prompt_with_allowed(&self, allowed: Option<&[String]>) -> String {
+        format_skills_for_prompt_with_allowed(&self.skills, allowed)
+    }
+
     pub fn list_commands(&self) -> Vec<Value> {
         let mut commands = Vec::new();
 
@@ -1276,9 +1280,27 @@ where
 }
 
 pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
+    format_skills_for_prompt_with_allowed(skills, None)
+}
+
+pub fn format_skills_for_prompt_with_allowed(
+    skills: &[Skill],
+    allowed: Option<&[String]>,
+) -> String {
+    let allowed_lower: Option<std::collections::HashSet<String>> = allowed.map(|list| {
+        list.iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
     let visible: Vec<&Skill> = skills
         .iter()
         .filter(|s| !s.disable_model_invocation)
+        .filter(|s| {
+            allowed_lower
+                .as_ref()
+                .is_none_or(|set| set.contains(&s.name.to_ascii_lowercase()))
+        })
         .collect();
     if visible.is_empty() {
         return String::new();
