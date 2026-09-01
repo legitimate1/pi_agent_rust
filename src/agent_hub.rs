@@ -1,8 +1,19 @@
-//! Agent hub registry (bd-cv653.5.3): a session-scoped roster of spawned
-//! subagent children with transcript persistence, steering delivery, kill,
-//! revive, and a minimal peer-messaging bus.
+//! Agent hub registry (bd-cv653.5.3, C2 continuable): a session-scoped
+//! roster of spawned subagent children with transcript persistence, steering
+//! delivery, kill, revive (deprecated → `continue`), and a minimal
+//! peer-messaging bus.
 //!
-//! Children are separate `pi` processes (`--mode json --print --no-session`),
+//! Continuable subagents (C1/C2): `hubId == sessionId == worktreeId`. A child
+//! session is persisted at `<global_dir>/sessions/subagents/<hubId>.jsonl` and
+//! is resumed by re-launching the child with `--session <path>`. Hub entries
+//! that reach [`ChildStatus::Done`] are **continuable**: the process has exited
+//! but its Session+Worktree are retained, so a later
+//! `subagent(continue=true, hubId, task)` can start a new process reusing the
+//! same `hubId`. Only [`ChildStatus::Failed`]/[`ChildStatus::Cancelled`]/
+//! [`ChildStatus::Killed`] are terminal and not continuable. `revive` is kept
+//! for compatibility but is deprecated in favour of `continue`.
+//!
+//! Children are separate `pi` processes (`--mode json --print --session …`),
 //! so cross-process steering is delivered through an append-only queue file
 //! per child (`<id>.steer`); the child's print-mode loop drains that file
 //! through a steering [`crate::agent::MessageFetcher`] between turns. The
@@ -11,6 +22,8 @@
 //!
 //! NTM layer distinction: this hub manages pi's OWN spawned children in this
 //! process. It does not rebuild ntm's cross-tmux fleet orchestration.
+//! This crate does NOT implement a resident Idle process pool — `Done` means
+//! the process is gone but the hub entry remains addressable for `continue`.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, OpenOptions};
@@ -28,6 +41,20 @@ const TRANSCRIPT_PAGE_BYTES: usize = 32 * 1024;
 const REVIVE_TRANSCRIPT_BUDGET: usize = 16 * 1024;
 /// Maximum queued steering messages retained per child in memory.
 const MAX_QUEUE_PER_CHILD: usize = 64;
+
+/// Hub session file layout: `<global_dir>/sessions/subagents/<hubId>.jsonl`.
+///
+/// `hubId == sessionId == worktreeId` — the registry id, session file id
+/// and worktree dir name are the same value so `continue` can reopen both.
+/// Mirrors `subagents::subagent_session_path`; Hub only stores `hubId` and
+/// derives the path on demand rather than persisting it per entry.
+#[must_use]
+pub fn session_path_for_hub(global_dir: &Path, hub_id: &str) -> PathBuf {
+    global_dir
+        .join("sessions")
+        .join("subagents")
+        .join(format!("{hub_id}.jsonl"))
+}
 
 /// Lifecycle states for a registered child run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +105,11 @@ impl ChildStatus {
     }
 
     /// Terminal states: the child process has exited or been reaped.
+    ///
+    /// Includes [`Self::Done`] which remains **continuable** via
+    /// `hubId` reuse (`hubId == sessionId == worktreeId`). Use
+    /// [`Self::is_terminal`] to test for non-continuable terminal states,
+    /// or [`Self::is_continuable`] to test for `Done`.
     #[must_use]
     pub const fn settled(self) -> bool {
         matches!(
@@ -85,13 +117,41 @@ impl ChildStatus {
             Self::Done | Self::Failed | Self::Cancelled | Self::Killed
         )
     }
+
+    /// Whether this status is terminal and **not** continuable.
+    ///
+    /// `Failed`/`Cancelled`/`Killed` are terminal; `Done` is settled
+    /// but continuable (session+worktree retained for `continue=true`).
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Failed | Self::Cancelled | Self::Killed)
+    }
+
+    /// Whether a `Done` entry can be resumed via `continue=true`.
+    ///
+    /// Only `Done` is continuable — the child process has exited but its
+    /// persistent Session (`<global_dir>/sessions/subagents/<hubId>.jsonl`)
+    /// and Worktree are retained so a new process can replay the session.
+    /// All other states return `false`.
+    #[must_use]
+    pub const fn is_continuable(self) -> bool {
+        matches!(self, Self::Done)
+    }
 }
 
 /// One registered child run.
+///
+/// `id` is the hub run id and, for continuable subagents (C1/C2),
+/// `hubId == sessionId == worktreeId` — i.e. `id` doubles as the
+/// persistent session file name (`<global_dir>/sessions/subagents/<id>.jsonl`)
+/// and worktree dir name. The hub entry remains addressable after
+/// [`ChildStatus::Done`] so a later `subagent(continue=true, hubId, task)`
+/// can start a new process replaying the same session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChildEntry {
     /// Unique run id: `<agent>-<seq>` (seq is per-registry monotonic).
+    /// For continuable subagents this is also `hubId == sessionId`.
     pub id: String,
     /// Agent definition name (e.g. `scout`).
     pub name: String,
@@ -113,6 +173,27 @@ pub struct ChildEntry {
     /// When revived, the id of the run this one continues.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revived_from: Option<String>,
+}
+
+impl ChildEntry {
+    /// Persistent session path for this entry's `hubId`.
+    ///
+    /// Derives `<global_dir>/sessions/subagents/<hubId>.jsonl` — the same
+    /// layout as `subagents::subagent_session_path`. The Hub stores only
+    /// `id` (`hubId`); the file itself is created/managed by `subagents.rs`.
+    #[must_use]
+    pub fn session_path(&self, global_dir: &Path) -> PathBuf {
+        session_path_for_hub(global_dir, &self.id)
+    }
+
+    /// Whether this entry is in a continuable state (`Done`).
+    ///
+    /// The process has exited but its session+worktree are retained, so
+    /// `subagent(continue=true, hubId=self.id, task=…)` can resume it.
+    #[must_use]
+    pub fn is_continuable(&self) -> bool {
+        self.status.is_continuable()
+    }
 }
 
 /// A peer bus message (child→child, or operator→child) in delivery order.
@@ -276,12 +357,25 @@ impl AgentHubRegistry {
 
     /// Queue a steering message for a running child: in-memory record +
     /// append to the child's steer file (the cross-process channel).
+    ///
+    /// `Done` entries are settled but **continuable** — the child process has
+    /// exited yet its session+worktree are retained. Steering cannot be
+    /// delivered to a dead process, so `Done` still returns an error, but the
+    /// message guides the caller to `subagent(continue=true, hubId, task)` which
+    /// replays the persistent session (`--session <global_dir>/sessions/subagents/<hubId>.jsonl`).
     pub fn steer(&mut self, id: &str, from: &str, body: &str) -> Result<BusMessage> {
         let entry = self
             .entries
             .get(id)
             .ok_or_else(|| Error::validation(format!("hub: unknown child '{id}'")))?
             .clone();
+        if entry.status.is_continuable() {
+            return Err(Error::validation(format!(
+                "hub: cannot steer '{}' — status done (process exited but session retained); \
+                 use subagent(continue=true, hubId=\"{}\", task=…) to resume in the same session/worktree",
+                id, id
+            )));
+        }
         if entry.status.settled() {
             return Err(Error::validation(format!(
                 "hub: cannot steer '{}' — status {}",
@@ -306,6 +400,30 @@ impl AgentHubRegistry {
             .get(id)
             .map(|q| q.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Whether the child can be continued via `subagent(continue=true, hubId, task)`.
+    ///
+    /// Returns `true` iff the hub entry exists and is in `Done` state — the
+    /// process has exited but its persistent session/worktree are retained
+    /// (`hubId == sessionId == worktreeId`). `Failed`/`Cancelled`/`Killed` are
+    /// terminal and not continuable; a missing entry is also not continuable.
+    #[must_use]
+    pub fn is_continuable(&self, id: &str) -> bool {
+        self.entries
+            .get(id)
+            .is_some_and(|entry| entry.status.is_continuable())
+    }
+
+    /// Alias for [`Self::is_continuable`] — whether `hubId` can be reused for `continue`.
+    ///
+    /// `subagents.rs` may call this to validate a `continue=true` request before
+    /// checking session-file existence (`sessions/subagents/<hubId>.jsonl`). The
+    /// canonical existence check is the session file itself; this registry check
+    /// is an in-memory fast path within the same parent process.
+    #[must_use]
+    pub fn can_reuse(&self, hub_id: &str) -> bool {
+        self.is_continuable(hub_id)
     }
 
     fn enqueue_bus(&mut self, to: &str, from: &str, body: &str) -> BusMessage {
@@ -333,6 +451,16 @@ impl AgentHubRegistry {
     /// Register a revived run continuing `from_id`: fresh entry carrying the
     /// prior transcript as context. Returns the new entry plus the task text
     /// to launch (original task + transcript tail + continue directive).
+    ///
+    /// Deprecated: `revive` reconstructed continuation by inlining a 16 KiB
+    /// transcript tail into a new task prompt with a new `hubId`/worktree. The
+    /// continuable subagent path (`subagent(continue=true, hubId, task)`) reuses
+    /// `hubId == sessionId == worktreeId` and replays the persistent session
+    /// (`--session <global_dir>/sessions/subagents/<hubId>.jsonl`) instead. New
+    /// code should use `continue`; this method is retained for compatibility.
+    #[deprecated(
+        note = "use subagent(continue=true, hubId, task) — revived via session replay, not transcript tail"
+    )]
     pub fn revive(&mut self, from_id: &str) -> Result<(ChildEntry, String)> {
         let prior = self
             .entries
@@ -563,6 +691,7 @@ mod tests {
             "{\"type\":\"message_end\",\"text\":\"half-done\"}",
         );
         reg.settle(&entry.id, ChildStatus::Failed);
+        #[allow(deprecated)]
         let (revived, task) = reg.revive(&entry.id).expect("revive");
         assert_eq!(revived.revived_from.as_deref(), Some(entry.id.as_str()));
         assert!(task.contains("original task"));
@@ -578,8 +707,42 @@ mod tests {
         reg.dir = Some(temp.clone());
         let entry = reg.register("scout", "task").expect("register");
         reg.mark_running(&entry.id, 9);
+        #[allow(deprecated)]
         let err = reg.revive(&entry.id).unwrap_err();
         assert!(err.to_string().contains("still running"));
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn done_is_continuable_and_steer_guides_to_continue() {
+        let mut reg = fresh_registry();
+        let temp = std::env::temp_dir().join(format!("pi-agent-hub-test7-{}", std::process::id()));
+        reg.dir = Some(temp.clone());
+        let entry = reg.register("scout", "task").expect("register");
+        reg.settle(&entry.id, ChildStatus::Done);
+        assert!(entry.status.is_continuable());
+        assert!(entry.status.settled());
+        assert!(!entry.status.is_terminal());
+        // Hub entry remains addressable for continue.
+        assert!(reg.is_continuable(&entry.id));
+        assert!(reg.can_reuse(&entry.id));
+        assert!(reg.get(&entry.id).expect("get").is_continuable());
+        // File layout helper mirrors subagents.rs.
+        let global = PathBuf::from("/tmp/pi-global");
+        assert_eq!(
+            reg.get(&entry.id).expect("get").session_path(&global),
+            session_path_for_hub(&global, &entry.id)
+        );
+        // Steering a Done entry must fail with guidance toward continue.
+        let err = reg.steer(&entry.id, "parent", "hello").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cannot steer"), "{msg}");
+        assert!(msg.contains("continue=true"), "{msg}");
+        assert!(msg.contains(&entry.id), "{msg}");
+        // Terminal states are not continuable.
+        reg.settle(&entry.id, ChildStatus::Failed);
+        assert!(!reg.is_continuable(&entry.id));
+        assert!(!reg.can_reuse(&entry.id));
         let _ = fs::remove_dir_all(&temp);
     }
 }
