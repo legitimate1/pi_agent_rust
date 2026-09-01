@@ -1,23 +1,37 @@
-//! Workspace isolation for subagents (bd-cv653.5.2).
+//! Workspace isolation for subagents (bd-cv653.5.2, C3 continuable).
 //!
-//! `worktree` mode: `git worktree add` a temp branch at HEAD into
-//! `<tmp>/pi-iso-<id>`; the child runs there; on completion the parent
-//! gets {worktree_path, diff_stat, patch} and applies per mode:
-//! `keep` (leave for the user), `apply` (git apply into the parent tree,
-//! serialized process-wide so sibling patches land in task order), `drop`
-//! (remove after reporting the patch). A failing apply reports the
-//! conflicting files and leaves the worktree — never force.
+//! Two flavours:
+//!
+//! * **ephemeral** (`isolate`) — `git worktree add` a temp branch at HEAD into
+//!   `<tmp>/pi-iso-<id>`; the child runs there; on completion the parent
+//!   collects `{worktree_path, diff_stat, patch}` and applies per
+//!   `keep`/`apply`/`drop`. Temporary worktrees are always cleaned up
+//!   (`drop_worktree` or reaped via `reap_stale`).
+//!
+//! * **persistent** (`worktree_path_for_hub` / `reopen_or_isolate`) —
+//!   `hubId == sessionId == worktreeId`. The worktree lives at
+//!   `<global_dir>/worktrees/subagents/<hubId>` and is **reused** across
+//!   `subagent(continue=true, hubId, task)` turns: the first turn creates it
+//!   (materialising the parent's dirty tree once and committing a baseline),
+//!   later turns reopen the same directory so edits accumulate incrementally.
+//!   A persistent worktree is **never** auto-removed on `collect_diff`/`Drop`;
+//!   only an explicit `cleanup_persistent_worktree` (or `drop_worktree` with a
+//!   persistent handle) removes it. This matches the `Done` continuable
+//!   contract: the child process exits but Session+Worktree are retained.
 //!
 //! Dirty-tree strategy (round-7 correctness): `git worktree add` starts
 //! from HEAD, so uncommitted parent changes would be invisible to isolated
-//! children. `isolate` materializes the working-tree state into the copy:
-//! a tracked-diff patch (`git diff HEAD`) applied into the worktree plus
-//! an untracked-file copy list. CoW backends (APFS clonefile, btrfs
-//! reflink, overlayfs) are the documented full-fidelity path when they
+//! children. `isolate`/`isolate_persistent` materializes the working-tree state
+//! into the copy: a tracked-diff patch (`git diff HEAD`) applied into the
+//! worktree plus an untracked-file copy list. CoW backends (APFS clonefile,
+//! btrfs reflink, overlayfs) are the documented full-fidelity path when they
 //! land — same interface.
 //!
 //! Cleanup: only `pi-iso-` prefix-tagged worktrees are ever reaped;
-//! foreign worktrees are untouchable.
+//! foreign worktrees are untouchable. Persistent worktrees live under
+//! `global_dir/worktrees/subagents/<hubId>` whose basename is the hubId
+//! (no prefix), so the stale reaper naturally skips them — they are managed
+//! by explicit `cleanup_persistent_worktree`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -75,6 +89,11 @@ pub struct IsoHandle {
     /// Commit recording the materialized parent state (HEAD + dirty
     /// materialization). The child's own work is the diff from here.
     pub baseline: String,
+    /// Whether this worktree is the persistent hubId worktree
+    /// (`<global_dir>/worktrees/subagents/<hubId>`). Persistent worktrees are
+    /// reused across `continue` turns and are never auto-removed — only an
+    /// explicit `cleanup_persistent_worktree`/`drop_worktree` deletes them.
+    pub persistent: bool,
 }
 
 /// The outcome of an isolated run.
@@ -137,8 +156,342 @@ fn sanitize_id(task_id: &str) -> String {
     }
 }
 
+/// Validate a hub/session id for filesystem safety.
+///
+/// Mirrors `subagents::is_valid_hub_id` / `agent_hub::is_valid_hub_id` — keeps
+/// the three `hubId == sessionId == worktreeId` derivations in sync.
+fn is_valid_hub_id(hub_id: &str) -> bool {
+    let trimmed = hub_id.trim();
+    !trimmed.is_empty()
+        && !trimmed.contains('/')
+        && !trimmed.contains('\\')
+        && !trimmed.contains('\0')
+        && trimmed != "."
+        && trimmed != ".."
+}
+
+fn validate_hub_id(hub_id: &str) -> Result<()> {
+    if !is_valid_hub_id(hub_id) {
+        return Err(Error::tool(
+            "subagent",
+            format!("Invalid hubId: {hub_id:?}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Derive the persistent worktree directory for a hub.
+///
+/// Layout: `<global_dir>/worktrees/subagents/<hubId>` — the same
+/// `hubId == sessionId == worktreeId` trinity as
+/// `subagents::subagent_session_path` (`<global_dir>/sessions/subagents/<hubId>.jsonl`)
+/// and `agent_hub::session_path_for_hub`. Callers that need validation should
+/// check `hub_id` via [`try_worktree_path_for_hub`] or [`validate_hub_id`].
+#[must_use]
+pub fn worktree_path_for_hub(global_dir: &Path, hub_id: &str) -> PathBuf {
+    global_dir.join("worktrees").join("subagents").join(hub_id)
+}
+
+/// Validated variant of [`worktree_path_for_hub`].
+///
+/// Returns `Error::tool("subagent", …)` when `hub_id` fails filesystem-safety
+/// checks (empty, contains `/`/`\`/`\0`, or `.`/`..`).
+///
+/// # Errors
+/// `Invalid hubId` when `hub_id` is not filesystem-safe.
+pub fn try_worktree_path_for_hub(global_dir: &Path, hub_id: &str) -> Result<PathBuf> {
+    validate_hub_id(hub_id)?;
+    Ok(worktree_path_for_hub(global_dir, hub_id))
+}
+
+/// Derive the branch name for a persistent hub worktree.
+///
+/// Persistent branches are `pi-iso-<hubId>` so they remain prefix-tagged for
+/// auditing even though the worktree *path* basename is the raw hubId.
+#[must_use]
+pub fn persistent_branch_for_hub(hub_id: &str) -> String {
+    format!("{ISO_PREFIX}{hub_id}")
+}
+
+/// Whether a registered worktree entry matches the given path/branch.
+///
+/// Used to decide if an existing persistent directory can be reused.
+fn is_worktree_registered(repo_root: &Path, worktree_path: &Path, branch: &str) -> bool {
+    let Ok(porcelain) = git_ok(repo_root, &["worktree", "list", "--porcelain"]) else {
+        return false;
+    };
+    let expected_branch = format!("refs/heads/{branch}");
+    let worktree_str = worktree_path.to_string_lossy().to_string();
+    let mut current_path: Option<String> = None;
+    let mut current_branch = String::new();
+    let mut found = false;
+    for line in porcelain.lines() {
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            // flush previous entry
+            if let Some(path) = current_path.take() {
+                if path == worktree_str || current_branch == expected_branch {
+                    found = true;
+                    break;
+                }
+            }
+            current_path = Some(rest.to_string());
+            current_branch.clear();
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            current_branch = rest.to_string();
+        }
+    }
+    if !found {
+        if let Some(path) = current_path {
+            if path == worktree_str || current_branch == expected_branch {
+                found = true;
+            }
+        }
+    }
+    found
+}
+
+/// Try to reopen an existing persistent worktree for `hub_id`.
+///
+/// Returns `Ok(Some(handle))` when the directory exists and is still
+/// registered in `git worktree list`; `Ok(None)` when no reusable worktree
+/// exists. The handle's `baseline` is refreshed from `HEAD` so later
+/// `collect_diff` captures the cumulative edits since the original baseline.
+///
+/// # Errors
+/// `Invalid hubId` or git failures.
+pub fn reopen_worktree(
+    global_dir: &Path,
+    repo_root: &Path,
+    hub_id: &str,
+) -> Result<Option<IsoHandle>> {
+    validate_hub_id(hub_id)?;
+    let path = worktree_path_for_hub(global_dir, hub_id);
+    let branch = persistent_branch_for_hub(hub_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    if !is_worktree_registered(repo_root, &path, &branch) {
+        return Ok(None);
+    }
+    // Refresh baseline from the worktree's current HEAD (the original
+    // materialized baseline commit). Keep the directory's edits intact.
+    let baseline = git_ok(&path, &["rev-parse", "HEAD"])?.trim().to_string();
+    Ok(Some(IsoHandle {
+        id: hub_id.to_string(),
+        branch,
+        path,
+        repo_root: repo_root.to_path_buf(),
+        baseline,
+        persistent: true,
+    }))
+}
+
+/// Reopen a persistent worktree for `hub_id` or create it if absent.
+///
+/// This is the C3 entry point for continuable subagents (`hubId ==
+/// worktreeId`): when the worktree directory already exists and is still
+/// listed by `git worktree list`, it is reused (incremental-edit semantics);
+/// otherwise a new persistent worktree is created at
+/// `<global_dir>/worktrees/subagents/<hubId>` with branch
+/// `pi-iso-<hubId>`, materialising the parent's dirty tree exactly once.
+///
+/// The returned handle has `persistent = true` and must be cleaned up via
+/// [`cleanup_persistent_worktree`] or [`drop_worktree`] when the hub entry
+/// reaches a terminal non-continuable state (`Failed`/`Cancelled`/`Killed`).
+///
+/// # Errors
+/// `PI_ISO_NOT_GIT` when `repo_root` is not a git work tree, `Invalid hubId`,
+/// or git failures.
+pub fn reopen_or_isolate(
+    global_dir: &Path,
+    repo_root: &Path,
+    hub_id: &str,
+    task_id: &str,
+) -> Result<IsoHandle> {
+    validate_hub_id(hub_id)?;
+    if let Some(handle) = reopen_worktree(global_dir, repo_root, hub_id)? {
+        return Ok(handle);
+    }
+    isolate_persistent(global_dir, repo_root, hub_id, task_id)
+}
+
+/// Create a new persistent worktree at `<global_dir>/worktrees/subagents/<hubId>`.
+///
+/// Internal helper for [`reopen_or_isolate`]; prefer that function when
+/// reuse semantics are desired.
+///
+/// # Errors
+/// `PI_ISO_NOT_GIT`, `Invalid hubId`, or git failures.
+pub fn isolate_persistent(
+    global_dir: &Path,
+    repo_root: &Path,
+    hub_id: &str,
+    _task_id: &str,
+) -> Result<IsoHandle> {
+    validate_hub_id(hub_id)?;
+    let is_git = git(repo_root, &["rev-parse", "--is-inside-work-tree"])
+        .is_ok_and(|output| output.status.success());
+    if !is_git {
+        return Err(Error::tool(
+            "subagent",
+            format!(
+                "PI_ISO_NOT_GIT: {} is not a git work tree; isolation requires git \
+                 (run non-isolated or copy the directory explicitly)",
+                repo_root.display()
+            ),
+        ));
+    }
+
+    let branch = persistent_branch_for_hub(hub_id);
+    let path = worktree_path_for_hub(global_dir, hub_id);
+
+    // Ensure the parent directory exists.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            Error::tool("subagent", format!("Failed to create worktree parent: {e}"))
+        })?;
+    }
+
+    // Stale directory without a git registration — remove so `worktree add` can succeed.
+    if path.exists() && !is_worktree_registered(repo_root, &path, &branch) {
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = git(repo_root, &["branch", "-D", &branch]);
+        let _ = git(repo_root, &["worktree", "prune"]);
+    }
+
+    // Stale branch without a directory — drop it so `-b <branch>` succeeds.
+    if !path.exists() {
+        let _ = git(repo_root, &["branch", "-D", &branch]);
+    }
+
+    // Suppress unused warning for task_id in persistent mode — the hubId is
+    // the stable identity; task_id only influences the ephemeral fallback.
+
+    git_ok(
+        repo_root,
+        &["worktree", "add", &path.to_string_lossy(), "-b", &branch],
+    )?;
+
+    let cleanup_on_err = |err: Error| -> Error {
+        let handle = IsoHandle {
+            branch: branch.clone(),
+            id: hub_id.to_string(),
+            path: path.clone(),
+            repo_root: repo_root.to_path_buf(),
+            baseline: String::new(),
+            persistent: true,
+        };
+        let _ = drop_worktree(&handle);
+        err
+    };
+
+    // Dirty-tree materialization: tracked diff + untracked files (same as ephemeral).
+    let tracked_patch =
+        git_ok(repo_root, &["diff", "--binary", "HEAD"]).map_err(&cleanup_on_err)?;
+    if !tracked_patch.trim().is_empty() {
+        let patch_file = path.join(".pi-iso-parent.patch");
+        std::fs::write(&patch_file, &tracked_patch)
+            .map_err(|e| Error::tool("subagent", format!("Failed to stage parent patch: {e}")))
+            .map_err(&cleanup_on_err)?;
+        git_ok(&path, &["apply", &patch_file.to_string_lossy()]).map_err(&cleanup_on_err)?;
+        let _ = std::fs::remove_file(&patch_file);
+    }
+    let untracked = git_ok(repo_root, &["ls-files", "--others", "--exclude-standard"])
+        .map_err(&cleanup_on_err)?;
+    for relative in untracked.lines().filter(|line| !line.is_empty()) {
+        let source = repo_root.join(relative);
+        let target = path.join(relative);
+        if source.is_file() {
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::copy(&source, &target);
+        }
+    }
+
+    git_ok(&path, &["add", "-A"]).map_err(&cleanup_on_err)?;
+    git_ok(
+        &path,
+        &[
+            "commit",
+            "--allow-empty",
+            "--no-verify",
+            "-m",
+            &format!("pi-iso baseline {branch}"),
+        ],
+    )
+    .map_err(&cleanup_on_err)?;
+    let baseline = git_ok(&path, &["rev-parse", "HEAD"])
+        .map_err(&cleanup_on_err)?
+        .trim()
+        .to_string();
+
+    Ok(IsoHandle {
+        branch,
+        id: hub_id.to_string(),
+        path,
+        repo_root: repo_root.to_path_buf(),
+        baseline,
+        persistent: true,
+    })
+}
+
+/// Explicitly clean up a persistent hub worktree.
+///
+/// Removes the worktree at `<global_dir>/worktrees/subagents/<hubId>` and its
+/// `pi-iso-<hubId>` branch. A no-op when the directory is already absent
+/// (still attempts to delete a dangling branch). Use this when a hub entry
+/// reaches a terminal non-continuable status (`Failed`/`Cancelled`/`Killed`)
+/// or on explicit `cleanup` of a `Done` entry.
+///
+/// # Errors
+/// `Invalid hubId` or git failures when a worktree is present but cannot be
+/// removed.
+pub fn cleanup_persistent_worktree(
+    global_dir: &Path,
+    hub_id: &str,
+    repo_root: &Path,
+) -> Result<()> {
+    validate_hub_id(hub_id)?;
+    let path = worktree_path_for_hub(global_dir, hub_id);
+    let branch = persistent_branch_for_hub(hub_id);
+    if !path.exists() {
+        let _ = git(repo_root, &["branch", "-D", &branch]);
+        let _ = git(repo_root, &["worktree", "prune"]);
+        return Ok(());
+    }
+    let handle = IsoHandle {
+        id: hub_id.to_string(),
+        branch: branch.clone(),
+        path: path.clone(),
+        repo_root: repo_root.to_path_buf(),
+        baseline: String::new(),
+        persistent: true,
+    };
+    // `drop_worktree` handles both the worktree removal and branch deletion.
+    // If it fails (e.g. worktree already pruned but dir remains), fall back
+    // to filesystem removal so we never leak the directory.
+    match drop_worktree(&handle) {
+        Ok(()) => {
+            let _ = git(repo_root, &["worktree", "prune"]);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&path);
+            let _ = git(repo_root, &["branch", "-D", &branch]);
+            let _ = git(repo_root, &["worktree", "prune"]);
+            Err(err)
+        }
+    }
+}
+
 /// Create an isolated worktree for a child task, materializing the parent's
 /// uncommitted state into it.
+///
+/// Ephemeral flavour — the worktree lives at `<tmp>/pi-iso-<id>` and is
+/// expected to be removed via `drop_worktree` or `reap_stale` after
+/// `collect_diff`. For the persistent hub-reused flavour, use
+/// [`reopen_or_isolate`] / [`isolate_persistent`].
 ///
 /// # Errors
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -181,6 +534,7 @@ pub fn isolate(repo_root: &Path, task_id: &str) -> Result<IsoHandle> {
             path: path.clone(),
             repo_root: repo_root.to_path_buf(),
             baseline: String::new(),
+            persistent: false,
         };
         let _ = drop_worktree(&handle);
         err
@@ -234,6 +588,7 @@ pub fn isolate(repo_root: &Path, task_id: &str) -> Result<IsoHandle> {
         path,
         repo_root: repo_root.to_path_buf(),
         baseline,
+        persistent: false,
     })
 }
 
@@ -322,6 +677,12 @@ pub fn apply_to_parent(handle: &IsoHandle, patch: &str) -> Result<()> {
 
 /// Remove the worktree and its branch.
 ///
+/// Works for both ephemeral (`<tmp>/pi-iso-*`) and persistent
+/// (`<global_dir>/worktrees/subagents/<hubId>`) handles. Persistent
+/// worktrees are only removed when this function (or
+/// [`cleanup_persistent_worktree`]) is explicitly called — `collect_diff`
+/// and normal completion never auto-delete them.
+///
 /// # Errors
 /// git failures.
 pub fn drop_worktree(handle: &IsoHandle) -> Result<()> {
@@ -361,7 +722,10 @@ pub fn list_mine(repo_root: &Path) -> Result<Vec<WorktreeInfo>> {
         let Some(path) = path else { return };
         // Match on the BASENAME prefix: a foreign worktree whose path
         // merely contains "pi-iso-" somewhere must never look like ours
-        // to the reaper.
+        // to the reaper. Persistent hub worktrees live under
+        // `worktrees/subagents/<hubId>` (no prefix) and are intentionally
+        // excluded from the ephemeral reaper — they are managed by explicit
+        // `cleanup_persistent_worktree`.
         let is_ours = std::path::Path::new(&path)
             .file_name()
             .and_then(|name| name.to_str())
@@ -451,6 +815,7 @@ pub fn reap_stale(repo_root: &Path, older_than: Duration) -> Result<Vec<String>>
             path: PathBuf::from(&info.path),
             repo_root: repo_root.to_path_buf(),
             baseline: String::new(),
+            persistent: false,
         };
         if drop_worktree(&handle).is_ok() {
             reaped.push(info.path);
