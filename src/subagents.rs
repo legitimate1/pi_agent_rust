@@ -1,10 +1,17 @@
-//! Native child-agent orchestration.
+//! Native child-agent orchestration with continuable sessions.
 //!
 //! This module deliberately uses the Pi executable that is already running
 //! (or the explicit `PI_SUBAGENT_PI_BINARY` override) instead of resolving a
 //! `pi` binary through `PATH`.  That makes a Rust Pi parent reliably launch
 //! Rust Pi children even on hosts that also have the TypeScript implementation
 //! installed.
+//!
+//! Continuable subagents (C1): `hubId == sessionId == worktreeId`. A child
+//! session is persisted at `<global_dir>/sessions/subagents/<hubId>.jsonl` and
+//! is resumed by re-launching the child with `--session <path>` so the next
+//! `task` is appended as a `user` message to the same session. New calls
+//! generate a `hubId` and a persistent session path; `continue=true` calls
+//! validate `hubId`+`task` and reuse the existing session file.
 
 use crate::agent_cx::AgentCx;
 use crate::config::Config;
@@ -45,6 +52,28 @@ const DEFAULT_CHILD_TOOLS: &str = "read,bash,edit,write,grep,find,ls,hashline_ed
 const TAN_RESULT_SCHEMA: &str = "pi.background-tan.result.v1";
 const TAN_AGENT_NAME: &str = "tan";
 const TAN_SYSTEM_PROMPT: &str = "You are a background tangential coding agent. Complete the assigned work autonomously in the current working directory. Keep your final response concise and lead with the concrete outcome, changed files, and verification performed. Do not ask follow-up questions.";
+
+/// Hub session file layout: `<global_dir>/sessions/subagents/<hubId>.jsonl`.
+///
+/// `hubId == sessionId == worktreeId` — the registry id, session file id and
+/// worktree dir name are the same value so `continue` can reopen both.
+fn subagent_session_path(global_dir: &Path, hub_id: &str) -> PathBuf {
+    global_dir
+        .join("sessions")
+        .join("subagents")
+        .join(format!("{hub_id}.jsonl"))
+}
+
+/// Validate a hub/session id for filesystem safety.
+fn is_valid_hub_id(hub_id: &str) -> bool {
+    let trimmed = hub_id.trim();
+    !trimmed.is_empty()
+        && !trimmed.contains('/')
+        && !trimmed.contains('\\')
+        && !trimmed.contains('\0')
+        && trimmed != "."
+        && trimmed != ".."
+}
 
 type UpdateCallback = Arc<dyn Fn(ToolUpdate) + Send + Sync>;
 
@@ -232,6 +261,8 @@ impl SubagentTool {
             iso_apply: None,
             output_schema: None,
             schema_mode: SchemaMode::Permissive,
+            continue_flag: None,
+            hub_id: None,
         };
         let result = ChildRunner::new(
             self.cwd.clone(),
@@ -287,6 +318,48 @@ impl SubagentTool {
         on_update: Option<UpdateCallback>,
     ) -> Result<Vec<SubagentResult>> {
         let agents = self.discover(request.scope)?;
+        // C1 continuable single: `continue=true` singles do not mix with
+        // parallel/chain, and must carry hubId+task contract.
+        if request.is_continuation() {
+            request.validate_continuation()?;
+            if request.tasks.is_some() || request.chain.is_some() {
+                return Err(Error::tool(
+                    "subagent",
+                    "continue=true is only valid for single agent+task delegation, not for tasks/chain.",
+                ));
+            }
+            let task = request.mode()?.into_single().ok_or_else(|| {
+                Error::tool(
+                    "subagent",
+                    "continue=true requires agent+task single delegation.",
+                )
+            })?;
+            return Ok(vec![self.run_one(&agents, task, None, on_update).await]);
+        }
+        // Guard: a single task requesting continue must also pass its own contract.
+        // Fail closed so hubId formatting bugs do not become unbounded reuses.
+        if request.tasks.is_none()
+            && request.chain.is_none()
+            && let Some(agent) = request.agent.as_deref()
+            && !agent.trim().is_empty()
+            && let Some(task) = request.task.as_deref()
+            && !task.trim().is_empty()
+        {
+            let provisional = SubagentTask {
+                agent: request.agent.clone().unwrap_or_default(),
+                task: request.task.clone().unwrap_or_default(),
+                cwd: None,
+                isolation: None,
+                iso_apply: None,
+                output_schema: request.output_schema.clone(),
+                schema_mode: request.schema_mode,
+                continue_flag: request.continue_flag,
+                hub_id: request.hub_id.clone(),
+            };
+            if provisional.is_continuation() {
+                provisional.validate_continuation()?;
+            }
+        }
         let concurrency = request
             .concurrency
             .unwrap_or(DEFAULT_CONCURRENCY)
@@ -396,7 +469,9 @@ impl Tool for SubagentTool {
                 "tasks": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Independent tasks to run in parallel."},
                 "chain": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Sequential tasks; {previous} is replaced with the prior child output, and {{previous.data.<field.path>}} addresses the prior task's schema-validated data."},
                 "concurrency": {"type": "integer", "minimum": 1, "maximum": MAX_PARALLEL_TASKS},
-                "scope": {"type": "string", "enum": ["both", "user", "project"], "default": "both"}
+                "scope": {"type": "string", "enum": ["both", "user", "project"], "default": "both"},
+                "continue": {"type": "boolean", "description": "When true, continue the existing subagent session identified by hubId with a new task. Requires hubId."},
+                "hubId": {"type": "string", "description": "Existing subagent session/hub id to continue. Required when continue is true."}
             },
             "definitions": {
                 "task": {
@@ -409,7 +484,9 @@ impl Tool for SubagentTool {
                         "isolation": {"type": "string", "enum": ["none", "worktree"], "default": "none", "description": "worktree runs the child in a git worktree with the parent's uncommitted state; non-git dirs refuse with PI_ISO_NOT_GIT."},
                         "isoApply": {"type": "string", "enum": ["keep", "apply", "drop"], "default": "apply", "description": "What to do with the isolated worktree after completion."},
                         "outputSchema": {"type": "object", "description": "JSON Schema this task's final output must match."},
-                        "schemaMode": {"type": "string", "enum": ["permissive", "strict"], "default": "permissive"}
+                        "schemaMode": {"type": "string", "enum": ["permissive", "strict"], "default": "permissive"},
+                        "continue": {"type": "boolean", "description": "When true, continue the existing subagent session identified by hubId."},
+                        "hubId": {"type": "string", "description": "Existing subagent session/hub id to continue."}
                     }
                 }
             },
@@ -434,10 +511,30 @@ impl Tool for SubagentTool {
         }
         let request: SubagentRequest = serde_json::from_value(input)
             .map_err(|error| Error::tool("subagent", format!("Invalid input: {error}")))?;
+        if request.is_continuation() {
+            request.validate_continuation()?;
+        }
         let update = on_update.map(Arc::from);
         let mode = request.mode_name()?;
+        let should_reject_parallel_continue =
+            request.is_continuation() && (request.tasks.is_some() || request.chain.is_some());
+        if should_reject_parallel_continue {
+            return Err(Error::tool(
+                "subagent",
+                "continue=true is only valid for single agent+task delegation, not for tasks/chain.",
+            ));
+        }
         let results = self.run_request(request, update).await?;
         let is_error = results.iter().any(|result| result.is_error);
+        let hub_id = results
+            .first()
+            .and_then(|r| r.hub_id.clone())
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        let session_isolation = results
+            .first()
+            .map(|r| r.session_isolation)
+            .unwrap_or("ephemeral_no_session");
         let mut content = render_results(&results);
         if self.structured_results {
             content.push_str("\n\n");
@@ -448,7 +545,8 @@ impl Tool for SubagentTool {
             details: Some(json!({
                 "schema": SUBAGENT_RESULT_SCHEMA,
                 "mode": mode,
-                "sessionIsolation": "ephemeral_no_session",
+                "sessionIsolation": session_isolation,
+                "hubId": hub_id,
                 "results": results,
             })),
             is_error,
@@ -481,9 +579,73 @@ struct SubagentRequest {
     concurrency: Option<usize>,
     #[serde(default)]
     scope: AgentScope,
+    /// Continue an existing subagent session instead of starting a new one (C1).
+    #[serde(default, rename = "continue")]
+    continue_flag: Option<bool>,
+    #[serde(default)]
+    hub_id: Option<String>,
 }
 
 impl SubagentRequest {
+    fn is_continuation(&self) -> bool {
+        self.continue_flag == Some(true)
+    }
+
+    fn validate_continuation(&self) -> Result<()> {
+        if !self.is_continuation() {
+            return Ok(());
+        }
+        let hub_id = self
+            .hub_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::tool(
+                    "subagent",
+                    "continue=true requires hubId (existing subagent session id).",
+                )
+            })?;
+        if !is_valid_hub_id(hub_id) {
+            return Err(Error::tool(
+                "subagent",
+                format!("Invalid hubId: {hub_id:?}"),
+            ));
+        }
+        let task = self
+            .task
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::tool(
+                    "subagent",
+                    "continue=true requires task (new user message to append).",
+                )
+            })?;
+        if task.is_empty() {
+            return Err(Error::tool(
+                "subagent",
+                "continue=true requires task (new user message to append).",
+            ));
+        }
+        // When continuing, agent+task must still select exactly one mode, so
+        // we also ensure agent is present for single delegation.
+        if self
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            return Err(Error::tool(
+                "subagent",
+                "continue=true requires agent for the continuation turn.",
+            ));
+        }
+        Ok(())
+    }
+
     fn mode(&self) -> Result<RequestMode> {
         let single = self
             .agent
@@ -497,6 +659,8 @@ impl SubagentRequest {
                 iso_apply: None,
                 output_schema: self.output_schema.clone(),
                 schema_mode: self.schema_mode,
+                continue_flag: self.continue_flag,
+                hub_id: self.hub_id.clone(),
             });
         let selected = usize::from(single.is_some())
             + usize::from(self.tasks.is_some())
@@ -555,6 +719,17 @@ enum RequestMode {
     Chain(Vec<SubagentTask>),
 }
 
+impl RequestMode {
+    /// Extract the single task when this mode is `Single`.
+    #[allow(clippy::wrong_self_convention)]
+    fn into_single(self) -> Option<SubagentTask> {
+        match self {
+            Self::Single(task) => Some(task),
+            Self::Parallel(_) | Self::Chain(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SubagentTask {
@@ -575,6 +750,49 @@ struct SubagentTask {
     output_schema: Option<Value>,
     #[serde(default)]
     schema_mode: SchemaMode,
+    /// Continue an existing session identified by `hubId` (C1).
+    #[serde(default, rename = "continue")]
+    continue_flag: Option<bool>,
+    #[serde(default)]
+    hub_id: Option<String>,
+}
+
+impl SubagentTask {
+    /// Whether this task requests continuation of an existing session.
+    const fn is_continuation(&self) -> bool {
+        matches!(self.continue_flag, Some(true))
+    }
+
+    /// Validate `continue` contract for a single task.
+    fn validate_continuation(&self) -> Result<()> {
+        if !self.is_continuation() {
+            return Ok(());
+        }
+        let hub_id = self
+            .hub_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::tool(
+                    "subagent",
+                    "continue=true requires hubId (existing subagent session id).",
+                )
+            })?;
+        if !is_valid_hub_id(hub_id) {
+            return Err(Error::tool(
+                "subagent",
+                format!("Invalid hubId: {hub_id:?}"),
+            ));
+        }
+        if self.task.trim().is_empty() {
+            return Err(Error::tool(
+                "subagent",
+                "continue=true requires task (new user message to append).",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// How a schema-validation failure that survives the corrective retry is
@@ -1137,24 +1355,112 @@ impl ChildRunner {
             .map_or_else(|| cwd.clone(), |handle| handle.path.clone());
         let iso_apply = task.iso_apply.clone();
 
-        let args = child_args(
+        // C1 session wiring: pick the child session path before launching.
+        //
+        // - `continue=true` + valid `hubId` → reuse `<global>/sessions/subagents/<hubId>.jsonl`
+        //   (validated earlier that the file already exists; we just re-derive here).
+        // - otherwise (fresh subagent) → allocated by hub id once hub registration
+        //   succeeds; we provisionally build `args` with `None` and patch after.
+        let continue_session_path: Option<PathBuf> = if task.is_continuation() {
+            task.hub_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && is_valid_hub_id(s))
+                .map(|hub_id| subagent_session_path(&self.global_dir, hub_id))
+        } else {
+            None
+        };
+        let initial_args = child_args(
             agent,
             &task.task,
             self.role_model_spec.as_deref(),
             output_schema,
+            continue_session_path.as_deref(),
         );
-        let mut result =
-            SubagentResult::starting(agent, task, step, &self.child_binary, &run_cwd, &args);
+        if let Some(path) = continue_session_path.as_deref()
+            && let Some(parent) = path.parent()
+        {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut args = initial_args;
+        let mut pending_continue_session = continue_session_path.clone();
+        let mut result = SubagentResult::starting(
+            agent,
+            task.clone(),
+            step,
+            &self.child_binary,
+            &run_cwd,
+            &args,
+        );
         // Agent-hub registration (bd-cv653.5.3): every spawned child joins the
         // session roster. Bookkeeping failure must never fail the run.
-        let hub_entry = crate::agent_hub::registry()
-            .lock()
-            .ok()
-            .and_then(|mut reg| {
-                reg.register_kind(&agent.name, &result.task, self.hub_kind)
-                    .ok()
-            });
-        result.hub_id = hub_entry.as_ref().map(|entry| entry.id.clone());
+        // For continuations, `pending_continue_session` already holds the
+        // reused hub id's session path. For fresh runs, we allocate a
+        // persistent session path once the hub id is known.
+        let hub_entry = if pending_continue_session.is_some() {
+            // Reuse: resolve hub entry by hubId so we don't mint a new id.
+            let hub_id = task
+                .hub_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            crate::agent_hub::registry()
+                .lock()
+                .ok()
+                .and_then(|r| r.get(&hub_id))
+                .or_else(|| {
+                    let dir = crate::config::Config::global_dir()
+                        .join("agent-hub")
+                        .join(std::process::id().to_string());
+                    let _ = std::fs::create_dir_all(&dir);
+                    Some(crate::agent_hub::ChildEntry {
+                        id: hub_id.clone(),
+                        name: agent.name.clone(),
+                        kind: self.hub_kind,
+                        task: result.task.clone(),
+                        pid: None,
+                        status: crate::agent_hub::ChildStatus::Starting,
+                        started_ms: 0,
+                        finished_ms: None,
+                        output_bytes: 0,
+                        transcript_path: dir.join(format!("{hub_id}.transcript.jsonl")),
+                        steer_path: dir.join(format!("{hub_id}.steer")),
+                        revived_from: None,
+                    })
+                })
+        } else {
+            crate::agent_hub::registry()
+                .lock()
+                .ok()
+                .and_then(|mut reg| {
+                    reg.register_kind(&agent.name, &result.task, self.hub_kind)
+                        .ok()
+                })
+        };
+        if let Some(entry) = hub_entry.as_ref() {
+            result.hub_id = Some(entry.id.clone());
+            if pending_continue_session.is_some() {
+                result.session_isolation = "persistent_session";
+            } else {
+                // Fresh: the hub id is the session id — ensure a persistent
+                // session file path exists and wire `--session` before spawn.
+                let canonical = subagent_session_path(&self.global_dir, &entry.id);
+                let _ = std::fs::create_dir_all(canonical.parent().unwrap_or(Path::new(".")));
+                let new_args = child_args(
+                    agent,
+                    &task.task,
+                    self.role_model_spec.as_deref(),
+                    output_schema,
+                    Some(&canonical),
+                );
+                args = new_args;
+                result.session_isolation = "persistent_session";
+                pending_continue_session = Some(canonical);
+            }
+        } else {
+            result.hub_id = None;
+        }
         let update = on_update.as_ref();
         emit_progress(update, &result);
 
@@ -1172,11 +1478,13 @@ impl ChildRunner {
             .env("PI_SUBAGENT_DEPTH", child_depth().to_string());
         // Hub steering channel (bd-cv653.5.3): the child drains this file
         // between turns via its print-mode steering fetcher.
-        if let Some(entry) = &hub_entry {
+        if let Some(entry) = hub_entry.as_ref() {
             command
                 .env("PI_SUBAGENT_STEER_FILE", &entry.steer_path)
                 .env("PI_SUBAGENT_RUN_ID", &entry.id);
         }
+        // Keep session-path alive for later use (e.g. diagnostics).
+        let _ = pending_continue_session;
 
         let child = match command.spawn() {
             Ok(child) => child,
@@ -1403,19 +1711,26 @@ fn child_args(
     task: &str,
     role_model_spec: Option<&str>,
     output_schema: Option<&Value>,
+    session_path: Option<&Path>,
 ) -> Vec<OsString> {
-    let mut args = vec![
-        "--mode".into(),
-        "json".into(),
-        "--print".into(),
-        "--no-session".into(),
+    let mut args = vec!["--mode".into(), "json".into(), "--print".into()];
+    // C1a: persistent subagent sessions. `Some(path)` → `--session <path>`
+    // so the child replays the same JSONL and the next user message is
+    // appended to the same session/worktree. `None` retains `--no-session`
+    // as a fallback (gray path — remove once every caller allocates a session).
+    if let Some(path) = session_path {
+        args.extend(["--session".into(), path.as_os_str().to_os_string()]);
+    } else {
+        args.push("--no-session".into());
+    }
+    args.extend([
         "--tools".into(),
         agent
             .tools
             .as_ref()
             .map_or_else(|| DEFAULT_CHILD_TOOLS.to_string(), |tools| tools.join(","))
             .into(),
-    ];
+    ]);
     // Model precedence (bd-cv653.3.1): agent-def `model:` pin > task/smol role
     // spec from settings > nothing (child inherits the parent's ambient model).
     if let Some(model) = &agent.model {
@@ -1611,7 +1926,8 @@ struct SubagentResult {
     iso: Option<crate::worktree_iso::IsoOutcome>,
     session_isolation: &'static str,
     /// Agent-hub run id (bd-cv653.5.3) when the registry tracked this run.
-    #[serde(skip)]
+    /// Serialized so callers can chain `hubId → continue` without parsing
+    /// hub transcript. Persisted sessions make this id stable across turns.
     hub_id: Option<String>,
     #[serde(skip)]
     is_error: bool,
@@ -2010,7 +2326,7 @@ mod tests {
             file_path: PathBuf::from("/tmp/scout.md"),
         };
         let args_of = |agent: &AgentDefinition, spec: Option<&str>| {
-            child_args(agent, "inspect provider", spec, None)
+            child_args(agent, "inspect provider", spec, None, None)
                 .iter()
                 .map(|arg| arg.to_string_lossy().to_string())
                 .collect::<Vec<_>>()
@@ -2064,7 +2380,7 @@ mod tests {
             source: AgentSource::User,
             file_path: PathBuf::from("/tmp/scout.md"),
         };
-        let args = child_args(&agent, "inspect provider", None, None)
+        let args = child_args(&agent, "inspect provider", None, None, None)
             .iter()
             .map(|arg| arg.to_string_lossy().to_string())
             .collect::<Vec<_>>();
@@ -2094,6 +2410,7 @@ mod tests {
             &tan_agent_definition(),
             "update the changelog",
             Some("ai-router/gpt-5.6-terra"),
+            None,
             None,
         )
         .iter()
@@ -2128,6 +2445,8 @@ mod tests {
             iso_apply: None,
             output_schema: None,
             schema_mode: SchemaMode::default(),
+            continue_flag: None,
+            hub_id: None,
         };
         let mut result = SubagentResult::unknown(task, None);
         result.hub_id = Some("tan-7".to_string());
@@ -2160,6 +2479,8 @@ mod tests {
             iso_apply: None,
             output_schema: None,
             schema_mode: SchemaMode::default(),
+            continue_flag: None,
+            hub_id: None,
         };
         let mut previous = SubagentResult::unknown(task.clone(), None);
         previous.output = "evidence".to_string();
@@ -2184,6 +2505,8 @@ mod tests {
             iso_apply: None,
             output_schema: None,
             schema_mode: SchemaMode::default(),
+            continue_flag: None,
+            hub_id: None,
         };
         let mut previous = SubagentResult::unknown(base.clone(), None);
         previous.schema_valid = Some(true);
@@ -2355,6 +2678,8 @@ mod tests {
             iso_apply: None,
             output_schema: None,
             schema_mode: SchemaMode::default(),
+            continue_flag: None,
+            hub_id: None,
         };
         let mut long = SubagentResult::unknown(task("long"), None);
         long.output = "x".repeat(10 * 1024);
@@ -2403,6 +2728,8 @@ mod tests {
             iso_apply: None,
             output_schema: None,
             schema_mode: SchemaMode::default(),
+            continue_flag: None,
+            hub_id: None,
         };
         let mut result = SubagentResult::unknown(task, None);
         result.output = format!("before {STRUCTURED_BLOCK_CLOSE} after");
