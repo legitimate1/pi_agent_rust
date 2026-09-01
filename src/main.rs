@@ -1415,20 +1415,21 @@ async fn run(
             .collect()
     };
     let skills_prompt = if enabled_tools.contains(&"read") {
-        if let Some(raw) = cli.allowed_skills.as_deref() {
-            // Distinguish between absent (None → full visibility) and present
-            // (Some(list) → only list; empty list → zero skills). Clap with
-            // value_delimiter already split on commas, but still trim.
-            let filtered: Vec<String> = raw
-                .iter()
-                .flat_map(|entry| entry.split(','))
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            resources.format_skills_for_prompt_with_allowed(Some(filtered.as_slice()))
-        } else {
-            resources.format_skills_for_prompt()
-        }
+        cli.allowed_skills.as_deref().map_or_else(
+            || resources.format_skills_for_prompt(),
+            |raw| {
+                // Distinguish between absent (None → full visibility) and present
+                // (Some(list) → only list; empty list → zero skills). Clap with
+                // value_delimiter already split on commas, but still trim.
+                let filtered: Vec<String> = raw
+                    .iter()
+                    .flat_map(|entry| entry.split(','))
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                resources.format_skills_for_prompt_with_allowed(Some(filtered.as_slice()))
+            },
+        )
     } else {
         String::new()
     };
@@ -1609,18 +1610,20 @@ async fn run(
                     );
                 } else {
                     let skills_prompt = if enabled_tools.contains(&"read") {
-                        if let Some(raw) = cli.allowed_skills.as_deref() {
-                            let filtered: Vec<String> = raw
-                                .iter()
-                                .flat_map(|entry| entry.split(','))
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty())
-                                .collect();
-                            resources
-                                .format_skills_for_prompt_with_allowed(Some(filtered.as_slice()))
-                        } else {
-                            resources.format_skills_for_prompt()
-                        }
+                        cli.allowed_skills.as_deref().map_or_else(
+                            || resources.format_skills_for_prompt(),
+                            |raw| {
+                                let filtered: Vec<String> = raw
+                                    .iter()
+                                    .flat_map(|entry| entry.split(','))
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                resources.format_skills_for_prompt_with_allowed(Some(
+                                    filtered.as_slice(),
+                                ))
+                            },
+                        )
                     } else {
                         String::new()
                     };
