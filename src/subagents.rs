@@ -2858,7 +2858,7 @@ printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"
             output.details.as_ref().is_some_and(|details| {
                 details["results"][0]["binary"] == Value::String(child.display().to_string())
                     && details["results"][0]["status"] == "completed"
-                    && details["sessionIsolation"] == "ephemeral_no_session"
+                    && details["sessionIsolation"] == "persistent_session"
             }),
             "missing child-process evidence: {output:?}"
         );
@@ -3217,6 +3217,214 @@ fi
         assert_eq!(
             output.details.as_ref().unwrap()["results"][0]["status"],
             "failed"
+        );
+    }
+
+    // ——— Continuable subagent (C5) ———
+    // Fresh→continue must reuse the same hubId/session/worktree. The child is a
+    // tiny shell stub; persistence is verified via the hubId round-trip and the
+    // `--session <global>/sessions/subagents/<hubId>.jsonl` argv.
+
+    #[cfg(unix)]
+    fn write_arg_logging_child(temp: &Path, log_path: &Path, output_text: &str) -> PathBuf {
+        let child = temp.join("logging-child.sh");
+        std::fs::write(
+            &child,
+            format!(
+                r#"#!/bin/sh
+echo "$@" > "{log}"
+printf '{{"type":"agent_end","messages":[{{"role":"assistant","content":[{{"type":"text","text":"{out}"}}]}}]}}\n'
+"#,
+                log = log_path.display(),
+                out = output_text,
+            ),
+        )
+        .expect("write logging child");
+        let mut permissions = std::fs::metadata(&child)
+            .expect("child metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&child, permissions).expect("make child executable");
+        child
+    }
+
+    /// Fresh delegation returns a persistent hubId and launches the child with
+    /// `--session <global>/sessions/subagents/<hubId>.jsonl`.
+    #[test]
+    #[cfg(unix)]
+    fn continuable_fresh_returns_persistent_hub_and_session_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let global_dir = temp.path().join("global");
+        write_agent(
+            &global_dir.join("agents"),
+            "scout",
+            "---\nname: scout\ndescription: continuable fresh\n---\nbody",
+        );
+        let log_path = temp.path().join("fresh-args.log");
+        let child = write_arg_logging_child(temp.path(), &log_path, "fresh done");
+        let tool = SubagentTool::with_paths(temp.path().to_path_buf(), global_dir.clone(), child);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let output = runtime
+            .block_on(tool.execute(
+                "continuable-fresh",
+                json!({"agent": "scout", "task": "first task"}),
+                None,
+                None,
+            ))
+            .expect("fresh run");
+        assert!(!output.is_error, "{output:?}");
+        let details = output.details.expect("details");
+        let hub_id = details["hubId"].as_str().expect("hubId string").to_string();
+        assert!(!hub_id.is_empty(), "hubId must be returned");
+        assert_eq!(
+            details["sessionIsolation"], "persistent_session",
+            "all subagent children are now persistent sessions"
+        );
+        assert_eq!(
+            details["results"][0]["hubId"].as_str(),
+            Some(hub_id.as_str()),
+            "result hubId must mirror top-level hubId"
+        );
+        let expected = global_dir
+            .join("sessions")
+            .join("subagents")
+            .join(format!("{hub_id}.jsonl"));
+        assert!(
+            expected.parent().is_some_and(|p| p.exists()),
+            "session parent dir must be created: {}",
+            expected.display()
+        );
+        let args = std::fs::read_to_string(&log_path).expect("args log");
+        assert!(
+            args.contains("--session"),
+            "child must be launched with --session, got: {args}"
+        );
+        assert!(
+            args.contains(&hub_id),
+            "session path must contain hubId, got: {args}"
+        );
+        assert!(
+            args.contains(expected.to_string_lossy().as_ref()),
+            "session path must be canonical {}, got: {args}",
+            expected.display()
+        );
+    }
+
+    /// `continue=true` with the fresh hubId reuses the same session path and
+    /// hubId; the child sees the same `--session` file rather than
+    /// `no session file` failure.
+    #[test]
+    #[cfg(unix)]
+    fn continuable_continue_reuses_same_hub_and_session() {
+        let temp = TempDir::new().expect("tempdir");
+        let global_dir = temp.path().join("global");
+        write_agent(
+            &global_dir.join("agents"),
+            "scout",
+            "---\nname: scout\ndescription: continuable continue\n---\nbody",
+        );
+        let log_path = temp.path().join("continue-args.log");
+        let child = write_arg_logging_child(temp.path(), &log_path, "first done");
+        let tool = SubagentTool::with_paths(temp.path().to_path_buf(), global_dir.clone(), child);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        // Fresh run — capture hubId.
+        let first = runtime
+            .block_on(tool.execute(
+                "continuable-continue-fresh",
+                json!({"agent": "scout", "task": "first task"}),
+                None,
+                None,
+            ))
+            .expect("fresh run");
+        assert!(!first.is_error, "{first:?}");
+        let hub_id = first.details.as_ref().expect("details")["hubId"]
+            .as_str()
+            .expect("hubId")
+            .to_string();
+        let expected = global_dir
+            .join("sessions")
+            .join("subagents")
+            .join(format!("{hub_id}.jsonl"));
+        // Materialise the session file so the `continue` guard
+        // (`!path.exists() => Failed "no session file"`) passes. A real Pi child
+        // would have created this JSONL; the stub does not.
+        std::fs::create_dir_all(expected.parent().expect("session parent"))
+            .expect("create session dir");
+        std::fs::write(
+            &expected,
+            "{\"role\":\"user\",\"content\":\"first task\"}\n",
+        )
+        .expect("seed session file");
+        let first_args = std::fs::read_to_string(&log_path).expect("first args");
+
+        // Overwrite the stub so the second turn has distinct output.
+        let child2 = write_arg_logging_child(temp.path(), &log_path, "second done");
+        // The tool holds the child binary path; point it at the new stub content
+        // by reusing the same file path (write_arg_logging_child overwrites it).
+        let _ = child2;
+        let tool2 = SubagentTool::with_paths(
+            temp.path().to_path_buf(),
+            global_dir.clone(),
+            temp.path().join("logging-child.sh"),
+        );
+
+        let second = runtime
+            .block_on(tool2.execute(
+                "continuable-continue-second",
+                json!({"agent": "scout", "task": "second task", "continue": true, "hubId": hub_id}),
+                None,
+                None,
+            ))
+            .expect("continue run");
+        assert!(!second.is_error, "continue must not fail: {second:?}");
+        let details = second.details.expect("details");
+        assert_eq!(
+            details["hubId"].as_str(),
+            Some(hub_id.as_str()),
+            "continue must preserve hubId"
+        );
+        assert_eq!(
+            details["results"][0]["hubId"].as_str(),
+            Some(hub_id.as_str())
+        );
+        assert_eq!(details["sessionIsolation"], "persistent_session");
+        let second_args = std::fs::read_to_string(&log_path).expect("second args");
+        assert!(
+            second_args.contains("--session"),
+            "continue child must be launched with --session, got: {second_args}"
+        );
+        assert!(
+            second_args.contains(&hub_id),
+            "continue session path must reuse hubId, got: {second_args}"
+        );
+        assert!(
+            second_args.contains(expected.to_string_lossy().as_ref()),
+            "continue must reuse canonical session path {}, got: {second_args}",
+            expected.display()
+        );
+        // Both turns used the same session file location.
+        assert!(
+            first_args.contains(expected.to_string_lossy().as_ref())
+                && second_args.contains(expected.to_string_lossy().as_ref()),
+            "fresh and continue must share the same session path"
+        );
+        let ContentBlock::Text(text) = &second.content[0] else {
+            panic!("expected text");
+        };
+        assert!(
+            text.text.contains("second done"),
+            "second turn output must be visible, got: {}",
+            text.text
+        );
+        assert!(
+            !text.text.contains("no session file"),
+            "continue must not report missing session: {}",
+            text.text
         );
     }
 }
