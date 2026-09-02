@@ -59,7 +59,7 @@
 
 ## 子代理与后台任务
 
-- **子代理并行执行** — 派生独立子代理完成指定任务，支持结构化输出校验、网络瞬断自动重试与工作区隔离；可续命 — Done 后通过 `hubId` + 新任务在同一会话与同一 Worktree 上增量继续 | `src/subagents.rs` + `src/agent_hub.rs` + `src/worktree_iso.rs`
+- **子代理并行执行** — 派生独立子代理完成指定任务，支持结构化输出校验、网络瞬断自动重试、工作区隔离与按代理技能白名单；可续命 — Done 后通过 `hubId` + 新任务在同一会话与同一 Worktree 上增量继续 | `src/subagents.rs` + `src/agent_hub.rs` + `src/worktree_iso.rs` + `src/resources.rs` + `src/main.rs` + `src/cli.rs`
 - **后台任务管理** — 后台执行命令并支持查询、等待与取消，完成通知在下一轮投递 | `src/jobs.rs`
 - **Hub 常驻服务** — 托管长驻进程与观察就绪条件，提供日志与生命周期管理 | `src/hub.rs`
 - **代理中心子进程登记** — 登记与管理子进程运行态、对话记录与消息投递 | `src/agent_hub.rs`
@@ -106,6 +106,6 @@
 
 - **技能仅项目模式** — `skill_mode: "project_only"` 跳过全局技能 | `src/package_manager.rs`
 - **全局技能白名单** — `global_skills` 只加载指定全局技能，可与 project_only 叠加 | `src/package_manager.rs`
-- **Skills 系统** — `~/.pi/agent/skills/` 或 `.pi/skills/` 下 `SKILL.md`，`/skill:name` 调用 | `src/resources.rs` + `src/package_manager.rs`
+- **Skills 系统** — `~/.pi/agent/skills/` 或 `.pi/skills/` 下 `SKILL.md`，`/skill:name` 调用；支持 `disable-model-invocation: true` 全局隐藏与子代理按代理 `allowed-skills` 白名单在提示词阶段过滤 | `src/resources.rs` + `src/package_manager.rs` + `src/subagents.rs` + `src/main.rs` + `src/cli.rs`
 - **Prompt Templates** — `.pi/prompts/` 或 `~/.pi/agent/prompts/` Markdown，`/template` 调用，支持 `$1`/`$2`/`$@` 位置参数 | `src/resources.rs`
 - **Packages 共享** — `pi install` 安装技能/提示词/主题/扩展包 | `src/package_manager.rs`

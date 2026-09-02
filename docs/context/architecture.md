@@ -86,7 +86,7 @@ CLI --tools read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit,s
 - **`tools/` 模块目录** → ToolRegistry + 内置工具模块 + verify 内部验证引擎 + touched_files 触达追踪（Single Shell：`shell.rs` 为 Single Shell 统一入口，薄转发 `bash.rs`/`pwsh.rs` 内部实现；`bash`/`pwsh` 仅 `PI_ENABLE_LEGACY_SHELL` 时 gated 注册；全量 asupersync 运行时 Cx/checkpoint/Budget/spawn_blocking，无 tokio）
 - **`hub.rs`** → Hub 常驻服务：PTY 托管、滚动日志与环、就绪观测（log 正则与端口探测）、生命周期与 detached 持久化
 - **`jobs.rs`** → 后台任务注册表：后台 bash 任务、完成通知队列、会话作用域与 shutdown 清理
-- **`subagents.rs`** → 子代理工具：派生 pi 子进程、任务与模式分发、结构化输出校验与网络瞬断自动重试；可续命持久会话 — 不再 `--no-session`，改 `--session <global>/sessions/subagents/<hubId>.jsonl` 落盘，`hubId==sessionId==worktreeId` 三位一体，`continue + hubId` 增量重放
+- **`subagents.rs`** → 子代理工具：派生 pi 子进程、任务与模式分发、结构化输出校验与网络瞬断自动重试；可续命持久会话 — 不再 `--no-session`，改 `--session <global>/sessions/subagents/<hubId>.jsonl` 落盘，`hubId==sessionId==worktreeId` 三位一体，`continue + hubId` 增量重放；技能可见性 — `AgentDefinition.allowed_skills`（frontmatter `allowed-skills`/`allowed_skills`，CSV，大小写不敏感）→ `child_args_inner` 交集（`inherited ∩ agent`）→ `--allowed-skills` + `PI_SUBAGENT_ALLOWED_SKILLS` 双通道透传，子进程 `main.rs` 以 `format_skills_for_prompt_with_allowed` 在提示词阶段过滤（先 `disable_model_invocation` 再白名单，未知忽略，`None=全量`/`Some([])=零技能`）
 - **`agent_hub.rs`** → 代理中心：子进程登记、对话记录分页、操控消息投递与转生；Done 可续但进程已回收 — `Done` 标记可续命，下次 `continue + hubId` 重启新进程重放 `<global>/sessions/subagents/<hubId>.jsonl`
 - **`tools/verify.rs`** → 编辑后轻量验证引擎：文件类型检测→检查器映射（.rs/.json/.toml/.ts/.js/.py/.go/.md）→进程内/外部进程执行，支持 Format+Lint 并行（oxfmt+oxlint/ruff），诊断直写 content 正文
 - **`tools/touched_files.rs`** → 文件触达追踪：三级快照（gix 0.77 status → git status --porcelain=v1 -z --find-renames → walk）+ 结构化写入与 shell 触达过滤 + TurnEnd 聚合（R>D>A>M，firstOldPath 重命名链）+ per-cwd asupersync::sync::Mutex 窗口锁 + capture_snapshot_async 经 asupersync::runtime::spawn_blocking 卸载阻塞
@@ -109,7 +109,7 @@ CLI --tools read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit,s
 - **`retry_state.rs`** → 公共重试簿记：`RetryCounters`（`consecutive`/`total`/`max_total = max*3`）、`RetryProgress(Arc<AtomicBool>)`、`is_progress_event`（`TextDelta|ThinkingDelta|ToolCallDelta` 非空 delta）；退避统一 `Config::retry_delay_ms`，无本地 `retry_delay_ms`（D61）
 - **`session_store_v2.rs`** → sidecar 分段日志：偏移索引 + 检查点回滚
 - **`autocomplete.rs`** → `@` 文件引用 + `/` 命令补全索引（WalkBuilder + 后台刷新）
-- **`resources.rs`** → Skills / prompt templates / themes / extensions 资源加载
+- **`resources.rs`** → Skills / prompt templates / themes / extensions 资源加载；`format_skills_for_prompt_with_allowed(skills, Option<&[String]>)` 技能白名单过滤（HashSet 小写匹配）
 - **`package_manager.rs`** → 包安装/移除/更新（pi install 等）
 - **`doctor.rs`** → 环境诊断（config/dirs/auth/sessions/swarm preflight）
 

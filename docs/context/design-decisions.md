@@ -640,3 +640,16 @@
 
 **何时重新考虑**：若需要真常驻 Idle 进程池或跨主会话 PID 恢复，且能承担显式泄漏防护与取消同步，则可在持久会话之上叠加 resident 复用，需扩展 hub 状态机与回收策略。
 
+
+---
+
+## D63: subagent 技能白名单 — 按代理 allowed-skills 在提示词阶段过滤
+
+**决策**：选按代理 frontmatter 的 allowed-skills 白名单在提示词阶段过滤，不选进程级全局 --no-skills 或追加 --skill 路径黑白名单。
+
+**理由**：技能可见性属于按代理授权边界，应随 AgentDefinition 声明并在子进程启动时通过 --allowed-skills 与 PI_SUBAGENT_ALLOWED_SKILLS 双通道透传，子进程在 main.rs 组装 system_prompt 时以 HashSet 小写匹配对 <available_skills> 做交集过滤，未知技能静默忽略，None=全量/Some([])=零技能，与 disable_model_invocation 取交集后渲染。
+
+**不选 B 的原因**：全局 --no-skills 为进程级开关无法按代理细分，追加 --skill 仅补充路径不约束可见性，二者均不支持 inherited 与 agent 的多层嵌套越往里越窄语义，且缺少大小写不敏感与 CSV 统一去重的契约。
+
+**何时重新考虑**：若需按任务动态覆盖或按调用链实时收敛白名单，可在 SubagentTask 上扩展 allowedSkills 覆盖 AgentDefinition，并在 effective_allowed_skills 中引入任务层交集策略。
+
