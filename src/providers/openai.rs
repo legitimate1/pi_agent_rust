@@ -8,6 +8,7 @@
 
 use std::borrow::Cow;
 
+use super::{OPENCODE_SESSION_HEADER, map_has_any_header, provider_targets_opencode};
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
@@ -52,12 +53,6 @@ fn to_cow_role(role: &str) -> Cow<'_, str> {
     }
 }
 
-fn map_has_any_header(headers: &std::collections::HashMap<String, String>, names: &[&str]) -> bool {
-    headers
-        .keys()
-        .any(|key| names.iter().any(|name| key.eq_ignore_ascii_case(name)))
-}
-
 fn authorization_override(
     options: &StreamOptions,
     compat: Option<&CompatConfig>,
@@ -92,30 +87,6 @@ fn openrouter_default_http_referer() -> String {
 fn openrouter_default_x_title() -> String {
     first_non_empty_env(&["OPENROUTER_X_TITLE", "PI_OPENROUTER_X_TITLE"])
         .unwrap_or_else(|| OPENROUTER_DEFAULT_X_TITLE.to_string())
-}
-
-/// Request header the OpenCode gateway requires for session correlation.
-///
-/// Every request to `opencode.ai` must carry one stable ID per conversation
-/// (starting 09/06 requests missing it may error). The value is the Pi
-/// session id (`StreamOptions.session_id`), which is stable per conversation.
-const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
-
-/// Whether this request targets the OpenCode gateway (`opencode` / `opencode-go`).
-///
-/// Matches on the canonical provider id first, then the raw provider name
-/// (case-insensitive), then the base URL — so a user-defined provider id
-/// pointing at `opencode.ai` is still covered.
-fn provider_targets_opencode(provider: &str, base_url: &str) -> bool {
-    if canonical_provider_id(provider)
-        .is_some_and(|canonical| canonical == "opencode" || canonical == "opencode-go")
-    {
-        return true;
-    }
-    if provider.eq_ignore_ascii_case("opencode") || provider.eq_ignore_ascii_case("opencode-go") {
-        return true;
-    }
-    base_url.to_ascii_lowercase().contains("opencode.ai")
 }
 
 // ============================================================================

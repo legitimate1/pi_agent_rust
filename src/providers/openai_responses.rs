@@ -3,6 +3,7 @@
 //! This module implements the Provider trait for the OpenAI `responses` endpoint,
 //! supporting streaming output text and function tool calls.
 
+use super::{OPENCODE_SESSION_HEADER, map_has_any_header, provider_targets_opencode};
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
@@ -277,6 +278,27 @@ impl Provider for OpenAIResponsesProvider {
                 .header("User-Agent", "pi_agent_rust");
             if let Some(session_id) = &options.session_id {
                 request = request.header("session_id", session_id);
+            }
+        }
+
+        // OpenCode gateway session correlation: one stable ID per
+        // conversation. Same rule as the completions transport — injected
+        // before custom headers so an explicit user override wins via
+        // upsert. Skipped when there is no session id or the user already
+        // set the header.
+        if provider_targets_opencode(&self.provider, &self.base_url) {
+            if let Some(session_id) = options.session_id.as_deref().filter(|id| !id.is_empty()) {
+                let user_set = map_has_any_header(&options.headers, &[OPENCODE_SESSION_HEADER])
+                    || self
+                        .compat
+                        .as_ref()
+                        .and_then(|c| c.custom_headers.as_ref())
+                        .is_some_and(|headers| {
+                            map_has_any_header(headers, &[OPENCODE_SESSION_HEADER])
+                        });
+                if !user_set {
+                    request = request.header(OPENCODE_SESSION_HEADER, session_id);
+                }
             }
         }
 
@@ -2501,6 +2523,98 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+    }
+
+    // ── x-opencode-session (OpenCode gateway session correlation) ──────
+
+    fn run_stream_and_capture_headers_with(
+        provider: OpenAIResponsesProvider,
+        options: &StreamOptions,
+    ) -> Option<CapturedRequest> {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = provider.with_base_url(base_url);
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        rx.recv_timeout(Duration::from_secs(2)).ok()
+    }
+
+    #[test]
+    fn test_stream_opencode_go_injects_session_header() {
+        let options = StreamOptions {
+            api_key: Some("test-opencode-key".to_string()),
+            session_id: Some("session-resp-123".to_string()),
+            ..Default::default()
+        };
+        let captured = run_stream_and_capture_headers_with(
+            OpenAIResponsesProvider::new("muse-spark-1.3-contributor")
+                .with_provider_name("opencode-go"),
+            &options,
+        )
+        .expect("captured request");
+
+        assert_eq!(
+            captured
+                .headers
+                .get("x-opencode-session")
+                .map(String::as_str),
+            Some("session-resp-123")
+        );
+    }
+
+    #[test]
+    fn test_stream_non_opencode_provider_omits_session_header() {
+        let options = StreamOptions {
+            api_key: Some("test-openai-key".to_string()),
+            session_id: Some("session-resp-123".to_string()),
+            ..Default::default()
+        };
+        let captured =
+            run_stream_and_capture_headers_with(OpenAIResponsesProvider::new("gpt-4o"), &options)
+                .expect("captured request");
+
+        assert!(
+            !captured.headers.contains_key("x-opencode-session"),
+            "plain openai provider must not send the header, got: {:?}",
+            captured.headers.get("x-opencode-session")
+        );
+    }
+
+    #[test]
+    fn test_stream_opencode_go_without_session_id_omits_header() {
+        let options = StreamOptions {
+            api_key: Some("test-opencode-key".to_string()),
+            ..Default::default()
+        };
+        let captured = run_stream_and_capture_headers_with(
+            OpenAIResponsesProvider::new("muse-spark-1.3-contributor")
+                .with_provider_name("opencode-go"),
+            &options,
+        )
+        .expect("captured request");
+
+        assert!(
+            !captured.headers.contains_key("x-opencode-session"),
+            "missing session_id must not send an empty header"
+        );
     }
 
     fn build_test_jwt(account_id: &str) -> String {

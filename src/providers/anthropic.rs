@@ -3,6 +3,7 @@
 //! This module implements the Provider trait for the Anthropic Messages API,
 //! supporting streaming responses, tool use, and extended thinking.
 
+use super::{OPENCODE_SESSION_HEADER, map_has_any_header, provider_targets_opencode};
 use crate::auth::unmark_anthropic_oauth_bearer_token;
 use crate::error::{Error, Result};
 use crate::http::client::Client;
@@ -620,6 +621,27 @@ impl Provider for AnthropicProvider {
         }
         if !beta_flags.is_empty() {
             request = request.header("anthropic-beta", beta_flags.join(","));
+        }
+
+        // OpenCode gateway session correlation: one stable ID per
+        // conversation. Same rule as the OpenAI transports — injected
+        // before custom headers so an explicit user override wins via
+        // upsert. Skipped when there is no session id or the user already
+        // set the header.
+        if provider_targets_opencode(&self.provider, &self.base_url) {
+            if let Some(session_id) = options.session_id.as_deref().filter(|id| !id.is_empty()) {
+                let user_set = map_has_any_header(&options.headers, &[OPENCODE_SESSION_HEADER])
+                    || self
+                        .compat
+                        .as_ref()
+                        .and_then(|c| c.custom_headers.as_ref())
+                        .is_some_and(|headers| {
+                            map_has_any_header(headers, &[OPENCODE_SESSION_HEADER])
+                        });
+                if !user_set {
+                    request = request.header(OPENCODE_SESSION_HEADER, session_id);
+                }
+            }
         }
 
         // Apply provider-specific custom headers from compat config.
@@ -2273,6 +2295,95 @@ mod tests {
             .expect("anthropic-beta header");
         assert!(beta.contains("oauth-2025-04-20"));
         assert!(beta.contains("prompt-caching-2024-07-31"));
+    }
+
+    // ── x-opencode-session (OpenCode gateway session correlation) ──────
+
+    fn run_stream_and_capture_headers_for_provider_with_options(
+        provider_name: &str,
+        options: &StreamOptions,
+    ) -> Option<CapturedRequest> {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = AnthropicProvider::new("minimax-m3")
+            .with_provider_name(provider_name)
+            .with_base_url(base_url);
+        let context = Context {
+            system_prompt: Some("test system".to_string().into()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        rx.recv_timeout(Duration::from_secs(2)).ok()
+    }
+
+    #[test]
+    fn test_stream_opencode_go_injects_session_header() {
+        let options = StreamOptions {
+            api_key: Some("test-opencode-key".to_string()),
+            session_id: Some("session-msg-123".to_string()),
+            ..Default::default()
+        };
+        let captured =
+            run_stream_and_capture_headers_for_provider_with_options("opencode-go", &options)
+                .expect("captured request");
+
+        assert_eq!(
+            captured
+                .headers
+                .get("x-opencode-session")
+                .map(String::as_str),
+            Some("session-msg-123")
+        );
+    }
+
+    #[test]
+    fn test_stream_non_opencode_provider_omits_session_header() {
+        let options = StreamOptions {
+            api_key: Some("sk-ant-test-key".to_string()),
+            session_id: Some("session-msg-123".to_string()),
+            ..Default::default()
+        };
+        let captured =
+            run_stream_and_capture_headers_for_provider_with_options("anthropic", &options)
+                .expect("captured request");
+
+        assert!(
+            !captured.headers.contains_key("x-opencode-session"),
+            "plain anthropic provider must not send the header, got: {:?}",
+            captured.headers.get("x-opencode-session")
+        );
+    }
+
+    #[test]
+    fn test_stream_opencode_go_without_session_id_omits_header() {
+        let options = StreamOptions {
+            api_key: Some("test-opencode-key".to_string()),
+            ..Default::default()
+        };
+        let captured =
+            run_stream_and_capture_headers_for_provider_with_options("opencode-go", &options)
+                .expect("captured request");
+
+        assert!(
+            !captured.headers.contains_key("x-opencode-session"),
+            "missing session_id must not send an empty header"
+        );
     }
 
     #[test]

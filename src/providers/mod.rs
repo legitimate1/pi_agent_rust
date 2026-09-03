@@ -58,6 +58,31 @@ pub(super) fn first_non_empty_header_value_case_insensitive(
     })
 }
 
+pub(crate) const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
+
+/// Whether this request targets the OpenCode gateway (`opencode` / `opencode-go`).
+///
+/// Matches on the canonical provider id first, then the raw provider name
+/// (case-insensitive), then the base URL — so a user-defined provider id
+/// pointing at `opencode.ai` is still covered.
+pub(crate) fn provider_targets_opencode(provider: &str, base_url: &str) -> bool {
+    if canonical_provider_id(provider)
+        .is_some_and(|canonical| canonical == "opencode" || canonical == "opencode-go")
+    {
+        return true;
+    }
+    if provider.eq_ignore_ascii_case("opencode") || provider.eq_ignore_ascii_case("opencode-go") {
+        return true;
+    }
+    base_url.to_ascii_lowercase().contains("opencode.ai")
+}
+
+pub(crate) fn map_has_any_header(headers: &HashMap<String, String>, names: &[&str]) -> bool {
+    headers
+        .keys()
+        .any(|key| names.iter().any(|name| key.eq_ignore_ascii_case(name)))
+}
+
 pub(super) fn apply_headers_ignoring_blank_auth_overrides<'a>(
     mut request: RequestBuilder<'a>,
     headers: &HashMap<String, String>,
