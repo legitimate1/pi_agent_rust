@@ -33,38 +33,7 @@ jobs:
           toolchain: nightly-2026-07-05
           targets: x86_64-pc-windows-msvc
 
-      - name: Bump version (workflow_dispatch only)
-        if: github.event_name == 'workflow_dispatch'
-        shell: pwsh
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Ensure we are on custom and up to date before bumping
-          git fetch origin custom 2>$null
-          $onCustom = (git branch --show-current) -eq "custom"
-          if (-not $onCustom) {
-            git checkout custom 2>$null
-            if ($LASTEXITCODE -ne 0) { git checkout -b custom origin/custom }
-          }
-          git pull --rebase origin custom 2>$null
-          if ($LASTEXITCODE -ne 0) { Write-Warning "git pull --rebase failed, continuing with local head" }
-          cargo install cargo-edit --locked --quiet
-          if ($LASTEXITCODE -ne 0) { throw "cargo install cargo-edit failed" }
-          cargo set-version --bump patch -p pi_agent_rust
-          if ($LASTEXITCODE -ne 0) { throw "cargo set-version failed" }
-          $v = (Select-String '^version = "([^"]+)"' Cargo.toml | ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1)
-          if (-not $v) { throw "Failed to parse bumped version from Cargo.toml" }
-          Write-Host "Bumped to $v"
-          git add Cargo.toml Cargo.lock
-          git diff --cached --quiet
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "No version change to commit"
-            exit 0
-          }
-          git commit -m "chore: bump version to $v [skip ci]"
-          git pull --rebase origin custom 2>$null
-          git push origin HEAD:custom
-          Write-Host "Pushed bump $v to origin/custom"
+      # NOTE: 版本号唯一写者在本地 deploy-artifact.ps1；云端只构建当前版本，不 bump。
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
