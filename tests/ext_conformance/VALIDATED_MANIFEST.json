@@ -146,7 +146,8 @@
           "echo",
           "greet",
           "no-handler",
-          "orphan"
+          "orphan",
+          "pi_ai_contract"
         ],
         "commands": [
           "ping"
@@ -3710,7 +3711,7 @@
       "entry_path": "npm/marckrenn-pi-sub-core/index.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -6128,6 +6129,62 @@
       }
     },
     {
+      "id": "pi_ai_fail_closed",
+      "entry_path": "pi_ai_fail_closed/pi_ai_fail_closed.ts",
+      "source_tier": "official-pi-mono",
+      "capabilities": {
+        "registers_tools": true,
+        "registers_commands": false,
+        "registers_flags": false,
+        "registers_providers": false,
+        "subscribes_events": [],
+        "uses_exec": false,
+        "uses_http": false,
+        "uses_ui": false,
+        "uses_session": false,
+        "is_multi_file": false,
+        "has_npm_deps": false
+      },
+      "conformance_tier": 1,
+      "mock_requirements": [],
+      "registrations": {
+        "tools": [
+          "pi_ai_contract"
+        ],
+        "commands": [],
+        "flags": [],
+        "event_handlers": []
+      }
+    },
+    {
+      "id": "pi_ai_provider_bridge",
+      "entry_path": "pi_ai_provider_bridge/pi_ai_provider_bridge.ts",
+      "source_tier": "official-pi-mono",
+      "capabilities": {
+        "registers_tools": true,
+        "registers_commands": false,
+        "registers_flags": false,
+        "registers_providers": false,
+        "subscribes_events": [],
+        "uses_exec": false,
+        "uses_http": false,
+        "uses_ui": false,
+        "uses_session": false,
+        "is_multi_file": false,
+        "has_npm_deps": false
+      },
+      "conformance_tier": 1,
+      "mock_requirements": [],
+      "registrations": {
+        "tools": [
+          "pi_ai_provider_bridge"
+        ],
+        "commands": [],
+        "flags": [],
+        "event_handlers": []
+      }
+    },
+    {
       "id": "pirate",
       "entry_path": "pirate/pirate.ts",
       "source_tier": "official-pi-mono",
@@ -7274,6 +7331,42 @@
       }
     },
     {
+      "id": "third-party/lll9p-pi-better-compaction",
+      "entry_path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/index.ts",
+      "source_tier": "third-party-github",
+      "capabilities": {
+        "registers_tools": false,
+        "registers_commands": false,
+        "registers_flags": false,
+        "registers_providers": false,
+        "subscribes_events": [
+          "before_provider_request",
+          "session_before_compact",
+          "session_start"
+        ],
+        "uses_exec": true,
+        "uses_http": false,
+        "uses_ui": false,
+        "uses_session": false,
+        "is_multi_file": true,
+        "has_npm_deps": false
+      },
+      "conformance_tier": 3,
+      "mock_requirements": [
+        "exec"
+      ],
+      "registrations": {
+        "tools": [],
+        "commands": [],
+        "flags": [],
+        "event_handlers": [
+          "before_provider_request",
+          "session_before_compact",
+          "session_start"
+        ]
+      }
+    },
+    {
       "id": "third-party/lsj5031-pi-notification-extension",
       "entry_path": "third-party/lsj5031-pi-notification-extension/notification.ts",
       "source_tier": "third-party-github",
@@ -7328,20 +7421,12 @@
         "registers_providers": false,
         "subscribes_events": [
           "model_select",
-          "session_branch",
           "session_shutdown",
           "session_start",
-          "session_switch",
-          "sub-core:action",
           "sub-core:ready",
-          "sub-core:request",
-          "sub-core:settings:patch",
           "sub-core:settings:updated",
           "sub-core:update-all",
-          "sub-core:update-current",
-          "tool_result",
-          "turn_end",
-          "turn_start"
+          "sub-core:update-current"
         ],
         "uses_exec": true,
         "uses_http": false,
@@ -7358,26 +7443,17 @@
         "tools": [],
         "commands": [
           "sub-bar:import",
-          "sub-bar:settings",
-          "sub-core:settings"
+          "sub-bar:settings"
         ],
         "flags": [],
         "event_handlers": [
           "model_select",
-          "session_branch",
           "session_shutdown",
           "session_start",
-          "session_switch",
-          "sub-core:action",
           "sub-core:ready",
-          "sub-core:request",
-          "sub-core:settings:patch",
           "sub-core:settings:updated",
           "sub-core:update-all",
-          "sub-core:update-current",
-          "tool_result",
-          "turn_end",
-          "turn_start"
+          "sub-core:update-current"
         ]
       }
     },
@@ -7485,7 +7561,9 @@
       "registrations": {
         "tools": [],
         "commands": [
-          "diff"
+          "diff",
+          "files",
+          "tui"
         ],
         "flags": [],
         "event_handlers": [
@@ -7827,13 +7905,15 @@
           "rpbind",
           "sandbox",
           "session-ask",
+          "skill",
           "speedread",
           "steer",
           "todos",
           "tools",
           "ultrathink",
           "usage",
-          "vog"
+          "vog",
+          "ws"
         ],
         "flags": [],
         "event_handlers": [

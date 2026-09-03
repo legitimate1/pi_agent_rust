@@ -131,6 +131,7 @@ async fn run_debug(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<(
             .as_ref()
             .and_then(|i| i.auto_resize)
             .unwrap_or(true),
+        &pi::workspace::WorkspaceHandle::default(),
     )?;
     step!(
         "   Initial message prepared: {:?}",
@@ -211,6 +212,8 @@ async fn run_debug(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<(
         &package_dir,
         test_mode,
         !cli.hide_cwd_in_prompt,
+        None,
+        &config,
     )?;
     let provider =
         providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;
@@ -222,6 +225,7 @@ async fn run_debug(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<(
         block_images: config.image_block_images(),
         fail_closed_hooks: config.fail_closed_hooks(),
         tool_approval: None,
+        ..AgentConfig::default()
     };
     let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&config));
     let session_arc = Arc::new(Mutex::new(session));

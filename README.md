@@ -5,7 +5,7 @@
 <h1 align="center">pi_agent_rust</h1>
 
 <p align="center">
-  <strong>pi_agent_rust - High-performance AI coding agent CLI written in Rust</strong>
+  <strong>pi_agent_rust - Native AI coding agent CLI written in Rust</strong>
 </p>
 
 <p align="center">
@@ -35,14 +35,35 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/ma
 ## The Problem
 
 You want an AI coding assistant in your terminal, but existing tools are:
-- **Slow to start**: Node.js/Python runtimes add 500ms+ before you can type
-- **Memory hungry**: Electron apps or heavy runtimes eat gigabytes
+- **Slow to start**: Managed runtimes can add noticeable startup overhead
+- **Resource intensive**: Electron apps or heavy runtimes can add substantial overhead
 - **Unreliable**: Streaming breaks, sessions corrupt, tools fail silently
 - **Hard to extend**: Closed ecosystems or complex plugin systems
 
 ## The Solution
 
-**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Single binary, instant startup, stable streaming, and 8 built-in tools.
+**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Official release archives install the single end-user binary `pi`, with streaming responses and 35 built-in tools (19 in the default `--tools` list; 14 always in the model's schema, the rest reachable through the `xdev` dispatcher or enabled in settings).
+
+### Current product direction
+
+This project is no longer trying to be a strict drop-in replacement for the
+legacy TypeScript Pi. That target became both impractical and undesirable as
+the legacy implementation evolved. Legacy Pi remains useful historical context,
+but it is not our compatibility authority or definition of completeness.
+
+OMP is the closer reference for where the product is going: feature surface,
+agent workflows, look and feel, and overall UI/UX. Pi Rust still chooses
+Rust-native architecture and may intentionally differ from both projects when
+that produces a simpler, safer, or better coding agent. Historical drop-in and
+parity artifacts remain in the repository as records; they do not gate product
+work, releases, or user-facing claims.
+
+All repository quality checks, builds, and releases run through Doodlestein
+Self-Releaser (DSR). Contributors must not invoke Cargo or RCH directly, and
+GitHub Actions is never an execution or evidence authority for this project.
+Use `dsr quality --tool pi_agent_rust` for the registered quality recipe and
+the canonical DSR build/release commands documented in
+[docs/releasing.md](docs/releasing.md).
 
 Rather than a direct line-by-line translation, this port builds on two purpose-built Rust libraries:
 - **[asupersync](https://github.com/Dicklesworthstone/asupersync)**: A structured concurrency async runtime with built-in HTTP, TLS, and SQLite
@@ -63,9 +84,9 @@ pi -p "What does this error mean?" < error.log
 
 If you already use Pi Agent, especially through OpenClaw, this project keeps the core workflow while upgrading the engine under the hood:
 
-- **Substantially faster in realistic end-to-end flows** (not synthetic microbenchmarks)
-- **Dramatically smaller memory footprint** in long-running sessions
-- **Materially stronger security model** for extension/tool execution, including command-level blocking of dangerous extension shell patterns
+- **A native single-binary design** intended to minimize startup and runtime overhead
+- **A bounded-resource architecture** for long-running sessions
+- **A capability-gated security model** for extension/tool execution, including command-level blocking of dangerous extension shell patterns
 
 Security is a first-class design goal here, not a bolt-on:
 
@@ -82,7 +103,8 @@ Security is a first-class design goal here, not a bolt-on:
 The Rust port is designed around large-session, multi-agent, and extension-heavy
 workloads. Release-facing performance numbers are published only when the
 checked-in evidence artifacts are current, have matching run provenance, and
-report no CI no-data or data-contract failures. Historical benchmark snapshots
+show data and a passing result for every declared budget, with no data-contract
+failures. Historical benchmark snapshots
 are retained in planning/evidence artifacts, but they are not treated as current
 README claims until the performance evidence gate is regenerated cleanly.
 
@@ -94,7 +116,7 @@ Extension runtime guarantees are also concrete:
 | Trust lifecycle + kill switch (`pending/acknowledged/trusted/killed`) | You can quarantine an extension instantly, log who pulled the switch and why, and require explicit re-acknowledgement before restoring access |
 | Hostcall lane kill-switch controls (`forced_compat_global_kill_switch`, `forced_compat_extension_kill_switch`) | Fast-path regressions can be contained immediately by forcing compatibility-lane execution without disabling the extension system |
 | Deterministic hostcall reactor mesh (shard affinity, bounded SPSC lanes, backpressure telemetry, optional NUMA slab tracking) | Runtime behavior stays predictable under contention; queue pressure and routing decisions are observable instead of opaque |
-| Startup prewarm + warm isolate reuse for JS runtimes | Runtime creation overlaps startup and warm reuse keeps repeated extension runs low-latency without a Node/Bun process model |
+| Cold owner-isolated JS realms + persistent transpile cache | Every reload gets a fresh realm while versioned disk-cached transpilation avoids treating mutable JavaScript state as safely reusable |
 | Tamper-evident runtime risk ledger (`verify` / `replay` / `calibrate`) | Security decisions are hash-linked and can be replayed or threshold-tuned from real runtime traces |
 
 Bottom line: Pi's architecture targets lower latency, lower memory use, and
@@ -105,32 +127,47 @@ claims must come from fresh, provenance-matched evidence artifacts.
 
 ### README Citation Convention
 
-All numeric performance claims in this README include inline citations with format:
+Release-facing numeric performance claims in this README include inline citations with format:
 `*(from [artifact-path], run [correlation-id])*`
 
 Example: `*(from [artifact-path], run [correlation-id])*`
 
-CI checks both file freshness and artifact content so stale, no-data, or
-correlation-mismatched evidence cannot back user-facing performance claims.
-The README evidence checker reports line-numbered proof obligations for cited
-claims and extracts claim-gated performance phrases for reviewer audit. Explicit
-historical snapshot citations are mapped separately and do not satisfy current
+Two additional machine-recognized citation forms exist:
+
+- `*(from [artifact-path])*` — path-only citation. The cited artifact must
+  exist and parse; freshness is enforced by the same 14-day rule as
+  release-facing claims.
+- `*(from [artifact-path]; historical snapshot)*` — explicit historical
+  contract. The citation itself declares the obligation a retained snapshot:
+  existence and validity are still checked, but staleness is not enforced
+  because such claims never satisfy current release-facing requirements.
+
+`scripts/check_readme_evidence_freshness.py` (a pre-release check listed in
+[docs/releasing.md](docs/releasing.md), not part of the code quality recipe)
+checks file freshness and artifact content so stale, no-data, or
+correlation-mismatched evidence cannot back user-facing performance claims;
+for release-facing citations of `budget_summary.json` it validates the full
+`pi.perf.budget_summary.v2` contract, including that the header counts equal
+the per-budget rows. It reports line-numbered proof obligations for cited
+claims and extracts claim-gated performance phrases for reviewer audit.
+Historical snapshot citations are mapped separately and do not satisfy current
 release-facing claims.
 
-## How We Made It So Fast
+## Performance-Oriented Architecture
 
 In this README, `we` means the project owner and collaborating coding agents.  
-The speed gains come from runtime design, not one trick.
+The design concentrates performance work in several runtime layers rather than
+assuming one optimization proves an end-to-end result.
 
-| Technique | What we do | Runtime effect |
+| Technique | What we do | Runtime intent |
 |---|---|---|
-| Cold-start minimization | Single static binary, no Node/Bun runtime bootstrap, no JIT warmup, startup prewarm for extension runtime paths | Faster time-to-first-interaction |
-| Less copying on hot paths | `Arc`/`Cow` message flow, zero-copy hostcall/tool payload handling, reduced clone-heavy provider/session paths | Lower CPU and allocation pressure |
-| Deterministic dispatch core | Typed hostcall opcodes, fast-lane/compat-lane routing, bounded shard queues with reactor-mesh telemetry | Better tail latency under concurrent extension load |
-| Efficient long-session storage | SQLite session index + v2 sidecar (segmented log + offset index) with O(index+tail) reopen path | Fast resume on large histories |
-| Streaming parser tuned for real networks | SSE parser tracks scanned bytes, handles UTF-8 tails, normalizes chunk boundaries, interns event-type strings | Lower streaming overhead and fewer parser stalls |
-| Safe fast-path controls | Shadow dual execution sampling, automatic backoff on divergence/overhead, compatibility-lane kill switches for containment | Keeps optimizations fast without silent behavior drift |
-| CI-level performance governance | Scenario matrices, strict artifact contracts, fail-closed perf gates | Regressions are caught before release |
+| Cold-start minimization | Single native binary, no Node/Bun runtime bootstrap, no JIT warmup, startup prewarm for extension runtime paths | Reduce time-to-first-interaction |
+| Less copying on hot paths | `Arc`/`Cow` message flow, zero-copy hostcall/tool payload handling, reduced clone-heavy provider/session paths | Reduce CPU and allocation pressure |
+| Deterministic dispatch core | Typed hostcall opcodes, fast-lane/compat-lane routing, bounded shard queues with reactor-mesh telemetry | Reduce tail latency under concurrent extension load |
+| Efficient long-session storage | SQLite session index + v2 sidecar (segmented log + offset index) with O(index+tail) reopen path | Avoid full-history work on eligible resumes |
+| Streaming parser tuned for real networks | SSE parser tracks scanned bytes, handles UTF-8 tails, normalizes chunk boundaries, interns event-type strings | Reduce repeated scanning and parser stalls |
+| Safe fast-path controls | Shadow dual execution sampling, automatic backoff on divergence/overhead, compatibility-lane kill switches for containment | Bound optimization risk and preserve fallback behavior |
+| DSR performance governance | Scenario matrices, strict artifact contracts, fail-closed perf gates | Detect regressions before release |
 
 If you want the full implementation inventory, see [Performance Engineering](#performance-engineering).
 
@@ -169,9 +206,9 @@ If you want full details, see:
 
 | Feature | Pi (Rust) | Typical TS/Python CLI |
 |---------|-----------|----------------------|
-| **Startup** | <100ms | 500ms-2s |
-| **Binary size** | ~21.1 MiB (default release) | 100MB+ (with runtime) |
-| **Memory (idle)** | <50MB | 200MB+ |
+| **Startup** | Native single-binary path (Fresh `v0.3.0` measurement pending; pre-v0.3.0 criterion: ~5-7ms p95 version, ~12-15ms help; see `tests/perf/reports/budget_summary.json` `startup_version_p95` and `startup_full_agent_p95`) | Runtime-dependent |
+| **Binary size** | Size-budgeted release profile (LTO, strip, `opt-level = "z"`); the `binary_size_release` budget and its latest stripped-artifact measurement are reported in [Current Evidence State](#current-evidence-state-auto-generated), never promoted here until claim readiness is `ready` | Runtime-dependent |
+| **Memory (idle)** | Bounded-resource design; the `idle_memory_rss` budget and its latest release-binary measurement are reported in [Current Evidence State](#current-evidence-state-auto-generated) (`docs/perf-budgets-recipe.md` defines the canonical 5-measurement taxonomy) | Runtime-dependent |
 | **Streaming** | Native SSE parser | Library-dependent |
 | **Tool execution** | Process tree management | Basic subprocess |
 | **Sessions** | JSONL with branching | Varies |
@@ -261,37 +298,210 @@ pi "Explain this codebase structure"
 pi @src/main.rs "What does this do?"
 ```
 
+### Using a local model
+
+`ollama`, `llamacpp` (llama.cpp's `llama-server`), `mistralrs` (mistral.rs), and
+`lmstudio` are built-in **local** providers. The first three need **no API key** and
+work out of the box against their default ports:
+
+```bash
+pi --provider ollama    --model llama3        -p "hi"
+pi --provider llamacpp  --model <gguf-repo-id> -p "hi"
+pi --provider mistralrs --model default        -p "hi"
+```
+
+To point at any other OpenAI-compatible server (a custom host/port, vLLM, etc.),
+add it to `~/.pi/agent/models.json`:
+
+```json
+{
+  "providers": {
+    "ollama": {
+      "api": "openai-completions",
+      "baseUrl": "http://127.0.0.1:11000/v1",
+      "apiKey": "ollama",
+      "models": [{ "id": "Qwen3.6-35B-A3B-4bit", "contextWindow": 32768 }]
+    }
+  }
+}
+```
+
+Then `pi --provider ollama --model Qwen3.6-35B-A3B-4bit`. See
+[docs/models.md](docs/models.md) for the full `models.json` schema, provider
+aliases, and secret resolution (env vars and `!command` shell lookups).
+
+### Refreshing provider model catalogs
+
+For OpenAI-compatible providers, model discovery is a standalone command: it
+prints one model ID per stdout line and exits without starting the TUI.
+
+```bash
+# Use a successful live response or (with a warning on stderr) the static
+# registry when live discovery is unavailable
+pi --fetch-models openrouter
+
+# Bypass the cache and require a genuinely live response; never fall back
+pi --fetch-models openrouter --refresh-models
+
+# Make a successful live/cache catalog available to future --list-models and
+# interactive /model pickers
+pi --fetch-models openrouter --refresh-models --persist-models
+```
+
+Each standalone CLI invocation starts a new process, so its in-memory cache is
+fresh. The five-minute cache only avoids repeat discovery calls made within one
+long-lived process by SDK/library users; `--refresh-models` bypasses that cache.
+
+Persistence is opt-in. The v2 `~/.pi/agent/models.fetched.json` schema stores
+provider/model IDs, the fetch timestamp, and a non-secret SHA-256 identity
+binding membership to the provider, API, query-free endpoint, auth-header
+mode, recognized credential-query ordered name/presence shape, and
+request-header name/presence shape that produced it. Pi never persists a static fallback, API
+credentials, URL query values, or request-header values—not even as
+offline-verifiable hashes. Credential-channel values are rotation-tolerant.
+Any non-empty query/header value outside a narrowly recognized credential
+channel may identify a tenant or deployment, so Pi refuses to persist that
+catalog (and ignores legacy persisted rows for such a current route) rather
+than reuse unverifiable membership. If a safely bound route shape no longer
+matches, Pi ignores those generated rows and reports how to refresh them.
+Credential rotation alone does not invalidate the catalog. The generated
+membership is likewise not account-bound: switching accounts on the same
+endpoint/transport shape can retain the prior account's saved model list until
+you rerun `--fetch-models <provider> --refresh-models --persist-models`.
+Inference still resolves and sends the current account's credential; only the
+opt-in model-membership list can be stale across that switch. The generated
+catalog is loaded first; your hand-written `~/.pi/agent/models.json` is loaded
+afterward and remains authoritative. Pi does not rewrite or merge that
+user-authored file.
+Legacy `pi.models.fetched.v1` files cannot be rebound safely because they lack
+this provenance, so Pi preserves them instead of overwriting them. Move the
+legacy file aside to `models.fetched.v1.backup.json`, then rerun the verified
+live refresh and persist command above to create a v2 catalog.
+
 ---
 
 ## Features
 
 ### Streaming Responses
 
-Real-time token streaming with extended thinking support:
+Real-time response streaming with extended thinking support:
 
 ```
 pi "Write a quicksort implementation"
 ```
 
-Watch the response appear token-by-token, with thinking blocks shown inline.
+Watch the response appear incrementally, with thinking blocks shown inline.
 
-### 8 Built-in Tools
+### 35 Built-in Tools
 
-| Tool | Description | Example |
-|------|-------------|---------|
-| `read` | Read file contents, supports images | Read src/main.rs |
-| `write` | Create or overwrite files | Write a new config file |
-| `edit` | Surgical string replacement | Fix the typo on line 42 |
-| `hashline_edit` | Precise edits using LINE#HASH tags | Apply edits to specific lines using hashline anchors |
-| `bash` | Execute shell commands with timeout | Run the test suite |
-| `grep` | Search file contents with context | Find all TODO comments |
-| `find` | Discover files by pattern | Find all *.rs files |
-| `ls` | List directory contents | What's in src/? |
+Tools are tiered so the model's live schema stays small while everything
+remains reachable. The tier table lives in `src/xdev.rs`; the default
+`--tools` list lives in `src/cli.rs`:
 
-All tools include:
-- Automatic truncation for large outputs (2000 lines / 1MB)
-- Detailed metadata in responses
-- Process tree cleanup for bash (no orphaned processes)
+- **Essential** (always in the provider schema): `read`, `write`, `edit`,
+  `bash`, `grep`, `find`, `ls`, `hashline_edit`, `ask`, `todo`,
+  `web_search`, `submit_plan`, `current_time`, `xdev`
+- **Discoverable** (registered, hidden from the schema until promoted via
+  `xdev list/describe/run/promote`): `ast_grep`, `ast_edit`, `lsp`,
+  `debug`, `manage_skill` — plus the memory-bank tools (`retain`,
+  `recall`, `reflect`, `memory_edit`, `learn`) when `memory.backend` is
+  `local`
+- **Default-enabled**: `jobs` (background bash job control) and `hub` (PTY
+  service supervision), alongside the essential tier. The default `--tools`
+  list names 19 tools; the registry always adds `manage_skill` and, when any
+  discoverable tool is enabled, the `xdev` dispatcher
+- **`--tools` opt-in extras**: `eval`, `github`, `security_scan`
+- **Settings-gated extras** (off until enabled in `settings.json`):
+  `browser` (`browser.enableBrowser`), `computer`
+  (`computer.enableComputer`), and the media trio `inspect_image`,
+  `generate_image`, `tts` (`media.enableInspectImage` /
+  `media.enableGenerateImage` / `media.enableTts`)
+- **Opt-in only**: `subagent` (it can start additional coding-agent
+  processes)
+
+| Tool | Description |
+|------|-------------|
+| `read` | Read files (images and http(s)/`skill://`-style URLs supported) |
+| `write` / `edit` / `hashline_edit` | Create, surgically replace, or hashline-anchored edit files |
+| `bash` | Shell with timeout, command mediation, optional PTY, background jobs |
+| `grep` / `find` / `ls` | In-process content search, file discovery, listing |
+| `web_search` | Ranked multi-provider web search with circuit breaking |
+| `ask` / `todo` | Structured mid-turn option cards; persistent session task list |
+| `submit_plan` | Submit a completed plan for approval when plan mode is active |
+| `current_time` | The host's wall-clock time: UTC and local ISO-8601 timestamps, the UTC offset, Unix epoch seconds, weekday, and ISO week (the local zone follows `TZ`); takes no arguments. The system prompt carries only the date so the cached prefix stays stable; this tool is the clock |
+| `xdev` | Dispatcher exposing the discoverable tier (`list/describe/run/promote`) |
+| `ast_grep` / `ast_edit` | Structural code search and rewrite |
+| `lsp` / `debug` | Language-server (14 ops) and DAP debugging (29 ops) bridges |
+| `eval` | Persistent Python and JS kernels with cell semantics |
+| `jobs` / `hub` | Background bash job control; PTY service supervision |
+| `github` | `gh`-backed PR/issue/run operations |
+| `security_scan` | Rule-pack security scanning to SARIF (`plan`/`run`/`disposition`/`compare`) |
+| `manage_skill` + memory tools | Managed skills CRUD; opt-in project memory bank |
+| `browser` | Headless Chromium automation over CDP (navigate, snapshot, click, type, screenshot) with a domain allowlist; settings-gated |
+| `computer` | Desktop automation (displays, windows, screenshots, mouse/keyboard, clipboard); mutating actions require approval; settings-gated |
+| `inspect_image` / `generate_image` / `tts` | Vision analysis of local images, image generation/editing, and text-to-speech through provider adapters; settings-gated |
+| `subagent` | Delegate isolated work to named Rust Pi child agents |
+
+All tools include automatic truncation for large outputs (2000 lines /
+1MB), detailed metadata in responses, and process-tree cleanup for bash.
+Background-job logs are preserved by default; when their dedicated directory
+cannot admit another 16 MiB artifact within its 256 MiB / 4096-entry budget,
+Pi refuses the new job instead of deleting history. Set
+`PI_JOBS_ARTIFACT_RETENTION=rotate` to opt into deleting the oldest unlocked
+artifacts while preserving active logs and at least eight recent logs. Job
+snapshots report the applied policy, removed-file count, and reclaimed bytes in
+`artifactCleanup`.
+Per-tool exposure is configurable via `tools.loadMode.<name>` set to
+`essential`, `discoverable`, or `off`; an explicit `--tools` list always
+wins:
+
+```bash
+pi --tools read,bash,edit,write,grep,find,ls,hashline_edit,subagent \
+  "Use the scout agent to inspect the provider implementation."
+```
+
+### Native Subagents and Orchestration
+
+Rust Pi includes a native `subagent` tool; it does not depend on a QuickJS
+extension and never resolves a child executable by assuming a `pi` binary on
+`PATH`. By default it starts the current Rust Pi executable. Set
+`PI_SUBAGENT_PI_BINARY=/absolute/path/to/rpi` only when an explicit binary
+override is needed.
+
+Agent definitions are Markdown files in `$PI_CODING_AGENT_DIR/agents/*.md`
+(normally `~/.pi/agent/agents/*.md`) or the nearest
+`.pi/agents/*.md`. Project definitions take precedence over same-named user
+definitions. The process inherits the parent's provider, router, authentication,
+and model-registry environment, including `PI_CODING_AGENT_DIR`.
+
+```markdown
+---
+name: scout
+description: Inspect code and return concise, evidence-backed findings.
+model: ai-router/gpt-5.6-sol
+reasoning: low
+tools: read,grep,find,ls
+skills: ../skills/codebase-archaeology/SKILL.md
+---
+
+Read relevant code before answering. Do not edit files.
+```
+
+The tool accepts exactly one workflow shape: a single `{ agent, task }`, a
+bounded parallel `tasks` array (up to 8, default concurrency 4), or a sequential
+`chain` array. In chains, `{previous}` in a task is replaced by the preceding
+child's final output. Children run headlessly in isolated ephemeral sessions,
+stream progress into the parent TUI/JSON output, return structured status and
+stderr details, and are killed/reaped if the parent is cancelled. Child agents
+receive the declared tool allowlist; the default child allowlist deliberately
+excludes `subagent` to prevent accidental recursive delegation.
+
+In interactive mode, `/tan <work>` starts the same task-role child machinery
+without interrupting the main conversation. The child runs in the current
+directory, appears in `hub agent roster` with `kind=tan`, and sends its bounded
+completion summary through the follow-up queue at the next idle turn boundary.
+Because `/tan` inherits the delegation safety gate, it is available only when
+the opt-in `subagent` tool is enabled.
 
 ### Session Management
 
@@ -321,7 +531,7 @@ Enable deep reasoning for complex problems:
 pi --thinking high "Design a distributed rate limiter"
 ```
 
-Thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`
+Thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`
 
 ### Customization (Skills & Prompt Templates)
 
@@ -334,21 +544,22 @@ Thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`
 Pi provides context-aware autocomplete in the interactive editor:
 
 - **`@` file references**: Type `@` followed by a path fragment to attach file contents. The completion engine indexes project files (respecting `.gitignore`) via the `ignore` crate's `WalkBuilder`, capping at 5,000 entries.
-- **`/` slash commands**: Built-in commands (`/help`, `/model`, `/tree`, `/clear`, `/compact`, `/exit`) and user-defined prompt templates and skills all appear as completions.
+- **`/` slash commands**: 40+ built-in commands (see the slash-command table below) and user-defined prompt templates and skills all appear as completions.
 - **Fuzzy scoring**: Prefix matches rank above substring matches. Results are sorted by match quality, then by kind (commands > templates > skills > files > paths).
 - **Background refresh**: A background thread re-indexes the project file tree every 30 seconds, so completions stay current without blocking the input loop.
 
-### Three Execution Modes
+### Four Execution Modes
 
-Pi runs in three modes, each suited to different workflows:
+Pi runs in four modes, each suited to different workflows:
 
 | Mode | Invocation | Use Case |
 |------|-----------|----------|
 | **Interactive** | `pi` (default) | Full TUI with streaming, tools, session branching, autocomplete |
 | **Print** | `pi -p "..."` | Single response to stdout, no TUI, scriptable |
 | **RPC** | `pi --mode rpc` | Headless JSON protocol over stdin/stdout for IDE integrations |
+| **ACP** | `pi --acp` | JSON-RPC 2.0 Agent Client Protocol over stdin/stdout (e.g. the Zed editor) |
 
-**Interactive mode** provides the full experience: a multi-line text editor with history, scrollable conversation viewport, model selector (`Ctrl+L`), scoped model cycling (`Ctrl+P`/`Ctrl+Shift+P`), session branch navigator (`/tree`), and real-time token/cost tracking.
+**Interactive mode** provides the full experience: a multi-line text editor with history, scrollable conversation viewport, model selector (`Ctrl+L`), scoped model cycling (`Ctrl+P`/`Ctrl+Shift+P`), session branch navigator (`/tree`), and real-time token/cost tracking. Since v0.4.0 the default interactive stack is the FrankenTUI (`ftui`) runtime; `pi --inline` keeps your shell scrollback by drawing the UI at the bottom of the screen instead of on the alternate screen, and `pi --classic` (aliases `--classic-tui`, `--charmed`, `--bubbletea`) selects the previous charmed_rust stack until it is removed.
 
 **Print mode** sends one message, streams the response to stdout, and exits. Useful for shell scripts and one-off queries.
 
@@ -365,13 +576,14 @@ Pi supports two extension runtime families with capability-gated host connectors
   - `.js/.ts/.mjs/.cjs/.tsx/.mts/.cts` run directly in embedded QuickJS (no descriptor conversion).
   - `*.native.json` loads the native-rust descriptor runtime.
   - One session currently uses one runtime family at a time (JS/TS or native descriptor).
-- **Sub-100ms cold load** (P95), **sub-1ms warm load** (P99)
+- Cold/warm extension load paths are instrumented; fresh `v0.3.0` measurements are pending
 - Node API shims for `fs`, `path`, `os`, `crypto`, `child_process`, `url`, and more
 - Capability-based security: extensions call explicit connectors (`tool/exec/http/session/ui`) with audit logging
 - Command-level exec mediation: dangerous shell signatures are classified and blocked before spawn, with redacted denial alerts and mediation ledger entries
 - Trust-state lifecycle and kill-switch controls with audited state transitions (`pending`/`acknowledged`/`trusted`/`killed`)
+- Workspace trust-on-first-use gate: project-local `.pi/settings.json` packages and `.pi/extensions/` require a one-time interactive approval (keyed to workspace path + content digest; `--trust`, `PI_WORKSPACE_TRUST`, or global `trustAllWorkspaces` for automation; non-interactive launches fail closed)
 - Hostcall reactor mesh with deterministic shard routing, bounded queue backpressure, and optional NUMA-aware telemetry
-- Runtime prewarm path with warm isolate reuse so extension startup cost is mostly paid before the first prompt
+- Fresh owner-isolated realms on every reload, with versioned persistent transpile caching instead of mutable realm reuse
 
 ### Credential-Aware Model Selection
 
@@ -389,7 +601,7 @@ and [docs/extension-catalog.json](docs/extension-catalog.json) for the
 
 This project validates extension compatibility with a three-track pipeline:
 
-- **Vendored corpus (224)**: deterministic conformance, compatibility matrix, and scenario suites.
+- **Vendored corpus (223, plus one intentionally excluded negative test fixture)**: deterministic conformance, compatibility matrix, and scenario suites.
 - **Unvendored corpus (777)**: source acquisition and onboarding prioritization.
 - **Release-binary live-provider E2E**: real `target/release/pi` execution against a non-mocked provider/model path.
 
@@ -405,8 +617,8 @@ This project validates extension compatibility with a three-track pipeline:
 
 1. **Fetch unvendored source corpus**
    - Binary: `ext_unvendored_fetch_run`
-   - Typical command:
-     - `cargo run --example ext_unvendored_fetch_run -- run-all --workers 8 --no-probe`
+   - Execution authority: the registered DSR extension-validation lane; do not
+     invoke the example directly with Cargo
    - Purpose:
      - Clones GitHub repos and unpacks npm tarballs into `.tmp-codex-unvendored-cache/`
      - Produces machine-readable acquisition status for all unvendored candidates
@@ -416,8 +628,7 @@ This project validates extension compatibility with a three-track pipeline:
 
 2. **Run end-to-end validation orchestration**
    - Binary: `ext_full_validation`
-   - Typical command:
-     - `cargo run --example ext_full_validation --`
+   - Execution authority: the registered DSR extension-validation lane
    - Stages (in order):
      1. `refresh_onboarding_queue` (runs `ext_onboarding_queue`)
      2. `conformance_shard_0..N` (runs `ext_conformance_generated` sharded matrix)
@@ -433,9 +644,7 @@ This project validates extension compatibility with a three-track pipeline:
 
 3. **Run dev-firstset live-provider gate (must pass before release build)**
    - Binary: `ext_release_binary_e2e`
-   - Typical command:
-     - `cargo build --bin pi --bin ext_release_binary_e2e`
-     - `PI_HTTP_REQUEST_TIMEOUT_SECS=0 target/debug/ext_release_binary_e2e --pi-bin target/debug/pi --provider ollama --model qwen2.5:0.5b --jobs 10 --timeout-secs 600 --max-cases 20 --extension-policy balanced --out-json tests/ext_conformance/reports/release_binary_e2e/ollama_firstset_dev_20260219_jobs10_timeout600.json --out-md tests/ext_conformance/reports/release_binary_e2e/ollama_firstset_dev_20260219_jobs10_timeout600.md`
+   - Execution authority: DSR quality with its configured live-provider inputs
    - Purpose:
      - Proves the current codepath works end-to-end on a representative first-set before paying release-build cost.
      - Serves as the promotion gate to full release-binary validation.
@@ -447,9 +656,7 @@ This project validates extension compatibility with a three-track pipeline:
 
 4. **Run full release-binary live-provider E2E (after step 3 passes)**
    - Binary: `ext_release_binary_e2e`
-   - Typical command:
-     - `cargo build --release --bin pi --bin ext_release_binary_e2e`
-     - `PI_HTTP_REQUEST_TIMEOUT_SECS=0 target/release/ext_release_binary_e2e --pi-bin target/release/pi --provider ollama --model qwen2.5:0.5b --jobs 10 --timeout-secs 600 --extension-policy balanced --out-json tests/ext_conformance/reports/release_binary_e2e/ollama_full_release_20260219_jobs10_timeout600.json --out-md tests/ext_conformance/reports/release_binary_e2e/ollama_full_release_20260219_jobs10_timeout600.md`
+   - Execution authority: the DSR release-validation lane after DSR quality passes
    - Purpose:
      - Executes `target/release/pi` directly for each selected extension case.
      - Uses a live provider/model path (default `ollama` + `qwen2.5:0.5b`) to exercise non-mocked end-to-end behavior.
@@ -472,22 +679,23 @@ This project validates extension compatibility with a three-track pipeline:
 
 ### Recommended run environment
 
-These runs compile many crates and can be disk-heavy. Point Cargo artifacts and temp files to a large volume:
+These runs compile many crates and can be disk-heavy. DSR owns target/temp
+placement, load admission, and any remote offload. Run the registered recipe:
 
 ```bash
-export CARGO_TARGET_DIR="/data/tmp/pi_agent_rust_cargo/${USER:-agent}/target"
-export TMPDIR="/data/tmp/pi_agent_rust_cargo/${USER:-agent}/tmp"
-mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
+dsr quality --tool pi_agent_rust
 ```
 
-Then run:
+### Historical run snapshot (extension gate refresh 2026-05-15)
 
-```bash
-cargo run --example ext_unvendored_fetch_run -- run-all --workers 8 --no-probe
-cargo run --example ext_full_validation --
-```
+These artifacts predate `v0.3.0` and do not certify the current source revision.
+The strict drop-in program has been retired; its contract and verdict are no
+longer release gates and will not be rerun to define product completeness. The
+figures below are retained only as a dated engineering snapshot.
 
-### Latest run snapshot (extension gate refresh 2026-05-15)
+The current extension must-pass corpus is the exact set selected by
+`docs/extension-inclusion-list.json`; the historical counts below do not prove
+coverage of that authoritative list.
 
 From:
 - `tests/ext_conformance/reports/gate/must_pass_gate_verdict.json` (generated `2026-05-15T17:03:02.000Z`, run `local-20260515T170218075Z`)
@@ -495,15 +703,14 @@ From:
 - `tests/ext_conformance/reports/journeys/journey_report.json` (generated `2026-05-13T02:59:58.302Z`)
 - `tests/evidence_bundle/index.json` (generated `2026-05-12T19:26:21.441Z`, run `local-20260512T192621Z`)
 - `tests/full_suite_gate/certification_verdict.json` (generated `2026-05-14T19:59:37.227Z`)
-- `docs/evidence/dropin-certification-verdict.json` (generated `2026-05-18T19:37:26Z`)
+- Historical verdict blob at `2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91:docs/evidence/dropin-certification-verdict.json` (generated `2026-05-18T19:37:26Z` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8`; the live file may contain a later verdict)
 
-- Strict drop-in status: **22/22 certification gates PASS, 16/16 blocking gates PASS** - `CERTIFIED` *(from docs/evidence/dropin-certification-verdict.json; strict replacement wording remains governed by docs/contracts/dropin-certification-contract.json and this verdict artifact)*
-- Unified evidence bundle: `29/29` sections present, `0` missing, `0` invalid *(from tests/evidence_bundle/index.json)*
-- Extension must-pass gate: `123/123` must-pass extensions passed; informational stretch set `100/101` passed with one non-blocking stretch failure *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json)*
-- Extension health delta: `223/223` tested extensions passed (`100.0%`), `0` regressions, `13` fixes vs the 2026-02-07 baseline, with `1` intentionally excluded test fixture disclosed in the report *(from tests/ext_conformance/reports/health_delta/health_delta_report.json)*
-- Health-delta full-manifest non-pass extensions: `0`; `base_fixtures` is a test-only negative fixture excluded from release-facing pass-rate claims with disposition recorded in `docs/evidence/extension-health-delta-failure-disposition.json`.
-- Extension journey coverage: `123/123` journey scenarios passed (`100.0%`); command, event-subscriber, multi-capability, passive, and tool-provider categories are green *(from tests/ext_conformance/reports/journeys/journey_report.json)*
-- Stress triage: `1,500` events, `0` errors, p99 latency `396us`, RSS growth `0.0%` *(from tests/perf/reports/stress_triage.json, run bd-2zcs5.71-darkgoose-20260510T0058Z)*
+- Historical strict drop-in result: **22/22 certification gates PASS, 16/16 blocking gates PASS** - `CERTIFIED` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8` only *(from the Git-pinned historical verdict blob above; it neither describes the live verdict file nor certifies `v0.3.0`)*
+- Unified evidence bundle, as regenerated `2026-08-28`: `30` total sections, `18` present, `12` missing, `0` invalid (bundle verdict: `partial`) *(from tests/evidence_bundle/index.json; historical snapshot)*
+- Extension must-pass gate, as regenerated `2026-08-17`: `206/208` must-pass extensions passed (`2` failures); informational stretch set `10/19` passed — the May 2026 `123/123` snapshot predates the expanded corpus *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json; historical snapshot)*
+- Extension health delta, as regenerated `2026-08-17`: `226` extensions tested at `95.6%` pass rate with `0` regressions vs the 2026-02-07 baseline *(from tests/ext_conformance/reports/health_delta/health_delta_report.json; historical snapshot)*
+- Extension journey coverage, as regenerated `2026-08-17`: `125/125` journey scenarios passed (`100.0%`); command, event-subscriber, multi-capability, passive, and tool-provider categories are green *(from tests/ext_conformance/reports/journeys/journey_report.json; historical snapshot)*
+- Historical stress-triage evidence is retained under `tests/perf/reports/`; it is not current enough to support a `v0.3.0` performance claim.
 
 ---
 
@@ -519,13 +726,13 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/ma
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash -s -- --yes --easy-mode
 
 # Pin a release tag
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash -s -- --version v0.1.0
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/v0.3.0/install.sh" | bash -s -- --version v0.3.0
 
 # Install from explicit artifact URL + checksum URL
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | \
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/v0.3.0/install.sh" | \
   bash -s -- \
-    --artifact-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.1.0/pi-linux-amd64.tar.xz" \
-    --checksum-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.1.0/SHA256SUMS"
+    --artifact-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.3.0/pi-linux-amd64.tar.xz" \
+    --checksum-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.3.0/pi-linux-amd64.tar.xz.sha256"
 
 # Skip completion setup (CI/non-interactive minimal install)
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | \
@@ -542,7 +749,10 @@ Notable installer flags:
 - `--offline [TARBALL]`: enforce offline mode; optional local artifact path (`.tar.gz`, `.tar.xz`, `.zip`, or raw binary)
 - `--artifact-url`: force a specific release artifact URL
 - `--checksum` / `--checksum-url`: override checksum source for explicit artifacts
-- `--sigstore-bundle-url`: override Sigstore bundle URL used by `cosign verify-blob`
+- `--sigstore-bundle-url`: override the optional Sigstore bundle URL used by
+  `cosign verify-blob`; set both `COSIGN_IDENTITY_RE` and
+  `COSIGN_OIDC_ISSUER` to the trusted signer policy (there is deliberately no
+  GitHub Actions identity default)
 - `--completions auto|off|bash|zsh|fish`: force shell completion install target (`off` is equivalent to `--no-completions`)
 - `--no-completions`: disable completion installation
 - `--no-agent-skills`: skip automatic installation of the `pi-agent-rust` skill into `~/.claude/skills/` and `~/.codex/skills/`
@@ -565,7 +775,9 @@ bash tests/installer_regression.sh
 
 For migration adoption, packaging and invocation compatibility follows this contract:
 
-- This section covers packaging/invocation behavior only; functional parity and certification status are tracked in `docs/contracts/dropin-certification-contract.json`.
+- This section covers packaging and invocation behavior only. Historical
+  drop-in/parity artifacts do not define the current product or release gate.
+  Current compatibility statements must name the concrete behavior they cover.
 
 - Canonical executable name is `pi` across release assets and installer-managed installs.
 - Installer-managed installs also create an `rpi` compatibility launcher when no conflicting `rpi` command already exists on your PATH.
@@ -573,7 +785,11 @@ For migration adoption, packaging and invocation compatibility follows this cont
 - If you keep TypeScript `pi` as canonical (`--keep-existing-pi`), Rust Pi is installed as `pi-rust`.
 - On Apple Silicon, the installer prefers the native arm64 artifact even when launched from a Rosetta-translated shell.
 - Version-pinned installs are supported via `install.sh --version vX.Y.Z` for deterministic rollouts.
-- Every GitHub release ships platform binaries plus `SHA256SUMS` for integrity validation.
+- DSR releases ship each platform archive with a same-name `.sha256` sidecar
+  for integrity validation. The v0.3.0 release predates that contract and
+  ships an aggregate `SHA256SUMS` instead; the installer verifies the
+  per-asset sidecar first and falls back to `SHA256SUMS` only when the
+  sidecar is absent.
 
 Representative smoke checks:
 
@@ -587,32 +803,31 @@ pi --help >/dev/null
 command -v legacy-pi && legacy-pi --version
 ```
 
-### From Source
+### Source builds
 
-Requires Rust nightly (2024 edition features):
+Repository builds are tested with the exact toolchain pinned in
+`rust-toolchain.toml` (`nightly-2026-07-05`). The locked dependency graph
+requires Rust 1.95 or newer. Project builds are DSR-only:
 
 ```bash
-# Install Rust nightly
-rustup install nightly
-rustup default nightly
-
-# Clone and build
-git clone https://github.com/Dicklesworthstone/pi_agent_rust.git
-cd pi_agent_rust
-cargo build --release
-
-# Binary is at target/release/pi
-./target/release/pi --version
-
-# To install system-wide (--locked ensures reproducible dependency resolution)
-cargo install --path . --locked
+dsr quality --tool pi_agent_rust
+dsr build pi_agent_rust
 ```
+
+End users should install a DSR-published archive through `install.sh`. There is
+no supported direct-Cargo contributor or installation lane.
 
 ### Dependencies
 
-Pi has minimal runtime dependencies:
-- `fd`: Required for the `find` tool (install via `apt install fd-find` or `brew install fd`)
-- `rg`: Required for the `grep` tool (install via `apt install ripgrep` or `brew install ripgrep`)
+Pi has no required external runtime dependencies: the `grep` and `find`
+tools search in-process using the same engines ripgrep is built from
+(`grep-searcher`/`grep-regex` and the `ignore` walker), so patterns keep
+ripgrep's default (Rust regex crate) syntax. PCRE2-only features
+(lookaround, backreferences) were never exposed and remain unsupported.
+
+To shell out to `rg`/`fd` instead (debugging escape hatch), set
+`"search_backend": "external"` in settings.json and install them via
+`apt install ripgrep fd-find` or `brew install ripgrep fd`.
 
 ### Uninstall
 
@@ -656,13 +871,16 @@ Interactive file references:
 | `--mode text|json|rpc` | Output/protocol mode |
 | `--provider <NAME>` | Force provider for this run (aliases supported) |
 | `--model <MODEL>` | Model to use (auto-select fallback: `anthropic/claude-sonnet-4-6`, then `anthropic/claude-opus-4-7`, then `openai/gpt-5.1-codex`) |
-| `--thinking <LEVEL>` | Thinking level: off/minimal/low/medium/high/xhigh |
+| `--thinking <LEVEL>` | Thinking level: off/minimal/low/medium/high/xhigh/max |
 | `--tools <TOOLS>` | Comma-separated tool list |
 | `--api-key <KEY>` | API key (or use provider-specific env vars such as `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) |
 | `--extension-policy safe|balanced|permissive` | Extension capability profile |
 | `--repair-policy off|suggest|auto-safe|auto-strict` | Extension auto-repair policy |
 | `--list-models [PATTERN]` | List available models (optional fuzzy filter) |
 | `--list-providers` | List canonical provider IDs, aliases, and auth env keys |
+| `--fetch-models <PROVIDER>` | Print provider model IDs to stdout and exit; warns when using the static fallback |
+| `--refresh-models` | With `--fetch-models`, bypass the same-process cache and require a successful live response |
+| `--persist-models` | With `--fetch-models`, atomically save a verified live/same-process-cache catalog for future model pickers |
 | `--export <PATH>` | Export session file to HTML |
 
 Additional high-leverage flags:
@@ -717,7 +935,11 @@ pi migrate ~/.pi/agent/sessions
 
 ## Configuration
 
-Pi reads configuration from `~/.pi/agent/settings.json`:
+Pi reads configuration from `~/.pi/agent/settings.json`. Keys are shown in
+their canonical snake_case form below, but every field also accepts the
+original TypeScript Pi's camelCase spelling (e.g. `defaultProvider`,
+`shellCommandPrefix`) as a serde alias, so an existing pi-mono `settings.json`
+is parsed as-is and is never rewritten to snake_case:
 
 ```json
 {
@@ -776,6 +998,8 @@ Skills, prompt templates, themes, and extensions follow the same resolution orde
 
 When multiple resources share the same name, the first occurrence wins. Collisions are logged as diagnostics.
 
+`--no-skills` (and its siblings `--no-prompt-templates`, `--no-themes`, `--no-extensions`) disables tiers 2–4 **including** `skills` entries listed in `settings.json` — upstream-pi parity. Explicit CLI paths (tier 1) still load, so `pi --no-skills --skill /path/to/skill-a --skill /path/to/skill-b` is the way to run with an exact, isolated skill set (e.g. per-profile setups via shell aliases or wrapper scripts).
+
 **Prompt template expansion** supports positional arguments: `$1`, `$2`, `$@` (all args), and slice syntax `${@:start}`, `${@:start:length}`. For example, a template invoked as `/review src/main.rs --strict` receives `src/main.rs` as `$1` and `--strict` as `$2`.
 
 ### Environment Variables
@@ -791,6 +1015,7 @@ When multiple resources share the same name, the first occurrence wins. Collisio
 | `DEEPINFRA_API_KEY` | DeepInfra API key (OpenAI-compatible) |
 | `CEREBRAS_API_KEY` | Cerebras API key (OpenAI-compatible) |
 | `OPENROUTER_API_KEY` | OpenRouter API key (OpenAI-compatible) |
+| `ORCAROUTER_API_KEY` | OrcaRouter API key (OpenAI-compatible) |
 | `MISTRAL_API_KEY` | Mistral API key (OpenAI-compatible) |
 | `MOONSHOT_API_KEY` | Moonshot/Kimi API key (OpenAI-compatible) |
 | `DASHSCOPE_API_KEY` | DashScope/Qwen API key (OpenAI-compatible) |
@@ -801,6 +1026,8 @@ When multiple resources share the same name, the first occurrence wins. Collisio
 | `XAI_API_KEY` | xAI API key (OpenAI-compatible) |
 | `PI_CONFIG_PATH` | Custom config file path |
 | `PI_CODING_AGENT_DIR` | Override the global config directory |
+| `PI_SUBAGENT_PI_BINARY` | Explicit Rust Pi executable for native child agents; defaults to the current executable |
+| `PI_JOBS_ARTIFACT_RETENTION` | Background-job artifact policy: `preserve` (default) or explicit opt-in `rotate` |
 | `PI_PACKAGE_DIR` | Override the packages directory |
 | `PI_SESSIONS_DIR` | Custom sessions directory |
 
@@ -827,7 +1054,8 @@ When multiple resources share the same name, the first occurrence wins. Collisio
 │ • Gemini/Cohere │  │  • ls              │  │  • Capability policy│
 │ • Azure/Bedrock │  │  • ext-registered  │  │  • Node shims       │
 │ • Vertex/Copilot│  │                    │  │  • Event hooks      │
-│ • GitLab/Ext    │  │                    │  │  • Runtime risk ctl │
+│ • GitLab/Cursor │  │                    │  │  • Runtime risk ctl │
+│   /Ext          │  │                    │  │                    │
 └────────┬────────┘  └─────────┬──────────┘  └───────┬──────────┘
          │                     │                      │
 ┌────────▼─────────────────────▼──────────────────────▼──────────┐
@@ -837,7 +1065,7 @@ When multiple resources share the same name, the first occurrence wins. Collisio
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-Provider-count rule: Pi has 10 native provider implementation modules, counted as the Rust files under `src/providers/` excluding `mod.rs`. Those modules are `anthropic`, `openai`, `openai_responses`, `gemini`, `cohere`, `azure`, `bedrock`, `vertex`, `copilot`, and `gitlab`. User-visible provider IDs, aliases, OpenAI-compatible presets, and extension-provided `streamSimple` providers are counted separately because several native modules expose multiple routes.
+Provider-count rule: Pi has 11 native provider implementation modules. Those modules are `anthropic`, `openai`, `openai_responses`, `gemini`, `cohere`, `azure`, `bedrock`, `vertex`, `copilot`, `gitlab`, and `cursor`. User-visible provider IDs, aliases, OpenAI-compatible presets, and extension-provided `streamSimple` providers are counted separately because several native modules expose multiple routes. The factory module `mod.rs` and shared live-catalog helper `model_fetch.rs` are support modules, not provider implementations, and are excluded.
 
 ### Key Design Decisions
 
@@ -916,18 +1144,21 @@ This is a second comparison pass focused on high-impact architectural deltas and
 |------|---------------------------------------------|------------------|----------------------------|
 | **Distribution model** | npm package (`npm install -g @mariozechner/pi-coding-agent`) | Single Rust binary (`pi`) | Remove Node runtime dependency and improve startup/deployment portability |
 | **Execution surfaces** | Interactive + print + JSON mode + RPC + SDK | Interactive + print + JSON mode + RPC + Rust SDK | Rust SDK provides idiomatic companion API for embedding Pi programmatically (documented in `docs/sdk.md`) |
-| **Default built-in tool posture** | Defaults to `read/write/edit/bash` (others available) | Eight built-ins treated as first-class (`read/write/edit/bash/grep/find/ls/hashline_edit`) | Keep common code-navigation, shell, and hashline-anchored edit workflows available without extra configuration |
+| **Default built-in tool posture** | Defaults to `read/write/edit/bash` (others available) | Thirteen Essential-tier built-ins always in the schema (`read/write/edit/bash/grep/find/ls/hashline_edit/ask/todo/web_search/submit_plan/xdev`), with a discoverable tier behind the `xdev` dispatcher | Keep common code-navigation, shell, and edit workflows available without extra configuration while bounding schema size |
 | **Extension trust model** | Extension/package model documented as full system access | Embedded runtime with capability-gated hostcalls and policy profiles | Reduce ambient authority and make extension behavior auditable/deny-by-default |
-| **Session architecture emphasis** | JSONL tree session model and branch navigation | JSONL v3 tree + explicit session index (SQLite sidecar) + default-enabled SQLite session backend support | Faster resume/lookups at scale and safer multi-instance coordination |
+| **Session architecture emphasis** | JSONL tree session model and branch navigation | JSONL v3 tree + derived SQLite metadata index + default-enabled SQLite session backend support | Bound eligible resume/lookups and coordinate multi-instance access |
 | **Streaming transport stack** | Node runtime networking stack | Purpose-built HTTP/TLS client + custom SSE parser on asupersync | Tighter control over chunking, parsing, and failure handling in long streams |
 | **Cancellation/timeout mechanics** | Platform/event-loop cancellation conventions | Explicit abort signaling, bounded tool iterations, process-tree termination | Minimize hangs/orphans and make stop behavior deterministic under load |
 | **Runtime context model** | Framework-level conventions and extension APIs | Explicit `AgentCx`/`asupersync::Cx` capability-scoped context threading | Make effect boundaries and testability first-class architectural constraints |
 
 Practical consequence of these deltas:
-- Extension/package workflows are compatible across both implementations.
-- The goal is functional equivalence to pi-mono with Rust-idiomatic patterns and performance improvements.
-- The Rust SDK provides a companion API that delivers equivalent capabilities without requiring TypeScript-specific adaptation patterns.
-- `docs/parity-certification.json` tracks functional parity progress and certification status.
+- Extension and package workflows are selected according to current user value,
+  with OMP as the closer product-surface and UX reference. Legacy pi-mono
+  behavior may be adopted selectively when it remains useful.
+- The goal is a coherent Rust-native coding agent, not parity with pi-mono.
+- The Rust SDK provides a companion API for core embedding workflows without
+  requiring TypeScript-specific adaptation patterns.
+- `docs/parity-certification.json` tracks informational functional-parity progress; it does not authorize strict replacement claims.
 
 ### Algorithmic Mechanics: pi-mono Baseline vs Rust Implementation
 
@@ -937,7 +1168,7 @@ This section compares concrete implementation mechanics for equivalent high-leve
 |-----------|-----------------------------|-------------------------------|-----------------------------|
 | **Session context rebuild after compaction** | `buildSessionContext()` emits compaction summary, then messages from `firstKeptEntryId` (pre-compaction path), then post-compaction entries | `to_messages_for_current_path()` uses the same ordering and adds a fallback if `first_kept_entry_id` is missing | Avoid silent context loss when compaction anchors are orphaned/corrupted |
 | **JSONL persistence** | Incremental append (`appendFileSync`) plus full rewrite (`writeFileSync`) for migrations/rewrites | Save via temp file + atomic persist/replace | Keep on-disk session state crash-resilient during save operations |
-| **Session discovery/resume** | Directory/file scan and mtime sorting of JSONL files | SQLite session index sidecar + WAL + lock file + staleness-triggered full reindex | Bound resume lookup cost and coordinate concurrent processes |
+| **Session discovery/resume** | Directory/file scan and mtime sorting of JSONL files | Derived SQLite session metadata index + WAL + lock file + staleness-triggered full reindex | Bound resume lookup cost and coordinate concurrent processes |
 | **Compaction token accounting** | Uses assistant usage (`totalTokens` else `input+output+cacheRead+cacheWrite`) plus heuristic trailing estimates | Uses assistant usage (`total_tokens` else `input+output`) plus heuristic trailing estimates; fixed image token estimate | Keep accounting stable across providers with uneven cache-token reporting while staying conservative |
 | **Cut-point + split-turn handling** | Valid cut points exclude tool results; split turns are summarized as history + turn-prefix context | Same cut-point class and split-turn strategy, implemented in Rust entry/message model | Preserve tool-call/result adjacency and turn coherence under budget pressure |
 | **Bash timeout/process cleanup** | Timeout/abort kills process tree (`killProcessTree`) and returns tail-truncated output | Timeout escalation (`TERM` then grace then `KILL`) + process-tree walk + shell exit trap + tail truncation | Enforce bounded cleanup and reduce descendant-process leaks from background jobs |
@@ -959,11 +1190,11 @@ The sections above compare mechanics. This section calls out concrete features p
 | **Tamper-evident runtime risk ledger tooling** (`ext_runtime_risk_ledger verify|replay|calibrate`) | Security decisions are hash-chained and can be verified, replayed, and threshold-calibrated from real traces |
 | **Unified incident evidence bundle export** (risk ledger, security alerts, hostcall telemetry, exec mediation, secret-broker events) | Incident response can triage from one structured artifact set instead of stitching ad-hoc logs |
 | **Deterministic hostcall reactor mesh with optional NUMA slab pool** (shard affinity, global-order drain, bounded SPSC lanes, telemetry) | Keeps extension dispatch predictable under load and surfaces queue/backpressure behavior for tuning |
-| **Warm isolate pool + startup prewarm handoff** | Moves JS runtime preparation off the first interactive turn and reuses warmed state safely between runs |
+| **Cold realm factory + persistent transpile cache** | Rebuilds mutable JS state for every load while reusing only versioned compiled artifacts that are safe to share across realms |
 | **Extension preflight static analysis** (imports/forbidden-pattern scan with policy-aware hints) | Catches risky extension patterns before runtime execution |
 | **Node/Bun-compatible extension runtime without Node/Bun dependency** (embedded QuickJS + shims) | Runs legacy extension workflows in a single native binary deployment model |
 | **Extension compatibility scanner + conformance harness** | Makes extension support measurable and auditable instead of anecdotal |
-| **SQLite session index sidecar** (WAL + lock + stale reindex path) | Gives fast session resume/list operations at scale without scanning every JSONL file on each query |
+| **Derived SQLite session metadata index** (WAL + lock + stale reindex path) | Gives fast session resume/list operations at scale without scanning every JSONL file on each query |
 | **Session Store V2 rollback and migration ledger** (segmented log + checkpoints + rollback events) | Long-session recovery can unwind to a known checkpoint with explicit migration/rollback provenance |
 | **Default-enabled SQLite session storage support** (`sqlite-sessions` feature) | Supports deployments that want database-backed session persistence in addition to JSONL; disable with `--no-default-features` when building a minimal binary |
 | **Crash-resilient session save path** (temp file + atomic persist) | Improves session-file durability during writes and reduces partial-write failure modes |
@@ -1226,23 +1457,24 @@ The `Provider` trait abstracts over different LLM backends:
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
-    fn models(&self) -> &[Model];
+    fn api(&self) -> &str;
+    fn model_id(&self) -> &str;
 
     async fn stream(
         &self,
-        context: &Context,
+        context: &Context<'_>,
         options: &StreamOptions,
-    ) -> Result<impl Stream<Item = Result<StreamEvent>>>;
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>>;
 }
 ```
 
 **Context structure:**
 
 ```rust
-pub struct Context {
-    pub system: Option<String>,      // System prompt
-    pub messages: Vec<Message>,       // Conversation history
-    pub tools: Vec<ToolDef>,          // Available tools with JSON schemas
+pub struct Context<'a> {
+    pub system_prompt: Option<Cow<'a, str>>, // System prompt
+    pub messages: Cow<'a, [Message]>,        // Conversation history
+    pub tools: Cow<'a, [ToolDef]>,           // Available tools with JSON schemas
 }
 ```
 
@@ -1250,11 +1482,14 @@ pub struct Context {
 
 ```rust
 pub struct StreamOptions {
-    pub model: String,
-    pub max_tokens: u32,
     pub temperature: Option<f32>,
-    pub thinking: Option<ThinkingConfig>,  // Extended thinking settings
-    pub stop_sequences: Vec<String>,
+    pub max_tokens: Option<u32>,
+    pub api_key: Option<String>,
+    pub cache_retention: CacheRetention,
+    pub session_id: Option<String>,
+    pub headers: HashMap<String, String>,
+    pub thinking_level: Option<ThinkingLevel>,
+    pub thinking_budgets: Option<ThinkingBudgets>,
 }
 ```
 
@@ -1279,7 +1514,7 @@ The algorithm runs automatically after each agent turn when estimated token usag
 └──────────────────────────────────────────────────────────────┘
 ```
 
-**Token estimation** uses a conservative `chars ÷ 4` heuristic for text and a flat 1,200 tokens per image. When an assistant message includes a `usage` field from the API, that measured value takes precedence over the heuristic.
+**Token estimation** counts tokens with real BPE tables (O200k/Cl100k, enabled by the default `bpe-tokens` feature); when BPE is unavailable it falls back to a conservative `chars ÷ 3` heuristic for text, plus a flat 1,200 tokens per image. When an assistant message includes a `usage` field from the API, that measured value takes precedence over the estimate.
 
 **Cut point selection** prefers boundaries between complete user-assistant turns. If the budget forces a mid-turn cut, the algorithm includes prefix messages from the split turn so the model retains context about what was being discussed at the boundary.
 
@@ -1447,7 +1682,7 @@ Mode changes are gated by sample coverage and risk checks, so Pi does not switch
 
 **Compatibility scanner**: Before loading, Pi statically analyzes extension source code for imports, `require()` calls, and forbidden patterns (`eval`, `Function()`, `process.binding`, `dlopen`). The scan produces a capability evidence ledger that informs policy decisions.
 
-**Environment variable filtering**: Extensions calling `pi.env()` hit a blocklist that denies access to API keys, credentials, tokens, and private keys. The filter blocks exact matches (`ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`), suffix patterns (`*_API_KEY`, `*_SECRET`, `*_TOKEN`), and prefix patterns (`AWS_SECRET_*`, `AWS_SESSION_*`). Only `PI_*` variables are unconditionally allowed.
+**Environment variable filtering**: Extensions calling `pi.env()` hit a blocklist that denies access to API keys, credentials, tokens, and private keys. The filter blocks exact matches (`ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`), suffix patterns (`*_API_KEY`, `*_SECRET`, `*_TOKEN`), and prefix patterns (`AWS_SECRET_*`, `AWS_SESSION_*`). Variables whose names do not match any secret pattern — including most `PI_*` variables — are served normally; there is no unconditional `PI_*` exemption, so a name like `PI_EXAMPLE_API_KEY` is blocked by the suffix rule.
 
 **Trust lifecycle and kill switch**: Extension trust state is tracked explicitly (`pending`, `acknowledged`, `trusted`, `killed`). A kill switch demotes an extension to `killed`, quarantines it in the runtime risk controller, emits a critical alert, and writes an audit record. Lifting the switch requires an explicit operator action and moves the extension back to `acknowledged`.
 
@@ -1463,9 +1698,11 @@ These pieces are intentionally conservative: if confidence is weak, Pi holds ste
 
 ### Interactive TUI Architecture
 
-The interactive mode uses the **Elm Architecture** (Model-Update-View) via the `charmed_rust` library family, which is a Rust port of Go's [Bubble Tea](https://github.com/charmbracelet/bubbletea) framework.
+The default interactive stack is **FrankenTUI** (`src/interactive_ftui.rs`, feature `ftui`, on by default since the 2026-08-25 cutover). It keeps the **Elm Architecture** (Model-Update-View): a driver thread owns an asupersync runtime plus an SDK agent session, agent events arrive through an `AgentEventSubscription`, and `PiFtuiModel` renders header, markdown conversation, status line, growing editor, and footer regions with tail-follow scrolling, per-entry render caching, inline ask cards, and modal overlays. All agent- and tool-originated text is sanitized before it reaches a frame. `pi --inline` draws the UI at the bottom of the terminal and preserves shell scrollback.
 
-**Component stack:**
+The previous stack, built on the `charmed_rust` library family (a Rust port of Go's [Bubble Tea](https://github.com/charmbracelet/bubbletea)), lives in `src/interactive.rs` and is still selectable with `pi --classic` until it is deleted. The diagram below describes that classic stack; the FrankenTUI stack keeps the same agent/UI split and the same `PiMsg` event vocabulary.
+
+**Component stack (classic `--classic` stack):**
 
 ```
 ┌────────────────────────────────────────────────────┐
@@ -1515,15 +1752,27 @@ The interactive mode uses the **Elm Architecture** (Model-Update-View) via the `
 
 | Command | Action |
 |---------|--------|
-| `/help` | Show available commands and keybindings |
-| `/model` or `Ctrl+L` | Open model selector with fuzzy search |
+| `/help` (`/h`, `/?`) | Show available commands and keybindings |
+| `/model` (`/m`) or `Ctrl+L` | Open model selector with fuzzy search; `/model roles` edits role bindings |
 | `Ctrl+P` / `Ctrl+Shift+P` | Cycle scoped models forward/backward |
-| `/tree` | Browse and fork the conversation tree |
-| `/clear` | Clear conversation and start fresh |
-| `/compact` | Trigger manual compaction |
-| `/thinking <level>` | Change thinking level mid-conversation |
-| `/share` | Export session to GitHub Gist |
-| `/exit` or `Ctrl+C` | Exit Pi |
+| `/login`, `/logout` | Provider OAuth/API-key credential management |
+| `/thinking <level>` (`/t`) | Change thinking level mid-conversation |
+| `/scoped-models` (`/scoped`) | Show or set model scope patterns |
+| `/tree`, `/fork` | Browse the conversation tree; branch from a previous message |
+| `/clear` (`/cls`), `/new` | Clear conversation; start a new session |
+| `/compact [shake\|aggressive]` | Manual compaction (shake drops oversized tool results with no LLM call) |
+| `/checkpoint`, `/rewind`, `/fresh`, `/retry` | Session restore points and turn control |
+| `/undo`, `/redo` | Revert/replay file mutations made by tools |
+| `/resume` (`/r`), `/session` (`/info`), `/name`, `/history` | Session picker, info, naming, input history |
+| `/settings`, `/theme`, `/hotkeys` (`/keys`), `/changelog` | Settings UI, themes (incl. `auto`), keybindings, changelog |
+| `/plan`, `/approval`, `/advisor` | Plan mode, approval modes, second-model turn review |
+| `/btw <question>`, `/tan <work>` | Ephemeral smol-role side question; background task-role tangential work |
+| `/mcp`, `/usage`, `/rules`, `/omfg` | MCP server status, provider credit/quota, stream rules, grievances |
+| `/export`, `/share`, `/copy` (`/cp`) | HTML export, secret/unlisted GitHub Gist share (not private; anyone with the URL can view it), copy last reply |
+| `/handoff`, `/commit`, `/review` | Handoff document, dependency-ordered commit splitting, review |
+| `/template`, `/skill:<name>` | Expand a prompt template; invoke a skill |
+| `/reload` | Reload skills/prompts/themes/extensions from disk |
+| `/exit` (`/quit`, `/q`) or `Ctrl+C` | Exit Pi |
 
 ### RPC Protocol
 
@@ -1562,7 +1811,7 @@ The RPC mode (`pi --mode rpc`) exposes a line-delimited JSON protocol over stdin
 
 Queue modes (`All` or `OneAtATime`) control whether multiple queued messages are batched into a single turn or processed individually.
 
-**Extension UI over RPC**: When an extension requests user input (capability prompt, selection dialog), Pi emits an `extension_ui_request` event. The client renders the prompt in its own UI and responds with an `extension_ui_response` message. IDE extensions can then present native UI for capability decisions instead of falling back to terminal prompts.
+**Extension UI over RPC**: When an extension requests user input (capability prompt, selection dialog), Pi emits an `extension_ui_request` event. Response-bearing events include a `requestGeneration` correlation token, which the client must echo alongside `requestId` in its `extension_ui_response`; this prevents a late response from resolving a newer request that reused the same public ID. IDE extensions can then present native UI for capability decisions instead of falling back to terminal prompts.
 
 ### Session Indexing
 
@@ -1607,9 +1856,13 @@ Pi also supports a v2 sidecar store next to JSONL sessions for faster resume and
 
 **How resume works:**
 
-1. If a v2 sidecar exists and is fresh, Pi opens from the sidecar index + segments.
-2. If sidecar data is stale relative to the source JSONL, Pi falls back to JSONL parsing.
-3. If index data is missing/corrupt but segments are valid, Pi rebuilds the index.
+1. A verified migration installs a durable `clean` source-state record, allowing the normal
+   v2 open to use the sidecar index + segments without rescanning the full JSONL file.
+2. Before any JSONL mutation, Pi durably marks the sidecar `dirty`; dirty, invalid, or
+   otherwise stale sidecars fall back to authoritative JSONL parsing. Filesystem mtimes remain
+   a secondary external-change check, and legacy sidecars are fully verified once before use.
+3. If index data needs repair, Pi marks the sidecar dirty first and adopts the repaired store
+   only after its entry IDs and hash chain match the source JSONL exactly.
 
 **Integrity strategy:**
 
@@ -1713,7 +1966,7 @@ Discover files by pattern:
 Input: { "pattern": "*.rs", "path": "src/", "limit": 1000 }
 ```
 
-- Glob patterns via `fd`
+- Glob patterns matched in-process (no `fd` required)
 - Sorted by modification time
 - Respects .gitignore
 
@@ -1737,21 +1990,22 @@ Input: { "path": "src/", "limit": 500 }
 
 CLI tools have different performance requirements than servers or GUI applications. The critical metric is **time-to-first-interaction**: how quickly can the user start typing after invoking the command?
 
-| Phase | TypeScript/Node.js | Rust |
-|-------|-------------------|------|
-| Process spawn | ~10ms | ~10ms |
-| Runtime initialization | 200-500ms | 0ms (no runtime) |
-| Module loading | 100-300ms | 0ms (static linking) |
-| JIT warmup | 50-100ms | 0ms (AOT compiled) |
-| **Total** | **360-910ms** | **~10ms** |
+| Phase | Managed-runtime CLI | Pi's native binary |
+|-------|---------------------|--------------------|
+| Application runtime bootstrap | Required | Not required |
+| Application module loading | Commonly dynamic | Ahead-of-time linked Rust code |
+| JIT warmup | Runtime-dependent | Not used |
+| Current release timing | Not measured here | Fresh `v0.3.0` measurement pending |
 
-This difference compounds with usage frequency, especially in short iterative terminal workflows.
+Current comparative timing numbers are intentionally omitted until a fresh,
+provenance-matched benchmark run is available.
 
-### Extreme Optimization Playbook
+### Optimization Playbook
 
-Pi is optimized more like a low-latency engine than a typical CLI app. We intentionally apply aggressive optimization at multiple layers, not just "compile with `--release` and hope."
+Pi applies performance-oriented design at multiple layers, not only in the Cargo
+release profile.
 
-Where the speed comes from:
+Where performance work is concentrated:
 
 - **Startup path kept minimal**: no JS runtime bootstrap, no module graph loading, no JIT warmup.
 - **Hot hostcall specialization**: common extension hostcalls use typed fast paths; uncommon shapes fall back to compatibility paths.
@@ -1762,7 +2016,9 @@ Where the speed comes from:
 - **Bounded growth controls**: compaction and truncation keep token/context growth and tool-output payload growth from degrading responsiveness over long sessions.
 - **Measurement-first culture**: perf artifacts are schema-validated and claim-gated in CI, so optimization work is driven by evidence and regressions are caught early.
 
-This is why Pi can stay responsive even with heavy streaming, tool usage, large session histories, and extension workloads running at the same time.
+These mechanisms are intended to preserve responsiveness under streaming, tool,
+large-session, and extension workloads. Achieved release-level latency and
+memory results require fresh, provenance-matched measurements.
 
 ### Optimization Catalog (Code + Commit History)
 
@@ -1777,7 +2033,7 @@ Concrete engineering work in this codebase includes:
 | Queueing + concurrency | Core-pinned SPSC reactor mesh, S3-FIFO-inspired admission with fairness guards, BRAVO-style fallback behavior | Improves tail latency under contention instead of only optimizing median latency |
 | Batched execution | AMAC-style interleaved batch executor with stall-aware toggling | Avoids head-of-line stalls when many independent hostcalls are in flight |
 | IO specialization | io_uring lane policy + telemetry and explicit executor-unavailable fallback | Evaluates IO-heavy calls without presenting the placeholder bridge as real io_uring execution |
-| Runtime startup for extensions | QuickJS pre-warm path, warm isolate/bytecode cache behavior, and startup pipeline parallelization | Lowers cold-start overhead before the first real extension workload |
+| Runtime startup for extensions | Cold owner-isolated QuickJS realms, bounded in-realm source caches, and versioned persistent transpile caching | Avoids mutable-realm reuse while reducing repeated transpilation work |
 | JS bridge/scheduler path | Pending-job fast-path tuning and bridge-level dispatch cleanup in hot extension loops | Reduces overhead between JS requests and Rust execution |
 | Adaptive control loops | Regime-shift detection (CUSUM/BOCPD), budget controllers, VOI-based experiment planner, mean-field load controller, off-policy evaluation gates | Lets runtime behavior adapt to workload shifts without blind tuning |
 | Fast-path safety | Shadow dual-execution sampling with automatic rollback/backoff on divergence | Prevents speed work from silently changing semantics |
@@ -1788,7 +2044,7 @@ Concrete engineering work in this codebase includes:
 | Session resume path | Session Store V2 sidecar (segmented log + offset index), O(index+tail) open path, stale-sidecar detection, migration/rollback tooling | Avoids full-file rescans on large histories and improves recovery behavior |
 | Long-session maintenance | Background compaction/snapshot workers with quotas + lazy hydration paths | Controls session growth and keeps long-running workspaces responsive |
 | Compaction internals | Binary-search cut-point logic, serialization helper extraction, and zero-allocation-oriented cleanup on compaction paths | Lowers compaction overhead and keeps compaction from becoming a pause source |
-| Streaming internals | SSE parser event-type interning, scanned-byte tracking (`scanned_len`), UTF-8 recovery hardening | Reduces repeated scanning/allocation during token streaming and improves resilience |
+| Streaming internals | SSE parser event-type interning, scanned-byte tracking (`scanned_len`), UTF-8 recovery hardening | Reduces repeated scanning/allocation during incremental response streaming and improves resilience |
 | Provider/message memory path | Zero-copy request context migration (`Cow`), `Arc`-based message/result sharing, clone elimination in stream end paths | Removes hot-path cloning and allocation churn in core agent/provider loops |
 | TUI rendering path | Message render cache, conversation-prefix cache, reusable render buffers, viewport/render-path refactors, Criterion perf gates | Reduces redraw cost and jitter while streaming long outputs |
 | Startup/resource loading | Parallelized skill/prompt/theme loading plus precomputed tool definitions/command names | Moves heavy initialization off the critical path to improve time-to-interaction |
@@ -1817,12 +2073,15 @@ panic = "abort"      # No unwinding machinery
 strip = true         # Remove symbol tables
 ```
 
-Binary size is explicitly budgeted in CI via `binary_size_release`, with a target
-threshold of `22.0 MiB` (the harness computes bytes / 1024 / 1024). Default
-release builds keep heavyweight extras opt-in and currently measure `21.12 MiB`
-for `pi` with the standard Cargo `release` profile. Use `--features full` when
-you need the image, clipboard, wasm, jemalloc, and syntax-highlighting extras in
-one build.
+Binary size is explicitly budgeted by the DSR quality recipe via `binary_size_release`, with a target
+threshold of `48.0 MiB` (the harness computes bytes / 1024 / 1024; raised from
+`26.0 MiB` for the v0.3.0 capability wave — BPE token tables, LSP/DAP
+bridges, the MCP client, and eval kernels — and previously from
+`22.0 MiB` with the FrankenSQLite cutover). A fresh
+`v0.3.0` release measurement is required before reporting the achieved size.
+Default release builds keep heavyweight extras opt-in; use `--features full`
+when you need the image, clipboard, wasm, jemalloc, and syntax-highlighting
+extras in one build.
 
 ### Benchmark Evidence vs Shipping Artifacts
 
@@ -1840,9 +2099,17 @@ See `docs/testing-policy.md` and `docs/releasing.md` for normative policy detail
 
 Current checked-in performance evidence state:
 - Run output: `tests/perf/reports/` (budget_summary.json, PERF_BUDGETS.md)
-- The current budget summary is a blocker artifact, not claim support: most
-  CI-enforced budgets have no measurement data and the data-contract section
-  reports missing or stale required evidence.
+- Current strict budget summary (run `beige-evidence-refresh-20260823`, source
+  `2697f21d`): `19` declared budgets. Its per-budget `budget_results` rows
+  show `16` PASS and `3` FAIL (extension simple cold-load p95 over budget,
+  tool-call latency and throughput inputs missing, fail-closed); claim
+  readiness is `blocked` and performance claims are NOT authorized. The
+  artifact's aggregate header still reports `12` PASS, `5` FAIL, `2`
+  NO_DATA from before the 2026-08-28 idle-memory, binary-size,
+  complex-cold-load, and event-dispatch re-measurements, so the header and
+  the rows disagree until the summary is regenerated (bd-sog97.20).
+  Counts are value-bound to the artifact:
+  *(from tests/perf/reports/budget_summary.json)*
 - Before spending time on a definitive refresh, run
   `python3 scripts/perf/preflight_budget_inputs.py` to list missing budget
   inputs, expected artifact paths, and RCH-only refresh commands.
@@ -1869,40 +2136,36 @@ Current checked-in performance evidence state:
 - Regenerate the perf evidence bundle before adding release-facing speed,
   throughput, memory, or startup numbers to this README.
 
-Latest certification/evidence refresh (`2026-05-15` progress SLO closeout; `2026-05-15` extension gate; `2026-05-14` full-suite reports; `2026-05-18` drop-in certification verdict):
-- Unified evidence bundle: `29/29` sections present, `0` missing, `0` invalid *(from tests/evidence_bundle/index.json)*
-- Full-suite gate: `20/20` gates passed, including `14/14` blocking gates *(from tests/full_suite_gate/full_suite_verdict.json)*
-- Drop-in certification: `22/22` certification gates passed, overall verdict `CERTIFIED` *(from docs/evidence/dropin-certification-verdict.json)*
-- Extension must-pass gate: `123/123` must-pass extensions passed; stretch set `100/101` passed with only non-blocking stretch failures *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json)*
-- Context-intelligence closeout gate: `pass`, with child Beads mapped to code, tests, docs/evidence, validation commands, pushed commits, redaction posture, perf-budget evidence, README freshness, staged UBS, and Beads ledger reconciliation *(from docs/evidence/context-intelligence-closeout-gate.json)*
-- Progress SLO closeout gate: `pass`, with child Beads mapped to code, tests, docs/evidence, validation commands, pushed commits, source-boundary checks, stress-budget evidence, README freshness, staged UBS, and Beads ledger reconciliation *(from docs/evidence/swarm-progress-slo-closeout-gate.json)*
-- Runtime-intelligence closeout gate: `pass`, with child Beads mapped to compaction admission, tool-output artifacts, provider routing, scheduler fairness, frame-budget telemetry, cancellation cleanup, extension safety provenance, docs/evidence, source-boundary checks, pushed commits, staged UBS, and Beads ledger reconciliation *(from docs/evidence/runtime-intelligence-closeout-gate.json)*
+- Full-suite gate at its latest regeneration (`2026-08-04`): `17/20` gates passed with `12/14` blocking gates. The `ext_must_pass` blocker is now substantive rather than staleness-only: the `2026-08-17` regeneration recorded `206/208` with two marckrenn-pi-sub family failures (tracked for remediation), alongside the practical-finish checkpoint *(from tests/full_suite_gate/full_suite_verdict.json; historical snapshot)*
+- Unified evidence bundle, as regenerated `2026-08-28`: `30` total sections, `18` present, `12` missing, `0` invalid (bundle verdict: `partial`) *(from tests/evidence_bundle/index.json; historical snapshot)*
+- Historical drop-in result: `22/22` certification gates passed, overall verdict `CERTIFIED` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8` only *(from the verdict blob stored at Git revision `2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91`, not from the live verdict file)*
+- Extension must-pass gate, as regenerated `2026-08-17`: `206/208` must-pass extensions passed (`2` failures); informational stretch set `10/19` passed *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json; historical snapshot)*
+- Context-intelligence closeout gate: `pass`, with child Beads mapped to code, tests, docs/evidence, validation commands, pushed commits, redaction posture, perf-budget evidence, README freshness, staged UBS, and Beads ledger reconciliation *(from docs/evidence/context-intelligence-closeout-gate.json; historical snapshot)*
+- Progress SLO closeout gate: `pass`, with child Beads mapped to code, tests, docs/evidence, validation commands, pushed commits, source-boundary checks, stress-budget evidence, README freshness, staged UBS, and Beads ledger reconciliation *(from docs/evidence/swarm-progress-slo-closeout-gate.json; historical snapshot)*
+- Runtime-intelligence closeout gate: `pass`, with child Beads mapped to compaction admission, tool-output artifacts, provider routing, scheduler fairness, frame-budget telemetry, cancellation cleanup, extension safety provenance, docs/evidence, source-boundary checks, pushed commits, staged UBS, and Beads ledger reconciliation *(from docs/evidence/runtime-intelligence-closeout-gate.json; historical snapshot)*
 
-### Fast Loop vs Definitive Benchmarks
+### Quality and benchmark authority
 
-For day-to-day implementation, use targeted checks to keep iteration fast. Reserve definitive
-benchmark conclusions for integration boundaries where full evidence is regenerated.
+Use the registered DSR recipe for day-to-day validation and definitive
+benchmark evidence:
 
-- **Fast loop (non-authoritative):** file-scoped `cargo fmt --check` and targeted test replays (`rch exec -- cargo test --test ...` when compilation is non-trivial).
-- **Definitive pass (authoritative):** offload heavy runs with strict remote gating (`rch exec -- ...` or script wrappers with `--require-rch`), then require
-  updated evidence artifacts:
+- **Quality gate:** `dsr quality --tool pi_agent_rust`.
+- **Definitive evidence:** require the DSR run to regenerate and validate these
+  artifacts:
   - `tests/perf/reports/phase1_matrix_validation.json`
   - `tests/full_suite_gate/full_suite_verdict.json`
   - `tests/full_suite_gate/certification_verdict.json`
   - `tests/full_suite_gate/extension_remediation_backlog.json`
 
-This keeps inner loops responsive while preserving strict claim-integrity at release time.
+Direct Cargo, RCH, and repository wrapper invocations are not evidence and are
+not an authorized fast path around DSR.
 
 ### Extension Workload Hotspot Profiling
 
-Pi includes a dedicated workload harness for extension runtime bottlenecks:
-
-```bash
-cargo run --example ext_workloads -- \
-  --out artifacts/perf/ext_workloads.jsonl \
-  --matrix-out artifacts/perf/ext_hostcall_hotspot_matrix.json \
-  --trace-out artifacts/perf/ext_hostcall_bridge_trace.jsonl
-```
+Pi includes a dedicated `ext_workloads` workload harness for extension runtime
+bottlenecks. Run it only through the registered DSR performance lane, which
+writes `ext_workloads.jsonl`, `ext_hostcall_hotspot_matrix.json`, and
+`ext_hostcall_bridge_trace.jsonl` with DSR provenance.
 
 This harness does more than raw timing:
 
@@ -1936,7 +2199,7 @@ The runpack also embeds `validation_scheduler_plan`
 `--out-validation-scheduler-plan-json` or print it with
 `--print-validation-scheduler-plan`. This is an advisory RCH-aware simulator:
 it ranks fast script checks, evidence regeneration, focused tests,
-E2E/conformance, `cargo check --all-targets`, and clippy from the current git
+E2E/conformance, compiler checks, and linting from the current git
 change profile, predictive telemetry, RCH admission, remote proof, and target
 cache evidence. It preserves exact command strings and required RCH env, but it
 does not execute cargo, mutate RCH, reserve Agent Mail, claim Beads, delete temp
@@ -1945,8 +2208,8 @@ artifacts, or allow heavy cargo to fail open into a local build.
 If validation-broker status or plan JSON is supplied with
 `--validation-broker-json`, the runpack projects source status, slot counts,
 stale slot warnings, duplicate-gate opportunities, and recommended next actions
-as advisory handoff data. This projection does not replace RCH, Doctor, Beads,
-Agent Mail, CI, UBS, `cargo_headroom.sh`, or release-claim gates. Operator
+as advisory handoff data. This projection does not replace DSR, Doctor, Beads,
+Agent Mail, UBS, or release-claim gates. Operator
 workflow, privacy, and degraded-data guidance lives in
 [docs/swarm-operations-runbook.md#validation-broker-operator-workflow](docs/swarm-operations-runbook.md#validation-broker-operator-workflow).
 
@@ -2207,9 +2470,15 @@ multi-agent runs, see [docs/swarm-operations-runbook.md](docs/swarm-operations-r
 
 Pi's perf pipeline includes strict evidence checks so global speed claims cannot be based on partial or stale data.
 
+**v0.3.0 performance-claim status: NOT authorized.** Its checked-in
+`pi.perf.budget_summary.v2` artifact is an explicit blocked/NO_DATA result, so
+this release may ship only without quantitative or global performance claims.
+That blocked state is not a passing benchmark result.
+
 - `scripts/perf/orchestrate.sh` generates artifacts tied to a shared `correlation_id` for the same run.
 - `scripts/e2e/run_all.sh` validates required schemas, freshness, and `correlation_id` alignment before considering claims valid.
-- `tests/release_evidence_gate.rs` fails closed when conformance/perf artifacts are missing `run_id` or `correlation_id`, or when lineage fields disagree across linked artifacts.
+- `tests/release_evidence_gate.rs` and `scripts/release_gate.sh` always reject malformed schemas, a non-canonical budget-inventory digest, reordered/duplicate/missing results, mismatched comparison semantics, inconsistent counts/statuses, or forged readiness fields. A coherent `blocked` summary is only a release warning when `RELEASE_GATE_REQUIRE_PERFORMANCE_CLAIM_READY=0`; it still cannot authorize performance copy.
+- A `claim_ready` summary must come from strict mode with data for every declared budget, no declared budget failures or data-contract failures, complete CI coverage, one matching `run_id`/`correlation_id`, and fresh source-bound evidence. The aggregate `budget_data_missing` and `budget_failed` blockers prevent non-CI informational budgets from being silently excluded from the global authorization boolean. The gate also proves its exact canonical strict test was listed once, executed once, and was not ignored; that test freshly recomputes and deep-compares the checked-in definitions, results, failures, counts, and readiness instead of accepting an unrelated passing benchmark run.
 - `scripts/e2e/run_all.sh` emits an evidence-adjudication matrix and only treats evidence as canonical when freshness and lineage checks both pass.
 - Key release-facing artifacts include:
   - `pi.perf.extension_benchmark_stratification.v1`
@@ -2246,38 +2515,32 @@ closed to the compiled allocator and includes a fallback reason in artifacts.
 
 ### Memory Usage
 
-Rust's ownership model enables predictable memory usage without garbage collection pauses:
-
-| State | Memory |
-|-------|--------|
-| Startup (idle) | ~15MB |
-| Active session (small) | ~25MB |
-| Large file in context | ~30-50MB |
-| Streaming response | +0MB (streamed, not buffered) |
-
-The absence of a GC means no surprise latency spikes during streaming output.
+Rust's ownership model avoids a garbage-collected application runtime. Current
+memory figures are intentionally withheld until the `v0.3.0` evidence inputs
+are regenerated with matching source and run provenance.
 
 ### Streaming Architecture
 
-Responses stream token-by-token from the API to the terminal with minimal buffering:
+Responses move incrementally from the API to the terminal with bounded buffering
+for incomplete network and SSE event frames:
 
 ```
 API Server → TCP → SSE Parser → Event Handler → Terminal
      │                              │
-     └──────── no buffering ────────┘
+     └──── incremental bounded buffering ────┘
 ```
 
-Each token appears on screen within milliseconds of leaving Anthropic's servers. The SSE parser processes events as they arrive rather than waiting for complete responses.
+The SSE parser processes events as they arrive rather than waiting for complete responses.
 
 ### TUI Rendering Performance
 
-The interactive TUI targets 60fps rendering with several optimization layers:
+The interactive TUI has a 60fps design target, with several optimization layers:
 
 **Frame timing telemetry**: Every render cycle is instrumented. Slow frames (>16ms) are tracked and classifiable by phase: viewport sync, message encoding, markdown rendering. This data feeds the internal performance monitor.
 
 **Message render cache**: Markdown-to-ANSI conversion involves syntax highlighting, table layout, and link detection. Pi caches the rendered output per message and invalidates only on theme change or terminal resize. During streaming, only the actively-changing message is re-rendered; all prior messages hit the cache.
 
-**Pre-allocated render buffers**: The `RenderBuffers` struct is reused across render cycles. Rather than allocating new `String` buffers each frame, Pi writes into pre-sized buffers and clears them before reuse, eliminating thousands of small allocations per second during streaming.
+**Pre-allocated render buffers**: The `RenderBuffers` struct is reused across render cycles. Rather than allocating new `String` buffers each frame, Pi writes into pre-sized buffers and clears them before reuse, avoiding repeated small allocations during streaming.
 
 **Memory pressure monitoring**: A `MemoryMonitor` samples process heap size and classifies it into three tiers:
 
@@ -2297,7 +2560,9 @@ For a more complete guide, see [docs/troubleshooting.md](docs/troubleshooting.md
 
 ### "fd not found"
 
-The `find` tool requires `fd`:
+The `find` tool searches in-process by default and needs no `fd` binary.
+This error only appears with `"search_backend": "external"` in
+settings.json; either remove that setting or install `fd`:
 
 ```bash
 # Ubuntu/Debian
@@ -2360,12 +2625,12 @@ Pi is honest about what it doesn't do:
 
 | Limitation | Workaround |
 |------------|------------|
-| **Not all provider APIs** | Built-in support is backed by 10 native provider implementation modules: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini, Cohere, Azure OpenAI, Bedrock, Vertex AI, GitHub Copilot, and GitLab Duo; some ecosystem-specific APIs are still TBD |
-| **No web browsing** | Use bash with curl |
+| **Not all provider APIs** | Built-in support is backed by 11 native provider implementation modules: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini, Cohere, Azure OpenAI, Bedrock, Vertex AI, GitHub Copilot, GitLab Duo, and Cursor; some ecosystem-specific APIs are still TBD |
+| **Search backend availability varies** | `web_search` uses the configured ranked providers; URL-aware `read` and bash/curl remain available when a provider is unavailable |
 | **No GUI** | Terminal-only by design |
 | **Some extensions need npm stubs** | Common stubs are provided; unlisted npm packages still require a stub. See docs/planning/EXTENSIONS.md §8.1 |
 | **English-centric** | Works but not optimized for other languages |
-| **Nightly Rust required** | Uses 2024 edition features |
+| **Pinned Rust toolchain** | Releases are validated with `nightly-2026-07-05`; locked dependencies require Rust 1.95+ |
 
 ---
 
@@ -2426,7 +2691,7 @@ environment with no ambient OS access:
 1. **No Node/Bun required**: QuickJS + Pi-provided shims for common Node APIs
 2. **Capability-based security**: each host connector call is policy-checked and logged
 3. **Conformance-tested**: status is tracked in `docs/ext-compat.md` and `tests/ext_conformance/reports/pipeline/`
-4. **Sub-100ms load times**: extensions load in <100ms (P95) with no JIT warmup
+4. **Measured load paths**: cold and warm extension loads are instrumented; fresh release measurements are pending
 
 Legacy extension behavior is automatic:
 - Existing `.js/.ts` extensions run directly (no manual conversion step).
@@ -2513,8 +2778,10 @@ The `#![forbid(unsafe_code)]` directive is project-wide and non-negotiable. Rati
 
 - **Attack surface**: Pi executes user-provided shell commands and reads arbitrary files
 - **Memory bugs = security bugs**: Buffer overflows or use-after-free in this context could be exploitable
-- **Performance irrelevant**: The bottleneck is network latency to the API, not CPU cycles
-- **Dependencies audited**: All dependencies either use no unsafe or are well-audited (e.g., `rustls`)
+- **No safety-for-speed trade**: The project forbids unsafe Rust regardless of workload profile
+- **Dependency boundary is explicit**: `forbid(unsafe_code)` governs this
+  project's Rust code; transitive dependencies remain subject to separate
+  review and supply-chain checks
 
 The safe Rust subset provides all necessary functionality without compromising security.
 
@@ -2526,22 +2793,22 @@ The safe Rust subset provides all necessary functionality without compromising s
 A: This is an authorized Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic), created with his blessing. The architecture differs significantly from the TypeScript original: it uses [asupersync](https://github.com/Dicklesworthstone/asupersync) for structured concurrency and [rich_rust](https://github.com/Dicklesworthstone/rich_rust) (a port of Will McGugan's [Rich](https://github.com/Textualize/rich) library) for terminal rendering. The goal is idiomatic Rust while preserving Pi Agent's UX.
 
 **Q: Why rewrite in Rust?**
-A: Startup time matters when you're in a terminal all day. Rust gives us <100ms startup vs 500ms+ for Node.js. Plus, no runtime dependencies to manage.
+A: Startup time matters when you're in a terminal all day. Rust provides a native single-binary deployment without a managed application runtime. Fresh comparative measurements are required before this release makes a speed claim.
 
-**Q: Can I use providers beyond Anthropic (OpenAI/Gemini/Cohere/Azure/Bedrock/Vertex/Copilot/GitLab/Codex)?**
-A: Yes. Pi has 10 native provider implementation modules: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini (native + Gemini CLI + Antigravity routes), Cohere, Azure OpenAI, Amazon Bedrock, Vertex AI, GitHub Copilot, and GitLab Duo. Pi also supports many OpenAI-compatible presets (for example Groq, OpenRouter, Mistral, Together, DeepSeek, Cerebras, DeepInfra, Alibaba/Qwen, and Moonshot/Kimi). Provider IDs and aliases are case-insensitive. Set credentials and choose via `--provider`/`--model`; run `pi --list-providers` to see canonical IDs, aliases, and env keys.
+**Q: Can I use providers beyond Anthropic (OpenAI/Gemini/Cohere/Azure/Bedrock/Vertex/Copilot/GitLab/Cursor/Codex)?**
+A: Yes. Pi has 11 native provider implementation modules: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini (native + Gemini CLI + Antigravity routes), Cohere, Azure OpenAI, Amazon Bedrock, Vertex AI, GitHub Copilot, GitLab Duo, and Cursor. Pi also supports many OpenAI-compatible presets (for example Groq, OpenRouter, OrcaRouter, Mistral, Together, DeepSeek, Cerebras, DeepInfra, Alibaba/Qwen, and Moonshot/Kimi). Provider IDs and aliases are case-insensitive. Set credentials and choose via `--provider`/`--model`; run `pi --list-providers` to see canonical IDs, aliases, and env keys.
 
 **Q: How do sessions work?**
 A: By default, each session is a JSONL v3 file with message entries, parent references for branching, and compaction metadata. Builds include `sqlite-sessions` support by default, so configured deployments can use SQLite-backed session storage too; JSONL remains the default store unless configuration selects SQLite.
 
 **Q: Why is unsafe forbidden?**
-A: Memory safety is non-negotiable for a tool that executes arbitrary commands. The performance cost is negligible for this use case.
+A: Memory safety is non-negotiable for a tool that executes arbitrary commands. The project does not trade that policy for performance.
 
 **Q: How do I extend Pi?**
 A: Pi has a full extension system with two runtime families: JS/TS entrypoints run in embedded QuickJS, and `*.native.json` descriptors run in the native-rust descriptor runtime. Both are capability-gated and audited through the same policy system. One session uses one runtime family at a time. Extensions can register tools, slash commands, event hooks, flags, and custom providers. See [EXTENSIONS.md](docs/planning/EXTENSIONS.md) for details. For built-in tool changes, implement the `Tool` trait in `src/tools.rs`.
 
 **Q: Why isn't X feature included?**
-A: Pi focuses on core coding assistance. Features like web browsing, image generation, etc. are out of scope. Use specialized tools for those.
+A: Pi focuses on core coding assistance, and the default tool set reflects that. Browser automation, desktop control, image analysis/generation, and text-to-speech exist as settings-gated tools (`browser`, `computer`, `inspect_image`, `generate_image`, `tts`) so they cost nothing in the model's schema unless you turn them on. Anything beyond that is out of scope; use specialized tools.
 
 **Q: How does compaction work?**
 A: When a conversation exceeds the model's context window, Pi summarizes older messages using the LLM itself, storing the summary as a session entry. Recent messages are kept verbatim. The cut point is chosen at a turn boundary, and the summary includes a record of which files were read or modified so the model retains that awareness. Compaction runs automatically after each agent turn when needed, or manually via `/compact`.
@@ -2565,10 +2832,10 @@ A: Yes. Point any provider at a custom base URL via `models.json`. Pi normalizes
 | Feature | Pi | Claude Code | Aider | Cursor |
 |---------|-----|-------------|-------|--------|
 | **Language** | Rust | TypeScript | Python | Electron |
-| **Startup** | <100ms | ~1s | ~2s | ~5s |
-| **Memory** | <50MB | ~200MB | ~150MB | ~500MB |
-| **Providers** | 10 native provider implementation modules + OpenAI-compatible presets | Anthropic | Many | Many |
-| **Tools** | 8 built-in | Many | File-focused | IDE-integrated |
+| **Startup** | Fresh comparative measurement pending | Not measured here | Not measured here | Not measured here |
+| **Memory** | Fresh comparative measurement pending | Not measured here | Not measured here | Not measured here |
+| **Providers** | 11 native provider implementation modules + OpenAI-compatible presets | Anthropic | Many | Many |
+| **Tools** | 35 built-in (19 in the default `--tools` list) | Many | File-focused | IDE-integrated |
 | **Sessions** | JSONL tree | Proprietary | Git-based | Proprietary |
 | **Open source** | Yes | Yes | Yes | No |
 
@@ -2579,23 +2846,13 @@ A: Yes. Point any provider at a custom base URL via `models.json`. Pi normalizes
 ### Building
 
 ```bash
-./scripts/cargo_headroom.sh build           # Debug build (remote offload)
-./scripts/cargo_headroom.sh build --release # Release build (optimized, remote offload)
-./scripts/cargo_headroom.sh test --all-targets # Full test run with disk preflight
-# Lint checks (remote-safe split to avoid rch clippy timeout fail-open)
-./scripts/cargo_headroom.sh clippy --lib --bins -- -D warnings
-./scripts/cargo_headroom.sh clippy --tests -- -D warnings
-./scripts/cargo_headroom.sh clippy --benches -- -D warnings
-./scripts/cargo_headroom.sh clippy --examples -- -D warnings
+dsr quality --tool pi_agent_rust
+dsr build pi_agent_rust
 ```
 
-When those variables are unset, `cargo_headroom.sh` defaults `CARGO_TARGET_DIR`
-and `TMPDIR` to a per-agent directory under `/data/tmp/pi_agent_rust_cargo/...`,
-writes a `CACHEDIR.TAG`, rejects accidental repo-root target directories, and
-fails before compilation if the target or temp mount has insufficient free
-space. Set `PI_CARGO_RUNNER=local` for a local-only run,
-`PI_CARGO_BUILD_ROOT=<dir>` for a different large volume, or
-`PI_CARGO_HEADROOM_MIN_FREE_MB=<mb>` for smaller focused checks.
+DSR owns formatting, compilation, linting, tests, target/temp placement, and
+any remote offload. RCH and repository wrappers are DSR implementation details,
+not alternate contributor entry points.
 
 Before launching swarms or heavyweight all-target gates, run
 `pi doctor --only swarm --format json`. The
@@ -2622,107 +2879,74 @@ slot posture for runpacks and operator handoff. Missing broker configuration is
 reported as optional and non-blocking; stale or degraded broker stores remain
 visible instead of being promoted to green validation evidence.
 
-### Cargo Feature Defaults
+### Feature defaults
 
-Default builds enable `sqlite-sessions` only. The `sqlite-sessions` feature is
-therefore on for normal `cargo build`, `cargo test`, release, and installer
-builds; JSONL remains the default session store unless configuration selects
-SQLite storage. Heavyweight extras (`image-resize`, `jemalloc`, `clipboard`,
-`wasm-host`, and syntax highlighting) are opt-in so the default release binary
-stays under the size budget. To build all optional user-facing extras, use:
-
-```bash
-./scripts/cargo_headroom.sh build --features full
-```
-
-To build a smaller custom subset without SQLite session backend support, use
-`--no-default-features` and explicitly re-enable only the features you need:
-
-```bash
-./scripts/cargo_headroom.sh build --no-default-features --features clipboard
-```
+Default DSR builds enable `sqlite-sessions` only; JSONL remains the default
+session store unless configuration selects SQLite. Heavyweight extras
+(`image-resize`, `jemalloc`, `clipboard`, `wasm-host`, and syntax highlighting)
+are opt-in so the default release binary stays under the size budget. Feature
+variants must be declared in the DSR recipe instead of injected through a
+direct Cargo invocation.
 
 ### Testing
 
 ```bash
-# Unified verification runner (recommended for deterministic evidence artifacts)
-./scripts/e2e/run_all.sh --profile focused
-./scripts/e2e/run_all.sh --profile ci
-./scripts/e2e/run_all.sh --rerun-from tests/e2e_results/<timestamp>/summary.json --skip-unit
-
-# Fast smoke/extension quality wrappers with strict remote enforcement
-./scripts/smoke.sh --require-rch
-./scripts/ext_quality_pipeline.sh --require-rch
-
-# Multi-agent safety: with CODEX_THREAD_ID set, run_all defaults
-# CARGO_TARGET_DIR to target/agents/<CODEX_THREAD_ID> unless overridden.
-# Set CARGO_TARGET_DIR explicitly if you want a custom shared or isolated target.
-
-# All tests
-./scripts/cargo_headroom.sh test --all-targets
-
-# Specific module
-./scripts/cargo_headroom.sh test tools::tests
-./scripts/cargo_headroom.sh test sse::tests
-
-# Conformance tests
-./scripts/cargo_headroom.sh test conformance
+dsr quality --tool pi_agent_rust
 ```
 
-Focused validation tools:
+The registered recipe owns unit, integration, conformance, E2E, installer,
+extension, formatting, lint, security, reachability, ledger-reconciliation,
+and evidence-integrity gates. If a required focused lane is missing, add it to
+DSR; do not bypass DSR by invoking Cargo, RCH, or a repository wrapper directly.
 
-```bash
-# Dev-firstset gate before release build
-rch exec -- cargo build --bin pi --bin ext_release_binary_e2e
-PI_HTTP_REQUEST_TIMEOUT_SECS=0 rch exec -- \
-  cargo run --example ext_release_binary_e2e -- \
-  --pi-bin target/debug/pi \
-  --provider ollama --model qwen2.5:0.5b \
-  --jobs 10 --timeout-secs 600 --max-cases 20 --extension-policy balanced
-
-# Full optimized release-binary run after gate passes
-rch exec -- cargo build --release --bin pi --bin ext_release_binary_e2e
-PI_HTTP_REQUEST_TIMEOUT_SECS=0 target/release/ext_release_binary_e2e \
-  --pi-bin target/release/pi \
-  --provider ollama --model qwen2.5:0.5b \
-  --jobs 10 --timeout-secs 600 --extension-policy balanced
-
-# Runtime risk ledger forensics (verify, replay, calibrate)
-rch exec -- cargo run --example ext_runtime_risk_ledger -- verify --input path/to/runtime_risk_ledger.json
-rch exec -- cargo run --example ext_runtime_risk_ledger -- replay --input path/to/runtime_risk_ledger.json
-rch exec -- cargo run --example ext_runtime_risk_ledger -- calibrate --input path/to/runtime_risk_ledger.json --objective balanced_accuracy
-```
+Important validation components include:
 
 - `ext_runtime_risk_ledger` operates on `pi.ext.runtime_risk_ledger.v1` artifacts (for example, from incident bundle exports).
+- `release_evidence_ledger` operates on `pi.release_evidence.ledger.v1` artifacts, ensuring proof-carrying tamper-evident hash chaining across all release evidence artifacts.
+- `nrun_evidence_evaluator` evaluates `pi.nrun.budget_evaluation.v1` multi-run series with $N \ge 10$ repetitions and bootstrap 95% confidence intervals against `pi.nrun.evidence_protocol.contract.v1`.
+- `sequential_budget_gate` evaluates anytime-valid sequential hypothesis testing and e-process SPRT trajectories against `pi.sequential_gate.contract.v1`.
+- `perf_drift_watch` monitors historical budget time-series for persistent CUSUM drift and BOCPD regime changes against `pi.perf.drift_watch.contract.v1`.
+- `conformal_budget_calibration` computes distribution-free conformal calibration quantiles and validates amendment records against `pi.conformal_calibration.contract.v1`.
+- `startup_benchmark_runner` measures fresh release startup latency distributions and binary size under N-run repetition protocol against `pi.perf.startup_benchmark.contract.v1`.
+- `variance_gate` gates benchmark inputs against host topology noise thresholds (`noise_score`), rejecting noisy runs as `NO_DATA` to prevent averaging into compliance against `pi.perf.variance_gating.contract.v1`.
 
 ### Release & Publishing
 
-Releases are tag-driven and must align with `Cargo.toml` versions.
+Releases are tag-driven, must align with `Cargo.toml` versions, and are built
+and published exclusively through Doodlestein Self-Releaser (DSR).
 
-- Tag format: `vX.Y.Z` (pre-releases like `vX.Y.Z-rc.N` are allowed but skip crates.io publish).
+- Tag format: `vX.Y.Z` (pre-releases like `vX.Y.Z-rc.N` are allowed).
 - The tag version **must** match `package.version` in `Cargo.toml`.
 - Publish order for dependencies: `asupersync` → `rich_rust` → `charmed-*` (lipgloss, bubbletea, bubbles, glamour) → `pi_agent_rust`.
-- `.github/workflows/publish.yml` handles crates.io publish when `CARGO_REGISTRY_TOKEN` is set.
+- Cargo registry publication is currently **HOLD** until DSR provides and
+  validates a fail-closed crates.io publisher. Neither stable nor pre-release
+  tags authorize an ad hoc `cargo publish` fallback.
+- GitHub Actions is never used for this repository. Files under
+  `.github/workflows/` are disabled historical references and are not build,
+  test, publication, or evidence authorities.
+- DSR owns quality checks, native cross-platform builds, packaging, signing,
+  publication, and public-release verification. DSR may use RCH internally;
+  contributors never invoke RCH as a parallel build or evidence lane.
+- The canonical DSR operating details are documented in
+  [docs/releasing.md](docs/releasing.md). A tag or source build without
+  DSR-published, publicly verified artifacts is not a release.
+  Immutable `v*` tag ruleset `20418963` was created and read back on 2026-08-04
+  with update/deletion forbidden and no bypass actors. That historical
+  observation is not current proof: DSR must gain a fail-closed live ruleset
+  check before any release. The retired manual lane is not a fallback, and no
+  GitHub Actions lane exists or may be enabled.
 
 ### Coverage
 
-Coverage uses `cargo-llvm-cov`:
+Coverage is a component of the registered DSR quality recipe:
 
 ```bash
-# One-time install
-cargo install cargo-llvm-cov --locked
-rustup component add llvm-tools-preview
-
-# Summary (fastest)
-cargo llvm-cov --all-targets --workspace --summary-only
-
-# LCOV report (for CI/artifacts)
-CI=true VCR_MODE=playback VCR_CASSETTE_DIR=tests/fixtures/vcr \
-  cargo llvm-cov --all-targets --workspace --lcov --output-path lcov.info
-
-# HTML report (defaults to target/llvm-cov/html)
-cargo llvm-cov --all-targets --workspace --html
+dsr quality --tool pi_agent_rust
 ```
+
+DSR provisions the coverage toolchain and records summary, LCOV, and HTML
+artifacts with source provenance; direct coverage-tool invocations are not an
+accepted project gate.
 
 ### Project Structure
 
@@ -2764,10 +2988,21 @@ src/
 ├── session_index.rs        # SQLite session metadata index/cache
 ├── session_sqlite.rs       # Default-enabled sqlite-sessions backend support
 ├── compaction.rs           # Context compaction algorithm
-├── interactive.rs          # Interactive TUI app loop/state
-├── interactive/            # Bubble Tea-style TUI submodules
+├── interactive_ftui.rs     # Default FrankenTUI interactive stack (feature `ftui`)
+├── interactive.rs          # Classic charmed_rust TUI app loop/state (`--classic`)
+├── interactive/            # Bubble Tea-style TUI submodules shared by both stacks
 ├── rpc.rs                  # RPC/stdio mode
-├── extensions.rs           # Extension protocol + policy + security
+├── extensions.rs           # Stable extension facade + manager/lifecycle
+├── extensions/
+│   ├── protocol.rs         # Wire validation + hostcall reactor internals
+│   ├── fs_connector.rs     # Capability-scoped filesystem implementation
+│   ├── exec_mediation.rs   # Dangerous-command + secret policy logic
+│   ├── permission_drift.rs # Permission snapshot drift evidence
+│   ├── event_coalescer_impl.rs # Coalesced event dispatch
+│   ├── extension_manager_impl.rs # Manager lifecycle + event orchestration
+│   ├── native_runtime.rs   # Active native descriptor runtime
+│   ├── wasm_host.rs        # Feature-gated Wasmtime component host
+│   └── tests/              # Behavior-domain characterization suites
 ├── extensions_js.rs        # QuickJS runtime bridge + hostcalls
 ├── extension_dispatcher.rs # Hostcall/tool dispatch plumbing
 ├── extension_preflight.rs  # Extension compatibility scanner
@@ -2791,9 +3026,9 @@ broader inventory.
 | Getting started and operations | [development](docs/development.md), [terminal setup](docs/terminal-setup.md), [settings](docs/settings.md), [models](docs/models.md), [keybindings](docs/keybindings.md), [packages](docs/packages.md), [troubleshooting](docs/troubleshooting.md), [releasing](docs/releasing.md) |
 | Swarm operations and replay | [operations runbook](docs/swarm-operations-runbook.md), [replay operator workflow](docs/swarm-replay-operator-workflow.md), [activity ledger](docs/swarm-activity-ledger.md), [flight recorder](docs/swarm-flight-recorder.md) |
 | Core runtime surfaces | [session](docs/session.md), [tree](docs/tree.md), [TUI](docs/tui.md), [RPC](docs/rpc.md), [SDK](docs/sdk.md), [skills](docs/skills.md), [prompt templates](docs/prompt-templates.md), [streaming hostcalls](docs/streaming-hostcalls.md), [context intelligence](docs/context-intelligence.md) |
-| Drop-in certification and migration | [certification contract](docs/contracts/dropin-certification-contract.json), [certification verdict](docs/evidence/dropin-certification-verdict.json), [parity gap ledger](docs/evidence/dropin-parity-gap-ledger.json), [differential evidence suite](docs/evidence/dropin-differential-evidence-suite.json), [feature inventory](docs/evidence/dropin-feature-inventory-matrix.json), [migration playbook](docs/integrator-migration-playbook.md), [parity snapshot](docs/parity-certification.json), [program governance](docs/program-governance.md) |
+| Historical legacy-Pi comparison and migration records | [retired certification contract](docs/contracts/dropin-certification-contract.json), [historical verdict](docs/evidence/dropin-certification-verdict.json), [historical parity gap ledger](docs/evidence/dropin-parity-gap-ledger.json), [historical differential suite](docs/evidence/dropin-differential-evidence-suite.json), [historical feature inventory](docs/evidence/dropin-feature-inventory-matrix.json), [migration playbook](docs/integrator-migration-playbook.md), [historical parity snapshot](docs/parity-certification.json) |
 | Extensions | [architecture](docs/extension-architecture.md), [compatibility guide](docs/ext-compat.md), [compatibility matrix](docs/extension-compatibility-matrix.md), [conformance plan](docs/extension-conformance-test-plan.json), [runtime threat model](docs/extension-runtime-threat-model.md), [troubleshooting](docs/extension-troubleshooting.md), [registry](docs/extension-registry.md), [WIT ABI](docs/wit/extension.wit) |
-| Providers | [provider guide](docs/providers.md), [auth troubleshooting checked crosswalk](docs/provider-auth-troubleshooting.md), [config examples](docs/provider-config-examples.md), [canonical ID policy](docs/provider-canonical-id-policy.md), [onboarding playbook](docs/provider-onboarding-playbook.md), [test obligations](docs/provider-test-obligations.md), [upstream catalog snapshot](docs/provider-upstream-catalog-snapshot.md), [support baseline audit](docs/provider-support-baseline-audit.md) |
+| Providers | [provider guide](docs/providers.md), [auth troubleshooting checked crosswalk](docs/provider-auth-troubleshooting.md), [config examples](docs/provider-config-examples.md), [canonical ID policy](docs/provider-canonical-id-policy.md), [onboarding playbook](docs/provider-onboarding-playbook.md), [test obligations](docs/provider-test-obligations.md), [upstream catalog snapshot](docs/provider-upstream-catalog-snapshot.md), [historical 2026-02-13 support baseline](docs/provider-support-baseline-audit.md) |
 | QA and evidence | [QA runbook](docs/qa-runbook.md), [testing policy](docs/testing-policy.md), [conformance playbook](docs/conformance-operator-playbook.md), [coverage matrix](docs/TEST_COVERAGE_MATRIX.md), [evidence schema](docs/evidence-contract-schema.json), [coverage baseline map](docs/coverage-baseline-map.json), [E2E scenario matrix](docs/e2e_scenario_matrix.json), [non-mock rubric](docs/non-mock-rubric.json) |
 | Security | [baseline audit](docs/security/baseline-audit.md), [threat model](docs/security/threat-model.md), [security invariants](docs/security/invariants.md), [operator handbook](docs/security/operator-handbook.md), [operator quick reference](docs/security/operator-quick-reference.md), [incident response](docs/security/incident-response-runbook.md), [runtime hostcall telemetry](docs/security/runtime-hostcall-telemetry.md), [security SLOs](docs/security/security-slos.md) |
 | Schemas and machine contracts | [extension manifest schema](docs/schema/extension_manifest.json), [extension protocol schema](docs/schema/extension_protocol.json), [session store v2 contract](docs/schema/session_store_v2_contract.json), [semantic workspace graph contract](docs/contracts/semantic-workspace-graph-contract.json), [semantic context graph contract](docs/contracts/semantic-context-graph-contract.json), [swarm replay trace contract](docs/contracts/swarm-replay-trace-contract.json), [swarm replay preview schema](docs/schema/swarm_replay_preview.json), [remote validation proof ledger contract](docs/contracts/remote-validation-proof-ledger-contract.json), [remote validation proof reuse gate contract](docs/contracts/remote-validation-proof-reuse-gate-contract.json), [validation proof-memory index contract](docs/contracts/validation-proof-memory-index-contract.json), [validation proof-memory index evidence](docs/evidence/validation-proof-memory-index.json), [operator work recommendation contract](docs/contracts/operator-work-recommendation-contract.json), [operator work recommendation evidence](docs/evidence/operator-work-recommendation.json), [operator smoothness SLO contract](docs/contracts/operator-smoothness-slo-contract.json), [operator smoothness SLO evidence](docs/evidence/operator-smoothness-slo.json), [extension resource firewall matrix contract](docs/contracts/extension-resource-firewall-matrix-contract.json), [validation broker contract](docs/contracts/validation-broker-contract.json), [validation broker closeout gate contract](docs/contracts/validation-broker-closeout-gate-contract.json), [validation broker closeout gate evidence](docs/evidence/validation-broker-closeout-gate.json), [context-intelligence closeout gate contract](docs/contracts/context-intelligence-closeout-gate-contract.json), [context-intelligence closeout gate evidence](docs/evidence/context-intelligence-closeout-gate.json), [progress SLO closeout gate contract](docs/contracts/swarm-progress-slo-closeout-gate-contract.json), [progress SLO closeout gate evidence](docs/evidence/swarm-progress-slo-closeout-gate.json), [runtime intelligence closeout gate contract](docs/contracts/runtime-intelligence-closeout-gate-contract.json), [runtime intelligence closeout gate evidence](docs/evidence/runtime-intelligence-closeout-gate.json), [sixth-wave validation hardening closeout gate contract](docs/contracts/sixth-wave-validation-hardening-closeout-gate-contract.json), [sixth-wave validation hardening closeout gate evidence](docs/evidence/sixth-wave-validation-hardening-closeout-gate.json), [seventh-wave runtime autonomy closeout gate contract](docs/contracts/seventh-wave-runtime-autonomy-closeout-gate-contract.json), [seventh-wave runtime autonomy closeout gate evidence](docs/evidence/seventh-wave-runtime-autonomy-closeout-gate.json), [predictive swarm telemetry ledger contract](docs/contracts/predictive-swarm-telemetry-ledger-contract.json), [predictive swarm telemetry ledger evidence](docs/evidence/predictive-swarm-telemetry-ledger.json), [test evidence logging contract](docs/schema/test_evidence_logging_contract.json), [runtime hostcall telemetry schema](docs/schema/runtime_hostcall_telemetry.json), [mock spec schema](docs/schema/mock_spec.json), [CLI surface diff schema](docs/schema/cli-surface-diff.json), [security traceability matrix](docs/sec_traceability_matrix.md) |
@@ -2815,3 +3050,43 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 <p align="center">
   <sub>Built with Rust, for developers who live in the terminal.</sub>
 </p>
+
+---
+
+## Current Evidence State (auto-generated)
+
+> **STATUS: PARTIAL** — `claim_readiness.status = "blocked"`, `performance_claims_authorized = false` (3 budgets still failing/no-data).
+> Four of the seven previously-failing budgets now have **fresh v0.3.0 measurements** (binary_size, idle_memory, ext_cold_load_complex, event_dispatch). The remaining items are: `ext_cold_load_simple_p95` (over 5ms budget; needs profile-driven optimization), `tool_call_latency_mean` and `tool_call_throughput_min` (need a pijs_workload binary), and the long-standing `ext_must_pass` marckrenn-pi-sub conformance gap.
+> See [`tests/perf/reports/budget_summary.json`](tests/perf/reports/budget_summary.json) for the current budget state and [`docs/perf-budgets-recipe.md`](docs/perf-budgets-recipe.md) for the recipe to regenerate.
+
+| Budget | Status | Notes |
+|---|---|---|
+| `binary_size_release` | **PASS** (32.8 MB) | Fresh v0.3.0 measurement against stripped release binary; under 48 MB budget |
+| `idle_memory_rss` | **PASS** (8.0 MB) | Fresh v0.3.0 measurement against the user-facing release binary; under 50 MB target |
+| `tool_call_latency_mean` | **FAIL** | `pijs_workload` data missing; generator at `scripts/perf/run_pijs_workload.py` |
+| `tool_call_throughput_min` | **FAIL** | same as above |
+| `ext_cold_load_simple_p95` | **FAIL** (11.9ms) | over budget (5.0ms); profile-driven optimization pending |
+| `ext_cold_load_complex_p95` | **PASS** (38.3ms) | Fresh measurement; under 50ms budget |
+| `event_dispatch_p99` | **PASS** (766us) | Fresh measurement; under 5000us budget |
+| `ext_must_pass` | **fail** | 2/208 marckrenn-pi-sub extensions fail conformance (event-handler mismatch); triaged to upstream fix or de-scope, see `bd-marckrenn-pi-sub-triage-xd3gh` |
+| `evidence_bundle` | **partial** (was `insufficient`) | 0 invalid sections now; 18 present, 12 missing (optional) |
+
+```bash
+# 1. Verify the DSR perf recipe is ready
+bash scripts/perf/preflight_dsr_recipe.sh
+
+# 2. Build the release binary via DSR
+/Users/jemanuel/projects/doodlestein_self_releaser/dsr build pi_agent_rust
+
+# 3. Generate the canonical evidence artifacts
+python3 scripts/perf/measure_idle_memory.py
+python3 scripts/perf/measure_binary_size.py --no-build
+python3 scripts/perf/run_ext_cold_load_complex.py
+python3 scripts/perf/run_event_dispatch_scenario.py
+
+# 4. Regenerate the evidence bundle and the markdown
+python3 scripts/perf/rebuild_evidence_bundle.py
+python3 scripts/perf/render_perf_budgets_md.py
+```
+
+When `claim_readiness.status` flips from `blocked` to `ready` (or `ready_with_advisories`), the `Current Evidence State` section above will be re-rendered and the `Why Pi?` table numbers can be re-promoted to current.

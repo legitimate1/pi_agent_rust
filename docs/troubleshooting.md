@@ -14,8 +14,16 @@ being implemented, the relevant bead ID is listed for tracking.
 
 **Config precedence (most → least):**
 1. `--api-key`
-2. Provider-specific env var
-3. `auth.json` (OAuth or stored API key)
+2. Unexpired OAuth/bearer credential in `auth.json`
+3. Provider-specific environment variables, in the order declared by provider metadata
+4. Stored API key in `auth.json`
+5. Supported external coding-CLI credential (global auth storage only)
+6. Inline `models.json` provider `apiKey` fallback, when the selected model supplies one
+
+Provider-managed credentials are exceptions to the generic API-key chain:
+Bedrock resolves the AWS credential chain/SigV4 at request time, and SAP AI
+Core exchanges its client credentials for a bearer token rather than sending a
+client secret as an API token.
 
 ## Provider errors (401/429/5xx)
 
@@ -62,6 +70,30 @@ Common fixes:
 Extension discovery is tracked under **bd-1e0** (install + resolution). If an
 extension fails to load, expect diagnostics to improve as that bead lands.
 
+**Symptom:** project-local `.pi/settings.json` packages or `.pi/extensions/`
+entries are not loading, or a "Trust this workspace?" prompt appears.
+
+Project-local configuration can execute code (npm/git package installs run
+lifecycle scripts; project extensions run JavaScript at session startup), so
+Pi gates it behind a workspace trust decision (GH #151):
+
+- On the first interactive launch in a workspace that declares such
+  configuration, Pi lists what would execute and asks once. The answer is
+  remembered in `~/.pi/agent/workspace-trust.json`, keyed to the workspace
+  path **and** a content digest — editing `.pi/settings.json` or anything
+  under `.pi/extensions/` re-prompts.
+- Non-interactive launches (`--mode rpc`, `-p/--print`, piped stdin) fail
+  closed: project-local configuration is skipped for that run with a warning,
+  and nothing is persisted.
+- Automation: pass `--trust` once (persists the decision for the current
+  content), set `PI_WORKSPACE_TRUST=trusted`/`untrusted` for a one-shot
+  override, or set `"trustAllWorkspaces": true` in the **global**
+  `~/.pi/agent/settings.json`.
+- Explicit CLI resource paths (`-e/--extension`, `--skill`, ...) are treated
+  as user consent and are never gated.
+- To revoke trust, edit or delete the workspace's entry in
+  `~/.pi/agent/workspace-trust.json`.
+
 ## Sessions (persistence + recovery)
 
 Sessions live under:
@@ -103,19 +135,21 @@ Interactive editor parity (autocomplete/bang/paste) is tracked by **bd-1iwi**.
 
 ## Missing system dependencies
 
-The `find` tool requires `fd`:
+The `grep` and `find` tools search in-process by default and need no
+external binaries. "fd/rg is not available" errors only appear with
+`"search_backend": "external"` in settings.json; either remove that
+setting or install the binaries:
+
 ```bash
 # Ubuntu/Debian
-apt install fd-find
+apt install ripgrep fd-find
 
 # macOS
-brew install fd
+brew install ripgrep fd
 
-# The binary might be named fdfind
+# The fd binary might be named fdfind
 ln -s $(which fdfind) ~/.local/bin/fd
 ```
-
-`rg` (ripgrep) is optional but recommended for faster searches.
 
 ## Tool output truncated
 

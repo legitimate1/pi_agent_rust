@@ -1,16 +1,23 @@
 # SDK Cookbook and Migration Guide
 
-This guide is for teams embedding Pi as a Rust library. The Rust SDK provides idiomatic Rust APIs that deliver equivalent functionality to the TypeScript SDK, using Rust-native patterns like `Result` types, structured concurrency, and zero-copy operations.
+This guide is for teams embedding Pi as a Rust library. The Rust SDK provides
+idiomatic Rust APIs for Pi's core embedding workflows, using Rust-native
+patterns such as `Result` types and structured concurrency.
 
-**Note**: This SDK is an idiomatic Rust companion to the pi-mono TypeScript SDK, not a drop-in equivalent. The APIs provide functional equivalence while following Rust ecosystem conventions.
+**Note**: This SDK is an idiomatic Rust companion to the pi-mono TypeScript
+SDK, not a drop-in equivalent. Parity remains governed by the active
+certification contract and its provenance-matched verdict.
 
 ## Install
 
 ```toml
 [dependencies]
-pi = { path = "." }
+pi = { package = "pi_agent_rust", version = "0.2.0" }
 futures = "0.3"
 ```
+
+When developing against a local checkout, replace `version = "0.2.0"` with
+`path = "/path/to/pi_agent_rust"` while retaining `package = "pi_agent_rust"`.
 
 ## SemVer Surface
 
@@ -21,9 +28,11 @@ published API documentation and may change without SemVer guarantees.
 
 The `semver` GitHub Actions workflow runs `cargo-semver-checks` on PRs and
 `main` pushes that touch the SDK/API surface. It compares the current public
-API to the PR target branch or previous push baseline. Removing or changing a
-stable item below requires a major version bump; additive changes remain
-minor-version compatible.
+API to the PR target branch or previous push baseline. An incompatible change
+to a stable item requires a SemVer-incompatible bump (`0.y` to `0.(y+1)` before
+1.0, or a major-version bump after 1.0). Only semver-compatible additions
+remain compatible; adding public enum variants or required struct fields can
+be breaking for Rust consumers.
 
 ### Stability Annotations
 
@@ -34,14 +43,14 @@ minor-version compatible.
 | `pi::sdk::{Error, Result}` | Stable | SDK error/result exports. |
 | `pi::sdk::{AbortHandle, AbortSignal}` | Stable | Prompt cancellation handles. |
 | `pi::sdk::{Agent, AgentConfig, AgentEvent, AgentSession, QueueMode}` | Stable | In-process agent/session integration exports. |
-| `pi::sdk::{AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, Message, StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage}` | Stable | Message, content, streaming, and accounting model types. |
+| `pi::sdk::{AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, Message, StopDetails, StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage}` | Stable | Message, content, streaming, and accounting model types. |
 | `pi::sdk::{Config, ExtensionManager, ExtensionPolicy, ExtensionRegion, Session, ThinkingLevel}` | Stable | Configuration, extension, session, and thinking-control exports. |
 | `pi::sdk::{InputType, Model, ModelCost, Provider, ProviderContext, ProviderThinkingBudgets, StreamOptions, ToolDef}` | Stable | Provider integration exports. |
 | `pi::sdk::{ModelEntry, ModelRegistry}` | Stable | Model registry exports. |
 | `pi::sdk::{Tool, ToolDefinition, ToolOutput, ToolRegistry, ToolUpdate}` | Stable | Tool integration exports. |
-| `pi::sdk::BUILTIN_TOOL_NAMES` | Stable | Canonical built-in tool-name inventory. |
-| `pi::sdk::{create_read_tool, create_bash_tool, create_edit_tool, create_write_tool, create_grep_tool, create_find_tool, create_ls_tool, create_hashline_edit_tool, create_all_tools}` | Stable | Built-in tool constructors. |
-| `pi::sdk::{tool_to_definition, all_tool_definitions}` | Stable | Tool schema helpers. |
+| `pi::sdk::BUILTIN_TOOL_NAMES` | Stable | Canonical default non-delegating tool-name inventory; opt-in `subagent` is separate. |
+| `pi::sdk::{create_read_tool, create_bash_tool, create_edit_tool, create_write_tool, create_grep_tool, create_find_tool, create_ls_tool, create_hashline_edit_tool, create_all_tools}` | Stable | Default non-delegating tool constructors. |
+| `pi::sdk::{tool_to_definition, all_tool_definitions}` | Stable | Default non-delegating tool schema helpers. |
 | `pi::sdk::{SubscriptionId, EventListeners, EventSubscriber, OnStreamEvent, OnToolEnd, OnToolStart}` | Stable | Event subscription and hook types. |
 | `pi::sdk::{SessionOptions, ToolFactory, default_tool_registry}` | Stable | In-process session construction and custom tool registry extension points. |
 | `pi::sdk::{AgentSessionHandle, AgentSessionState, create_agent_session}` | Stable | Primary in-process SDK entry point and state handle. |
@@ -170,6 +179,74 @@ fn main() -> pi::sdk::Result<()> {
 }
 ```
 
+## Recipe 5b: Handle Extension UI Prompts and Permission Scope
+
+Without a UI handler, SDK sessions fail closed: extension UI requests error and
+capability prompts resolve to deny. Attach a handler to answer them in-process.
+
+```rust
+use futures::executor::block_on;
+use pi::sdk::{
+    ExtensionUiHandler, ExtensionUiRequest, ExtensionUiResponse, SessionOptions,
+    create_agent_session,
+};
+use serde_json::json;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+struct AllowOnce;
+
+#[async_trait::async_trait]
+impl ExtensionUiHandler for AllowOnce {
+    async fn request_ui(
+        &self,
+        request: ExtensionUiRequest,
+    ) -> pi::sdk::Result<Option<ExtensionUiResponse>> {
+        Ok(Some(ExtensionUiResponse {
+            id: request.id,
+            // Plain `Value::Bool(allow)` keeps default persistence; an object
+            // controls it per decision ("persist": false = this session only).
+            value: Some(json!({ "allow": true, "persist": false })),
+            cancelled: false,
+        }))
+    }
+}
+
+fn main() -> pi::sdk::Result<()> {
+    let _session = block_on(create_agent_session(SessionOptions {
+        extension_paths: vec![PathBuf::from("extensions/my_extension.js")],
+        extension_ui_handler: Some(Arc::new(AllowOnce)),
+        // `false` scopes all prompt decisions to this session's memory instead
+        // of `~/.pi/extension-permissions.json` (default `true` = CLI behavior).
+        persist_extension_permissions: false,
+        ..SessionOptions::default()
+    }))?;
+    Ok(())
+}
+```
+
+## Recipe 5c: Override Compaction Settings Per Session
+
+```rust
+use futures::executor::block_on;
+use pi::sdk::{ResolvedCompactionSettings, SessionOptions, create_agent_session};
+
+fn main() -> pi::sdk::Result<()> {
+    let session = block_on(create_agent_session(SessionOptions {
+        // Used verbatim; `None` keeps the config/model-derived defaults.
+        compaction_settings: Some(ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 200_000,
+            reserve_tokens: 32_768,
+            keep_recent_tokens: 40_000,
+        }),
+        ..SessionOptions::default()
+    }))?;
+    eprintln!("resolved: {:?}", session.compaction_settings());
+    Ok(())
+}
+```
+
 ## Recipe 6: Use RPC Transport Client
 
 ```rust
@@ -210,8 +287,11 @@ fn main() -> pi::sdk::Result<()> {
 
 - `SessionOptions::default().no_session` is `true` (ephemeral by default).
 - In-process `AgentSessionHandle` currently exposes prompt/state/model/thinking/compaction flows; queue controls like `steer`/`follow_up` are on `RpcTransportClient`.
-- `SessionTransport::prompt` returns `SessionPromptResult`, which is `InProcess(AssistantMessage)` or `RpcEvents(Vec<Value>)` depending on backend.
+- `SessionTransport::prompt` returns `SessionPromptResult`, which is `InProcess(Box<AssistantMessage>)` or `RpcEvents(Vec<Value>)` depending on backend.
 - Extension loading is opt-in via `extension_paths`, with `extension_policy`/`repair_policy` controls.
+- Extension UI/capability prompts are answered via `SessionOptions::extension_ui_handler`; without one they fail closed (deny).
+- Prompt decisions persist to disk by default (CLI parity); `persist_extension_permissions: false` or a per-response `"persist": false` scopes them to the session.
+- `SessionOptions::compaction_settings` overrides the config/model-derived compaction settings verbatim when `Some`.
 
 ## Verified Reference Surfaces
 

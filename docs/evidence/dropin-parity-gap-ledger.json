@@ -2,6 +2,7 @@
   "schema": "pi.dropin.parity_gap_ledger.v1",
   "bead_id": "bd-13pqz",
   "generated_at_utc": "2026-02-14T19:16:00Z",
+  "last_updated_at_utc": "2026-08-04T23:48:36Z",
   "status": "active",
   "baseline_reference": "docs/dropin-upstream-baseline.json",
   "inventory_references": [
@@ -24,14 +25,14 @@
       "severity": "retired",
       "status": "retired",
       "retirement_date": "2026-04-22T17:50:00Z",
-      "retirement_reason": "Strict SDK drop-in parity claim officially retired per bd-lnmtp.3.1 decision. Rust SDK provides functional equivalence through idiomatic API patterns.",
+      "retirement_reason": "Strict SDK drop-in parity claim officially retired per bd-lnmtp.3.1 decision. Rust SDK provides a Rust-native companion API for core embedding workflows without claiming contract-shape equivalence.",
       "retirement_decision_bead": "bd-lnmtp.3.1",
       "sources": [
         "docs/evidence/dropin-feature-inventory-matrix.json#row:mode.sdk.embedding",
         "docs/evidence/dropin-feature-inventory-matrix.json#unknown:unknown-01-sdk-dropin-contract"
       ],
-      "final_state": "Rust SDK provides equivalent functionality to TypeScript SDK using idiomatic Rust patterns. Contract shape parity no longer required.",
-      "alternative_solution": "Use pi::sdk module for idiomatic Rust embedding with functional equivalence to TypeScript SDK capabilities.",
+      "final_state": "Rust SDK provides Rust-native APIs for core embedding workflows. Contract-shape parity is not claimed and remains outside the supported compatibility contract.",
+      "alternative_solution": "Use the supported pi::sdk module and consult the active certification contract for current parity status.",
       "owner_issue_primary": "bd-1it6z",
       "owner_issue_supporting": [
         "bd-c9usa",
@@ -57,7 +58,7 @@
       "verification_evidence": [
         "tests/extension_flag_passthrough.rs - comprehensive integration tests",
         "tests/cli_edge_cases.rs - 40+ edge case test functions",
-        "G04 certification gate marked as pass in docs/evidence/dropin-certification-verdict.json"
+        "Historical G04 pass evidence for source 52e9fbfb24352045985b59df9d7ea63f1f8f2ef8 is retained in the verdict blob at artifact commit 2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91; the live docs/evidence/dropin-certification-verdict.json remains the only authority for current release claims"
       ],
       "owner_issue_primary": "bd-2cd9b",
       "owner_issue_supporting": [
@@ -170,12 +171,12 @@
         "docs/dropin-112-feature-inventory-matrix.md#section:5-slash-commands"
       ],
       "final_state": "tests/dropin_slash_differential.rs now requires real mirrored Rust Pi/pi-mono RPC success for every credential-free RPC-observable slash scenario. UI-only, process-exit, invalid parser, and model-dependent compaction scenarios are explicit policy exclusions from pass evidence and continue to fail closed if counted.",
-      "release_claim_impact": "No longer blocks strict drop-in replacement claims. G04 and G10 may rely on the real mirrored slash-command differential evidence for the credential-free pass-evidence set.",
+      "release_claim_impact": "This individual gap was closed for the recorded evidence run. G04 and G10 may rely on the real mirrored slash-command differential evidence only when it is rerun and provenance-matched to the release source; this row does not independently authorize strict drop-in wording.",
       "closure_path": [
         "Provisioned the pinned legacy pi-mono runtime on the RCH worker used for the proof so legacy_pi_mono_code/pi-mono/node_modules/tsx/dist/cli.mjs is runnable.",
         "Required pass evidence to come only from slash inputs that map to credential-free shared RPC commands.",
         "Kept UI-only, process-exit, invalid parser, and model-dependent compaction scenarios fail-closed and out of pass evidence with explicit observability policy.",
-        "Regenerated docs/evidence/dropin-differential-evidence-suite.json and docs/evidence/dropin-certification-verdict.json after the runner produced non-synthetic pass evidence."
+        "Regenerated the differential suite and verdict artifacts for the historical 2026-05-18 evidence run after the runner produced non-synthetic pass evidence; later live artifacts may supersede those historical file contents."
       ],
       "verification_evidence": [
         "rch exec -- cargo test --test dropin_slash_differential -- --nocapture passed 12/12 on ts2 at 2026-05-18T19:37:26Z",
@@ -426,7 +427,7 @@
         "docs/dropin-112-feature-inventory-matrix.md#summary:features-in-rust-not-in-ts"
       ],
       "final_state": "Rust-only flags, subcommands, and policy knobs are accepted as non-blocking supersets when defaults remain compatible and strict release wording remains gated by the certification verdict.",
-      "waiver_reason": "The hard certification contract explicitly blocks strict drop-in release language unless docs/evidence/dropin-certification-verdict.json reports overall_verdict = CERTIFIED; rust-only supersets are not a behavioral blocker when unused.",
+      "waiver_reason": "The hard certification contract explicitly blocks strict drop-in release language unless docs/evidence/dropin-certification-verdict.json reports overall_verdict = CERTIFIED for the release source and the final ref differs only by allowlisted evidence-only descendants; rust-only supersets are not a behavioral blocker when unused.",
       "release_claim_impact": "No strict replacement claim may rely on these supersets directly; strict wording remains governed by the certification verdict.",
       "owner_issue_primary": "bd-35t7i",
       "owner_issue_supporting": [
@@ -439,8 +440,8 @@
         "Align documentation language and certification criteria."
       ],
       "verification_evidence": [
-        "docs/contracts/dropin-certification-contract.json: strict replacement requires CERTIFIED verdict",
-        "docs/evidence/dropin-certification-verdict.json: current overall_verdict = CERTIFIED and blocking_reasons is empty",
+        "docs/contracts/dropin-certification-contract.json: strict replacement requires a provenance-valid CERTIFIED verdict",
+        "Git blob 2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91:docs/evidence/dropin-certification-verdict.json historically reported CERTIFIED with no blockers for recorded source 52e9fbfb24352045985b59df9d7ea63f1f8f2ef8; this is a historical fact, not a description of the live verdict file or current release source",
         "docs/integrator-migration-playbook.md and docs/testing-policy.md keep strict drop-in language gated by the certification verdict"
       ],
       "blocked_by": []
@@ -529,7 +530,7 @@
     "notes": [
       "All currently identified mismatches from inventory sources are mapped to explicit owner issues, closure evidence, or a deliberate non-blocking waiver.",
       "Closed enabling beads (bd-2ilgm, bd-2km0n) are retained as supporting references where they affected gap state.",
-      "Medium/low stale gaps were reconciled by bd-8t27h.8 on 2026-05-10; strict release claims remain gated by docs/evidence/dropin-certification-verdict.json.",
+      "Medium/low stale gaps were reconciled by bd-8t27h.8 on 2026-05-10; strict release claims remain gated by a provenance-valid docs/evidence/dropin-certification-verdict.json.",
       "Any new mismatch discovery should append a new ledger entry and update coverage_mapping."
     ]
   }

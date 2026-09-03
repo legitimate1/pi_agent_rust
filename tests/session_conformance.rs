@@ -42,6 +42,7 @@ fn make_assistant_message(text: &str) -> SessionMessage {
             model: "test".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         },
@@ -167,6 +168,7 @@ fn proptest_session_header() -> impl Strategy<Value = SessionHeader> {
                 fallback_thinking_level: None,
                 current_leaf: None,
                 parent_session,
+                additional_roots: None,
             },
         )
 }
@@ -272,6 +274,7 @@ proptest! {
             fallback_thinking_level: None,
             current_leaf: None,
             parent_session: None,
+            additional_roots: None,
         };
         session.entries = decoded_entries;
         session._test_set_leaf_id(leaf_id);
@@ -942,6 +945,7 @@ fn make_assistant_with_tool_use(
             model: "test".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         },

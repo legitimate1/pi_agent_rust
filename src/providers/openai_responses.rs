@@ -42,6 +42,14 @@ pub struct OpenAIResponsesProvider {
     api: String,
     codex_mode: bool,
     compat: Option<CompatConfig>,
+    auth_header: bool,
+    /// Whether the catalog entry declares this a reasoning model. When true,
+    /// non-codex requests emit `reasoning: { effort, summary }` (plus the
+    /// encrypted-content include) for a non-`off` thinking level, mirroring the
+    /// TS `openai-responses` builder (gh #165). Defaults to `false`; the
+    /// registry sets it from `ModelEntry::model.reasoning` via
+    /// [`with_reasoning`](Self::with_reasoning).
+    reasoning: bool,
 }
 
 impl OpenAIResponsesProvider {
@@ -55,7 +63,16 @@ impl OpenAIResponsesProvider {
             api: "openai-responses".to_string(),
             codex_mode: false,
             compat: None,
+            auth_header: true,
+            reasoning: false,
         }
+    }
+
+    /// Declare whether the underlying catalog model is a reasoning model.
+    #[must_use]
+    pub const fn with_reasoning(mut self, reasoning: bool) -> Self {
+        self.reasoning = reasoning;
+        self
     }
 
     /// Override the provider name reported in streamed events.
@@ -100,12 +117,20 @@ impl OpenAIResponsesProvider {
         self
     }
 
+    /// Control whether this route generates a Bearer Authorization header.
+    /// Custom Authorization headers remain authoritative regardless of this flag.
+    #[must_use]
+    pub const fn with_auth_header(mut self, enabled: bool) -> Self {
+        self.auth_header = enabled;
+        self
+    }
+
     pub fn build_request(
         &self,
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> OpenAIResponsesRequest {
-        let input = build_openai_responses_input(context);
+        let input = build_openai_responses_input(context, &self.model, &self.provider, &self.api);
         let tools: Option<Vec<OpenAIResponsesTool>> = if context.tools.is_empty() {
             None
         } else {
@@ -123,10 +148,10 @@ impl OpenAIResponsesProvider {
         // Codex mode requires additional fields per the TS reference implementation.
         // tool_choice and parallel_tool_calls are always sent (not conditional on tools).
         let (tool_choice, parallel_tool_calls, text, include, reasoning) = if self.codex_mode {
-            let effort = options
-                .thinking_level
-                .as_ref()
-                .map_or_else(|| "high".to_string(), ToString::to_string);
+            let effort = options.thinking_level.as_ref().map_or_else(
+                || "high".to_string(),
+                |level| responses_effort_for_level(*level, self.compat.as_ref()),
+            );
             (
                 Some("auto"),
                 Some(true),
@@ -136,6 +161,25 @@ impl OpenAIResponsesProvider {
                 Some(vec!["reasoning.encrypted_content"]),
                 Some(OpenAIResponsesReasoning {
                     effort,
+                    summary: Some("auto"),
+                }),
+            )
+        } else if let Some(level) = options
+            .thinking_level
+            .filter(|level| self.reasoning && *level != crate::model::ThinkingLevel::Off)
+        {
+            // Non-codex reasoning models mirror the TS `openai-responses`
+            // builder (gh #165): when the catalog marks the model as reasoning
+            // and a thinking level is requested, send `reasoning: { effort,
+            // summary: "auto" }` plus the encrypted-content include so
+            // reasoning items round-trip across turns.
+            (
+                None,
+                None,
+                None,
+                Some(vec!["reasoning.encrypted_content"]),
+                Some(OpenAIResponsesReasoning {
+                    effort: responses_effort_for_level(level, self.compat.as_ref()),
                     summary: Some("auto"),
                 }),
             )
@@ -161,8 +205,30 @@ impl OpenAIResponsesProvider {
             text,
             include,
             reasoning,
+            prompt_cache_key: options.prompt_cache_key.clone(),
         }
     }
+}
+
+/// Map pi's thinking level onto the Responses API `reasoning.effort` value.
+///
+/// A per-model `thinkingLevelMap` from the catalog (gh #117/#165) overrides the
+/// default mapping (e.g. `{"xhigh": "high"}` for gateways with different
+/// vocabularies), keyed by the lowercase `ThinkingLevel` name. Without an
+/// override the level name itself is the effort value, matching the TS
+/// implementation which passes thinking levels straight through.
+fn responses_effort_for_level(
+    level: crate::model::ThinkingLevel,
+    compat: Option<&CompatConfig>,
+) -> String {
+    let name = level.to_string();
+    if let Some(mapped) = compat
+        .and_then(|c| c.thinking_level_map.as_ref())
+        .and_then(|map| map.get(name.as_str()))
+    {
+        return mapped.clone();
+    }
+    name
 }
 
 fn bearer_token_from_authorization_header(value: &str) -> Option<String> {
@@ -196,6 +262,128 @@ fn authorization_override(
         })
 }
 
+/// Derive the sibling native-compact endpoint from a Responses base URL
+/// (gh #167): `…/responses` → `…/responses/compact`. Returns `None` when the
+/// base URL does not end in `/responses` (a custom shape we cannot safely
+/// extend), so callers fail open instead of POSTing to a guessed route.
+fn derive_compact_url(base_url: &str) -> Option<String> {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/responses") {
+        Some(format!("{base}/compact"))
+    } else {
+        None
+    }
+}
+
+impl OpenAIResponsesProvider {
+    /// POST a sanitized, extension-composed compact request to the native
+    /// `…/responses/compact` endpoint and return the raw response JSON
+    /// (gh #167). Auth mirrors [`Provider::stream`]: `options.api_key` /
+    /// `OPENAI_API_KEY` (keyless-local providers skip auth entirely), plus
+    /// codex-mode and compat headers. Credentials never appear in the
+    /// returned value.
+    async fn compact_native_impl(
+        &self,
+        request_body: &serde_json::Value,
+        options: &StreamOptions,
+    ) -> Result<serde_json::Value> {
+        let Some(url) = derive_compact_url(&self.base_url) else {
+            return Err(Error::provider(
+                self.name(),
+                format!(
+                    "cannot derive a /responses/compact endpoint from base URL {} — native compaction unavailable",
+                    self.base_url
+                ),
+            ));
+        };
+
+        // Auth resolution: identical policy to `stream()` above.
+        let authorization_header_value = authorization_override(options, self.compat.as_ref());
+        let auth_value = if authorization_header_value.is_some() || !self.auth_header {
+            None
+        } else {
+            let resolved = options
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+            match resolved {
+                Some(key) => Some(key),
+                None if crate::provider_metadata::provider_is_keyless_local(self.name()) => None,
+                None => {
+                    return Err(Error::provider(
+                        self.name(),
+                        "Missing API key for provider. Configure credentials with /login <provider> or set the provider's API key env var.",
+                    ));
+                }
+            }
+        };
+
+        let mut request = self.client.post(&url).header("Accept", "application/json");
+        if let Some(ref auth) = auth_value {
+            request = request.header("Authorization", format!("Bearer {auth}"));
+        }
+        if self.codex_mode {
+            let codex_bearer = authorization_header_value
+                .as_deref()
+                .and_then(bearer_token_from_authorization_header)
+                .or_else(|| auth_value.clone())
+                .ok_or_else(|| {
+                    Error::provider(
+                        self.name(),
+                        "OpenAI Codex mode requires a Bearer token. Provide one via /login openai-codex or an Authorization: Bearer <token> header.",
+                    )
+                })?;
+            let account_id = extract_chatgpt_account_id(&codex_bearer).ok_or_else(|| {
+                Error::provider(
+                    self.name(),
+                    "Invalid OpenAI Codex OAuth token (missing chatgpt_account_id claim). Run /login openai-codex again.",
+                )
+            })?;
+            request = request
+                .header("chatgpt-account-id", account_id)
+                .header("OpenAI-Beta", "responses=experimental")
+                .header("originator", "pi")
+                .header("User-Agent", "pi_agent_rust");
+            if let Some(session_id) = &options.session_id {
+                request = request.header("session_id", session_id);
+            }
+        }
+        if let Some(compat) = &self.compat
+            && let Some(custom_headers) = &compat.custom_headers
+        {
+            request = super::apply_headers_ignoring_blank_auth_overrides(
+                request,
+                custom_headers,
+                &["authorization"],
+            );
+        }
+        request = super::apply_headers_ignoring_blank_auth_overrides(
+            request,
+            &options.headers,
+            &["authorization"],
+        );
+
+        let request = request.json(request_body)?;
+        let response = Box::pin(request.send()).await?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
+        if !(200..300).contains(&status) {
+            return Err(Error::provider(
+                self.name(),
+                format!("OpenAI compact endpoint error (HTTP {status}): {body}"),
+            ));
+        }
+        serde_json::from_str(&body).map_err(|err| {
+            Error::api(format!(
+                "OpenAI compact endpoint returned non-JSON (HTTP {status}): {err}"
+            ))
+        })
+    }
+}
+
 #[async_trait]
 impl Provider for OpenAIResponsesProvider {
     fn name(&self) -> &str {
@@ -210,6 +398,14 @@ impl Provider for OpenAIResponsesProvider {
         &self.model
     }
 
+    async fn compact_native(
+        &self,
+        request_body: &serde_json::Value,
+        options: &StreamOptions,
+    ) -> Result<serde_json::Value> {
+        self.compact_native_impl(request_body, options).await
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn stream(
         &self,
@@ -218,7 +414,7 @@ impl Provider for OpenAIResponsesProvider {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let authorization_header_value = authorization_override(options, self.compat.as_ref());
 
-        let auth_value = if authorization_header_value.is_some() {
+        let auth_value = if authorization_header_value.is_some() || !self.auth_header {
             None
         } else {
             let resolved = options
@@ -241,6 +437,41 @@ impl Provider for OpenAIResponsesProvider {
         };
 
         let request_body = self.build_request(context, options);
+
+        // before_provider_request rewrite hook (gh #167 / bd-1q31s): offer
+        // the fully-built body to extensions, validate any rewrite, and fail
+        // open to the original body on rejection. The rewritten JSON is sent
+        // verbatim (after validation) so extension-added provider fields
+        // survive; auth headers are never part of the exchange.
+        let mut rewritten_body: Option<serde_json::Value> = None;
+        if let Some(hook) = &options.before_provider_request {
+            match serde_json::to_value(&request_body) {
+                Ok(original) => {
+                    let event = crate::provider::BeforeProviderRequestEvent {
+                        provider: self.provider.clone(),
+                        api: self.api.clone(),
+                        model: self.model.clone(),
+                        base_url: self.base_url.clone(),
+                        payload: original,
+                    };
+                    if let Some(mutated) = hook.rewrite(event).await {
+                        match validate_rewritten_responses_request(mutated) {
+                            Ok(validated) => rewritten_body = Some(validated),
+                            Err(reason) => {
+                                tracing::warn!(
+                                    "before_provider_request rewrite rejected (fail-open, original request kept): {reason}"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to serialize request body for before_provider_request (fail-open): {err}"
+                    );
+                }
+            }
+        }
 
         // Note: Content-Type is set by .json() below; setting it here too
         // produces a duplicate header that OpenAI's server rejects.
@@ -281,14 +512,14 @@ impl Provider for OpenAIResponsesProvider {
         }
 
         // Apply provider-specific custom headers from compat config.
-        if let Some(compat) = &self.compat {
-            if let Some(custom_headers) = &compat.custom_headers {
-                request = super::apply_headers_ignoring_blank_auth_overrides(
-                    request,
-                    custom_headers,
-                    &["authorization"],
-                );
-            }
+        if let Some(compat) = &self.compat
+            && let Some(custom_headers) = &compat.custom_headers
+        {
+            request = super::apply_headers_ignoring_blank_auth_overrides(
+                request,
+                custom_headers,
+                &["authorization"],
+            );
         }
 
         // Per-request headers from StreamOptions (highest priority).
@@ -298,7 +529,10 @@ impl Provider for OpenAIResponsesProvider {
             &["authorization"],
         );
 
-        let request = request.json(&request_body)?;
+        let request = match &rewritten_body {
+            Some(body) => request.json(body)?,
+            None => request.json(&request_body)?,
+        };
 
         let response = Box::pin(request.send()).await?;
         let status = response.status();
@@ -673,6 +907,7 @@ where
                 model,
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             },
@@ -954,8 +1189,17 @@ where
                         id: call_id.clone(),
                         name: name.clone(),
                         arguments: serde_json::Value::Null,
-                        thought_signature: None,
+                        // Preserve the original `fc_...` output-item id so
+                        // subsequent requests can replay it (OpenAI validates
+                        // reasoning/function-call pairing by item id).
+                        thought_signature: Some(id.clone()),
                     }));
+
+                    self.pending_events.push_back(StreamEvent::ToolCallStart {
+                        content_index,
+                        id: call_id.clone(),
+                        name: name.clone(),
+                    });
 
                     self.tool_calls_by_item_id.insert(
                         id,
@@ -966,9 +1210,6 @@ where
                             arguments: buffered_arguments.clone(),
                         },
                     );
-
-                    self.pending_events
-                        .push_back(StreamEvent::ToolCallStart { content_index });
 
                     if !buffered_arguments.is_empty() {
                         self.pending_events.push_back(StreamEvent::ToolCallDelta {
@@ -994,15 +1235,58 @@ where
                 }
             }
             OpenAIResponsesChunk::OutputItemDone { item } => {
-                if let OpenAIResponsesOutputItemDone::FunctionCall {
-                    id,
-                    call_id,
-                    name,
-                    arguments,
-                } = item
-                {
-                    self.ensure_started();
-                    self.end_tool_call(&id, &call_id, &name, &arguments);
+                // Legacy parity: before the raw-item capture lane, only
+                // `function_call` was a known done-item shape — anything else
+                // (including malformed `reasoning`/`message` payloads) fell
+                // into the `#[serde(other)]` arm and was ignored. Keep the
+                // hard error for malformed function calls, and keep the new
+                // capture paths opportunistic so a partial item never aborts
+                // the stream.
+                let typed =
+                    match serde_json::from_value::<OpenAIResponsesOutputItemDone>(item.clone()) {
+                        Ok(typed) => typed,
+                        Err(e) => {
+                            if item.get("type").and_then(serde_json::Value::as_str)
+                                == Some("function_call")
+                            {
+                                return Err(Error::api(format!(
+                                    "JSON parse error: {e}\nData: {data}"
+                                )));
+                            }
+                            OpenAIResponsesOutputItemDone::Unknown
+                        }
+                    };
+                match typed {
+                    OpenAIResponsesOutputItemDone::FunctionCall {
+                        id,
+                        call_id,
+                        name,
+                        arguments,
+                    } => {
+                        self.ensure_started();
+                        self.end_tool_call(&id, &call_id, &name, &arguments);
+                    }
+                    OpenAIResponsesOutputItemDone::Reasoning {
+                        id,
+                        summary,
+                        encrypted_content,
+                    } => {
+                        let summary_text = summary
+                            .iter()
+                            .map(|part| part.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        self.capture_reasoning_item(
+                            &id,
+                            encrypted_content.as_deref(),
+                            &summary_text,
+                            &item,
+                        );
+                    }
+                    OpenAIResponsesOutputItemDone::Message { id } => {
+                        self.capture_message_item_id(&id);
+                    }
+                    OpenAIResponsesOutputItemDone::Unknown => {}
                 }
             }
             OpenAIResponsesChunk::ResponseCompleted { response }
@@ -1048,6 +1332,71 @@ where
         Ok(())
     }
 
+    /// Preserve a completed `reasoning` output item (TS parity: the raw item
+    /// JSON — id, summary, `encrypted_content`, status — is stored in the
+    /// thinking block's `thinking_signature` so subsequent requests can replay
+    /// it verbatim).
+    ///
+    /// The signature lands on the first thinking block streamed for the item.
+    /// A reasoning item that produced no summary/text deltas gets a fresh
+    /// (possibly empty) thinking block, but only when it carries
+    /// `encrypted_content` — otherwise there is nothing replayable and the
+    /// legacy behavior (ignore) is preserved.
+    fn capture_reasoning_item(
+        &mut self,
+        item_id: &str,
+        encrypted_content: Option<&str>,
+        summary_text: &str,
+        raw_item: &serde_json::Value,
+    ) {
+        let existing_idx = self
+            .reasoning_blocks
+            .iter()
+            .filter(|(key, _)| key.item_id == item_id)
+            .map(|(_, idx)| *idx)
+            .min();
+
+        let idx = if let Some(idx) = existing_idx {
+            idx
+        } else {
+            if encrypted_content.is_none() {
+                return;
+            }
+            self.ensure_started();
+            let idx = self.reasoning_block_for(ReasoningKind::Summary, item_id.to_string(), 0);
+            if !summary_text.is_empty() {
+                self.apply_reasoning_snapshot(
+                    ReasoningKind::Summary,
+                    item_id.to_string(),
+                    0,
+                    summary_text.to_string(),
+                );
+            }
+            idx
+        };
+
+        if let Some(ContentBlock::Thinking(block)) = self.partial.content.get_mut(idx) {
+            block.thinking_signature = serde_json::to_string(raw_item).ok();
+        }
+    }
+
+    /// Record the original `msg_...` item id on the text blocks streamed for a
+    /// completed `message` output item (TS parity: `textSignature = item.id`),
+    /// enabling faithful replay of the item id on subsequent requests.
+    fn capture_message_item_id(&mut self, item_id: &str) {
+        let indexes: Vec<usize> = self
+            .text_blocks
+            .iter()
+            .filter(|(key, _)| key.item_id == item_id)
+            .map(|(_, idx)| *idx)
+            .collect();
+        for idx in indexes {
+            if let Some(ContentBlock::Text(block)) = self.partial.content.get_mut(idx) {
+                block.text_signature = Some(item_id.to_string());
+            }
+        }
+    }
+
     fn partial_has_tool_call(&self) -> bool {
         self.partial
             .content
@@ -1065,7 +1414,7 @@ where
                     id: call_id.to_string(),
                     name: name.to_string(),
                     arguments: serde_json::Value::Null,
-                    thought_signature: None,
+                    thought_signature: Some(item_id.to_string()),
                 }));
                 (
                     ToolCallState {
@@ -1086,6 +1435,8 @@ where
         if synthesized_start {
             self.pending_events.push_back(StreamEvent::ToolCallStart {
                 content_index: tc.content_index,
+                id: tc.call_id.clone(),
+                name: tc.name.clone(),
             });
         }
 
@@ -1118,7 +1469,7 @@ where
                 id: tc.call_id.clone(),
                 name: tc.name.clone(),
                 arguments: parsed_args.clone(),
-                thought_signature: None,
+                thought_signature: Some(item_id.to_string()),
             },
         });
 
@@ -1127,6 +1478,7 @@ where
             block.id = tc.call_id;
             block.name = tc.name;
             block.arguments = parsed_args;
+            block.thought_signature = Some(item_id.to_string());
         }
     }
 
@@ -1263,6 +1615,30 @@ fn extract_chatgpt_account_id(token: &str) -> Option<String> {
 // OpenAI Responses API Types (minimal)
 // ============================================================================
 
+/// Validated re-ingest of a `before_provider_request` rewrite (bd-1q31s).
+///
+/// The typed request struct cannot round-trip through `Deserialize` (it holds
+/// `&'static str` fields), so validation is structural: the rewrite must be a
+/// JSON object that still names a model and carries an `input` array, and it
+/// must not disable streaming — the SSE reader depends on `stream: true`, so
+/// that invariant is re-imposed on the accepted value.
+fn validate_rewritten_responses_request(
+    mut value: serde_json::Value,
+) -> std::result::Result<serde_json::Value, String> {
+    let Some(object) = value.as_object_mut() else {
+        return Err("rewrite is not a JSON object".to_string());
+    };
+    match object.get("model") {
+        Some(serde_json::Value::String(model)) if !model.is_empty() => {}
+        _ => return Err("rewrite is missing a non-empty string `model`".to_string()),
+    }
+    if !object.get("input").is_some_and(serde_json::Value::is_array) {
+        return Err("rewrite is missing an `input` array".to_string());
+    }
+    object.insert("stream".to_string(), serde_json::Value::Bool(true));
+    Ok(value)
+}
+
 #[derive(Debug, Serialize)]
 pub struct OpenAIResponsesRequest {
     model: String,
@@ -1287,6 +1663,12 @@ pub struct OpenAIResponsesRequest {
     include: Option<Vec<&'static str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<OpenAIResponsesReasoning>,
+    /// Cache-affinity key (`prompt_cache_key`, gh #188). Parity with the TS
+    /// `openai-responses` and `openai-codex-responses` providers, which both
+    /// send it. Omitted when unset so the wire format is unchanged. See
+    /// `StreamOptions::prompt_cache_key`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1316,9 +1698,27 @@ enum OpenAIResponsesInputItem {
         role: &'static str,
         content: Vec<OpenAIResponsesAssistantContentPart>,
     },
+    /// Assistant `message` output item replayed with its original item id and
+    /// `status`, mirroring the TS reference (`ResponseOutputMessage`). Only
+    /// emitted when the source text block carries a `text_signature` captured
+    /// from a previous Responses stream; signature-less text keeps the legacy
+    /// role/content shape above.
+    AssistantMessageItem {
+        #[serde(rename = "type")]
+        r#type: &'static str,
+        role: &'static str,
+        id: String,
+        status: &'static str,
+        content: Vec<OpenAIResponsesAssistantContentPart>,
+    },
     FunctionCall {
         #[serde(rename = "type")]
         r#type: &'static str,
+        /// Original Responses output-item id (`fc_...`). Replayed so OpenAI's
+        /// reasoning/function-call pairing validation recognizes the item.
+        /// Absent for legacy sessions with no captured metadata.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         call_id: String,
         name: String,
         arguments: String,
@@ -1329,6 +1729,10 @@ enum OpenAIResponsesInputItem {
         call_id: String,
         output: String,
     },
+    /// Raw provider item replayed verbatim (currently: `reasoning` items with
+    /// their `encrypted_content`, captured on parse into
+    /// `ThinkingContent::thinking_signature`).
+    RawItem(serde_json::Value),
 }
 
 #[derive(Debug, Serialize)]
@@ -1344,7 +1748,14 @@ enum OpenAIResponsesUserContentPart {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OpenAIResponsesAssistantContentPart {
     #[serde(rename = "output_text")]
-    OutputText { text: String },
+    OutputText {
+        text: String,
+        /// Present (as `[]`) only on replayed `message` items, matching the TS
+        /// reference; omitted on legacy role/content assistant items so their
+        /// serialization stays byte-identical.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        annotations: Option<Vec<serde_json::Value>>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -1370,7 +1781,13 @@ fn convert_tool_to_openai_responses(tool: &ToolDef) -> OpenAIResponsesTool {
     }
 }
 
-fn build_openai_responses_input(context: &Context<'_>) -> Vec<OpenAIResponsesInputItem> {
+#[allow(clippy::too_many_lines)]
+fn build_openai_responses_input(
+    context: &Context<'_>,
+    model: &str,
+    provider: &str,
+    api: &str,
+) -> Vec<OpenAIResponsesInputItem> {
     let mut input = Vec::with_capacity(context.messages.len());
 
     // System prompt is sent as top-level `instructions` field, not in input array.
@@ -1387,26 +1804,104 @@ fn build_openai_responses_input(context: &Context<'_>) -> Vec<OpenAIResponsesInp
                 }],
             }),
             Message::Assistant(assistant) => {
+                // TS parity (`convertResponsesMessages`): when this assistant
+                // turn was produced by a *different model*, none of its
+                // captured raw-item metadata may be replayed: OpenAI validates
+                // reasoning/function-call pairing per model, and another
+                // model's `encrypted_content` cannot be decrypted. The TS
+                // reference gets this via `transformMessages` (which strips
+                // thinking/text/thought signatures for non-same-model turns)
+                // plus the `isDifferentModel` fc-id gate in
+                // `convertResponsesMessages`; pi-rust has no transform layer
+                // yet, so the gate lives here. Same-provider/api comparison
+                // keeps foreign-api turns on the existing prefix/JSON gates.
+                let is_different_model = assistant.model != model
+                    && assistant.provider == provider
+                    && assistant.api == api;
                 // Preserve ordering between text and tool calls.
                 let mut pending_text = String::new();
+                let flush_pending =
+                    |pending: &mut String, input: &mut Vec<OpenAIResponsesInputItem>| {
+                        if !pending.is_empty() {
+                            input.push(OpenAIResponsesInputItem::Assistant {
+                                role: "assistant",
+                                content: vec![OpenAIResponsesAssistantContentPart::OutputText {
+                                    text: std::mem::take(pending),
+                                    annotations: None,
+                                }],
+                            });
+                        }
+                    };
 
                 for block in &assistant.content {
                     match block {
-                        ContentBlock::Text(t) => pending_text.push_str(&t.text),
-                        ContentBlock::ToolCall(tc) => {
-                            if !pending_text.is_empty() {
-                                input.push(OpenAIResponsesInputItem::Assistant {
-                                    role: "assistant",
-                                    content: vec![
-                                        OpenAIResponsesAssistantContentPart::OutputText {
-                                            text: std::mem::take(&mut pending_text),
-                                        },
-                                    ],
-                                });
+                        ContentBlock::Text(t) => {
+                            let replay_id = if is_different_model {
+                                None
+                            } else {
+                                replayable_message_item_id(t)
+                            };
+                            if let Some(item_id) = replay_id {
+                                // Replay the original `message` output item with
+                                // its id + status so OpenAI's reasoning pairing
+                                // validation recognizes it (TS parity).
+                                flush_pending(&mut pending_text, &mut input);
+                                let part = OpenAIResponsesAssistantContentPart::OutputText {
+                                    text: t.text.clone(),
+                                    annotations: Some(Vec::new()),
+                                };
+                                // A multi-part message item streams one text
+                                // block per content_index, each stamped with
+                                // the same `msg_...` id. Fold them back into a
+                                // single item — OpenAI rejects duplicate input
+                                // item ids.
+                                if let Some(OpenAIResponsesInputItem::AssistantMessageItem {
+                                    id,
+                                    content,
+                                    ..
+                                }) = input.last_mut()
+                                    && *id == item_id
+                                {
+                                    content.push(part);
+                                } else {
+                                    input.push(OpenAIResponsesInputItem::AssistantMessageItem {
+                                        r#type: "message",
+                                        role: "assistant",
+                                        id: item_id,
+                                        status: "completed",
+                                        content: vec![part],
+                                    });
+                                }
+                            } else {
+                                pending_text.push_str(&t.text);
                             }
+                        }
+                        ContentBlock::Thinking(thinking) => {
+                            // Replay raw reasoning items (with encrypted_content)
+                            // captured from a previous Responses stream — but
+                            // never across models: OpenAI cannot decrypt
+                            // another model's encrypted_content. Thinking
+                            // blocks without a replayable raw item keep the
+                            // legacy behavior of being dropped without
+                            // flushing text.
+                            if !is_different_model
+                                && let Some(raw_item) = replayable_reasoning_item(thinking)
+                            {
+                                flush_pending(&mut pending_text, &mut input);
+                                input.push(OpenAIResponsesInputItem::RawItem(raw_item));
+                            }
+                        }
+                        ContentBlock::ToolCall(tc) => {
+                            flush_pending(&mut pending_text, &mut input);
+                            let (call_id, embedded_item_id) = split_responses_tool_call_id(&tc.id);
                             input.push(OpenAIResponsesInputItem::FunctionCall {
                                 r#type: "function_call",
-                                call_id: tc.id.clone(),
+                                id: if is_different_model {
+                                    None
+                                } else {
+                                    replayable_function_call_item_id(tc, embedded_item_id)
+                                },
+                                call_id: call_id.to_string(),
                                 name: tc.name.clone(),
                                 arguments: tc.arguments.to_string(),
                             });
@@ -1415,14 +1910,7 @@ fn build_openai_responses_input(context: &Context<'_>) -> Vec<OpenAIResponsesInp
                     }
                 }
 
-                if !pending_text.is_empty() {
-                    input.push(OpenAIResponsesInputItem::Assistant {
-                        role: "assistant",
-                        content: vec![OpenAIResponsesAssistantContentPart::OutputText {
-                            text: pending_text,
-                        }],
-                    });
-                }
+                flush_pending(&mut pending_text, &mut input);
             }
             Message::ToolResult(result) => {
                 let mut out = String::new();
@@ -1434,9 +1922,10 @@ fn build_openai_responses_input(context: &Context<'_>) -> Vec<OpenAIResponsesInp
                         out.push_str(&t.text);
                     }
                 }
+                let (call_id, _) = split_responses_tool_call_id(&result.tool_call_id);
                 input.push(OpenAIResponsesInputItem::FunctionCallOutput {
                     r#type: "function_call_output",
-                    call_id: result.tool_call_id.clone(),
+                    call_id: call_id.to_string(),
                     output: out,
                 });
             }
@@ -1444,6 +1933,67 @@ fn build_openai_responses_input(context: &Context<'_>) -> Vec<OpenAIResponsesInp
     }
 
     input
+}
+
+/// Maximum item-id length OpenAI accepts on replayed input items.
+const MAX_RESPONSES_ITEM_ID_LEN: usize = 64;
+
+/// Split a pi tool-call id into `(call_id, embedded_item_id)`.
+///
+/// Legacy pi-rust sessions store the bare `call_...` id (no `|`), so the split
+/// is the identity and requests stay byte-identical. Sessions written by TS
+/// pi-mono store `"<call_id>|<item_id>"`; the suffix is the original `fc_...`
+/// output-item id.
+fn split_responses_tool_call_id(id: &str) -> (&str, Option<&str>) {
+    id.split_once('|')
+        .map_or((id, None), |(call_id, item_id)| (call_id, Some(item_id)))
+}
+
+/// Original `fc_...` output-item id to replay on a `function_call` input item.
+///
+/// Prefers the id captured on parse (stored in `thought_signature`), falling
+/// back to a TS-session embedded id. Only ids that look like Responses
+/// function-call item ids (`fc_` prefix, within OpenAI's 64-char limit) are
+/// replayed; anything else (e.g. a Gemini thought signature imported from a
+/// TS session) is ignored so the request keeps the legacy shape.
+fn replayable_function_call_item_id(
+    tool_call: &ToolCall,
+    embedded_item_id: Option<&str>,
+) -> Option<String> {
+    tool_call
+        .thought_signature
+        .as_deref()
+        .or(embedded_item_id)
+        .filter(|id| id.starts_with("fc_") && id.len() <= MAX_RESPONSES_ITEM_ID_LEN)
+        .map(ToString::to_string)
+}
+
+/// Original `msg_...` output-item id to replay on an assistant `message` item.
+///
+/// Present only when the text block carries a `text_signature` captured from a
+/// previous Responses stream. Foreign or oversized signatures fall back to the
+/// legacy signature-less shape.
+fn replayable_message_item_id(text: &TextContent) -> Option<String> {
+    text.text_signature
+        .as_deref()
+        .filter(|id| id.starts_with("msg_") && id.len() <= MAX_RESPONSES_ITEM_ID_LEN)
+        .map(ToString::to_string)
+}
+
+/// Raw `reasoning` output item to replay verbatim, parsed from the
+/// `thinking_signature` captured on stream parse.
+///
+/// The signature must be a JSON object with `"type": "reasoning"`; opaque
+/// signatures from other providers (Anthropic base64 blobs, etc.) fail the
+/// parse or the tag check and are skipped, preserving legacy behavior.
+fn replayable_reasoning_item(thinking: &ThinkingContent) -> Option<serde_json::Value> {
+    let signature = thinking.thinking_signature.as_deref()?;
+    let value: serde_json::Value = serde_json::from_str(signature).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("reasoning") {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 fn convert_user_message_to_responses(content: &UserContent) -> OpenAIResponsesInputItem {
@@ -1502,8 +2052,11 @@ enum OpenAIResponsesChunk {
     },
     #[serde(rename = "response.output_item.added")]
     OutputItemAdded { item: OpenAIResponsesOutputItem },
+    /// Raw item payload kept as JSON so `reasoning` items (encrypted content,
+    /// ids, status) can be preserved verbatim; typed interpretation happens in
+    /// `process_event` via [`OpenAIResponsesOutputItemDone`].
     #[serde(rename = "response.output_item.done")]
-    OutputItemDone { item: OpenAIResponsesOutputItemDone },
+    OutputItemDone { item: serde_json::Value },
     #[serde(rename = "response.function_call_arguments.delta")]
     FunctionCallArgumentsDelta { item_id: String, delta: String },
     #[serde(rename = "response.content_part.done")]
@@ -1610,8 +2163,24 @@ enum OpenAIResponsesOutputItemDone {
         #[serde(default)]
         arguments: String,
     },
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        id: String,
+        #[serde(default)]
+        summary: Vec<OpenAIResponsesReasoningSummaryPart>,
+        #[serde(default)]
+        encrypted_content: Option<String>,
+    },
+    #[serde(rename = "message")]
+    Message { id: String },
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIResponsesReasoningSummaryPart {
+    #[serde(default)]
+    text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1678,6 +2247,92 @@ mod tests {
         assert_eq!(provider.api(), "openai-responses");
     }
 
+    /// bd-1q31s: a `before_provider_request` rewrite must survive validated
+    /// re-ingest — objects keeping `model` + `input` pass (with `stream: true`
+    /// re-imposed and extension-added fields preserved), everything else is
+    /// rejected so the provider falls back to its original body.
+    #[test]
+    fn test_validate_rewritten_responses_request() {
+        let valid = serde_json::json!({
+            "model": "gpt-5.2-codex",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+            "stream": false,
+            "custom_extension_field": {"kept": true},
+        });
+        let accepted = validate_rewritten_responses_request(valid).expect("valid rewrite accepted");
+        assert_eq!(
+            accepted["stream"],
+            serde_json::Value::Bool(true),
+            "stream: true must be re-imposed on accepted rewrites"
+        );
+        assert_eq!(accepted["custom_extension_field"]["kept"], true);
+
+        let missing_stream = serde_json::json!({
+            "model": "gpt-5.2-codex",
+            "input": [],
+        });
+        let accepted =
+            validate_rewritten_responses_request(missing_stream).expect("missing stream accepted");
+        assert_eq!(accepted["stream"], serde_json::Value::Bool(true));
+
+        for (label, invalid) in [
+            ("non-object", serde_json::json!("payload")),
+            ("missing model", serde_json::json!({"input": []})),
+            ("empty model", serde_json::json!({"model": "", "input": []})),
+            (
+                "missing input",
+                serde_json::json!({"model": "gpt-5.2-codex"}),
+            ),
+            (
+                "non-array input",
+                serde_json::json!({"model": "gpt-5.2-codex", "input": {}}),
+            ),
+        ] {
+            assert!(
+                validate_rewritten_responses_request(invalid).is_err(),
+                "rewrite must be rejected: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_request_prompt_cache_key_serialize_and_omit() {
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+
+        // Set → serialized verbatim, on both the plain Responses path and the
+        // codex path (TS parity: both providers send prompt_cache_key,
+        // gh #188).
+        let options = StreamOptions {
+            prompt_cache_key: Some("sess-123".to_string()),
+            ..Default::default()
+        };
+        for codex_mode in [false, true] {
+            let provider = OpenAIResponsesProvider::new("gpt-5.2").with_codex_mode(codex_mode);
+            let value = serde_json::to_value(provider.build_request(&context, &options))
+                .expect("serialize request");
+            assert_eq!(
+                value["prompt_cache_key"], "sess-123",
+                "codex_mode={codex_mode}"
+            );
+
+            // Unset → field absent, wire format byte-identical to before.
+            let value =
+                serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                    .expect("serialize request");
+            assert!(
+                value.get("prompt_cache_key").is_none(),
+                "codex_mode={codex_mode}"
+            );
+        }
+    }
+
     #[test]
     fn test_build_request_includes_system_tools_and_defaults() {
         let provider = OpenAIResponsesProvider::new("gpt-4o");
@@ -1734,6 +2389,768 @@ mod tests {
             })
         );
         assert!(value["tools"][1].get("description").is_none());
+        assert!(
+            value.get("reasoning").is_none(),
+            "non-reasoning model must not send a reasoning field"
+        );
+        assert!(value.get("include").is_none());
+    }
+
+    fn reasoning_test_context() -> Context<'static> {
+        Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })],
+            vec![],
+        )
+    }
+
+    /// gh #165: a non-codex reasoning model with a thinking level set emits
+    /// `reasoning: { effort, summary }` plus the encrypted-content include,
+    /// mirroring the TS `openai-responses` builder.
+    #[test]
+    fn test_build_request_reasoning_model_emits_effort() {
+        let provider = OpenAIResponsesProvider::new("custom-reasoner").with_reasoning(true);
+        let options = StreamOptions {
+            thinking_level: Some(crate::model::ThinkingLevel::High),
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&reasoning_test_context(), &options);
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(value["reasoning"]["effort"], "high");
+        assert_eq!(value["reasoning"]["summary"], "auto");
+        assert_eq!(value["include"], json!(["reasoning.encrypted_content"]));
+        // Codex-only fields must stay absent on the plain responses route.
+        assert!(value.get("tool_choice").is_none());
+        assert!(value.get("parallel_tool_calls").is_none());
+        assert!(value.get("text").is_none());
+        // Non-codex requests keep sending max_output_tokens.
+        assert_eq!(value["max_output_tokens"], DEFAULT_MAX_OUTPUT_TOKENS);
+    }
+
+    /// gh #165: a catalog `thinkingLevelMap` re-maps pi's thinking level onto
+    /// the provider's effort vocabulary for non-codex requests.
+    #[test]
+    fn test_build_request_thinking_level_map_overrides_effort() {
+        let compat = CompatConfig {
+            thinking_level_map: Some(HashMap::from([
+                ("xhigh".to_string(), "max".to_string()),
+                ("high".to_string(), "high".to_string()),
+            ])),
+            ..CompatConfig::default()
+        };
+        let provider = OpenAIResponsesProvider::new("custom-reasoner")
+            .with_reasoning(true)
+            .with_compat(Some(compat));
+        let options = StreamOptions {
+            thinking_level: Some(crate::model::ThinkingLevel::XHigh),
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&reasoning_test_context(), &options);
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(value["reasoning"]["effort"], "max");
+
+        // Unmapped levels fall back to the level name itself.
+        let medium = provider.build_request(
+            &reasoning_test_context(),
+            &StreamOptions {
+                thinking_level: Some(crate::model::ThinkingLevel::Medium),
+                ..Default::default()
+            },
+        );
+        let medium = serde_json::to_value(&medium).expect("serialize request");
+        assert_eq!(medium["reasoning"]["effort"], "medium");
+    }
+
+    /// gh #165: no reasoning field when the model is non-reasoning, when the
+    /// thinking level is `off`, or when no thinking level is requested.
+    #[test]
+    fn test_build_request_omits_reasoning_when_disabled_or_off() {
+        let cases = [
+            (false, Some(crate::model::ThinkingLevel::High)),
+            (true, Some(crate::model::ThinkingLevel::Off)),
+            (true, None),
+        ];
+        for (reasoning, thinking_level) in cases {
+            let provider = OpenAIResponsesProvider::new("custom-model").with_reasoning(reasoning);
+            let options = StreamOptions {
+                thinking_level,
+                ..Default::default()
+            };
+            let request = provider.build_request(&reasoning_test_context(), &options);
+            let value = serde_json::to_value(&request).expect("serialize request");
+            assert!(
+                value.get("reasoning").is_none(),
+                "reasoning={reasoning} thinking={thinking_level:?} must omit reasoning"
+            );
+            assert!(
+                value.get("include").is_none(),
+                "reasoning={reasoning} thinking={thinking_level:?} must omit include"
+            );
+        }
+    }
+
+    /// Codex mode keeps its existing defaults (effort falls back to "high")
+    /// while honoring a catalog `thinkingLevelMap` override.
+    #[test]
+    fn test_build_request_codex_mode_effort_defaults_and_map() {
+        let provider = OpenAIResponsesProvider::new("gpt-5.2-codex").with_codex_mode(true);
+        let request = provider.build_request(&reasoning_test_context(), &StreamOptions::default());
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(value["reasoning"]["effort"], "high");
+        assert_eq!(value["reasoning"]["summary"], "auto");
+        assert_eq!(value["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(value["tool_choice"], "auto");
+
+        let mapped = OpenAIResponsesProvider::new("gpt-5.2-codex")
+            .with_codex_mode(true)
+            .with_compat(Some(CompatConfig {
+                thinking_level_map: Some(HashMap::from([("xhigh".to_string(), "max".to_string())])),
+                ..CompatConfig::default()
+            }));
+        let request = mapped.build_request(
+            &reasoning_test_context(),
+            &StreamOptions {
+                thinking_level: Some(crate::model::ThinkingLevel::XHigh),
+                ..Default::default()
+            },
+        );
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(value["reasoning"]["effort"], "max");
+    }
+
+    // ========================================================================
+    // Raw-item preservation and replay (gh #167)
+    // ========================================================================
+
+    fn assistant_message_with_blocks(content: Vec<ContentBlock>) -> Message {
+        Message::Assistant(std::sync::Arc::new(AssistantMessage {
+            content,
+            api: "openai-responses".to_string(),
+            provider: "openai".to_string(),
+            model: "gpt-test".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            stop_details: None,
+            error_message: None,
+            timestamp: 0,
+        }))
+    }
+
+    fn tool_result_message(tool_call_id: &str, text: &str) -> Message {
+        Message::ToolResult(std::sync::Arc::new(crate::model::ToolResultMessage {
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: "echo".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        }))
+    }
+
+    fn raw_reasoning_item() -> Value {
+        json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{ "type": "summary_text", "text": "Plan the echo." }],
+            "encrypted_content": "gAAAAA-encrypted",
+            "status": "completed"
+        })
+    }
+
+    /// End-to-end round trip: a stream carrying reasoning + message +
+    /// function_call items is captured on the assistant message, and the next
+    /// request replays the preserved items with their original ids,
+    /// `encrypted_content`, and status fields (TS parity).
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_stream_captures_raw_items_and_build_request_replays_them() {
+        let events = vec![
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_1",
+                "summary_index": 0,
+                "delta": "Plan the echo."
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": raw_reasoning_item()
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "content_index": 0,
+                "delta": "Calling echo."
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [
+                        { "type": "output_text", "text": "Calling echo.", "annotations": [] }
+                    ]
+                }
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 2,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "echo",
+                    "arguments": ""
+                }
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "delta": "{\"text\":\"hi\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 2,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "echo",
+                    "arguments": "{\"text\":\"hi\"}",
+                    "status": "completed"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": { "input_tokens": 1, "output_tokens": 2, "total_tokens": 3 }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        let done_message = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Done { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("done message");
+
+        // Parse-side capture on the assistant message.
+        let ContentBlock::Thinking(thinking) = &done_message.content[0] else {
+            panic!("expected thinking block first");
+        };
+        assert_eq!(thinking.thinking, "Plan the echo.");
+        let signature_value: Value = serde_json::from_str(
+            thinking
+                .thinking_signature
+                .as_deref()
+                .expect("thinking signature"),
+        )
+        .expect("signature parses as JSON");
+        assert_eq!(signature_value, raw_reasoning_item());
+
+        let ContentBlock::Text(text) = &done_message.content[1] else {
+            panic!("expected text block second");
+        };
+        assert_eq!(text.text_signature.as_deref(), Some("msg_1"));
+
+        let ContentBlock::ToolCall(tool_call) = &done_message.content[2] else {
+            panic!("expected tool call block third");
+        };
+        assert_eq!(tool_call.id, "call_1");
+        assert_eq!(tool_call.thought_signature.as_deref(), Some("fc_1"));
+
+        // The captured message survives a session JSONL round trip.
+        let serialized = serde_json::to_string(&Message::Assistant(done_message.clone().into()))
+            .expect("serialize");
+        let Message::Assistant(roundtripped) =
+            serde_json::from_str::<Message>(&serialized).expect("deserialize")
+        else {
+            panic!("expected assistant message");
+        };
+
+        // Request-side replay.
+        let provider = OpenAIResponsesProvider::new("gpt-test");
+        let context = Context::owned(
+            None,
+            vec![
+                Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("Ping".to_string()),
+                    timestamp: 0,
+                }),
+                Message::Assistant(roundtripped),
+                tool_result_message("call_1", "ok"),
+            ],
+            vec![],
+        );
+        let request = provider.build_request(&context, &StreamOptions::default());
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            value["input"],
+            json!([
+                { "role": "user", "content": [{ "type": "input_text", "text": "Ping" }] },
+                raw_reasoning_item(),
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "content": [
+                        { "type": "output_text", "text": "Calling echo.", "annotations": [] }
+                    ]
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "echo",
+                    "arguments": "{\"text\":\"hi\"}"
+                },
+                { "type": "function_call_output", "call_id": "call_1", "output": "ok" }
+            ])
+        );
+    }
+
+    /// A reasoning item that produced no summary deltas but carries
+    /// `encrypted_content` still yields a thinking block holding the raw item,
+    /// so the encrypted reasoning is not lost.
+    #[test]
+    fn test_stream_creates_thinking_block_for_summaryless_encrypted_reasoning() {
+        let raw_item = json!({
+            "type": "reasoning",
+            "id": "rs_2",
+            "summary": [],
+            "encrypted_content": "gAAAAA-opaque"
+        });
+        let events = vec![
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": raw_item
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        assert!(
+            out.iter()
+                .any(|event| matches!(event, StreamEvent::ThinkingStart { content_index: 0 }))
+        );
+        let done_message = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Done { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("done message");
+        let ContentBlock::Thinking(thinking) = &done_message.content[0] else {
+            panic!("expected thinking block");
+        };
+        assert!(thinking.thinking.is_empty());
+        let signature_value: Value = serde_json::from_str(
+            thinking
+                .thinking_signature
+                .as_deref()
+                .expect("thinking signature"),
+        )
+        .expect("signature parses");
+        assert_eq!(
+            signature_value,
+            json!({
+                "type": "reasoning",
+                "id": "rs_2",
+                "summary": [],
+                "encrypted_content": "gAAAAA-opaque"
+            })
+        );
+    }
+
+    /// A reasoning item with neither prior blocks nor `encrypted_content` has
+    /// nothing replayable and keeps the legacy behavior of being ignored.
+    #[test]
+    fn test_stream_ignores_reasoning_done_without_encrypted_content() {
+        let events = vec![
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": { "type": "reasoning", "id": "rs_3", "summary": [] }
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "content_index": 0,
+                "delta": "hi"
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        let done_message = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Done { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("done message");
+        assert_eq!(done_message.content.len(), 1);
+        assert!(matches!(&done_message.content[0], ContentBlock::Text(_)));
+    }
+
+    /// Legacy sessions (no captured metadata) must build byte-identical
+    /// requests to the pre-preservation implementation: merged assistant text
+    /// with no id/status/annotations, function_call without an `id` field, and
+    /// untouched call ids.
+    #[test]
+    fn test_build_request_without_raw_metadata_keeps_legacy_shape() {
+        let provider = OpenAIResponsesProvider::new("gpt-test");
+        let context = Context::owned(
+            None,
+            vec![
+                Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("Ping".to_string()),
+                    timestamp: 0,
+                }),
+                assistant_message_with_blocks(vec![
+                    ContentBlock::Thinking(ThinkingContent {
+                        thinking: "legacy thinking".to_string(),
+                        thinking_signature: None,
+                    }),
+                    ContentBlock::Text(TextContent::new("Part one. ")),
+                    ContentBlock::Text(TextContent::new("Part two.")),
+                    ContentBlock::ToolCall(ToolCall {
+                        id: "call_legacy".to_string(),
+                        name: "echo".to_string(),
+                        arguments: json!({ "text": "hi" }),
+                        thought_signature: None,
+                    }),
+                ]),
+                tool_result_message("call_legacy", "ok"),
+            ],
+            vec![],
+        );
+
+        let request = provider.build_request(&context, &StreamOptions::default());
+        let serialized = serde_json::to_string(&request).expect("serialize request");
+        let value: Value = serde_json::from_str(&serialized).expect("parse request");
+        assert_eq!(
+            value["input"],
+            json!([
+                { "role": "user", "content": [{ "type": "input_text", "text": "Ping" }] },
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "Part one. Part two." }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_legacy",
+                    "name": "echo",
+                    "arguments": "{\"text\":\"hi\"}"
+                },
+                { "type": "function_call_output", "call_id": "call_legacy", "output": "ok" }
+            ])
+        );
+        // Explicit absence checks for the new optional fields.
+        assert!(!serialized.contains("\"annotations\""));
+        assert!(!serialized.contains("\"status\""));
+        assert!(!serialized.contains("\"id\""));
+    }
+
+    /// Combined `call_id|item_id` tool-call ids written by TS pi-mono sessions
+    /// are split on replay: call_id keeps the prefix, and the embedded
+    /// `fc_...` suffix is replayed as the function_call item id.
+    #[test]
+    fn test_build_request_splits_ts_session_combined_tool_call_ids() {
+        let provider = OpenAIResponsesProvider::new("gpt-test");
+        let context = Context::owned(
+            None,
+            vec![
+                assistant_message_with_blocks(vec![ContentBlock::ToolCall(ToolCall {
+                    id: "call_9|fc_9".to_string(),
+                    name: "echo".to_string(),
+                    arguments: json!({ "text": "hi" }),
+                    thought_signature: None,
+                })]),
+                tool_result_message("call_9|fc_9", "ok"),
+            ],
+            vec![],
+        );
+
+        let request = provider.build_request(&context, &StreamOptions::default());
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            value["input"],
+            json!([
+                {
+                    "type": "function_call",
+                    "id": "fc_9",
+                    "call_id": "call_9",
+                    "name": "echo",
+                    "arguments": "{\"text\":\"hi\"}"
+                },
+                { "type": "function_call_output", "call_id": "call_9", "output": "ok" }
+            ])
+        );
+    }
+
+    /// Foreign signatures (other providers' opaque blobs) never leak into
+    /// Responses requests: only JSON reasoning items, `msg_`-prefixed text
+    /// signatures, and `fc_`-prefixed item ids are replayed.
+    #[test]
+    fn test_build_request_ignores_foreign_signatures() {
+        let provider = OpenAIResponsesProvider::new("gpt-test");
+        let context = Context::owned(
+            None,
+            vec![assistant_message_with_blocks(vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "anthropic thinking".to_string(),
+                    thinking_signature: Some("EqQBCkgIBBAB".to_string()),
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "Hello".to_string(),
+                    text_signature: Some("sig123".to_string()),
+                }),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_a".to_string(),
+                    name: "echo".to_string(),
+                    arguments: json!({}),
+                    thought_signature: Some("gemini-opaque-blob".to_string()),
+                }),
+            ])],
+            vec![],
+        );
+
+        let request = provider.build_request(&context, &StreamOptions::default());
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            value["input"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "Hello" }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_a",
+                    "name": "echo",
+                    "arguments": "{}"
+                }
+            ])
+        );
+    }
+
+    /// Malformed `reasoning`/`message` done items (and non-object items) are
+    /// ignored, exactly as the pre-capture implementation ignored every
+    /// non-`function_call` done item via `#[serde(other)]`. The stream must
+    /// not abort on an unparseable opportunistic-capture payload.
+    #[test]
+    fn test_stream_tolerates_malformed_reasoning_and_message_done_items() {
+        let events = vec![
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": { "type": "message" } // missing id
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": { "type": "reasoning", "id": 123 } // non-string id
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 2,
+                "item": "not-an-object"
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "content_index": 0,
+                "delta": "still streaming"
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        let done_message = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Done { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("done message");
+        assert_eq!(done_message.content.len(), 1);
+        let ContentBlock::Text(text) = &done_message.content[0] else {
+            panic!("expected text block");
+        };
+        assert_eq!(text.text, "still streaming");
+        assert!(text.text_signature.is_none());
+    }
+
+    /// A malformed `function_call` done item keeps the legacy hard error: the
+    /// pre-capture code failed the whole-chunk parse for these, and silently
+    /// dropping a tool call would corrupt the conversation.
+    #[test]
+    fn test_stream_errors_on_malformed_function_call_done_item() {
+        let empty = stream::empty::<std::result::Result<Vec<u8>, std::io::Error>>();
+        let event_source = crate::sse::SseStream::new(Box::pin(empty));
+        let mut state = StreamState::new(
+            event_source,
+            "gpt-test".to_string(),
+            "openai-responses".to_string(),
+            "openai".to_string(),
+        );
+        let data = json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": { "type": "function_call", "id": "fc_1" } // missing call_id/name
+        })
+        .to_string();
+        let err = state
+            .process_event(&data)
+            .expect_err("malformed function_call done item must error");
+        assert!(err.to_string().contains("JSON parse error"));
+    }
+
+    /// Text blocks stamped with the same `msg_...` id (a multi-part message
+    /// item) fold back into a single replayed `message` item — OpenAI rejects
+    /// duplicate input item ids. Distinct ids stay distinct items.
+    #[test]
+    fn test_build_request_merges_multipart_message_item() {
+        let provider = OpenAIResponsesProvider::new("gpt-test");
+        let context = Context::owned(
+            None,
+            vec![assistant_message_with_blocks(vec![
+                ContentBlock::Text(TextContent {
+                    text: "Part one. ".to_string(),
+                    text_signature: Some("msg_1".to_string()),
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "Part two.".to_string(),
+                    text_signature: Some("msg_1".to_string()),
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "New item.".to_string(),
+                    text_signature: Some("msg_2".to_string()),
+                }),
+            ])],
+            vec![],
+        );
+
+        let request = provider.build_request(&context, &StreamOptions::default());
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            value["input"],
+            json!([
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "content": [
+                        { "type": "output_text", "text": "Part one. ", "annotations": [] },
+                        { "type": "output_text", "text": "Part two.", "annotations": [] }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_2",
+                    "status": "completed",
+                    "content": [
+                        { "type": "output_text", "text": "New item.", "annotations": [] }
+                    ]
+                }
+            ])
+        );
+    }
+
+    /// TS-net parity: an assistant turn produced by a different model on the
+    /// same provider/api must not replay any captured raw-item metadata —
+    /// OpenAI validates reasoning/function-call pairing per model and cannot
+    /// decrypt another model's `encrypted_content` (in TS, `transformMessages`
+    /// strips the signatures and `isDifferentModel` gates the fc id). The
+    /// request falls back to the legacy shape.
+    #[test]
+    fn test_build_request_omits_raw_item_replay_for_different_model_same_api() {
+        let provider = OpenAIResponsesProvider::new("gpt-test");
+        let other_model = Message::Assistant(std::sync::Arc::new(AssistantMessage {
+            content: vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "Plan the echo.".to_string(),
+                    thinking_signature: Some(raw_reasoning_item().to_string()),
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "Calling echo.".to_string(),
+                    text_signature: Some("msg_1".to_string()),
+                }),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_1".to_string(),
+                    name: "echo".to_string(),
+                    arguments: json!({ "text": "hi" }),
+                    thought_signature: Some("fc_1".to_string()),
+                }),
+            ],
+            api: "openai-responses".to_string(),
+            provider: "openai".to_string(),
+            model: "gpt-other".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            stop_details: None,
+            error_message: None,
+            timestamp: 0,
+        }));
+        let context = Context::owned(
+            None,
+            vec![other_model, tool_result_message("call_1", "ok")],
+            vec![],
+        );
+
+        let request = provider.build_request(&context, &StreamOptions::default());
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            value["input"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "Calling echo." }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "echo",
+                    "arguments": "{\"text\":\"hi\"}"
+                },
+                { "type": "function_call_output", "call_id": "call_1", "output": "ok" }
+            ])
+        );
     }
 
     #[test]
@@ -2498,6 +3915,152 @@ mod tests {
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
     }
 
+    /// gh #167: the compact endpoint is derived only from a `…/responses`
+    /// base URL; anything else refuses rather than guessing a route.
+    #[test]
+    fn derive_compact_url_requires_responses_suffix() {
+        assert_eq!(
+            derive_compact_url("https://api.openai.com/v1/responses"),
+            Some("https://api.openai.com/v1/responses/compact".to_string())
+        );
+        assert_eq!(
+            derive_compact_url("http://localhost:8080/v1/responses/"),
+            Some("http://localhost:8080/v1/responses/compact".to_string())
+        );
+        assert_eq!(derive_compact_url("https://api.openai.com/v1"), None);
+        assert_eq!(
+            derive_compact_url("https://chatgpt.com/backend-api/codex"),
+            None
+        );
+    }
+
+    /// gh #167: `compact_native` POSTs the sanitized body verbatim to the
+    /// sibling compact endpoint with the session's Bearer auth, and returns
+    /// the raw response JSON.
+    #[test]
+    fn compact_native_posts_body_with_session_auth() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let response_body = r#"{"id":"resp_1","created_at":123,"output":[{"type":"message","role":"user","content":[{"type":"input_text","text":"window"}]}]}"#;
+            let (base_url, rx) = spawn_test_server(200, "application/json", response_body);
+            let provider = OpenAIResponsesProvider::new("gpt-test")
+                .with_base_url(format!("{base_url}/v1/responses"));
+            let options = StreamOptions {
+                api_key: Some("sk-compact-test".to_string()),
+                ..Default::default()
+            };
+            let body = serde_json::json!({
+                "model": "gpt-test",
+                "instructions": "compact this",
+                "input": [{ "type": "message", "role": "user", "content": [] }],
+            });
+
+            let result = provider
+                .compact_native(&body, &options)
+                .await
+                .expect("compact POST succeeds");
+            assert_eq!(result["id"], "resp_1");
+            assert_eq!(result["output"][0]["content"][0]["text"], "window");
+
+            let captured = rx.recv().expect("captured request");
+            assert_eq!(
+                captured.headers.get("authorization").map(String::as_str),
+                Some("Bearer sk-compact-test")
+            );
+            assert_eq!(
+                captured.headers.get("accept").map(String::as_str),
+                Some("application/json")
+            );
+            let sent: Value = serde_json::from_str(&captured.body).expect("body json");
+            assert_eq!(sent, body, "body must be sent verbatim");
+        });
+    }
+
+    /// gh #167: an underivable base URL refuses before any network activity,
+    /// and a non-2xx compact response surfaces as a provider error.
+    #[test]
+    fn compact_native_refuses_bad_base_url_and_surfaces_http_errors() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let provider = OpenAIResponsesProvider::new("gpt-test")
+                .with_base_url("http://127.0.0.1:9/custom-route");
+            let err = provider
+                .compact_native(
+                    &serde_json::json!({ "model": "gpt-test", "input": [] }),
+                    &StreamOptions {
+                        api_key: Some("sk-x".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("underivable base URL must refuse");
+            assert!(
+                err.to_string().contains("cannot derive"),
+                "unexpected error: {err}"
+            );
+
+            let (base_url, _rx) = spawn_test_server(500, "application/json", r#"{"error":"boom"}"#);
+            let provider = OpenAIResponsesProvider::new("gpt-test")
+                .with_base_url(format!("{base_url}/v1/responses"));
+            let err = provider
+                .compact_native(
+                    &serde_json::json!({ "model": "gpt-test", "input": [] }),
+                    &StreamOptions {
+                        api_key: Some("sk-x".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("HTTP 500 must surface");
+            let message = err.to_string();
+            assert!(message.contains("HTTP 500"), "unexpected error: {message}");
+            assert!(message.contains("boom"), "unexpected error: {message}");
+        });
+    }
+
+    #[test]
+    fn auth_header_false_sends_custom_responses_request_without_authorization() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = OpenAIResponsesProvider::new("custom-model")
+            .with_provider_name("custom-openai-responses")
+            .with_auth_header(false)
+            .with_base_url(base_url);
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider
+                .stream(&context, &StreamOptions::default())
+                .await
+                .expect("keyless stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured keyless custom request");
+        assert!(
+            !captured.headers.contains_key("authorization"),
+            "authHeader:false must not synthesize Authorization"
+        );
+    }
+
     fn build_test_jwt(account_id: &str) -> String {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(br#"{"alg":"none","typ":"JWT"}"#);
@@ -3093,6 +4656,8 @@ mod tests {
             StopReason::Stop => "stop".to_string(),
             StopReason::ToolUse => "tool_use".to_string(),
             StopReason::Length => "length".to_string(),
+            StopReason::PauseTurn => "pause_turn".to_string(),
+            StopReason::Refusal => "refusal".to_string(),
             StopReason::Error => "error".to_string(),
             StopReason::Aborted => "aborted".to_string(),
         }

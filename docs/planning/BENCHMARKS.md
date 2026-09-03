@@ -30,16 +30,23 @@ cargo bench -- --baseline main
 
 ## Performance Budgets
 
-These are the target performance metrics. Regressions beyond these thresholds should be investigated.
+> **Governance note (2026-08-23):** The numeric budget tables below are
+> **historical diagnostics** from the 2026-02 era and are superseded for
+> release purposes. Release-facing budgets are governed by
+> `tests/perf_budgets.rs` / `tests/perf_regression.rs` thresholds (for example
+> `binary_size_release` at 48 MiB), validated against provenance-matched
+> artifacts in `tests/perf/reports/budget_summary.json`, and enforced by
+> `scripts/release_gate.sh`. Where the tables below disagree with those
+> sources, those sources win.
 
-### Core Metrics (Hard Budgets)
+### Historical Core Metrics (Hard Budgets; 2026-02 era)
 
 | Benchmark | Budget | Current | Status |
 |-----------|--------|---------|--------|
 | **startup/version** | <100ms (p95) | ~11ms | ✅ |
 | **startup/help** | <150ms (p95) | ~15ms | ✅ |
 | **startup/list_models** | <200ms (p95) | ~25ms | ✅ |
-| **binary/size_mb** | <20MB | ~7.6MB | ✅ |
+| **binary/size_mb** | <20MB | ~7.6MB | ✅ (historical; current governed budget is 48 MiB pending fresh v0.3.x measurement) |
 | **memory/version_peak** | <50MB RSS | TBD | ⬜ |
 
 ### Micro-Benchmarks
@@ -218,11 +225,12 @@ jobs:
         run: |
           SIZE_MB=$(stat --printf="%s" target/release/pi | awk '{printf "%.2f", $1/1024/1024}')
           echo "Binary size: ${SIZE_MB}MB"
+          # Historical snippet: 20MB was the pre-v0.3.0 budget. The governed
+          # release budget lives in tests/perf_budgets.rs (binary_size_release,
+          # 48 MiB) and is enforced by scripts/release_gate.sh.
           if (( $(echo "$SIZE_MB > 20" | bc -l) )); then
-            echo "::error::Binary size ${SIZE_MB}MB exceeds 20MB budget"
-            exit 1
+            echo "::warning::Binary size ${SIZE_MB}MB exceeds the historical 20MB diagnostic budget (governed budget: 48 MiB)"
           fi
-
       - name: Run benchmarks
         run: |
           cargo bench --bench tools -- --noplot
@@ -232,9 +240,11 @@ jobs:
       - name: Generate PiJS workload perf data (JSONL)
         run: |
           set -euxo pipefail
-          mkdir -p target/perf/perf
-          PI_BENCH_BUILD_PROFILE=perf cargo run --profile perf --example pijs_workload -- --iterations 2000 --tool-calls 1 > target/perf/perf/pijs_workload_perf.jsonl
-          PI_BENCH_BUILD_PROFILE=perf cargo run --profile perf --example pijs_workload -- --iterations 2000 --tool-calls 10 >> target/perf/perf/pijs_workload_perf.jsonl
+          BENCH_ALLOCATORS_CSV=system \
+          BENCH_PGO_MODE=off \
+          ITERATIONS=2000 \
+          TOOL_CALLS_CSV=1,10 \
+          scripts/bench_extension_workloads.sh
 
       - name: Perf budget gate
         run: cargo test --test perf_budgets -- --nocapture
@@ -347,7 +357,13 @@ hyperfine --warmup 3 --runs 10 'target/release/pi --version'
 scripts/bench_extension_workloads.sh
 ```
 
-#### Baseline Captures (2026-02-05)
+#### Historical Diagnostic Baseline Captures (2026-02-05)
+
+These 200-iteration direct-binary captures predate the release-evidence contract.
+They are diagnostic only and are not eligible for regression-gate or release
+claims. Generate authoritative PiJS evidence through the canonical harness above,
+which binds the source commit, run identity, exact shipping feature set, allocator,
+Cargo fingerprint, executable path, and executable checksum.
 
 Commands:
 

@@ -23,10 +23,18 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from check_readme_evidence_freshness import (
+    ReleaseArtifactSnapshot,
+    capture_release_artifact_snapshot,
+    performance_budget_claim_errors,
+    revalidate_release_artifact_snapshot,
+)
 
 
 REPORT_SCHEMA = "pi.swarm.claim_readiness_report.v1"
+PERF_BUDGET_SUMMARY_SCHEMA = "pi.perf.budget_summary.v2"
 STALE_CLAIM_REPORT_SCHEMA = "pi.swarm.stale_claim_report.v1"
 REDUNDANT_AGENT_WORK_SCHEMA = "pi.swarm.redundant_agent_work.v1"
 HOSTCALL_QUEUE_REPORT_SCHEMA = "pi.swarm.hostcall_queue_readiness.v1"
@@ -34,6 +42,7 @@ OPERATOR_EXPLANATIONS_SCHEMA = "pi.swarm.operator_explanations.v1"
 GOLDEN_REPORT_DIRECTORY = Path("tests/golden_corpus/swarm_claim_readiness")
 COMPLETE_REPORT_GOLDEN = "complete_report_projection.json"
 UPDATE_GOLDEN_ENV = "UPDATE_SWARM_CLAIM_READINESS_GOLDEN"
+_FIXTURE_GIT_TEMPLATE: Path | None = None
 DEFAULT_MAX_AGE_DAYS = 14
 DEFAULT_STALE_CLAIM_AFTER_HOURS = 24
 DEFAULT_STALE_CLAIM_ACTIVITY_FRESH_HOURS = 6
@@ -41,6 +50,7 @@ DEFAULT_STALE_CLAIM_ACTIVITY_PATHS = (
     "tests/full_suite_gate/swarm_activity_events.jsonl",
     "tests/full_suite_gate/swarm_activity_ledger.jsonl",
 )
+MAX_FUTURE_CLOCK_SKEW = timedelta(minutes=5)
 BEAD_ID_PATTERN = re.compile(r"\bbd-[A-Za-z0-9][A-Za-z0-9.-]*\b")
 BACKTICK_PATH_PATTERN = re.compile(r"`([^`]+)`")
 BARE_REPO_PATH_PATTERN = re.compile(
@@ -100,6 +110,8 @@ class EvidenceSpec:
     status_path: str | None = None
     ok_values: tuple[Any, ...] = ()
     zero_paths: tuple[str, ...] = ()
+    required_true_paths: tuple[str, ...] = ()
+    required_empty_list_paths: tuple[str, ...] = ()
     provenance_paths: tuple[str, ...] = DEFAULT_PROVENANCE_PATHS
     provenance_group: str | None = None
 
@@ -127,6 +139,8 @@ class EvidenceCheck:
     schema: str | None
     provenance_value: str | None
     issues: list[EvidenceIssue]
+    release_snapshot: ReleaseArtifactSnapshot | None = None
+    parsed_payload: dict[str, Any] | None = None
 
     def status(self) -> str:
         kinds = {issue.kind for issue in self.issues}
@@ -137,8 +151,10 @@ class EvidenceCheck:
             "status_not_ready",
             "no_data",
             "missing_timestamp",
+            "future_timestamp",
             "stale",
             "provenance_mismatch",
+            "source_binding",
         ):
             if kind in kinds:
                 return kind
@@ -324,8 +340,21 @@ EVIDENCE_SPECS = (
         path="tests/perf/reports/budget_summary.json",
         description="CI-enforced performance budget summary.",
         claim_surface="release_facing",
-        required_schema="pi.perf.budget_summary.v1",
-        zero_paths=("ci_fail", "ci_no_data", "data_contract_failures_count"),
+        required_schema=PERF_BUDGET_SUMMARY_SCHEMA,
+        status_path="claim_readiness.status",
+        ok_values=("claim_ready",),
+        zero_paths=(
+            "fail",
+            "no_data",
+            "ci_fail",
+            "ci_no_data",
+            "data_contract_failures_count",
+        ),
+        required_true_paths=(
+            "strict_mode",
+            "claim_readiness.performance_claims_authorized",
+        ),
+        required_empty_list_paths=("claim_readiness.blocking_reason_codes",),
         provenance_group="perf",
     ),
     EvidenceSpec(
@@ -630,19 +659,48 @@ def issue_for(spec: EvidenceSpec, kind: str, detail: str) -> EvidenceIssue:
     return EvidenceIssue(kind=kind, detail=detail, blocking=blocking)
 
 
-def load_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+def reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        payload[key] = value
+    return payload
+
+
+def load_json_bytes(contents: bytes) -> tuple[dict[str, Any] | None, str | None]:
+    """Decode one already captured JSON byte snapshot without duplicate keys."""
     try:
-        with path.open(encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except json.JSONDecodeError as exc:
+        text = contents.decode("utf-8", "strict")
+        payload = json.loads(text, object_pairs_hook=reject_duplicate_json_keys)
+    except (json.JSONDecodeError, ValueError) as exc:
         return None, f"invalid JSON: {exc}"
     except UnicodeDecodeError:
         return None, "artifact is not UTF-8"
-    except OSError as exc:
-        return None, f"failed to read artifact: {exc}"
     if not isinstance(payload, dict):
         return None, "JSON artifact must be an object"
     return payload, None
+
+
+def load_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        contents = path.read_bytes()
+    except OSError as exc:
+        return None, f"failed to read artifact: {exc}"
+    return load_json_bytes(contents)
+
+
+def parse_json_metadata_string(
+    raw: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Parse optional JSON-encoded metadata and reject recursive duplicate keys."""
+    try:
+        payload = json.loads(raw, object_pairs_hook=reject_duplicate_json_keys)
+    except json.JSONDecodeError:
+        return None, None
+    except ValueError as exc:
+        return None, str(exc)
+    return (payload if isinstance(payload, dict) else None), None
 
 
 def load_jsonl_objects(path: Path) -> tuple[list[dict[str, Any]], str | None]:
@@ -654,10 +712,22 @@ def load_jsonl_objects(path: Path) -> tuple[list[dict[str, Any]], str | None]:
                 if not stripped:
                     continue
                 try:
-                    payload = json.loads(stripped)
-                except json.JSONDecodeError as exc:
+                    payload = json.loads(
+                        stripped,
+                        object_pairs_hook=reject_duplicate_json_keys,
+                    )
+                except (json.JSONDecodeError, ValueError) as exc:
                     return objects, f"{path}:{line_number}: invalid JSON: {exc}"
                 if isinstance(payload, dict):
+                    metadata = payload.get("metadata")
+                    if isinstance(metadata, str) and metadata.strip():
+                        _, metadata_error = parse_json_metadata_string(metadata)
+                        if metadata_error is not None:
+                            return (
+                                objects,
+                                f"{path}:{line_number}: invalid metadata JSON: "
+                                f"{metadata_error}",
+                            )
                     payload["_source_line"] = line_number
                     objects.append(payload)
     except UnicodeDecodeError:
@@ -897,10 +967,7 @@ def issue_surface_paths(issue: dict[str, Any]) -> tuple[str, ...]:
 
     metadata = issue.get("metadata")
     if isinstance(metadata, str) and metadata.strip():
-        try:
-            parsed = json.loads(metadata)
-        except json.JSONDecodeError:
-            parsed = None
+        parsed, _ = parse_json_metadata_string(metadata)
         if isinstance(parsed, dict):
             append_surface_paths_from_mapping(paths, parsed)
     elif isinstance(metadata, dict):
@@ -1007,23 +1074,46 @@ def classify_stale_claim(
     latest_commit_at: str | None = None
     evidence_source = bead_source
     reasons: list[str] = []
+    future_timestamp_sources: list[str] = []
 
     if updated_at is not None:
-        bead_age_hours = max(0.0, (now - updated_at).total_seconds() / 3600.0)
+        bead_age_hours = (now - updated_at).total_seconds() / 3600.0
+        if updated_at > now + MAX_FUTURE_CLOCK_SKEW:
+            future_timestamp_sources.append("bead.updated_at")
     else:
         reasons.append("bead updated_at is missing or unparseable")
 
     if activity is not None:
         latest_activity_at = format_datetime(activity.timestamp)
-        latest_activity_age_hours = max(0.0, (now - activity.timestamp).total_seconds() / 3600.0)
+        latest_activity_age_hours = (
+            now - activity.timestamp
+        ).total_seconds() / 3600.0
+        if activity.timestamp > now + MAX_FUTURE_CLOCK_SKEW:
+            future_timestamp_sources.append("coordination_activity.timestamp")
         evidence_source = activity.source
 
     if recent_commit is not None:
         latest_commit_at = format_datetime(recent_commit.timestamp)
-        latest_commit_age_hours = max(0.0, (now - recent_commit.timestamp).total_seconds() / 3600.0)
+        latest_commit_age_hours = (
+            now - recent_commit.timestamp
+        ).total_seconds() / 3600.0
+        if recent_commit.timestamp > now + MAX_FUTURE_CLOCK_SKEW:
+            future_timestamp_sources.append("git_commit.timestamp")
         evidence_source = recent_commit.source
 
-    if updated_at is None:
+    if future_timestamp_sources:
+        classification = "invalid_future_timestamp"
+        operator_bucket = "ambiguous"
+        reasons.append(
+            "clock-integrity failure: materially future timestamp(s): "
+            + ", ".join(future_timestamp_sources)
+        )
+        recommended_action = (
+            f"Report-only: do not treat {bead_id} as active or stale until the future "
+            "timestamp source is corrected and corroborated against Beads, Agent Mail, "
+            "and git history."
+        )
+    elif updated_at is None:
         classification = "missing_evidence"
         operator_bucket = "ambiguous"
         recommended_action = (
@@ -1437,6 +1527,24 @@ def classify_agent_mail_health(payload: dict[str, Any] | None, source: str) -> d
         "classification": classification,
         "detail": detail,
     }
+
+
+def performance_budget_contract_issues(
+    repo_root: Path,
+    spec: EvidenceSpec,
+    payload: dict[str, Any],
+    now: datetime,
+) -> list[EvidenceIssue]:
+    """Apply the canonical v2 claim contract and hardened source binding."""
+    return [
+        issue_for(spec, "status_not_ready", detail)
+        for detail in performance_budget_claim_errors(
+            repo_root,
+            payload,
+            now,
+            spec.path,
+        )
+    ]
 
 
 def collect_git_path_activity(
@@ -1878,6 +1986,8 @@ def check_spec(
     spec: EvidenceSpec,
     now: datetime,
     max_age: timedelta,
+    *,
+    expected_release_head: str | None = None,
 ) -> EvidenceCheck:
     full_path = repo_root / spec.path
     issues: list[EvidenceIssue] = []
@@ -1895,11 +2005,37 @@ def check_spec(
             schema=None,
             provenance_value=None,
             issues=[issue_for(spec, "missing", "artifact path does not exist")],
+            parsed_payload=None,
         )
+
+    release_snapshot: ReleaseArtifactSnapshot | None = None
+    if spec.claim_surface == "release_facing":
+        release_snapshot, binding_error = capture_release_artifact_snapshot(
+            repo_root, spec.path
+        )
+        if binding_error is not None:
+            issues.append(issue_for(spec, "source_binding", binding_error))
+        elif (
+            release_snapshot is not None
+            and expected_release_head is not None
+            and release_snapshot.head != expected_release_head
+        ):
+            issues.append(issue_for(
+                spec,
+                "source_binding",
+                (
+                    "artifact was captured from a different repository HEAD than "
+                    f"the report snapshot ({release_snapshot.head} != "
+                    f"{expected_release_head})"
+                ),
+            ))
 
     payload: dict[str, Any] | None = None
     if spec.path.endswith(".json"):
-        payload, json_error = load_json(full_path)
+        if release_snapshot is not None:
+            payload, json_error = load_json_bytes(release_snapshot.contents)
+        else:
+            payload, json_error = load_json(full_path)
         if json_error is not None:
             issues.append(issue_for(spec, "invalid_json", json_error))
         if payload is not None:
@@ -1934,13 +2070,47 @@ def check_spec(
                 if detail is not None:
                     issues.append(issue_for(spec, "no_data", detail))
 
+            for required_true_path in spec.required_true_paths:
+                value = get_path(payload, required_true_path)
+                if value is not True:
+                    issues.append(issue_for(
+                        spec,
+                        "status_not_ready",
+                        f"{required_true_path}={value!r}, expected True",
+                    ))
+
+            for required_empty_list_path in spec.required_empty_list_paths:
+                value = get_path(payload, required_empty_list_path)
+                if not isinstance(value, list) or value:
+                    issues.append(issue_for(
+                        spec,
+                        "status_not_ready",
+                        f"{required_empty_list_path}={value!r}, expected an empty array",
+                    ))
+
+            if spec.id == "perf_budget_summary":
+                issues.extend(
+                    performance_budget_contract_issues(repo_root, spec, payload, now)
+                )
+
+    if release_snapshot is not None:
+        final_binding_error = revalidate_release_artifact_snapshot(release_snapshot)
+        if final_binding_error is not None:
+            issues.append(issue_for(spec, "source_binding", final_binding_error))
+
     if generated_at is None and spec.generated:
         issues.append(issue_for(spec, "missing_timestamp", "artifact lacks a parseable generated timestamp"))
 
     if generated_at is not None:
         age = now - generated_at
         age_days = age.total_seconds() / 86400
-        if age > max_age and spec.claim_surface != "release_policy":
+        if generated_at > now + timedelta(minutes=5):
+            issues.append(issue_for(
+                spec,
+                "future_timestamp",
+                "generated timestamp is more than five minutes in the future",
+            ))
+        elif age > max_age and spec.claim_surface != "release_policy":
             issues.append(issue_for(
                 spec,
                 "stale",
@@ -1955,6 +2125,8 @@ def check_spec(
         schema=schema,
         provenance_value=provenance_value,
         issues=issues,
+        release_snapshot=release_snapshot,
+        parsed_payload=payload,
     )
 
 
@@ -2008,8 +2180,15 @@ def remediation_for(kind: str) -> str:
         "status_not_ready": "Do not make the release-facing claim until the gate verdict is passing.",
         "no_data": "Regenerate the evidence from a run with real measurements and clean data contracts.",
         "missing_timestamp": "Regenerate with generated_at or generated_at_utc provenance.",
+        "future_timestamp": (
+            "Regenerate the evidence with the current UTC clock and truthful provenance."
+        ),
         "stale": "Regenerate the evidence and update claim citations, or soften the claim to historical language.",
         "provenance_mismatch": "Use a single correlated evidence run for the claim or split the claim by run.",
+        "source_binding": (
+            "Regenerate and commit the exact release-facing artifact as a regular HEAD blob "
+            "with no symlink components or worktree byte drift."
+        ),
         "readme_snapshot_mismatch": "Update README.md release-facing snapshot text to match the current evidence artifacts.",
         "readme_snapshot_missing": "Restore the README.md release-facing snapshot section or remove release-facing snapshot claims.",
     }.get(kind, "Review the artifact before using it for release claims.")
@@ -2021,13 +2200,13 @@ def blocker_category(kind: str, detail: str) -> str:
         return "rch_failure"
     if kind in {"missing", "readme_snapshot_missing"}:
         return "missing_artifact"
-    if kind == "stale":
+    if kind in {"stale", "future_timestamp"}:
         return "stale_evidence"
     if kind == "no_data":
         return "no_data_evidence"
     if kind == "provenance_mismatch":
         return "provenance_mismatch"
-    if kind in {"invalid_json", "schema_mismatch"}:
+    if kind in {"invalid_json", "schema_mismatch", "source_binding"}:
         return "invalid_evidence_contract"
     if kind == "status_not_ready":
         return "release_gate_not_ready"
@@ -2232,11 +2411,14 @@ def readme_count(payload: dict[str, Any], path: str) -> int | None:
     return non_negative_count(get_path(payload, path))
 
 
-def readme_json_artifact(repo_root: Path, relative_path: str) -> dict[str, Any]:
-    payload, error = load_json(repo_root / relative_path)
-    if error is not None or payload is None:
+def readme_json_artifact(
+    evidence_checks_by_path: dict[str, EvidenceCheck],
+    relative_path: str,
+) -> dict[str, Any]:
+    evidence_check = evidence_checks_by_path.get(relative_path)
+    if evidence_check is None or evidence_check.parsed_payload is None:
         return {}
-    return payload
+    return evidence_check.parsed_payload
 
 
 def readme_gate_counts(payload: dict[str, Any]) -> tuple[int | None, int | None, int | None, int | None]:
@@ -2291,18 +2473,26 @@ def add_readme_check(
         ))
 
 
-def build_readme_line_checks(repo_root: Path) -> list[ReadmeLineCheck]:
+def build_readme_line_checks(
+    evidence_checks_by_path: dict[str, EvidenceCheck],
+) -> list[ReadmeLineCheck]:
     must_pass_path = "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json"
     evidence_bundle_path = "tests/evidence_bundle/index.json"
     full_suite_path = "tests/full_suite_gate/full_suite_verdict.json"
     certification_path = "tests/full_suite_gate/certification_verdict.json"
     dropin_path = "docs/evidence/dropin-certification-verdict.json"
 
-    must_pass = readme_json_artifact(repo_root, must_pass_path)
-    evidence_bundle = readme_json_artifact(repo_root, evidence_bundle_path)
-    full_suite = readme_json_artifact(repo_root, full_suite_path)
-    certification = readme_json_artifact(repo_root, certification_path)
-    dropin = readme_json_artifact(repo_root, dropin_path)
+    must_pass = readme_json_artifact(evidence_checks_by_path, must_pass_path)
+    evidence_bundle = readme_json_artifact(
+        evidence_checks_by_path,
+        evidence_bundle_path,
+    )
+    full_suite = readme_json_artifact(evidence_checks_by_path, full_suite_path)
+    certification = readme_json_artifact(
+        evidence_checks_by_path,
+        certification_path,
+    )
+    dropin = readme_json_artifact(evidence_checks_by_path, dropin_path)
 
     checks: list[ReadmeLineCheck] = []
 
@@ -2463,7 +2653,7 @@ def find_readme_anchor(
 
 
 def check_readme_snapshot_artifact_citations(
-    repo_root: Path,
+    evidence_checks_by_path: dict[str, EvidenceCheck],
     lines: list[str],
     section_specs: dict[str, ReadmeSectionSpec],
     bounds: dict[str, tuple[int, int, int | None]],
@@ -2483,8 +2673,8 @@ def check_readme_snapshot_artifact_citations(
                     continue
                 seen.add(key)
 
-                artifact_file = repo_root / artifact_path
-                if not artifact_file.is_file():
+                evidence_check = evidence_checks_by_path.get(artifact_path)
+                if evidence_check is None or not evidence_check.exists:
                     issues.append({
                         "path": "README.md",
                         "line": line_number,
@@ -2502,7 +2692,10 @@ def check_readme_snapshot_artifact_citations(
                 if generated_match is None:
                     continue
 
-                payload = readme_json_artifact(repo_root, artifact_path)
+                payload = readme_json_artifact(
+                    evidence_checks_by_path,
+                    artifact_path,
+                )
                 actual_generated = readme_timestamp_text(payload)
                 expected_generated = generated_match.group(1)
                 if actual_generated != expected_generated:
@@ -2537,78 +2730,114 @@ def check_readme_snapshot_artifact_citations(
     return issues
 
 
-def check_readme_release_snapshot(repo_root: Path) -> list[dict[str, Any]]:
-    readme_path = repo_root / "README.md"
+def check_readme_release_snapshot(
+    evidence_checks_by_path: dict[str, EvidenceCheck],
+    *,
+    readme_snapshot: ReleaseArtifactSnapshot | None,
+    binding_error: str | None,
+    _before_expectations: Callable[[], None] | None = None,
+    _after_expectations: Callable[[], None] | None = None,
+) -> list[dict[str, Any]]:
+    if binding_error is not None or readme_snapshot is None:
+        return [{
+            "path": "README.md",
+            "line": None,
+            "category": "docs",
+            "kind": "source_binding",
+            "detail": binding_error or "README.md snapshot capture failed",
+            "remediation": remediation_for("source_binding"),
+        }]
     try:
-        lines = readme_path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
+        lines = readme_snapshot.contents.decode("utf-8", "strict").splitlines()
+    except UnicodeDecodeError as exc:
         return [{
             "path": "README.md",
             "line": None,
             "category": "docs",
             "kind": "readme_snapshot_missing",
-            "detail": f"README.md could not be read: {exc}",
+            "detail": f"README.md is not UTF-8: {exc}",
             "remediation": remediation_for("readme_snapshot_missing"),
         }]
 
-    section_specs = {spec.id: spec for spec in README_SECTIONS}
-    bounds = {
-        section_id: readme_section_bounds(lines, spec)
-        for section_id, spec in section_specs.items()
-    }
     issues: list[dict[str, Any]] = []
-    for section_id, (_, _, section_line) in bounds.items():
-        if section_line is None:
-            issues.append({
-                "path": "README.md",
-                "line": None,
-                "category": "docs",
-                "kind": "readme_snapshot_missing",
-                "detail": (
-                    f"README.md is missing release snapshot section "
-                    f"{section_specs[section_id].start_marker!r}"
-                ),
-                "remediation": remediation_for("readme_snapshot_missing"),
-            })
+    try:
+        if _before_expectations is not None:
+            _before_expectations()
+        section_specs = {spec.id: spec for spec in README_SECTIONS}
+        bounds = {
+            section_id: readme_section_bounds(lines, spec)
+            for section_id, spec in section_specs.items()
+        }
+        for section_id, (_, _, section_line) in bounds.items():
+            if section_line is None:
+                issues.append({
+                    "path": "README.md",
+                    "line": None,
+                    "category": "docs",
+                    "kind": "readme_snapshot_missing",
+                    "detail": (
+                        f"README.md is missing release snapshot section "
+                        f"{section_specs[section_id].start_marker!r}"
+                    ),
+                    "remediation": remediation_for("readme_snapshot_missing"),
+                })
 
-    for check in build_readme_line_checks(repo_root):
-        if check.section_id not in bounds:
-            continue
-        start_index, end_index, section_line = bounds[check.section_id]
-        if section_line is None:
-            continue
-        line_number, actual = find_readme_anchor(lines, start_index, end_index, check.anchor)
-        if actual is None:
-            issues.append({
-                "path": "README.md",
-                "line": section_line,
-                "category": "docs",
-                "kind": "readme_snapshot_mismatch",
-                "detail": (
-                    f"{check.section_id}.{check.id} ({check.description}) could not find anchor "
-                    f"{check.anchor!r}; expected {check.expected!r} from {check.source_path}"
-                ),
-                "remediation": remediation_for("readme_snapshot_mismatch"),
-            })
-            continue
-        if check.expected not in actual:
-            issues.append({
-                "path": "README.md",
-                "line": line_number,
-                "category": "docs",
-                "kind": "readme_snapshot_mismatch",
-                "detail": (
-                    f"{check.section_id}.{check.id} ({check.description}) expected {check.expected!r} "
-                    f"from {check.source_path}; actual line is {actual!r}"
-                ),
-                "remediation": remediation_for("readme_snapshot_mismatch"),
-            })
-    issues.extend(check_readme_snapshot_artifact_citations(
-        repo_root,
-        lines,
-        section_specs,
-        bounds,
-    ))
+        for check in build_readme_line_checks(evidence_checks_by_path):
+            if check.section_id not in bounds:
+                continue
+            start_index, end_index, section_line = bounds[check.section_id]
+            if section_line is None:
+                continue
+            line_number, actual = find_readme_anchor(
+                lines,
+                start_index,
+                end_index,
+                check.anchor,
+            )
+            if actual is None:
+                issues.append({
+                    "path": "README.md",
+                    "line": section_line,
+                    "category": "docs",
+                    "kind": "readme_snapshot_mismatch",
+                    "detail": (
+                        f"{check.section_id}.{check.id} ({check.description}) could not find anchor "
+                        f"{check.anchor!r}; expected {check.expected!r} from {check.source_path}"
+                    ),
+                    "remediation": remediation_for("readme_snapshot_mismatch"),
+                })
+                continue
+            if check.expected not in actual:
+                issues.append({
+                    "path": "README.md",
+                    "line": line_number,
+                    "category": "docs",
+                    "kind": "readme_snapshot_mismatch",
+                    "detail": (
+                        f"{check.section_id}.{check.id} ({check.description}) expected {check.expected!r} "
+                        f"from {check.source_path}; actual line is {actual!r}"
+                    ),
+                    "remediation": remediation_for("readme_snapshot_mismatch"),
+                })
+        issues.extend(check_readme_snapshot_artifact_citations(
+            evidence_checks_by_path,
+            lines,
+            section_specs,
+            bounds,
+        ))
+    finally:
+        if _after_expectations is not None:
+            _after_expectations()
+    final_binding_error = revalidate_release_artifact_snapshot(readme_snapshot)
+    if final_binding_error is not None:
+        issues.append({
+            "path": "README.md",
+            "line": None,
+            "category": "docs",
+            "kind": "source_binding",
+            "detail": final_binding_error,
+            "remediation": remediation_for("source_binding"),
+        })
     return issues
 
 
@@ -2625,10 +2854,31 @@ def build_report(
     redundant_agent_mail_health: dict[str, Any] | None = None,
     redundant_agent_mail_health_source: str = "not_provided",
     redundant_path_activity: dict[str, list[str]] | None = None,
+    _after_evidence_check: Callable[[int], None] | None = None,
+    _before_readme_expectations: Callable[[], None] | None = None,
+    _after_readme_expectations: Callable[[], None] | None = None,
+    _before_final_binding_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     now = as_utc(now or datetime.now(timezone.utc))
     max_age = timedelta(days=max_age_days)
-    checks = [check_spec(repo_root, spec, now, max_age) for spec in EVIDENCE_SPECS]
+    report_snapshot, report_snapshot_error = capture_release_artifact_snapshot(
+        repo_root,
+        "README.md",
+    )
+    expected_release_head = (
+        report_snapshot.head if report_snapshot is not None else None
+    )
+    checks: list[EvidenceCheck] = []
+    for index, spec in enumerate(EVIDENCE_SPECS):
+        checks.append(check_spec(
+            repo_root,
+            spec,
+            now,
+            max_age,
+            expected_release_head=expected_release_head,
+        ))
+        if _after_evidence_check is not None:
+            _after_evidence_check(index)
     add_provenance_mismatches(checks)
     stale_claims = build_stale_claim_report(
         repo_root,
@@ -2650,6 +2900,46 @@ def build_report(
         path_activity=redundant_path_activity,
     )
 
+    readme_blocking_issues = check_readme_release_snapshot(
+        {check.spec.path: check for check in checks},
+        readme_snapshot=report_snapshot,
+        binding_error=report_snapshot_error,
+        _before_expectations=_before_readme_expectations,
+        _after_expectations=_after_readme_expectations,
+    )
+    if _before_final_binding_check is not None:
+        _before_final_binding_check()
+    for check in checks:
+        if check.release_snapshot is None:
+            continue
+        final_binding_error = revalidate_release_artifact_snapshot(
+            check.release_snapshot
+        )
+        if final_binding_error is not None:
+            check.issues.append(issue_for(
+                check.spec,
+                "source_binding",
+                (
+                    "release-facing artifact changed after its evidence check "
+                    f"while the report was being assembled: {final_binding_error}"
+                ),
+            ))
+    if report_snapshot is not None:
+        final_report_binding_error = revalidate_release_artifact_snapshot(
+            report_snapshot
+        )
+        if final_report_binding_error is not None:
+            readme_blocking_issues.append({
+                "path": "README.md",
+                "line": None,
+                "category": "docs",
+                "kind": "source_binding",
+                "detail": (
+                    "repository changed while the claim-readiness report was "
+                    f"being assembled: {final_report_binding_error}"
+                ),
+                "remediation": remediation_for("source_binding"),
+            })
     blocking_issues = [
         {
             "path": check.spec.path,
@@ -2662,7 +2952,7 @@ def build_report(
         for issue in check.issues
         if issue.blocking
     ]
-    blocking_issues.extend(check_readme_release_snapshot(repo_root))
+    blocking_issues.extend(readme_blocking_issues)
     operator_explanations = build_operator_explanations(
         blocking_issues=blocking_issues,
         stale_claims=stale_claims,
@@ -2855,6 +3145,55 @@ def fixture_payload(
         assign_path(payload, spec.status_path, ok_value)
     for zero_path in spec.zero_paths:
         assign_path(payload, zero_path, 0)
+    for required_true_path in spec.required_true_paths:
+        assign_path(payload, required_true_path, True)
+    for required_empty_list_path in spec.required_empty_list_paths:
+        assign_path(payload, required_empty_list_path, [])
+    if spec.id == "perf_budget_summary":
+        canonical_summary_path = (
+            Path(__file__).resolve().parent.parent / spec.path
+        )
+        canonical_summary, canonical_error = load_json(canonical_summary_path)
+        if canonical_error is not None or canonical_summary is None:
+            raise AssertionError(
+                "failed to load canonical performance budget inventory: "
+                f"{canonical_error}"
+            )
+        raw_budgets = canonical_summary.get("budgets")
+        if not isinstance(raw_budgets, list) or not raw_budgets:
+            raise AssertionError("canonical performance budget inventory is empty")
+        budgets = json.loads(json.dumps(raw_budgets))
+        budget_results = [
+            {
+                "budget_name": budget["name"],
+                "category": budget["category"],
+                "threshold": budget["threshold"],
+                "comparison": budget["comparison"],
+                "unit": budget["unit"],
+                "actual": budget["threshold"],
+                "status": "PASS",
+                "source": f"fixture:{budget['name']}",
+                "ci_enforced": budget["ci_enforced"],
+            }
+            for budget in budgets
+        ]
+        ci_enforced = sum(
+            int(budget["ci_enforced"] is True) for budget in budgets
+        )
+        payload.update({
+            "generated_at": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "run_id": provenance,
+            "source_commit": "0123456789abcdef0123456789abcdef01234567",
+            "total_budgets": len(budgets),
+            "pass": len(budgets),
+            "fail": 0,
+            "no_data": 0,
+            "ci_enforced": ci_enforced,
+            "ci_with_data": ci_enforced,
+            "budgets": budgets,
+            "budget_results": budget_results,
+            "failing_data_contracts": [],
+        })
     if spec.id == "dropin_certification_verdict":
         payload["overall_verdict"] = "CERTIFIED"
         payload["generated_at_utc"] = format_datetime(now)
@@ -2961,6 +3300,78 @@ def make_complete_fixture(
         else:
             write_artifact(repo_root, spec.path, payload, mtime=now)
     write_readme_release_snapshot_fixture(repo_root, now, provenance)
+    write_artifact(
+        repo_root,
+        "Cargo.toml",
+        None,
+        text=(
+            "[package]\n"
+            'name = "pi-claim-readiness-fixture"\n'
+            'version = "0.0.0"\n'
+            'edition = "2024"\n'
+            'include = ["Cargo.toml"]\n'
+        ),
+        mtime=now,
+    )
+
+    commit_fixture_changes(repo_root, "fixture source snapshot")
+
+    source_commit = git_output(repo_root, ["rev-parse", "HEAD"])
+    if source_commit is None:
+        raise AssertionError("fixture repository has no source commit")
+    source_commit = source_commit.strip()
+    budget_path = repo_root / EVIDENCE_SPECS[0].path
+    budget_payload, budget_error = load_json(budget_path)
+    if budget_error is not None or budget_payload is None:
+        raise AssertionError(f"failed to bind fixture budget summary: {budget_error}")
+    budget_payload["source_commit"] = source_commit
+    write_artifact(repo_root, EVIDENCE_SPECS[0].path, budget_payload)
+    commit_fixture_changes(repo_root, "bind performance evidence to source")
+
+
+def commit_fixture_changes(repo_root: Path, message: str) -> None:
+    """Commit all current fixture changes with an isolated test identity."""
+    commands = (
+        ("add", "--all"),
+        ("add", "--renormalize", "--", "."),
+        (
+            "-c",
+            "user.name=Pi claim-readiness fixture",
+            "-c",
+            "user.email=pi-fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            message,
+        ),
+    )
+    for args in commands:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise AssertionError(
+                f"fixture git {' '.join(args)} failed: {result.stderr.strip()}"
+            )
+
+
+def rebind_fixture_performance_summary(repo_root: Path) -> None:
+    """Commit a new source snapshot, then bind and commit its evidence summary."""
+    commit_fixture_changes(repo_root, "update fixture source snapshot")
+    source_commit = git_output(repo_root, ["rev-parse", "HEAD"])
+    if source_commit is None:
+        raise AssertionError("fixture repository has no updated source commit")
+    budget_path = repo_root / EVIDENCE_SPECS[0].path
+    budget_payload, budget_error = load_json(budget_path)
+    if budget_error is not None or budget_payload is None:
+        raise AssertionError(f"failed to rebind fixture budget summary: {budget_error}")
+    budget_payload["source_commit"] = source_commit.strip()
+    write_artifact(repo_root, EVIDENCE_SPECS[0].path, budget_payload)
+    commit_fixture_changes(repo_root, "rebind performance evidence to updated source")
 
 
 def write_readme_release_snapshot_fixture(repo_root: Path, now: datetime, provenance: str) -> None:
@@ -3130,6 +3541,7 @@ def run_self_test() -> int:
         repo_root = fixture_root()
         make_complete_fixture(repo_root, now)
         write_beads_ledger(repo_root, [])
+        rebind_fixture_performance_summary(repo_root)
         report = build_report(repo_root, now=now)
         assert_condition(report["overall_status"] == "ready", "fresh fixture should be ready")
         assert_condition(report["overall_ready"] is True, "overall_ready should mirror ready status")
@@ -3160,6 +3572,7 @@ def run_self_test() -> int:
             readme_path.read_text(encoding="utf-8").replace("101/101", "100/101", 1),
             encoding="utf-8",
         )
+        rebind_fixture_performance_summary(repo_root)
         report = build_report(repo_root, now=now)
         readme_blockers = [
             issue
@@ -3179,9 +3592,113 @@ def run_self_test() -> int:
         make_complete_fixture(repo_root, now)
         readme_path = repo_root / "README.md"
         readme_path.write_text(
+            readme_path.read_text(encoding="utf-8").replace(
+                "Full-suite gate: `20/20` gates passed",
+                "Full-suite gate: `19/20` gates passed",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        rebind_fixture_performance_summary(repo_root)
+        full_suite_spec = next(
+            spec for spec in EVIDENCE_SPECS if spec.id == "full_suite_verdict"
+        )
+        full_suite_path = repo_root / full_suite_spec.path
+        full_suite_contents = full_suite_path.read_bytes()
+        full_suite_metadata = full_suite_path.stat()
+        transient_full_suite, transient_full_suite_error = load_json_bytes(
+            full_suite_contents
+        )
+        assert_condition(
+            transient_full_suite_error is None and transient_full_suite is not None,
+            "full-suite mutation fixture must start with valid JSON",
+        )
+        assert transient_full_suite is not None
+        transient_summary = transient_full_suite.get("summary")
+        assert_condition(
+            isinstance(transient_summary, dict),
+            "full-suite mutation fixture must contain a summary object",
+        )
+        assert isinstance(transient_summary, dict)
+        transient_summary["passed"] = 19
+        transient_summary["failed"] = 1
+        transient_full_suite_contents = (
+            json.dumps(transient_full_suite, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        assert_condition(
+            readme_gate_counts(transient_full_suite) == (20, 19, 14, 14),
+            "transient full-suite fixture must agree with the forged README counts",
+        )
+        mutated_during_readme_expectations = False
+        restored_after_readme_expectations = False
+
+        def mutate_full_suite_during_readme_expectations() -> None:
+            nonlocal mutated_during_readme_expectations
+            full_suite_path.write_bytes(transient_full_suite_contents)
+            mutated_during_readme_expectations = True
+
+        def restore_full_suite_after_readme_expectations() -> None:
+            nonlocal restored_after_readme_expectations
+            full_suite_path.write_bytes(full_suite_contents)
+            os.utime(
+                full_suite_path,
+                ns=(
+                    full_suite_metadata.st_atime_ns,
+                    full_suite_metadata.st_mtime_ns,
+                ),
+            )
+            restored_after_readme_expectations = True
+
+        report = build_report(
+            repo_root,
+            now=now,
+            _before_readme_expectations=(
+                mutate_full_suite_during_readme_expectations
+            ),
+            _after_readme_expectations=(
+                restore_full_suite_after_readme_expectations
+            ),
+        )
+        assert_condition(
+            mutated_during_readme_expectations,
+            "README expectation mutation hook did not execute",
+        )
+        assert_condition(
+            restored_after_readme_expectations,
+            "README expectation restoration hook did not execute",
+        )
+        assert_condition(
+            full_suite_path.read_bytes() == full_suite_contents,
+            "README expectation fixture did not restore the evidence bytes",
+        )
+        readme_blockers = [
+            issue
+            for issue in report["blocking_issues"]
+            if issue["kind"] == "readme_snapshot_mismatch"
+            and "refresh_full_suite_counts" in issue["detail"]
+        ]
+        assert_condition(
+            readme_blockers,
+            "transient artifact mutation must not suppress captured README expectations",
+        )
+        full_suite_artifact = next(
+            artifact
+            for artifact in report["artifacts"]
+            if artifact["id"] == full_suite_spec.id
+        )
+        assert_condition(
+            full_suite_artifact["status"] == "ready",
+            "restored evidence must still pass final snapshot revalidation",
+        )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        readme_path = repo_root / "README.md"
+        readme_path.write_text(
             readme_path.read_text(encoding="utf-8").replace("`CERTIFIED`", "`NOT_CERTIFIED`", 1),
             encoding="utf-8",
         )
+        rebind_fixture_performance_summary(repo_root)
         report = build_report(repo_root, now=now)
         readme_blockers = [
             issue
@@ -3205,6 +3722,7 @@ def run_self_test() -> int:
             ),
             encoding="utf-8",
         )
+        rebind_fixture_performance_summary(repo_root)
         report = build_report(repo_root, now=now)
         readme_blockers = [
             issue
@@ -3224,6 +3742,7 @@ def run_self_test() -> int:
         health_delta = json.loads(health_delta_path.read_text(encoding="utf-8"))
         health_delta["generated_at"] = stale_generated
         health_delta_path.write_text(json.dumps(health_delta, sort_keys=True) + "\n", encoding="utf-8")
+        rebind_fixture_performance_summary(repo_root)
         report = build_report(repo_root, now=now)
         readme_blockers = [
             issue
@@ -3240,6 +3759,7 @@ def run_self_test() -> int:
         payload = fixture_payload(EVIDENCE_SPECS[0], stale, "fixture-run")
         assert payload is not None
         write_artifact(repo_root, EVIDENCE_SPECS[0].path, payload, mtime=stale)
+        rebind_fixture_performance_summary(repo_root)
         report = build_report(repo_root, now=now)
         kinds = {issue["kind"] for issue in report["blocking_issues"]}
         assert_condition("stale" in kinds, "stale artifact should block gate mode")
@@ -3255,6 +3775,7 @@ def run_self_test() -> int:
         assert policy_payload is not None
         policy_payload["effective_date_utc"] = format_datetime(stale)
         write_artifact(repo_root, policy_spec.path, policy_payload, mtime=stale)
+        rebind_fixture_performance_summary(repo_root)
         report = build_report(repo_root, now=now)
         policy_artifact = next(
             artifact for artifact in report["artifacts"] if artifact["id"] == "dropin_contract"
@@ -3290,11 +3811,388 @@ def run_self_test() -> int:
         budget_path = "tests/perf/reports/budget_summary.json"
         payload = fixture_payload(EVIDENCE_SPECS[0], now, "fixture-run")
         assert payload is not None
+        duplicate_key_text = json.dumps(payload, sort_keys=True).replace(
+            "{",
+            f'{{"schema":{json.dumps(payload["schema"])},',
+            1,
+        )
+        (repo_root / budget_path).write_text(
+            duplicate_key_text + "\n",
+            encoding="utf-8",
+        )
+        report = build_report(repo_root, now=now)
+        budget_artifact = next(
+            artifact
+            for artifact in report["artifacts"]
+            if artifact["id"] == "perf_budget_summary"
+        )
+        assert_condition(
+            budget_artifact["status"] == "invalid_json",
+            "duplicate-key performance summaries must be invalid JSON",
+        )
+        assert_condition(
+            any(
+                "duplicate JSON object key: schema" in issue["detail"]
+                for issue in budget_artifact["issues"]
+            ),
+            "duplicate-key performance summaries must report the repeated key",
+        )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        payload = fixture_payload(EVIDENCE_SPECS[0], now, "fixture-run")
+        assert payload is not None
         payload["ci_no_data"] = 2
         write_artifact(repo_root, budget_path, payload, mtime=now)
         report = build_report(repo_root, now=now)
         details = "\n".join(issue["detail"] for issue in report["blocking_issues"])
         assert_condition("ci_no_data=2" in details, "no-data budget summary should block")
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        payload = fixture_payload(EVIDENCE_SPECS[0], now, "fixture-run")
+        assert payload is not None
+        payload["claim_readiness"] = {
+            "status": "blocked",
+            "performance_claims_authorized": False,
+            "blocking_reason_codes": ["ci_budget_data_missing"],
+        }
+        write_artifact(repo_root, budget_path, payload, mtime=now)
+        report = build_report(repo_root, now=now)
+        details = "\n".join(issue["detail"] for issue in report["blocking_issues"])
+        assert_condition(
+            "claim_readiness.status='blocked'" in details,
+            "blocked v2 claim_readiness status should block",
+        )
+        assert_condition(
+            "performance_claims_authorized=False" in details,
+            "false v2 performance claim authorization should block",
+        )
+        assert_condition(
+            "blocking_reason_codes=['ci_budget_data_missing']" in details,
+            "non-empty v2 claim-readiness blockers should block",
+        )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        payload = fixture_payload(EVIDENCE_SPECS[0], now, "fixture-run")
+        assert payload is not None
+        payload["schema"] = "pi.perf.budget_summary.v1"
+        write_artifact(repo_root, budget_path, payload, mtime=now)
+        report = build_report(repo_root, now=now)
+        details = "\n".join(issue["detail"] for issue in report["blocking_issues"])
+        assert_condition(
+            "expected schema 'pi.perf.budget_summary.v2'" in details,
+            "legacy v1 budget summary must not authorize current claims",
+        )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        payload, payload_error = load_json(repo_root / budget_path)
+        assert payload_error is None and payload is not None
+        payload["generated_at"] = (
+            now + timedelta(minutes=6)
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        write_artifact(repo_root, budget_path, payload, mtime=now)
+        report = build_report(repo_root, now=now)
+        details = "\n".join(issue["detail"] for issue in report["blocking_issues"])
+        assert_condition(
+            "more than five minutes in the future" in details,
+            "future-dated v2 budget summary must fail closed",
+        )
+
+        payload["generated_at"] = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        payload["source_commit"] = "fedcba9876543210fedcba9876543210fedcba98"
+        write_artifact(repo_root, budget_path, payload, mtime=now)
+        commit_fixture_changes(repo_root, "record forged source binding fixture")
+        report = build_report(repo_root, now=now)
+        details = "\n".join(issue["detail"] for issue in report["blocking_issues"])
+        assert_condition(
+            "could not be resolved" in details,
+            "forged v2 source_commit must fail closed",
+        )
+
+        bound_source_commit = git_output(repo_root, ["rev-parse", "HEAD"])
+        assert bound_source_commit is not None
+        payload["source_commit"] = bound_source_commit.strip()
+        non_ci_result = next(
+            result
+            for result in payload["budget_results"]
+            if result["ci_enforced"] is False
+        )
+        non_ci_result["actual"] = None
+        non_ci_result["status"] = "NO_DATA"
+        payload["pass"] = payload["total_budgets"] - 1
+        payload["no_data"] = 1
+        payload["claim_readiness"] = {
+            "status": "blocked",
+            "performance_claims_authorized": False,
+            "blocking_reason_codes": ["budget_data_missing"],
+        }
+        write_artifact(repo_root, budget_path, payload, mtime=now)
+        report = build_report(repo_root, now=now)
+        details = "\n".join(issue["detail"] for issue in report["blocking_issues"])
+        assert_condition(
+            "blocking_reason_codes=['budget_data_missing']" in details,
+            "global no-data must block even when the CI subset is green",
+        )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        payload, payload_error = load_json(repo_root / budget_path)
+        assert payload_error is None and payload is not None
+        payload.pop("budget_results")
+        write_artifact(repo_root, budget_path, payload, mtime=now)
+        report = build_report(repo_root, now=now)
+        details = "\n".join(issue["detail"] for issue in report["blocking_issues"])
+        assert_condition(
+            "budget_results" in details and "missing" in details,
+            "aggregate-only performance summaries must fail closed",
+        )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        write_artifact(
+            repo_root,
+            "untracked-release-input.txt",
+            None,
+            text="untracked source mutation\n",
+        )
+        report = build_report(repo_root, now=now)
+        details = "\n".join(issue["detail"] for issue in report["blocking_issues"])
+        assert_condition(
+            "repository is not clean" in details,
+            "untracked source mutations must invalidate performance claims",
+        )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        cargo_path = repo_root / "Cargo.toml"
+        cargo_path.write_text(
+            cargo_path.read_text(encoding="utf-8") + "\n# staged mutation\n",
+            encoding="utf-8",
+        )
+        staged = subprocess.run(
+            ["git", "-C", str(repo_root), "add", "--", "Cargo.toml"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert_condition(staged.returncode == 0, "failed to stage source mutation fixture")
+        report = build_report(repo_root, now=now)
+        details = "\n".join(issue["detail"] for issue in report["blocking_issues"])
+        assert_condition(
+            "repository is not clean" in details,
+            "staged source mutations must invalidate performance claims",
+        )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        head_advanced = False
+
+        def advance_head_between_evidence_checks(index: int) -> None:
+            nonlocal head_advanced
+            if index != 0 or head_advanced:
+                return
+            write_artifact(
+                repo_root,
+                "tests/perf/reports/report_head_advance.json",
+                {
+                    "schema": "pi.swarm.report_head_advance_fixture.v1",
+                    "generated_at": format_datetime(now),
+                },
+                mtime=now,
+            )
+            commit_fixture_changes(
+                repo_root,
+                "advance HEAD between claim-readiness evidence checks",
+            )
+            head_advanced = True
+
+        report = build_report(
+            repo_root,
+            now=now,
+            _after_evidence_check=advance_head_between_evidence_checks,
+        )
+        source_binding_details = "\n".join(
+            issue["detail"]
+            for issue in report["blocking_issues"]
+            if issue["kind"] == "source_binding"
+        )
+        assert_condition(head_advanced, "HEAD-advance fixture hook did not execute")
+        assert_condition(
+            "different repository HEAD" in source_binding_details
+            or "repository changed while the claim-readiness report was being assembled"
+            in source_binding_details,
+            "one report must not combine release evidence captured from different commits",
+        )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        late_mutation_spec = next(
+            spec
+            for spec in reversed(EVIDENCE_SPECS)
+            if spec.claim_surface == "release_facing"
+        )
+        mutated_after_check = False
+
+        def mutate_already_checked_artifact() -> None:
+            nonlocal mutated_after_check
+            if mutated_after_check:
+                return
+            artifact_path = repo_root / late_mutation_spec.path
+            artifact_path.write_bytes(artifact_path.read_bytes() + b"\n")
+            mutated_after_check = True
+
+        report = build_report(
+            repo_root,
+            now=now,
+            _before_final_binding_check=mutate_already_checked_artifact,
+        )
+        source_binding_details = "\n".join(
+            issue["detail"]
+            for issue in report["blocking_issues"]
+            if issue["kind"] == "source_binding"
+        )
+        assert_condition(
+            mutated_after_check,
+            "post-check artifact-mutation fixture hook did not execute",
+        )
+        assert_condition(
+            "changed after its evidence check" in source_binding_details,
+            "one report must revalidate every captured artifact after all checks finish",
+        )
+        mutated_artifact = next(
+            artifact
+            for artifact in report["artifacts"]
+            if artifact["id"] == late_mutation_spec.id
+        )
+        assert_condition(
+            mutated_artifact["status"] == "source_binding"
+            and any(
+                issue["kind"] == "source_binding"
+                for issue in mutated_artifact["issues"]
+            ),
+            "late source-binding failures must appear on the affected artifact",
+        )
+        mutated_category = next(
+            category
+            for category in report["categories"]
+            if category["category"] == late_mutation_spec.category
+        )
+        assert_condition(
+            mutated_category["status"] == "blocked"
+            and mutated_category["blocking_issues"] >= 1,
+            "late source-binding failures must block the affected category summary",
+        )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        activity_digest_spec = next(
+            spec for spec in EVIDENCE_SPECS if spec.id == "activity_ledger_digest"
+        )
+        payload, payload_error = load_json(repo_root / activity_digest_spec.path)
+        assert payload_error is None and payload is not None
+        payload["generated_at"] = format_datetime(now + timedelta(minutes=6))
+        write_artifact(repo_root, activity_digest_spec.path, payload, mtime=now)
+        rebind_fixture_performance_summary(repo_root)
+        report = build_report(repo_root, now=now)
+        activity_digest_artifact = next(
+            artifact
+            for artifact in report["artifacts"]
+            if artifact["id"] == activity_digest_spec.id
+        )
+        assert_condition(
+            activity_digest_artifact["status"] == "future_timestamp",
+            "future-dated non-performance release evidence must fail closed",
+        )
+        assert_condition(
+            any(
+                issue["kind"] == "future_timestamp"
+                for issue in activity_digest_artifact["issues"]
+            ),
+            "future-dated release evidence must report its clock-integrity failure",
+        )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        activity_digest_path = repo_root / activity_digest_spec.path
+        symlink_target = activity_digest_path.with_name("activity_digest_target.json")
+        activity_digest_path.rename(symlink_target)
+        activity_digest_path.symlink_to(symlink_target.name)
+        report = build_report(repo_root, now=now)
+        activity_digest_artifact = next(
+            artifact
+            for artifact in report["artifacts"]
+            if artifact["id"] == activity_digest_spec.id
+        )
+        assert_condition(
+            any(
+                issue["kind"] == "source_binding"
+                and "symlink components" in issue["detail"]
+                for issue in activity_digest_artifact["issues"]
+            ),
+            "release-facing evidence reached through a symlink must fail source binding",
+        )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        activity_digest_path = repo_root / activity_digest_spec.path
+        original_activity_bytes = activity_digest_path.read_bytes()
+        original_capture = globals()["capture_release_artifact_snapshot"]
+
+        def capture_then_substitute(
+            fixture_root: Path,
+            fixture_path: str,
+        ) -> tuple[ReleaseArtifactSnapshot | None, str | None]:
+            snapshot, error = original_capture(fixture_root, fixture_path)
+            if snapshot is not None and fixture_path == activity_digest_spec.path:
+                snapshot.full_path.write_bytes(snapshot.contents + b" ")
+            return snapshot, error
+
+        globals()["capture_release_artifact_snapshot"] = capture_then_substitute
+        try:
+            report = build_report(repo_root, now=now)
+        finally:
+            globals()["capture_release_artifact_snapshot"] = original_capture
+            activity_digest_path.write_bytes(original_activity_bytes)
+        activity_digest_artifact = next(
+            artifact
+            for artifact in report["artifacts"]
+            if artifact["id"] == activity_digest_spec.id
+        )
+        assert_condition(
+            any(
+                issue["kind"] == "source_binding"
+                and "raw bytes changed during validation" in issue["detail"]
+                for issue in activity_digest_artifact["issues"]
+            ),
+            "production report path must reject validate-then-substitute TOCTOU",
+        )
+
+        if os.name != "nt":
+            repo_root = fixture_root()
+            make_complete_fixture(repo_root, now)
+            activity_digest_path = repo_root / activity_digest_spec.path
+            os.chmod(
+                activity_digest_path,
+                activity_digest_path.stat().st_mode | 0o100,
+            )
+            report = build_report(repo_root, now=now)
+            activity_digest_artifact = next(
+                artifact
+                for artifact in report["artifacts"]
+                if artifact["id"] == activity_digest_spec.id
+            )
+            assert_condition(
+                any(
+                    issue["kind"] == "source_binding"
+                    and "executable mode does not exactly match HEAD" in issue["detail"]
+                    for issue in activity_digest_artifact["issues"]
+                ),
+                "production report path must bind live executable mode to HEAD",
+            )
 
         repo_root = fixture_root()
         make_complete_fixture(repo_root, now)
@@ -3305,6 +4203,7 @@ def run_self_test() -> int:
         assert payload is not None
         payload["current_summary"] = {"skipped": 1, "excluded": 1}
         write_artifact(repo_root, health_delta_spec.path, payload, mtime=now)
+        rebind_fixture_performance_summary(repo_root)
         report = build_report(repo_root, now=now)
         health_delta_blockers = [
             issue
@@ -3334,6 +4233,7 @@ def run_self_test() -> int:
         payload = fixture_payload(EVIDENCE_SPECS[1], now, "other-run")
         assert payload is not None
         write_artifact(repo_root, EVIDENCE_SPECS[1].path, payload, mtime=now)
+        rebind_fixture_performance_summary(repo_root)
         report = build_report(repo_root, now=now)
         kinds = {issue["kind"] for issue in report["blocking_issues"]}
         assert_condition(
@@ -3381,6 +4281,7 @@ def run_self_test() -> int:
         assign_path(stress_payload, "results.reactor.s3fifo.fallback_event_total", 1)
         assign_path(stress_payload, "results.reactor.bravo.rollbacks", 3)
         write_artifact(repo_root, EVIDENCE_SPECS[1].path, stress_payload, mtime=now)
+        rebind_fixture_performance_summary(repo_root)
         report = build_report(repo_root, now=now)
         hostcall = report["hostcall_queue_telemetry"]
         assert_report_matches_golden(report, "hostcall_fallback_heavy_projection.json")
@@ -3409,6 +4310,7 @@ def run_self_test() -> int:
         assert stress_payload is not None
         stress_payload["results"] = {}
         write_artifact(repo_root, EVIDENCE_SPECS[1].path, stress_payload, mtime=now)
+        rebind_fixture_performance_summary(repo_root)
         report = build_report(repo_root, now=now)
         assert_report_matches_golden(report, "hostcall_missing_telemetry_projection.json")
         missing_source = hostcall_source(report, "perf_stress_triage")
@@ -3444,6 +4346,7 @@ def run_self_test() -> int:
             }
         }
         write_artifact(repo_root, EVIDENCE_SPECS[1].path, stress_payload, mtime=now)
+        rebind_fixture_performance_summary(repo_root)
         report = build_report(repo_root, now=now)
         assert_report_matches_golden(report, "hostcall_missing_fields_projection.json")
         hostcall = report["hostcall_queue_telemetry"]
@@ -3473,6 +4376,118 @@ def run_self_test() -> int:
             in missing_source["recommended_operator_action"],
             "partial hostcall telemetry should surface the exact regeneration action",
         )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        write_artifact(
+            repo_root,
+            ".beads/issues.jsonl",
+            None,
+            text=(
+                '{"id":"bd-original","id":"bd-forged",'
+                '"status":"in_progress"}\n'
+            ),
+        )
+        report = build_report(repo_root, now=now)
+        assert_condition(
+            any(
+                ".beads/issues.jsonl:1: invalid JSON: "
+                "duplicate JSON object key: id" in warning
+                for warning in report["stale_claims"]["warnings"]
+            ),
+            "duplicate-key Beads JSONL rows must be rejected with their source line",
+        )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        write_beads_ledger(
+            repo_root,
+            [
+                {
+                    "id": "bd-duplicate-metadata",
+                    "status": "in_progress",
+                    "updated_at": format_datetime(now),
+                    "metadata": (
+                        '{"file_paths":["src/original.rs"],'
+                        '"file_paths":["src/forged.rs"]}'
+                    ),
+                }
+            ],
+        )
+        report = build_report(repo_root, now=now)
+        assert_condition(
+            any(
+                "invalid metadata JSON: duplicate JSON object key: file_paths"
+                in warning
+                for warning in report["stale_claims"]["warnings"]
+            ),
+            "duplicate-key JSON-encoded metadata must be rejected before path analysis",
+        )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        old_update = format_datetime(now - timedelta(hours=30))
+        future_timestamp = now + timedelta(minutes=6)
+        write_beads_ledger(
+            repo_root,
+            [
+                {
+                    "id": "bd-future-bead",
+                    "status": "in_progress",
+                    "updated_at": format_datetime(future_timestamp),
+                },
+                {
+                    "id": "bd-future-activity",
+                    "status": "in_progress",
+                    "updated_at": old_update,
+                },
+                {
+                    "id": "bd-future-commit",
+                    "status": "in_progress",
+                    "updated_at": old_update,
+                },
+            ],
+        )
+        future_activity_path = "tests/full_suite_gate/swarm_activity_events.jsonl"
+        write_activity_jsonl(
+            repo_root,
+            future_activity_path,
+            [
+                {
+                    "bead_id": "bd-future-activity",
+                    "timestamp": format_datetime(future_timestamp),
+                    "kind": "agent_mail",
+                }
+            ],
+        )
+        report = build_report(
+            repo_root,
+            now=now,
+            stale_claim_activity_paths=(future_activity_path,),
+            stale_claim_dirty_worktree_paths=(),
+            stale_claim_recent_commit_activity={
+                "bd-future-commit": ClaimActivityEvidence(
+                    bead_id="bd-future-commit",
+                    timestamp=future_timestamp,
+                    source="git log:future-fixture",
+                    agent_name=None,
+                )
+            },
+        )
+        for bead_id in (
+            "bd-future-bead",
+            "bd-future-activity",
+            "bd-future-commit",
+        ):
+            item = stale_claim_item(report, bead_id)
+            assert_condition(
+                item["classification"] == "invalid_future_timestamp",
+                f"{bead_id} must reject materially future timestamps",
+            )
+            assert_condition(
+                item["operator_bucket"] == "ambiguous",
+                f"{bead_id} future timestamp must not be classified fresh",
+            )
 
         repo_root = fixture_root()
         make_complete_fixture(repo_root, now)
@@ -3908,7 +4923,40 @@ def run_self_test() -> int:
 
 
 def fixture_root() -> Path:
-    return Path(tempfile.mkdtemp(prefix="pi_claim_readiness_"))
+    global _FIXTURE_GIT_TEMPLATE
+    if _FIXTURE_GIT_TEMPLATE is None:
+        template = Path(tempfile.mkdtemp(prefix="pi_claim_readiness_git_"))
+        commands = (
+            ("init", "-b", "main"),
+            ("config", "user.name", "Pi claim-readiness fixture"),
+            ("config", "user.email", "pi-fixture@example.invalid"),
+            ("commit", "--allow-empty", "-m", "fixture source baseline"),
+        )
+        for args in commands:
+            result = subprocess.run(
+                ["git", "-C", str(template), *args],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                raise AssertionError(
+                    f"fixture template git {' '.join(args)} failed: {result.stderr.strip()}"
+                )
+        _FIXTURE_GIT_TEMPLATE = template
+
+    root = Path(tempfile.mkdtemp(prefix="pi_claim_readiness_"))
+    clone = subprocess.run(
+        ["git", "clone", "--quiet", "--shared", str(_FIXTURE_GIT_TEMPLATE), str(root)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if clone.returncode != 0:
+        raise AssertionError(f"fixture git clone failed: {clone.stderr.strip()}")
+    return root
 
 
 def parse_args() -> argparse.Namespace:

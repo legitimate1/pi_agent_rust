@@ -1,10 +1,10 @@
-//! Pi - High-performance AI coding agent CLI
+//! Pi - Native AI coding agent CLI
 //!
 //! This library provides the core functionality for the Pi CLI tool,
 //! a Rust port of pi-mono (TypeScript) with emphasis on:
-//! - Performance: Sub-100ms startup, smooth TUI at 60fps
-//! - Reliability: No panics in normal operation
-//! - Efficiency: Single binary, minimal dependencies
+//! - Performance-oriented native architecture with instrumented startup and TUI paths
+//! - Reliability through explicit errors, bounded cancellation, and conformance tests
+//! - Distribution through one supported end-user binary in official release archives
 //!
 //! ## Public API policy
 //!
@@ -52,6 +52,18 @@
 // paths the same way integration tests do.
 extern crate self as pi;
 
+/// Serialize unit tests that temporarily change the process-wide current
+/// directory. Rust's test runner executes modules concurrently, so separate
+/// per-module locks do not prevent one module from observing another module's
+/// temporary directory.
+#[cfg(test)]
+pub(crate) fn test_current_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 // Gap H: jemalloc allocator for allocation-heavy paths.
 // Declared in the library so all project binaries/tests share allocator behavior.
 // BSD-family targets stay on their platform allocator to avoid allocator-domain
@@ -62,24 +74,44 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 
 #[doc(hidden)]
 pub mod acp;
+pub mod advisor;
 #[doc(hidden)]
 pub mod agent;
 #[doc(hidden)]
 pub mod agent_cx;
 #[doc(hidden)]
+pub mod agent_hub;
+#[doc(hidden)]
 pub mod app;
+pub mod approval;
+pub mod ask;
+#[doc(hidden)]
+pub mod ast_tools;
 #[doc(hidden)]
 pub mod auth;
 #[doc(hidden)]
 pub mod autocomplete;
 #[doc(hidden)]
+pub mod bash_mediation;
+#[doc(hidden)]
+pub mod browser;
+#[doc(hidden)]
+pub mod btw;
+#[doc(hidden)]
 pub mod buffer_shim;
+pub mod checkpoint;
 #[doc(hidden)]
 pub mod cli;
+pub mod commit_split;
 #[doc(hidden)]
 pub mod compaction;
 #[doc(hidden)]
+pub mod compaction_snap;
+#[doc(hidden)]
 pub mod compaction_worker;
+pub mod completions;
+#[doc(hidden)]
+pub mod computer;
 #[doc(hidden)]
 pub mod config;
 #[doc(hidden)]
@@ -88,14 +120,29 @@ pub mod conformance;
 pub mod conformance_shapes;
 #[doc(hidden)]
 pub mod connectors;
+pub mod context_files;
+pub mod crash;
 #[doc(hidden)]
 pub mod crypto_shim;
+pub mod current_time;
+// Always declared: the module is dual-mode internally (its non-feature
+// `imp` degrades to named errors), and main.rs's `pi profile` arm calls
+// its unconditional helpers — gating the declaration broke default builds.
+#[doc(hidden)]
+pub mod debug;
+#[doc(hidden)]
+pub mod delight;
+pub mod dialects;
 #[doc(hidden)]
 pub mod doctor;
+#[doc(hidden)]
+pub(crate) mod embedded_assets;
 #[doc(hidden)]
 pub mod error;
 #[doc(hidden)]
 pub mod error_hints;
+#[doc(hidden)]
+pub mod eval;
 #[doc(hidden)]
 pub mod extension_conformance_matrix;
 #[doc(hidden)]
@@ -124,17 +171,25 @@ pub mod extension_validation;
 pub mod extensions;
 #[doc(hidden)]
 pub mod extensions_js;
+pub mod failover;
 #[doc(hidden)]
 pub mod file_lock;
 #[doc(hidden)]
 pub mod flake_classifier;
 #[doc(hidden)]
+pub mod gallery;
+pub mod gc;
+#[doc(hidden)]
+pub mod github;
+pub mod handoff;
+#[doc(hidden)]
 pub mod hostcall_amac;
+#[doc(hidden)]
+pub mod hostcall_egraph;
 #[doc(hidden)]
 pub mod hostcall_io_uring_lane;
 #[doc(hidden)]
 pub mod hostcall_queue;
-#[doc(hidden)]
 pub mod hostcall_rewrite;
 #[doc(hidden)]
 pub mod hostcall_s3_fifo;
@@ -146,11 +201,30 @@ pub mod hostcall_trace_jit;
 pub mod http;
 #[doc(hidden)]
 pub mod http_shim;
+#[doc(hidden)]
+pub mod hub;
 #[cfg(feature = "tui")]
 #[doc(hidden)]
 pub mod interactive;
+#[cfg(feature = "ftui")]
+#[doc(hidden)]
+pub mod interactive_ftui;
+#[doc(hidden)]
+pub mod jobs;
 #[doc(hidden)]
 pub mod keybindings;
+#[doc(hidden)]
+pub mod lsp;
+#[doc(hidden)]
+pub mod magic_keywords;
+#[doc(hidden)]
+pub mod markdown_rich;
+#[doc(hidden)]
+pub mod mcp;
+#[doc(hidden)]
+pub mod media_tools;
+#[doc(hidden)]
+pub mod memory;
 #[doc(hidden)]
 pub mod migrations;
 #[doc(hidden)]
@@ -162,6 +236,8 @@ pub mod model_selector;
 #[doc(hidden)]
 pub mod models;
 #[doc(hidden)]
+pub mod overlay_system;
+#[doc(hidden)]
 pub mod package_manager;
 #[doc(hidden)]
 pub mod perf_build;
@@ -170,8 +246,12 @@ pub mod permissions;
 #[cfg(feature = "wasm-host")]
 #[doc(hidden)]
 pub mod pi_wasm;
+pub mod plan;
 #[doc(hidden)]
 pub mod platform;
+#[doc(hidden)]
+pub mod pmu_telemetry;
+pub mod profiler;
 #[doc(hidden)]
 pub mod provider;
 #[doc(hidden)]
@@ -183,14 +263,24 @@ pub mod resource_governor;
 #[doc(hidden)]
 pub mod resources;
 #[doc(hidden)]
+pub mod review;
+#[doc(hidden)]
 pub mod rpc;
 #[doc(hidden)]
 pub mod scheduler;
 pub mod sdk;
 #[doc(hidden)]
+pub mod secrets;
+#[doc(hidden)]
+pub mod security_scan;
+#[doc(hidden)]
+pub mod self_update;
+#[doc(hidden)]
 pub mod semantic_workspace_graph;
 #[doc(hidden)]
 pub mod session;
+#[doc(hidden)]
+pub mod session_import;
 #[doc(hidden)]
 pub mod session_index;
 #[doc(hidden)]
@@ -204,7 +294,14 @@ pub mod session_sqlite;
 #[doc(hidden)]
 pub mod session_store_v2;
 #[doc(hidden)]
+pub mod skills_managed;
 pub mod sse;
+pub mod stats;
+#[doc(hidden)]
+pub mod status_line;
+pub mod stream_rules;
+#[doc(hidden)]
+pub mod subagents;
 #[doc(hidden)]
 pub mod swarm_activity_ledger;
 #[doc(hidden)]
@@ -218,15 +315,31 @@ pub mod terminal_images;
 #[doc(hidden)]
 pub mod theme;
 #[doc(hidden)]
+pub mod todo;
+#[doc(hidden)]
+pub mod token_count;
 pub mod tools;
 #[doc(hidden)]
 pub mod tui;
+pub mod turn_recovery;
+pub mod undo;
+pub mod url_read;
+#[doc(hidden)]
+pub mod url_router;
+pub mod usage;
 #[doc(hidden)]
 pub mod validation_broker;
 #[doc(hidden)]
 pub mod vcr;
 #[doc(hidden)]
 pub mod version_check;
+pub mod web_remote;
+pub mod web_search;
+pub mod workspace;
+pub mod workspace_trust;
+#[doc(hidden)]
+pub mod worktree_iso;
+pub mod xdev;
 
 pub use error::{Error, Result as PiResult};
 #[doc(hidden)]

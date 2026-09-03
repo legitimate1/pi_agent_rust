@@ -3,6 +3,7 @@
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionCliFlag {
@@ -43,6 +44,23 @@ const ROOT_SUBCOMMANDS: &[&str] = &[
     "config",
     "doctor",
     "migrate",
+    "usage",
+    "gc",
+    "review",
+    "rules",
+    "handoff",
+    "commit",
+    "worktree",
+    "completions",
+    "__complete",
+    "token",
+    "stats",
+    "profile",
+    "import",
+    "grievances",
+    "self-update",
+    "web",
+    "gallery",
 ];
 
 fn known_long_option(name: &str) -> Option<LongOptionSpec> {
@@ -59,26 +77,54 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "verbose"
         | "no-tools"
         | "no-extensions"
+        | "plan-mode"
+        | "plan-yolo"
+        | "yolo"
+        | "auto-approve"
         | "explain-extension-policy"
         | "explain-repair-policy"
         | "no-skills"
+        // bd-cv653.3.12 / bd-cv653.7.12 / bd-cv653.7.12.1: the pre-parser
+        // must pass these through to clap — any top-level long missing from
+        // this match gets silently diverted to extension-flag extraction.
+        | "crash-test"
+        | "profile"
         | "no-prompt-templates"
         | "no-themes"
         | "list-providers"
+        | "refresh-models"
+        | "persist-models"
+        | "trust"
+        // ftui migration flags (bd-cv653.9.1). Listed unconditionally: on
+        // non-ftui builds clap still rejects them with a proper error instead
+        // of the pre-parser silently diverting them to extension flags.
+        | "ftui"
+        | "classic"
+        | "classic-tui"
+        | "charmed"
+        | "bubbletea"
+        | "inline"
         | "hide-cwd-in-prompt" => (false, false),
         "provider"
         | "model"
         | "api-key"
         | "models"
+        | "smol"
+        | "slow"
+        | "plan"
+        | "advisor"
+        | "approval-mode"
         | "thinking"
         | "system-prompt"
         | "append-system-prompt"
         | "session"
         | "session-dir"
+        | "add-dir"
         | "session-durability"
         | "mode"
         | "tools"
         | "extension"
+        | "mcp-config"
         | "extension-policy"
         | "repair-policy"
         | "skill"
@@ -86,7 +132,10 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "theme"
         | "theme-path"
         | "max-tool-iterations"
-        | "export" => (true, false),
+        | "max-time"
+        | "request-timeout"
+        | "export"
+        | "fetch-models" => (true, false),
         "list-models" => (true, true),
         _ => return None,
     };
@@ -184,15 +233,12 @@ fn preprocess_extension_flags(raw_args: &[String]) -> (Vec<String>, Vec<Extensio
             let mut value = inline_value;
             if value.is_none() {
                 let next = raw_args.get(index + 1);
-                if let Some(next) = next {
-                    if next.ne("--")
-                        && (!next.starts_with('-')
-                            || next.eq("-")
-                            || is_negative_numeric_token(next))
-                    {
-                        value = Some(next.clone());
-                        index += 1;
-                    }
+                if let Some(next) = next
+                    && next.ne("--")
+                    && (!next.starts_with('-') || next.eq("-") || is_negative_numeric_token(next))
+                {
+                    value = Some(next.clone());
+                    index += 1;
                 }
             }
             extracted.push(ExtensionCliFlag {
@@ -306,6 +352,40 @@ pub struct Cli {
     #[arg(long)]
     pub models: Option<String>,
 
+    /// Model spec for the `smol` role (cheap/fast work, e.g. subagent fan-out).
+    /// Format: provider/model with optional :thinking suffix (bd-cv653.3.1).
+    #[arg(long, value_name = "PROVIDER/MODEL")]
+    pub smol: Option<String>,
+
+    /// Model spec for the `slow` role (deep reasoning).
+    #[arg(long, value_name = "PROVIDER/MODEL")]
+    pub slow: Option<String>,
+
+    /// Model spec for the `plan` role (plan mode).
+    #[arg(long, value_name = "PROVIDER/MODEL")]
+    pub plan: Option<String>,
+
+    /// Model spec for the `advisor` role (turn-review second model).
+    #[arg(long, value_name = "PROVIDER/MODEL")]
+    pub advisor: Option<String>,
+
+    /// Start in plan mode: read-only planning until a plan is approved
+    /// (bd-cv653.3.5).
+    #[arg(long)]
+    pub plan_mode: bool,
+
+    /// Auto-approve submitted plans without review (unattended runs).
+    #[arg(long)]
+    pub plan_yolo: bool,
+
+    /// Tool approval mode: always-ask (default), write, or yolo (bd-cv653.3.19).
+    #[arg(long, value_parser = ["always-ask", "write", "yolo"])]
+    pub approval_mode: Option<String>,
+
+    /// Shorthand alias for --approval-mode yolo (bd-cv653.3.19).
+    #[arg(long, alias = "auto-approve")]
+    pub yolo: bool,
+
     /// HTTP request timeout in seconds for provider API calls.
     ///
     /// Bounds connect + request + first-response-header latency for each
@@ -322,7 +402,7 @@ pub struct Cli {
 
     // === Thinking/Reasoning ===
     /// Extended thinking level
-    #[arg(long, value_parser = ["off", "minimal", "low", "medium", "high", "xhigh"])]
+    #[arg(long, value_parser = ["off", "minimal", "low", "medium", "high", "xhigh", "max"])]
     pub thinking: Option<String>,
 
     // === System Prompt ===
@@ -354,6 +434,21 @@ pub struct Cli {
     /// Don't save session (ephemeral)
     #[arg(long)]
     pub no_session: bool,
+
+    /// Launch the FrankenTUI interactive stack (default when built with `ftui`).
+    #[cfg(feature = "ftui")]
+    #[arg(long)]
+    pub ftui: bool,
+
+    /// Force the classic charmed_rust TUI stack instead of the default ftui stack.
+    #[arg(long, aliases = ["classic-tui", "charmed", "bubbletea"])]
+    pub classic: bool,
+
+    /// With ftui: run inline (UI at the bottom, shell scrollback
+    /// preserved) instead of the alternate screen.
+    #[cfg(feature = "ftui")]
+    #[arg(long)]
+    pub inline: bool,
 
     /// Session durability mode: strict, balanced, or throughput
     #[arg(
@@ -413,10 +508,13 @@ pub struct Cli {
     #[arg(long)]
     pub no_tools: bool,
 
-    /// Specific tools to enable (comma-separated: read,write,edit,bash,grep,find,ls,hashline_edit)
+    /// Specific tools to enable (comma-separated). Default: the essential
+    /// set plus discoverable tools behind the xdev dispatcher (bd-cv653.1.6);
+    /// `subagent` stays opt-in only.
     #[arg(
         long,
-        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit"
+        value_name = "TOOLS",
+        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit,web_search,ast_grep,ast_edit,lsp,debug,ask,todo,submit_plan,jobs,hub,current_time"
     )]
     pub tools: String,
 
@@ -425,9 +523,21 @@ pub struct Cli {
     #[arg(short = 'e', long, action = clap::ArgAction::Append)]
     pub extension: Vec<String>,
 
+    /// Extra MCP server config file (can be repeated; highest precedence
+    /// over .pi/mcp.json, .agents/mcp.json, ~/.pi/agent/mcp.json, and
+    /// discovered foreign configs)
+    #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
+    pub mcp_config: Vec<PathBuf>,
+
     /// Disable extension discovery
     #[arg(long)]
     pub no_extensions: bool,
+
+    /// Trust this workspace: allow project-local .pi/settings.json packages
+    /// and .pi/extensions to load and execute (persisted for the current
+    /// content digest; content changes re-prompt)
+    #[arg(long)]
+    pub trust: bool,
 
     /// Extension capability policy: safe, balanced, or permissive (legacy alias: standard)
     #[arg(long, value_name = "PROFILE")]
@@ -450,7 +560,7 @@ pub struct Cli {
     #[arg(long, action = clap::ArgAction::Append)]
     pub skill: Vec<String>,
 
-    /// Disable skill discovery
+    /// Disable skill discovery and configured skills (explicit --skill paths still load)
     #[arg(long)]
     pub no_skills: bool,
 
@@ -498,6 +608,33 @@ pub struct Cli {
     #[arg(long, value_name = "N")]
     pub max_tool_iterations: Option<usize>,
 
+    /// Wall-clock cap for a run in seconds (bd-cv653.3.7): the agent pauses
+    /// politely at the NEXT TURN BOUNDARY with a 'time cap reached' marker
+    /// (never mid-tool-call), flushes session state, and exits 0 in print
+    /// mode. Distinct from --request-timeout (per-request) and
+    /// --max-tool-iterations (per-turn count).
+    #[arg(long, value_name = "SECONDS")]
+    pub max_time: Option<u64>,
+
+    /// Additional workspace roots (bd-cv653.3.12): grant the agent access to
+    /// extra directories beyond the primary cwd. Repeatable. Tools and the
+    /// extension filesystem connector can then touch paths under ANY root;
+    /// paths outside all roots stay fail-closed.
+    #[arg(long = "add-dir", value_name = "DIR")]
+    pub add_dir: Vec<std::path::PathBuf>,
+    // === Export & Listing ===
+    /// Export session file to HTML
+
+    /// Inject an intentional panic to verify the crash-bundle pipeline
+    /// (bd-cv653.7.12). Hidden smoke hook.
+    #[arg(long, hide = true)]
+    pub crash_test: bool,
+    /// Start the sampling profiler for this run and write folded stacks
+    /// under <agent-dir>/profiles/ (bd-cv653.7.12.1). Requires the
+    /// `profiler` feature.
+    #[arg(long)]
+    pub profile: bool,
+
     // === Export & Listing ===
     /// Export session file to HTML
     #[arg(long)]
@@ -515,15 +652,22 @@ pub struct Cli {
 
     /// Fetch the live model catalog from a provider's `/v1/models` endpoint
     /// (OpenAI-compatible providers only). Falls back to the static registry
-    /// when the live call fails. Results are cached in-memory for 5 minutes;
-    /// set `PI_DISABLE_MODEL_CACHE=1` to bypass.
+    /// when the live call fails. Long-lived library callers reuse successful
+    /// results in-process for 5 minutes; separate CLI invocations do not share
+    /// that cache. Set `PI_DISABLE_MODEL_CACHE=1` to bypass it.
     #[arg(long, value_name = "PROVIDER")]
     pub fetch_models: Option<String>,
 
-    /// When used with `--fetch-models`, ignore any cached entry and force a
-    /// fresh network call (still falls back to the static registry on error).
+    /// When used with `--fetch-models`, ignore any cached entry and require a
+    /// successful fresh network call. Live-refresh failures are reported
+    /// instead of being disguised as static-registry results.
     #[arg(long, requires = "fetch_models")]
     pub refresh_models: bool,
+
+    /// Persist a verified live or same-process cached `--fetch-models` catalog
+    /// to `models.fetched.json`. Static fallback results are never persisted.
+    #[arg(long, requires = "fetch_models")]
+    pub persist_models: bool,
 
     // === Subcommands ===
     #[command(subcommand)]
@@ -537,8 +681,12 @@ pub struct Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, ROOT_SUBCOMMANDS, parse_with_extension_flags};
-    use clap::{CommandFactory, Parser};
+    use super::{
+        Cli, Commands, ExtensionCliFlag, ROOT_SUBCOMMANDS, known_long_option,
+        parse_with_extension_flags,
+    };
+    use clap::{CommandFactory, Parser, error::ErrorKind};
+    use std::path::PathBuf;
 
     // ── 1. Basic flag parsing ────────────────────────────────────────
 
@@ -655,6 +803,36 @@ mod tests {
         assert_eq!(cli.model.as_deref(), Some("claude-opus-4"));
     }
 
+    /// bd-cv653.3.1: role model flags parse independently and together.
+    #[test]
+    fn parse_role_model_flags() {
+        let cli = Cli::parse_from(["pi", "--smol", "openai/gpt-5-mini"]);
+        assert_eq!(cli.smol.as_deref(), Some("openai/gpt-5-mini"));
+        assert!(cli.slow.is_none());
+        assert!(cli.plan.is_none());
+
+        let cli = Cli::parse_from([
+            "pi",
+            "--smol",
+            "openai/gpt-5-mini",
+            "--slow",
+            "anthropic/claude-opus-4-7:max",
+            "--plan",
+            "google/gemini-3-pro",
+        ]);
+        assert_eq!(cli.smol.as_deref(), Some("openai/gpt-5-mini"));
+        assert_eq!(cli.slow.as_deref(), Some("anthropic/claude-opus-4-7:max"));
+        assert_eq!(cli.plan.as_deref(), Some("google/gemini-3-pro"));
+    }
+
+    /// bd-cv653.3.1: role flags compose with the classic model flags.
+    #[test]
+    fn parse_role_flags_compose_with_model_flag() {
+        let cli = Cli::parse_from(["pi", "--model", "gpt-5.5", "--smol", "openai/gpt-5-mini"]);
+        assert_eq!(cli.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(cli.smol.as_deref(), Some("openai/gpt-5-mini"));
+    }
+
     #[test]
     fn parse_provider_flag() {
         let cli = Cli::parse_from(["pi", "--provider", "openai"]);
@@ -715,7 +893,7 @@ mod tests {
 
     #[test]
     fn parse_all_thinking_levels() {
-        for level in &["off", "minimal", "low", "medium", "high", "xhigh"] {
+        for level in &["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
             let cli = Cli::parse_from(["pi", "--thinking", level]);
             assert_eq!(cli.thinking.as_deref(), Some(*level));
         }
@@ -1006,6 +1184,130 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn fetch_models_flags_survive_extension_flag_preprocessing() {
+        let parsed = parse_with_extension_flags(
+            [
+                "pi",
+                "--fetch-models",
+                "openrouter",
+                "--refresh-models",
+                "--persist-models",
+                "--request-timeout",
+                "17",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        )
+        .expect("parse fetch-models flags");
+
+        assert_eq!(parsed.cli.fetch_models.as_deref(), Some("openrouter"));
+        assert!(parsed.cli.refresh_models);
+        assert!(parsed.cli.persist_models);
+        assert_eq!(parsed.cli.request_timeout, Some(17));
+        assert!(
+            parsed.extension_flags.is_empty(),
+            "built-in model flags must not be reclassified as extension flags"
+        );
+    }
+
+    #[test]
+    fn formerly_omitted_builtin_flags_survive_production_preprocessing() {
+        let parsed = parse_with_extension_flags(
+            [
+                "pi",
+                "--smol",
+                "openai/smol",
+                "--slow",
+                "anthropic/slow",
+                "--plan",
+                "openai/plan",
+                "--advisor",
+                "openai/advisor",
+                "--plan-mode",
+                "--plan-yolo",
+                "--approval-mode",
+                "write",
+                "--yolo",
+                "--mcp-config",
+                "project.mcp.json",
+                "--max-time",
+                "37",
+                "hello",
+                "--extension-answer",
+                "ship-it",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        )
+        .expect("parse built-in and extension flags through the production pre-parser");
+
+        assert_eq!(parsed.cli.message_args(), vec!["hello"]);
+        assert_eq!(parsed.cli.smol.as_deref(), Some("openai/smol"));
+        assert_eq!(parsed.cli.slow.as_deref(), Some("anthropic/slow"));
+        assert_eq!(parsed.cli.plan.as_deref(), Some("openai/plan"));
+        assert_eq!(parsed.cli.advisor.as_deref(), Some("openai/advisor"));
+        assert!(parsed.cli.plan_mode);
+        assert!(parsed.cli.plan_yolo);
+        assert_eq!(parsed.cli.approval_mode.as_deref(), Some("write"));
+        assert!(parsed.cli.yolo);
+        assert_eq!(
+            parsed.cli.mcp_config,
+            vec![PathBuf::from("project.mcp.json")]
+        );
+        assert_eq!(parsed.cli.max_time, Some(37));
+        assert_eq!(
+            parsed.extension_flags,
+            vec![ExtensionCliFlag {
+                name: "extension-answer".to_string(),
+                value: Some("ship-it".to_string()),
+            }]
+        );
+
+        let alias = parse_with_extension_flags(
+            ["pi", "--auto-approve"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+        .expect("parse yolo alias through the production pre-parser");
+        assert!(alias.cli.yolo);
+        assert!(alias.extension_flags.is_empty());
+    }
+
+    #[test]
+    fn extension_preparser_classifies_every_top_level_clap_long_option_and_alias() {
+        let mut missing = Vec::new();
+        for arg in Cli::command().get_arguments() {
+            let mut names = arg.get_long().into_iter().collect::<Vec<_>>();
+            if let Some(aliases) = arg.get_all_aliases() {
+                names.extend(aliases);
+            }
+            for name in names {
+                // Clap's generated help flag is handled by the early DisplayHelp
+                // return in parse_with_extension_flags, before preprocessing.
+                if name != "help" && known_long_option(name).is_none() {
+                    missing.push(name.to_string());
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "top-level Clap options missing from extension pre-parser: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn persist_models_requires_fetch_models() {
+        let error = Cli::try_parse_from(["pi", "--persist-models"])
+            .expect_err("persist-models without fetch-models must be rejected");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
     // ── 5b. --list-providers (bool) ────────────────────────────────────
 
     #[test]
@@ -1036,6 +1338,17 @@ mod tests {
                 "find",
                 "ls",
                 "hashline_edit",
+                "web_search",
+                "ast_grep",
+                "ast_edit",
+                "lsp",
+                "debug",
+                "ask",
+                "todo",
+                "submit_plan",
+                "jobs",
+                "hub",
+                "current_time",
             ]
         );
     }
@@ -1100,7 +1413,7 @@ mod tests {
     fn extension_flags_are_extracted_in_second_pass_parse() {
         let parsed = parse_with_extension_flags(vec![
             "pi".to_string(),
-            "--plan".to_string(),
+            "--extension-plan".to_string(),
             "ship it".to_string(),
             "--model".to_string(),
             "gpt-4o".to_string(),
@@ -1109,7 +1422,7 @@ mod tests {
 
         assert_eq!(parsed.cli.model.as_deref(), Some("gpt-4o"));
         assert_eq!(parsed.extension_flags.len(), 1);
-        assert_eq!(parsed.extension_flags[0].name, "plan");
+        assert_eq!(parsed.extension_flags[0].name, "extension-plan");
         assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("ship it"));
     }
 
@@ -1184,7 +1497,7 @@ mod tests {
         let parsed = parse_with_extension_flags(vec![
             "pi".to_string(),
             "--no-mouse-capture".to_string(),
-            "--plan".to_string(),
+            "--extension-plan".to_string(),
             "ship-it".to_string(),
             "--print".to_string(),
             "hello".to_string(),
@@ -1195,7 +1508,7 @@ mod tests {
         assert!(parsed.cli.print);
         assert_eq!(parsed.cli.message_args(), vec!["hello"]);
         assert_eq!(parsed.extension_flags.len(), 1);
-        assert_eq!(parsed.extension_flags[0].name, "plan");
+        assert_eq!(parsed.extension_flags[0].name, "extension-plan");
         assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("ship-it"));
     }
 
@@ -1216,7 +1529,7 @@ mod tests {
             "pi".to_string(),
             "-pe".to_string(),
             "ext.js".to_string(),
-            "--plan".to_string(),
+            "--extension-plan".to_string(),
             "ship-it".to_string(),
             "hello".to_string(),
         ])
@@ -1226,7 +1539,7 @@ mod tests {
         assert_eq!(parsed.cli.extension, vec!["ext.js".to_string()]);
         assert_eq!(parsed.cli.message_args(), vec!["hello"]);
         assert_eq!(parsed.extension_flags.len(), 1);
-        assert_eq!(parsed.extension_flags[0].name, "plan");
+        assert_eq!(parsed.extension_flags[0].name, "extension-plan");
         assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("ship-it"));
     }
 
@@ -1235,14 +1548,14 @@ mod tests {
         let parsed = parse_with_extension_flags(vec![
             "pi".to_string(),
             "hello".to_string(),
-            "--plan".to_string(),
+            "--extension-plan".to_string(),
             "ship-it".to_string(),
         ])
         .expect("parse extension flag after message");
 
         assert_eq!(parsed.cli.message_args(), vec!["hello"]);
         assert_eq!(parsed.extension_flags.len(), 1);
-        assert_eq!(parsed.extension_flags[0].name, "plan");
+        assert_eq!(parsed.extension_flags[0].name, "extension-plan");
         assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("ship-it"));
     }
 
@@ -1250,7 +1563,7 @@ mod tests {
     fn extension_flag_inline_value_matches_separate_value() {
         let separate = parse_with_extension_flags(vec![
             "pi".to_string(),
-            "--plan".to_string(),
+            "--extension-plan".to_string(),
             "ship-it".to_string(),
             "--print".to_string(),
             "hello".to_string(),
@@ -1259,7 +1572,7 @@ mod tests {
 
         let inline = parse_with_extension_flags(vec![
             "pi".to_string(),
-            "--plan=ship-it".to_string(),
+            "--extension-plan=ship-it".to_string(),
             "--print".to_string(),
             "hello".to_string(),
         ])
@@ -1342,6 +1655,30 @@ mod tests {
     }
 
     #[test]
+    fn trust_flag() {
+        let cli = Cli::parse_from(["pi", "--trust"]);
+        assert!(cli.trust);
+        let cli = Cli::parse_from(["pi"]);
+        assert!(!cli.trust);
+    }
+
+    #[test]
+    fn trust_flag_is_builtin_not_extension_flag() {
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--trust".to_string(),
+            "-p".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("parse --trust with print mode");
+        assert!(parsed.cli.trust, "--trust must survive preprocessing");
+        assert!(
+            parsed.extension_flags.is_empty(),
+            "--trust must not be extracted as an extension flag"
+        );
+    }
+
+    #[test]
     fn no_skills_flag() {
         let cli = Cli::parse_from(["pi", "--no-skills"]);
         assert!(cli.no_skills);
@@ -1383,7 +1720,9 @@ mod tests {
         assert!(cli.list_models.is_none());
         assert!(cli.command.is_none());
         assert!(cli.args.is_empty());
-        assert_eq!(cli.tools, "read,bash,edit,write,grep,find,ls,hashline_edit");
+        // The bare-invocation default must stay in lockstep with the
+        // canonical default-enabled tool list.
+        assert_eq!(cli.tools, crate::xdev::default_enabled_tools().join(","));
     }
 
     // ── 11. Combined flags ───────────────────────────────────────────
@@ -1855,6 +2194,210 @@ pub enum Commands {
     #[command(name = "update-index")]
     UpdateIndex,
 
+    /// Manage pi-iso agent worktrees (bd-cv653.5.2)
+    #[command(name = "worktree")]
+    Worktree {
+        /// `list` live agent worktrees or `clean` stale ones
+        #[arg(value_parser = ["list", "clean"])]
+        action: String,
+        /// Reap worktrees older than this many days (clean only, default 1)
+        #[arg(long, default_value = "1")]
+        older_than_days: u64,
+    },
+
+    /// Print shell completion script from the live CLI graph (bd-cv653.7.2)
+    #[command(name = "completions")]
+    Completions {
+        /// bash | zsh | fish
+        #[arg(value_parser = ["bash", "zsh", "fish"])]
+        shell: String,
+    },
+
+    /// Dynamic completion protocol (bd-cv653.7.2): answer candidates for a
+    /// value-taking flag from the live registry/session index.
+    #[command(name = "__complete", hide = true)]
+    Complete {
+        /// The flag being completed (`--model`, `--session`, ...). Hyphen
+        /// values are allowed because the completed token IS a flag.
+        #[arg(allow_hyphen_values = true)]
+        flag: String,
+        /// Prefix typed so far (may be empty)
+        #[arg(default_value = "", allow_hyphen_values = true)]
+        prefix: String,
+    },
+
+    /// Count tokens in text (or @file) against the active counter
+    /// (bd-cv653.7.1) — price a prompt before sending it.
+    #[command(name = "token")]
+    Token {
+        /// Text to count, or @file to read from disk
+        input: String,
+    },
+
+    /// Render folded profiler stacks (bd-cv653.7.12.1): top functions by
+    /// inclusive samples from a `.folded` snapshot.
+    #[command(name = "profile")]
+    Profile {
+        /// Path to a `.folded` snapshot (defaults to the newest under
+        /// <agent-dir>/profiles/)
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// How many top rows to print
+        #[arg(long, default_value_t = 25)]
+        top: usize,
+    },
+
+    /// Aggregate local session usage: tokens/cost by provider, model, day;
+    /// tool-call frequency; compactions (bd-cv653.7.7). All local — no
+    /// network.
+    #[command(name = "stats")]
+    Stats {
+        /// Only entries at/after this RFC 3339 timestamp (day prefixes work)
+        #[arg(long)]
+        since: Option<String>,
+        /// Only entries at/before this RFC 3339 timestamp (day prefixes work)
+        #[arg(long)]
+        until: Option<String>,
+        /// Only sessions under project dirs whose name contains this text
+        #[arg(long)]
+        project: Option<String>,
+        /// Only assistant messages from this provider
+        #[arg(long)]
+        provider: Option<String>,
+        /// Only assistant messages from this model
+        #[arg(long)]
+        model: Option<String>,
+        /// Output format: text | json | markdown
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+
+    /// Import a foreign session into a native continuable pi session
+    /// (bd-cv653.6.4): Claude Code or Codex JSONL.
+    #[command(name = "import")]
+    Import {
+        /// Import from Claude Code (~/.claude/projects/**/*.jsonl)
+        #[arg(long, conflicts_with = "from_codex")]
+        from_claude: Option<String>,
+        /// Import from Codex (~/.codex/sessions/**/*.jsonl)
+        #[arg(long, conflicts_with = "from_claude")]
+        from_codex: Option<String>,
+    },
+
+    /// Generate structured cross-session/cross-agent handoff brief (bd-cv653.3.17)
+    #[command(name = "handoff")]
+    Handoff {
+        /// Delivery target: human | bead:<id> | agent:<thread_id>
+        #[arg(long, default_value = "human")]
+        to: String,
+        /// Output file path for markdown brief (sidecar .json written alongside)
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Session ID or session file path (defaults to latest active session)
+        #[arg(short, long)]
+        session: Option<String>,
+        /// Print generated handoff markdown directly to stdout
+        #[arg(long)]
+        print: bool,
+    },
+
+    /// Manage time-traveling stream rules (TTSR) (bd-cv653.3.4)
+    #[command(name = "rules")]
+    Rules {
+        #[command(subcommand)]
+        command: RulesCommands,
+    },
+
+    /// Manage per-project grievances ledger (bd-cv653.3.4)
+    #[command(name = "grievances")]
+    Grievances {
+        #[command(subcommand)]
+        command: GrievancesCommands,
+    },
+
+    /// Create dependency-ordered atomic commits from working tree changes (bd-cv653.3.14)
+    #[command(name = "commit")]
+    Commit {
+        /// Dry-run mode: plan and preview atomic commits without writing to git
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+        /// Include lockfiles (Cargo.lock, etc.) in commit planning (excluded by default)
+        #[arg(long)]
+        include_lockfiles: bool,
+        /// Automatically stage all untracked files
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Optional bead / issue reference to annotate conventional commit messages
+        #[arg(short = 'b', long)]
+        bead: Option<String>,
+        /// Optional custom commit message prefix
+        #[arg(short = 'm', long)]
+        message: Option<String>,
+    },
+
+    /// Verified in-place self-updater for Pi binary (bd-cv653.7.10)
+    #[command(name = "self-update")]
+    SelfUpdate {
+        /// Target version to update to (e.g. v0.2.0 or 0.2.0; defaults to latest release)
+        #[arg(long)]
+        version: Option<String>,
+        /// Check for available updates without applying any binary changes
+        #[arg(long)]
+        check: bool,
+    },
+
+    /// Prioritized parallel code review with ship verdict (bd-cv653.3.11)
+    #[command(name = "review")]
+    Review {
+        /// Target to review: uncommitted (default), commit range (e.g. main..HEAD), or branch
+        #[arg(value_name = "TARGET")]
+        target: Option<String>,
+        /// Fail with non-zero exit code if findings meet or exceed severity (P0, P1, P2)
+        #[arg(long, value_name = "SEVERITY")]
+        fail_on: Option<String>,
+        /// Output format: text (default), json, or markdown
+        #[arg(long, default_value = "text", value_parser = ["text", "json", "markdown"])]
+        format: String,
+        /// Minimum confidence threshold for findings (0.0 to 1.0)
+        #[arg(long, default_value_t = 0.70)]
+        confidence_threshold: f64,
+        /// Maximum number of findings to report
+        #[arg(long, default_value_t = 50)]
+        max_findings: usize,
+        /// Optional path to write output report to
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+
+    /// Prune stale sessions, artifacts, and caches per retention policy (bd-cv653.7.11)
+    #[command(name = "gc")]
+    Gc {
+        /// Retention window (e.g. 30d, 7d, 24h, or integer days; default: 30d)
+        #[arg(long, default_value = "30d")]
+        older_than: String,
+        /// Number of most recent prunable sessions to preserve per project; named/pinned sessions are always kept and do not consume a slot (default: 5)
+        #[arg(long, default_value_t = 5)]
+        keep_last: usize,
+        /// Include extension transpile caches and temporary runtime caches
+        #[arg(long, default_value_t = true)]
+        caches: bool,
+        /// Perform dry run: analyze and print the reclamation plan without modifying disk (default: true)
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm destructive sweep and move pruned items to trash
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Empty the trash directory permanently
+        #[arg(long)]
+        empty_trash: bool,
+        /// Restore a previously trashed session by filename or ID
+        #[arg(long)]
+        restore: Option<String>,
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+    },
+
     /// Preview the semantic context bundle Pi would use for a task
     #[command(name = "context-preview")]
     ContextPreview {
@@ -1987,6 +2530,39 @@ pub enum Commands {
     },
 
     /// Migrate session files from JSONL v1 to v2 segment format
+    /// Show provider usage/quota state (bd-cv653.7.4)
+    Usage {
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+        /// Force live reads (skip the 60s cache)
+        #[arg(long)]
+        refresh: bool,
+    },
+
+    /// Serve the agent session over a Web interface via WebSocket frame diffs (bd-cv653.10.1)
+    Web {
+        /// Port to bind web server (default: 8080)
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Network interface binding mode: loopback (default), tailscale, lan
+        #[arg(long, default_value = "loopback", value_parser = ["loopback", "tailscale", "lan"])]
+        bind: String,
+        /// Connect in view-only mode (disallows input from web clients)
+        #[arg(long)]
+        view_only: bool,
+        /// Maximum concurrent connected web viewers (default: 4)
+        #[arg(long, default_value_t = 4)]
+        max_viewers: usize,
+    },
+
+    /// Visual component gallery harness (bd-cv653.9.10)
+    Gallery {
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+    },
+
     Migrate {
         /// Path to specific session JSONL file (or directory to migrate all)
         path: String,
@@ -2124,6 +2700,75 @@ pub enum ValidationBrokerCommand {
         /// Write concise text; refuses to overwrite
         #[arg(long = "out-text")]
         out_text: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum RulesCommands {
+    /// List configured stream rules
+    List {
+        /// Show global rules in addition to project rules
+        #[arg(long)]
+        global: bool,
+    },
+    /// Add a new stream rule
+    Add {
+        /// Rule identifier (e.g. no-box-leak)
+        #[arg(short, long)]
+        id: String,
+        /// Rule display name
+        #[arg(short, long)]
+        name: String,
+        /// Matching regex pattern
+        #[arg(short, long)]
+        pattern: String,
+        /// Reminder directive body injected on match
+        #[arg(short, long)]
+        body: String,
+        /// Save to global settings (~/.pi/agent/stream-rules.json) instead of project
+        #[arg(long)]
+        global: bool,
+        /// Optional turn cooldown in turns
+        #[arg(long)]
+        cooldown: Option<usize>,
+    },
+    /// Remove a stream rule by ID
+    Remove {
+        /// Rule ID
+        id: String,
+    },
+    /// Test a regex pattern or existing rule against sample text
+    Test {
+        /// Regex pattern or rule ID
+        pattern: String,
+        /// Sample text to test against
+        sample: String,
+    },
+    /// Export stream rules as JSON
+    Export,
+    /// Import stream rules from JSON file or stdin
+    Import {
+        /// File path or "-" for stdin
+        path: String,
+        /// Import to global rules
+        #[arg(long)]
+        global: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum GrievancesCommands {
+    /// List recorded grievances
+    List,
+    /// Record a user complaint / grievance
+    Add {
+        /// Complaint description
+        complaint: String,
+    },
+    /// Forge a stream rule from a grievance
+    ForgeRule {
+        /// Grievance ID
+        id: String,
     },
 }
 

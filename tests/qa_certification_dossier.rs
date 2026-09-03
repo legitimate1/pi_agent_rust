@@ -17,6 +17,7 @@
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const OPPORTUNITY_MATRIX_SCHEMA: &str = "pi.perf.opportunity_matrix.v1";
 const PRACTICAL_FINISH_CHECKPOINT_ARTIFACT: &str =
@@ -30,6 +31,34 @@ const CANONICAL_223_FAILURE_TRIO: [&str; 3] = [
     "npm/aliou-pi-synthetic",
     "npm/pi-package-test",
 ];
+const GENERATE_QA_CERTIFICATION_DOSSIER_ENV: &str = "PI_GENERATE_QA_CERTIFICATION_DOSSIER";
+
+fn qa_certification_dossier_generation_requested() -> bool {
+    let raw = std::env::var(GENERATE_QA_CERTIFICATION_DOSSIER_ENV).ok();
+    qa_certification_dossier_generation_requested_from(raw.as_deref())
+}
+
+fn qa_certification_dossier_generation_requested_from(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1"))
+}
+
+fn write_non_empty_certification_artifact(path: &Path, contents: &str) {
+    assert!(
+        !contents.trim().is_empty(),
+        "refusing to emit empty certification artifact {}",
+        path.display()
+    );
+    std::fs::write(path, contents)
+        .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
+    let size = std::fs::metadata(path)
+        .unwrap_or_else(|err| panic!("failed to stat {}: {err}", path.display()))
+        .len();
+    assert!(
+        size > 0,
+        "certification artifact is empty: {}",
+        path.display()
+    );
+}
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -38,6 +67,15 @@ fn repo_root() -> PathBuf {
 fn load_json(path: &Path) -> Option<Value> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+fn rust_test_count(path: &Path) -> usize {
+    std::fs::read_to_string(path).map_or(0, |source| {
+        source
+            .lines()
+            .filter(|line| line.trim() == "#[test]")
+            .count()
+    })
 }
 
 fn find_latest_opportunity_matrix(root: &Path) -> Option<PathBuf> {
@@ -342,18 +380,24 @@ fn quarantine_waiver_counts(root: &Path) -> (usize, usize) {
     (quarantine, waiver)
 }
 
-/// Count all test files in tests/ directory.
-fn test_file_count(root: &Path) -> usize {
-    let tests_dir = root.join("tests");
-    let Ok(entries) = std::fs::read_dir(&tests_dir) else {
-        return 0;
+/// Count top-level tracked Rust test files, matching traceability governance.
+fn tracked_test_file_count(root: &Path, metadata_free_fallback: usize) -> usize {
+    let Ok(output) = Command::new("git")
+        .current_dir(root)
+        .args(["ls-files", "--", "tests/*.rs"])
+        .output()
+    else {
+        return metadata_free_fallback;
     };
-    entries
-        .filter_map(std::result::Result::ok)
-        .filter(|e| {
-            let name = e.file_name();
-            let name_str = name.to_string_lossy();
-            name_str.ends_with(".rs") && name_str != "mod.rs"
+    if !output.status.success() {
+        return metadata_free_fallback;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|path| {
+            path.strip_prefix("tests/")
+                .is_some_and(|relative| relative != "mod.rs" && !relative.contains('/'))
         })
         .count()
 }
@@ -1023,18 +1067,31 @@ fn certification_dossier() {
 
     let root = repo_root();
     let report_dir = root.join("tests").join("full_suite_gate");
-    let _ = std::fs::create_dir_all(&report_dir);
+    let generate = qa_certification_dossier_generation_requested();
+    if generate {
+        std::fs::create_dir_all(&report_dir).unwrap_or_else(|err| {
+            panic!(
+                "failed to create certification report directory {}: {err}",
+                report_dir.display()
+            )
+        });
+    }
 
     eprintln!("\n=== QA Certification Dossier (bd-1f42.8.10) ===\n");
 
     // ── Suite classification ──
     let (unit, vcr, e2e) = suite_counts(&root);
     let total_classified = unit + vcr + e2e;
-    let total_test_files = test_file_count(&root);
+    let total_test_files = tracked_test_file_count(&root, total_classified);
     let (quarantined, waivers) = quarantine_waiver_counts(&root);
 
+    assert_eq!(
+        total_test_files, total_classified,
+        "tracked test inventory and suite classification must stay one-to-one"
+    );
+
     eprintln!("Suite classification: {unit} unit, {vcr} vcr, {e2e} e2e ({total_classified} total)");
-    eprintln!("Test files on disk: {total_test_files}");
+    eprintln!("Tracked test files: {total_test_files}");
     eprintln!("Quarantined: {quarantined}, Active waivers: {waivers}");
 
     // ── Test double inventory ──
@@ -1176,7 +1233,7 @@ fn certification_dossier() {
         },
         AllowlistEntry {
             identifier: "MockHostActions".to_string(),
-            location: "src/extensions.rs".to_string(),
+            location: "src/extensions/tests/registration.rs".to_string(),
             suite: "vcr".to_string(),
             owner: "bd-m9rk".to_string(),
             replacement_plan: "Replace with real session-based dispatch".to_string(),
@@ -1184,26 +1241,89 @@ fn certification_dossier() {
         },
     ];
 
+    let allowlist_tracked = allowlist
+        .iter()
+        .filter(|entry| entry.status == "tracked")
+        .count();
+    let allowlist_accepted = allowlist
+        .iter()
+        .filter(|entry| entry.status == "accepted")
+        .count();
+    let non_mock_gate_checks = rust_test_count(&root.join("tests/non_mock_compliance_gate.rs"));
+    let full_suite_gate_checks = rust_test_count(&root.join("tests/ci_full_suite_gate.rs"));
+
     // ── Residual gaps ──
-    let residual_gaps = vec![
-        ResidualGap {
+    let mut residual_gaps = Vec::new();
+    let platform = if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "windows"
+    };
+    let platform_report = load_json(&root.join(format!(
+        "tests/cross_platform_reports/{platform}/platform_report.json"
+    )));
+    if !platform_report
+        .as_ref()
+        .and_then(|report| report.pointer("/summary/all_required_pass"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        residual_gaps.push(ResidualGap {
             id: "cross_platform_gate".to_string(),
-            description: "Cross-platform matrix gate fails (platform_report.json incomplete)".to_string(),
+            description: "Cross-platform matrix gate fails (platform_report.json incomplete)"
+                .to_string(),
             severity: "medium".to_string(),
             follow_up_bead: "bd-1f42.6.7".to_string(),
-        },
-        ResidualGap {
+        });
+    }
+
+    let conformance_summary =
+        load_json(&root.join("tests/ext_conformance/reports/conformance_summary.json"));
+    let conformance_total = conformance_summary
+        .as_ref()
+        .and_then(|summary| summary.pointer("/counts/total"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let conformance_tested = conformance_summary
+        .as_ref()
+        .and_then(|summary| summary.pointer("/counts/tested"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let conformance_na = conformance_summary
+        .as_ref()
+        .and_then(|summary| summary.pointer("/counts/na"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| conformance_total.saturating_sub(conformance_tested));
+    if conformance_total == 0 || conformance_tested < conformance_total {
+        residual_gaps.push(ResidualGap {
             id: "ext_conformance_artifacts".to_string(),
-            description: "Extension conformance gate artifacts not present in local runs (requires ext-conformance feature)".to_string(),
+            description: format!(
+                "Extension conformance is incomplete: {conformance_tested}/{conformance_total} tested, {conformance_na} not exercised"
+            ),
             severity: "low".to_string(),
             follow_up_bead: "bd-1f42.4.4".to_string(),
-        },
-        ResidualGap {
+        });
+    }
+
+    let evidence_bundle = load_json(&root.join("tests/evidence_bundle/index.json"));
+    let evidence_bundle_verdict = evidence_bundle
+        .as_ref()
+        .and_then(|bundle| bundle.pointer("/summary/verdict"))
+        .and_then(Value::as_str)
+        .unwrap_or("missing");
+    if evidence_bundle_verdict != "complete" {
+        residual_gaps.push(ResidualGap {
             id: "evidence_bundle_artifact".to_string(),
-            description: "Evidence bundle index.json only generated during full E2E runs".to_string(),
+            description: format!(
+                "Evidence bundle is not complete (current verdict: {evidence_bundle_verdict})"
+            ),
             severity: "low".to_string(),
             follow_up_bead: "bd-1f42.6.8".to_string(),
-        },
+        });
+    }
+    residual_gaps.extend([
         ResidualGap {
             id: "recording_doubles_cleanup".to_string(),
             description: "RecordingSession/RecordingHostActions/MockHostActions tracked for migration to real sessions".to_string(),
@@ -1216,28 +1336,29 @@ fn certification_dossier() {
             severity: "low".to_string(),
             follow_up_bead: "bd-1f42.8.5.3".to_string(),
         },
-    ];
+    ]);
 
     // ── Build closure questions ──
     let q1 = ClosureAnswer {
         question: "Do we have full unit/integration coverage without mocks/fakes?".to_string(),
         answer: format!(
-            "Yes, with quantified residuals. {total_classified} test files classified \
+            "The policy gates pass with quantified residuals. {total_classified} test files classified \
              ({unit} unit, {vcr} VCR, {e2e} E2E). Non-mock compliance gate passes \
-             (19 checks). Test double inventory: {inv_entries} entries across {inv_modules} modules. \
-             7 allowlisted exceptions documented with owner and replacement plan. \
-             3 tracked for active migration (Recording*/MockHostActions via bd-m9rk), \
-             4 permanent with rationale."
+             ({non_mock_gate_checks} checks). Test double inventory: {inv_entries} entries across {inv_modules} modules. \
+             {} allowlisted exceptions documented with owner and replacement plan. \
+             {allowlist_tracked} tracked for active migration (Recording*/MockHostActions via bd-m9rk), \
+             {allowlist_accepted} permanent with rationale.",
+            allowlist.len()
         ),
         status: "pass_with_residuals".to_string(),
         evidence: vec![
             "docs/non-mock-rubric.json".to_string(),
             "docs/test_double_inventory.json".to_string(),
             "docs/testing-policy.md (Allowlisted Exceptions)".to_string(),
-            "tests/non_mock_compliance_gate.rs (19 tests pass)".to_string(),
+            format!("tests/non_mock_compliance_gate.rs ({non_mock_gate_checks} tests)"),
         ],
         quantified_residuals: vec![
-            "3 recording doubles tracked for migration (bd-m9rk)".to_string(),
+            format!("{allowlist_tracked} recording doubles tracked for migration (bd-m9rk)"),
             format!(
                 "{inv_high} high-risk entries in inventory (mostly extension_dispatcher inline stubs)"
             ),
@@ -1248,7 +1369,7 @@ fn certification_dossier() {
     let q2 = ClosureAnswer {
         question: "Do we have complete E2E integration scripts with detailed logging?".to_string(),
         answer: format!(
-            "Yes. {covered}/{total_workflows} E2E workflows covered ({coverage_pct:.0}%), \
+            "The covered workflows have structured E2E evidence. {covered}/{total_workflows} workflows covered ({coverage_pct:.0}%), \
              {waived} waived (live-only, requires credentials). \
              {e2e} E2E test files classified. Structured logging: failure_digest.v1, \
              failure_timeline.v1, evidence_contract.json, replay_bundle.v1. \
@@ -1259,17 +1380,17 @@ fn certification_dossier() {
         evidence: vec![
             "docs/e2e_scenario_matrix.json".to_string(),
             "scripts/e2e/run_all.sh".to_string(),
-            "tests/ci_full_suite_gate.rs (12 tests pass)".to_string(),
+            format!("tests/ci_full_suite_gate.rs ({full_suite_gate_checks} tests)"),
             "tests/e2e_replay_bundles.rs (10 tests pass)".to_string(),
             "docs/qa-runbook.md".to_string(),
             "docs/ci-operator-runbook.md".to_string(),
         ],
         quantified_residuals: vec![
-            "1 waived workflow (live provider parity, requires credentials)".to_string(),
+            format!("{waived} waived workflows (live provider parity, require credentials)"),
             format!(
-                "{gate_fail} CI gate failure (cross_platform), {gate_skip} skipped (missing conformance artifacts)"
+                "{gate_fail} CI gate failures and {gate_skip} skipped gates in the current full-suite verdict"
             ),
-            "Evidence bundle only generated during full E2E runs".to_string(),
+            format!("Evidence bundle current verdict: {evidence_bundle_verdict}"),
         ],
     };
 
@@ -1327,9 +1448,16 @@ fn certification_dossier() {
     };
 
     // ── Write artifacts ──
-    let dossier_json = serde_json::to_string_pretty(&dossier).unwrap_or_default();
+    let dossier_json =
+        serde_json::to_string_pretty(&dossier).expect("certification dossier must serialize");
+    assert!(
+        !dossier_json.trim().is_empty(),
+        "certification dossier JSON must be non-empty"
+    );
     let dossier_path = report_dir.join("certification_dossier.json");
-    let _ = std::fs::write(&dossier_path, &dossier_json);
+    if generate {
+        write_non_empty_certification_artifact(&dossier_path, &dossier_json);
+    }
     let dossier_value: Value =
         serde_json::from_str(&dossier_json).expect("dossier must be valid JSON");
 
@@ -1343,14 +1471,32 @@ fn certification_dossier() {
         &dossier.generated_at,
     );
 
-    let remediation_backlog_json =
-        serde_json::to_string_pretty(&remediation_backlog).unwrap_or_default();
+    let remediation_backlog_json = serde_json::to_string_pretty(&remediation_backlog)
+        .expect("extension remediation backlog must serialize");
+    assert!(
+        !remediation_backlog_json.trim().is_empty(),
+        "extension remediation backlog JSON must be non-empty"
+    );
     let remediation_backlog_path = report_dir.join("extension_remediation_backlog.json");
-    let _ = std::fs::write(&remediation_backlog_path, &remediation_backlog_json);
+    if generate {
+        write_non_empty_certification_artifact(
+            &remediation_backlog_path,
+            &remediation_backlog_json,
+        );
+    }
 
     let remediation_backlog_md = render_extension_remediation_backlog_md(&remediation_backlog);
+    assert!(
+        !remediation_backlog_md.trim().is_empty(),
+        "extension remediation backlog markdown must be non-empty"
+    );
     let remediation_backlog_md_path = report_dir.join("extension_remediation_backlog.md");
-    let _ = std::fs::write(&remediation_backlog_md_path, &remediation_backlog_md);
+    if generate {
+        write_non_empty_certification_artifact(
+            &remediation_backlog_md_path,
+            &remediation_backlog_md,
+        );
+    }
 
     // ── Write markdown summary ──
     let mut md = String::new();
@@ -1511,19 +1657,31 @@ fn certification_dossier() {
     );
 
     let md_path = report_dir.join("certification_dossier.md");
-    let _ = std::fs::write(&md_path, &md);
+    assert!(
+        !md.trim().is_empty(),
+        "certification dossier markdown must be non-empty"
+    );
+    if generate {
+        write_non_empty_certification_artifact(&md_path, &md);
+    }
 
     eprintln!("\n  Verdict: {}", dossier.verdict.to_uppercase());
-    eprintln!("  JSON: {}", dossier_path.display());
-    eprintln!("  Markdown: {}", md_path.display());
-    eprintln!(
-        "  Extension remediation backlog JSON: {}",
-        remediation_backlog_path.display()
-    );
-    eprintln!(
-        "  Extension remediation backlog Markdown: {}",
-        remediation_backlog_md_path.display()
-    );
+    if generate {
+        eprintln!("  JSON: {}", dossier_path.display());
+        eprintln!("  Markdown: {}", md_path.display());
+        eprintln!(
+            "  Extension remediation backlog JSON: {}",
+            remediation_backlog_path.display()
+        );
+        eprintln!(
+            "  Extension remediation backlog Markdown: {}",
+            remediation_backlog_md_path.display()
+        );
+    } else {
+        eprintln!(
+            "  Artifacts validated in memory; set {GENERATE_QA_CERTIFICATION_DOSSIER_ENV}=1 to write tracked reports"
+        );
+    }
     eprintln!();
 
     // ── Assertions ──
@@ -1624,6 +1782,19 @@ fn certification_dossier() {
         assert_eq!(
             readiness_decision, "NO_DECISION",
             "missing opportunity matrix must remain fail-closed (NO_DECISION)"
+        );
+    }
+}
+
+#[test]
+fn certification_dossier_generation_requires_exact_one() {
+    assert!(qa_certification_dossier_generation_requested_from(Some(
+        "1"
+    )));
+    for raw in [None, Some(""), Some("0"), Some("true"), Some(" 1 ")] {
+        assert!(
+            !qa_certification_dossier_generation_requested_from(raw),
+            "unexpected generation request for {raw:?}"
         );
     }
 }

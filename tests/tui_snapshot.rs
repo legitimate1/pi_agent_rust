@@ -99,6 +99,17 @@ fn build_app(harness: &TestHarness) -> PiApp {
 fn build_app_with_config(harness: &TestHarness, config: Config) -> PiApp {
     let config = common::hermetic_interactive_config(config);
     let cwd = harness.temp_dir().to_path_buf();
+    // Stop VCS discovery at the hermetic test root. Remote test runners may
+    // place temporary directories inside a repository, while local runners
+    // often place them outside one; without a local sentinel every snapshot
+    // depends on the runner's checkout branch. Individual VCS snapshots can
+    // seed a valid HEAD before constructing the app.
+    let git_dir = cwd.join(".git");
+    fs::create_dir_all(&git_dir).expect("create hermetic git sentinel");
+    let git_head = git_dir.join("HEAD");
+    if !git_head.exists() {
+        fs::write(&git_head, "not-a-git-ref\n").expect("write hermetic git sentinel");
+    }
     let tools = ToolRegistry::new(&[], &cwd, Some(&config));
     let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
     let agent = Agent::new(provider, tools, AgentConfig::default());
@@ -129,6 +140,7 @@ fn build_app_with_config(harness: &TestHarness, config: Config) -> PiApp {
         model_entry,
         model_scope,
         available_models,
+        None,
         Vec::new(),
         event_tx,
         test_runtime_handle(),
@@ -138,6 +150,7 @@ fn build_app_with_config(harness: &TestHarness, config: Config) -> PiApp {
         Some(KeyBindings::new()),
         Vec::new(),
         Usage::default(),
+        None,
     );
     app.set_terminal_size(80, 24);
     app
@@ -157,9 +170,17 @@ fn set_conversation(
     usage: Usage,
     status: Option<&str>,
 ) {
+    let session = app.session_handle();
+    let session_id = session
+        .try_lock()
+        .expect("lock session for conversation reset")
+        .header
+        .id
+        .clone();
     send_pi(
         app,
         PiMsg::ConversationReset {
+            session_id,
             messages,
             usage,
             status: status.map(str::to_string),
@@ -440,6 +461,7 @@ fn tui_snapshot_tool_output_message() {
             name: "read".to_string(),
             tool_id: "tool-2".to_string(),
             is_error: false,
+            output: None,
         },
     );
     send_pi(
@@ -533,6 +555,10 @@ fn tui_snapshot_scrolled_viewport() {
 #[test]
 fn tui_snapshot_footer_with_usage() {
     let harness = TestHarness::new("tui_snapshot_footer_with_usage");
+    let git_dir = harness.temp_dir().join(".git");
+    fs::create_dir(&git_dir).expect("create deterministic git metadata");
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/snapshot-fixture\n")
+        .expect("write deterministic git HEAD");
     let mut app = build_app(&harness);
     let usage = Usage {
         input: 120,
@@ -556,6 +582,7 @@ fn tui_snapshot_footer_with_usage() {
     let context = vec![
         ("scenario".to_string(), "usage-footer".to_string()),
         ("tokens".to_string(), "165".to_string()),
+        ("branch".to_string(), "snapshot-fixture".to_string()),
     ];
     snapshot(&harness, "tui_footer_with_usage", &app, &context);
 }

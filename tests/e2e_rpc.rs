@@ -16,12 +16,16 @@ use pi::auth::AuthStorage;
 use pi::config::Config;
 use pi::extensions::{ExtensionManager, ExtensionRegion, ExtensionUiRequest};
 use pi::http::client::Client;
+#[cfg(unix)]
+use pi::model::Message;
 use pi::model::{AssistantMessage, ContentBlock, StopReason, TextContent, Usage, UserContent};
 use pi::models::ModelEntry;
 use pi::provider::{Context, InputType, Model, ModelCost, Provider, StreamEvent, StreamOptions};
 use pi::providers::openai::OpenAIProvider;
 use pi::resources::ResourceLoader;
 use pi::rpc::{RpcOptions, RpcScopedModel, run};
+#[cfg(unix)]
+use pi::session::SessionEntry;
 use pi::session::{Session, SessionMessage};
 use pi::session_index::SessionIndex;
 use pi::tools::ToolRegistry;
@@ -129,6 +133,7 @@ impl KeylessReplayProvider {
             model: self.model_id.clone(),
             usage: Usage::default(),
             stop_reason,
+            stop_details: None,
             error_message: None,
             timestamp: chrono::Utc::now().timestamp_millis(),
         }
@@ -285,9 +290,13 @@ fn build_options(
         resources: ResourceLoader::empty(false),
         available_models,
         scoped_models,
-        cli_api_key: None,
+        // Session installs (switch/resume/fork) verify that credentials exist
+        // for the session's model before the RPC loop adopts it; the mock
+        // providers never read the key, so any non-empty value satisfies it.
+        cli_api_key: Some("test-key".to_string()),
         auth,
         runtime_handle: handle.clone(),
+        ask_tool: None,
     }
 }
 
@@ -478,6 +487,34 @@ async fn wait_for_streaming_state(
         "session {session_idx}: prompt never entered streaming state"
     );
     Value::Null
+}
+
+async fn wait_for_non_streaming_state(
+    in_tx: &asupersync::channel::mpsc::Sender<String>,
+    out_rx: &Arc<Mutex<Receiver<String>>>,
+    command_id: &str,
+    label: &str,
+) -> Value {
+    let start = Instant::now();
+    let cmd = json!({
+        "id": command_id,
+        "type": "get_state",
+    })
+    .to_string();
+
+    loop {
+        let resp = send_recv(in_tx, out_rx, &cmd, label).await;
+        assert_ok(&resp, "get_state");
+        if matches!(is_streaming(&resp), Some(false)) {
+            return resp;
+        }
+
+        assert!(
+            start.elapsed() <= RPC_E2E_WAIT_TIMEOUT,
+            "{label}: RPC state remained streaming: {resp}"
+        );
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+    }
 }
 
 async fn wait_for_non_streaming_state_after_abort(
@@ -879,9 +916,22 @@ impl CrashInterruptRecoveryMode {
 #[derive(Debug)]
 struct SpawnedCrashInterruptWorker {
     child: Child,
-    stdout_handle: JoinHandle<Vec<u8>>,
-    stderr_handle: JoinHandle<Vec<u8>>,
-    started_at: Instant,
+    stdout_handle: Option<JoinHandle<Vec<u8>>>,
+    stderr_handle: Option<JoinHandle<Vec<u8>>>,
+}
+
+#[cfg(unix)]
+impl Drop for SpawnedCrashInterruptWorker {
+    fn drop(&mut self) {
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                let _ = self.child.kill();
+            }
+        }
+        let _ = self.child.wait();
+        let _ = collect_crash_interrupt_worker_output(self);
+    }
 }
 
 #[cfg(unix)]
@@ -982,9 +1032,15 @@ fn spawn_crash_interrupt_recovery_worker(
         command.env(CRASH_INTERRUPT_RECOVERY_SESSION_ENV, session_path);
     }
 
-    let mut child = command
+    let child = command
         .spawn()
         .expect("spawn crash interrupt recovery worker");
+
+    capture_crash_interrupt_worker(child)
+}
+
+#[cfg(unix)]
+fn capture_crash_interrupt_worker(mut child: Child) -> SpawnedCrashInterruptWorker {
     let mut child_stdout = child.stdout.take().expect("child stdout piped");
     let mut child_stderr = child.stderr.take().expect("child stderr piped");
     let stdout_handle = std::thread::spawn(move || {
@@ -1000,10 +1056,29 @@ fn spawn_crash_interrupt_recovery_worker(
 
     SpawnedCrashInterruptWorker {
         child,
-        stdout_handle,
-        stderr_handle,
-        started_at: Instant::now(),
+        stdout_handle: Some(stdout_handle),
+        stderr_handle: Some(stderr_handle),
     }
+}
+
+#[cfg(unix)]
+fn collect_crash_interrupt_worker_output(
+    spawned: &mut SpawnedCrashInterruptWorker,
+) -> (String, String) {
+    let stdout = spawned
+        .stdout_handle
+        .take()
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let stderr = spawned
+        .stderr_handle
+        .take()
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    (
+        String::from_utf8_lossy(&stdout).to_string(),
+        String::from_utf8_lossy(&stderr).to_string(),
+    )
 }
 
 #[cfg(unix)]
@@ -1011,6 +1086,7 @@ fn wait_crash_interrupt_recovery_worker(
     mut spawned: SpawnedCrashInterruptWorker,
     timeout: Duration,
 ) -> CrashInterruptWorkerResult {
+    let started_at = Instant::now();
     let mut timed_out = false;
     let status = loop {
         match spawned.child.try_wait() {
@@ -1023,7 +1099,7 @@ fn wait_crash_interrupt_recovery_worker(
             }
         }
 
-        if spawned.started_at.elapsed() > timeout {
+        if started_at.elapsed() > timeout {
             timed_out = true;
             let _ = spawned.child.kill();
             break spawned.child.wait().ok();
@@ -1031,10 +1107,7 @@ fn wait_crash_interrupt_recovery_worker(
         std::thread::sleep(Duration::from_millis(20));
     };
 
-    let stdout =
-        String::from_utf8_lossy(&spawned.stdout_handle.join().unwrap_or_default()).to_string();
-    let mut stderr =
-        String::from_utf8_lossy(&spawned.stderr_handle.join().unwrap_or_default()).to_string();
+    let (stdout, mut stderr) = collect_crash_interrupt_worker_output(&mut spawned);
     if timed_out {
         stderr = format!("ERROR: timed out after {timeout:?}\n{stderr}");
     }
@@ -1078,6 +1151,49 @@ fn wait_for_crash_interrupt_checkpoint(path: &Path, timeout: Duration) -> Value 
             "timed out waiting for worker checkpoint {}",
             path.display()
         );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_crash_interrupt_worker_checkpoint(
+    spawned: &mut SpawnedCrashInterruptWorker,
+    path: &Path,
+    timeout: Duration,
+) -> std::io::Result<Value> {
+    let started_at = Instant::now();
+    loop {
+        if path.exists() {
+            let raw = std::fs::read_to_string(path)?;
+            let checkpoint = serde_json::from_str(&raw).map_err(|source| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    CrashInterruptCheckpointParseError { path, source }.to_string(),
+                )
+            })?;
+            return Ok(checkpoint);
+        }
+
+        if let Some(status) = spawned.child.try_wait()? {
+            let (stdout, stderr) = collect_crash_interrupt_worker_output(spawned);
+            return Err(std::io::Error::other(format!(
+                "worker exited before checkpoint {}: status={status}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                path.display()
+            )));
+        }
+
+        if started_at.elapsed() > timeout {
+            let _ = spawned.child.kill();
+            let _ = spawned.child.wait();
+            let (stdout, stderr) = collect_crash_interrupt_worker_output(spawned);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for worker checkpoint {} after {timeout:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                    path.display()
+                ),
+            ));
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -1145,13 +1261,22 @@ fn assert_lock_released(lock_path: &Path) {
         .truncate(false)
         .open(lock_path)
         .expect("open lock file");
-    if let Err(err) = fs4::fs_std::FileExt::try_lock_exclusive(&file) {
+    if let Err(err) = fs4::FileExt::try_lock(&file) {
         exit_crash_interrupt_worker(format!(
             "lock should be released after interrupted worker: {} ({err})",
             lock_path.display()
         ));
     }
-    fs4::fs_std::FileExt::unlock(&file).expect("unlock test lock probe");
+    fs4::FileExt::unlock(&file).expect("unlock test lock probe");
+}
+
+#[cfg(unix)]
+fn assert_dir_lock_released(lock_path: &Path) {
+    assert!(
+        !lock_path.exists(),
+        "directory lock should be removed after interrupted worker: {}",
+        lock_path.display()
+    );
 }
 
 #[cfg(unix)]
@@ -1275,6 +1400,16 @@ fn run_crash_interrupt_recovery_active_worker(
             "active extension custom message",
         )
         .await;
+        let idle_state_id = format!("active-{cycle}-extension-idle");
+        let idle_state = wait_for_non_streaming_state(
+            &in_tx,
+            &out_rx,
+            &idle_state_id,
+            "active extension completion",
+        )
+        .await;
+        let idle_message_count =
+            require_response_field_u64(&idle_state, "messageCount", "active idle get_state");
 
         let prompt = json!({
             "id": format!("active-{cycle}-prompt"),
@@ -1290,8 +1425,31 @@ fn run_crash_interrupt_recovery_active_worker(
             "sessionFile",
             "active streaming get_state",
         );
-        let message_count =
+        // The streaming user prompt is appended to the session just after the
+        // streaming state flips on, so poll until the count includes it —
+        // otherwise the recorded count races the persisted session file.
+        let expected_count = idle_message_count + 1;
+        let mut message_count =
             require_response_field_u64(&streaming_state, "messageCount", "active get_state");
+        for attempt in 0..200 {
+            if message_count >= expected_count {
+                break;
+            }
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+            let recheck_cmd = json!({
+                "id": format!("active-{cycle}-count-{attempt}"),
+                "type": "get_state",
+            })
+            .to_string();
+            let recheck = send_recv(&in_tx, &out_rx, &recheck_cmd, "active count get_state").await;
+            assert_ok(&recheck, "get_state");
+            message_count =
+                require_response_field_u64(&recheck, "messageCount", "active count get_state");
+        }
+        assert_eq!(
+            message_count, expected_count,
+            "streaming prompt should be persisted exactly once before the interrupt"
+        );
 
         write_json_atomic(
             &ready_path,
@@ -1346,7 +1504,28 @@ fn run_crash_interrupt_recovery_restart_worker(
             diagnostics.skipped_entries.is_empty(),
             "restart should not skip interrupted session entries: {diagnostics:?}"
         );
-        let message_count_before = loaded.to_messages_for_current_path().len();
+        let loaded_messages = loaded.to_messages_for_current_path();
+        let message_count_before = loaded
+            .entries_for_current_path()
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Message(_)))
+            .count();
+        let recovered_session_id = loaded.header.id.clone();
+        let pre_interrupt_prompt = format!("interrupt recovery streaming prompt {cycle}");
+        let pre_interrupt_prompt_preserved = loaded_messages.iter().any(|message| {
+            matches!(
+                message,
+                Message::User(user)
+                    if matches!(
+                        &user.content,
+                        UserContent::Text(text) if text == &pre_interrupt_prompt
+                    )
+            )
+        });
+        assert!(
+            pre_interrupt_prompt_preserved,
+            "restart should preserve the pre-interrupt prompt {pre_interrupt_prompt:?}"
+        );
 
         let extension_entry = artifact_dir.join(format!("restart-{cycle}-{}.mjs", mode.as_str()));
         std::fs::write(&extension_entry, RPC_PROMPT_EXTENSION_COMMAND_EXT)
@@ -1406,14 +1585,15 @@ fn run_crash_interrupt_recovery_restart_worker(
         )
         .await;
 
-        let state_cmd = json!({
-            "id": format!("restart-{cycle}-state"),
-            "type": "get_state",
-        })
-        .to_string();
-        let state_after = send_recv(&in_tx, &out_rx, &state_cmd, "restart get_state").await;
-        assert_ok(&state_after, "get_state");
-        let message_count_after =
+        let state_id = format!("restart-{cycle}-state");
+        let state_after = wait_for_non_streaming_state(
+            &in_tx,
+            &out_rx,
+            &state_id,
+            "restart extension completion",
+        )
+        .await;
+        let rpc_message_count_after =
             require_response_field_u64(&state_after, "messageCount", "restart get_state");
 
         drop(in_tx);
@@ -1421,6 +1601,28 @@ fn run_crash_interrupt_recovery_restart_worker(
         assert!(
             server_result.is_ok(),
             "restart rpc server error: {server_result:?}"
+        );
+
+        let (persisted_after_restart, restart_diagnostics) =
+            Session::open_with_diagnostics(session_path.to_string_lossy().as_ref())
+                .await
+                .expect("restart worker reopens session after RPC shutdown");
+        assert!(
+            restart_diagnostics.skipped_entries.is_empty(),
+            "restart shutdown should leave a clean session: {restart_diagnostics:?}"
+        );
+        assert_eq!(
+            persisted_after_restart.header.id, recovered_session_id,
+            "restart shutdown must preserve the recovered session ID"
+        );
+        let message_count_after = persisted_after_restart
+            .entries_for_current_path()
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Message(_)))
+            .count();
+        assert!(
+            message_count_after > message_count_before,
+            "restart work should persistently grow the recovered session: before={message_count_before}, after={message_count_after}"
         );
 
         let index = SessionIndex::for_sessions_root(&sessions_root);
@@ -1439,8 +1641,11 @@ fn run_crash_interrupt_recovery_restart_worker(
                 "cycle": cycle,
                 "interrupt": mode.as_str(),
                 "sessionPath": session_path.display().to_string(),
+                "sessionIdBeforeRestart": recovered_session_id,
                 "messageCountBeforeRestart": message_count_before,
                 "messageCountAfterRestart": message_count_after,
+                "rpcMessageCountAfterRestart": rpc_message_count_after,
+                "preInterruptPromptPreserved": pre_interrupt_prompt_preserved,
                 "indexFailedFiles": index_summary.failed_files,
                 "indexedSessionCount": indexed.len(),
                 "markerPath": marker_path.display().to_string(),
@@ -1465,6 +1670,7 @@ fn run_crash_interrupt_recovery_worker_from_env() {
             exit_crash_interrupt_worker(format!("unknown crash interrupt recovery mode {other}"))
         }
     };
+    install_crash_interrupt_recovery_signal_default(mode);
     let sessions_root = PathBuf::from(env_required(CRASH_INTERRUPT_RECOVERY_SESSIONS_ENV));
     let artifact_dir = PathBuf::from(env_required(CRASH_INTERRUPT_RECOVERY_ARTIFACT_ENV));
     let project_dir = PathBuf::from(env_required(CRASH_INTERRUPT_RECOVERY_PROJECT_ENV));
@@ -1493,6 +1699,24 @@ fn run_crash_interrupt_recovery_worker_from_env() {
 }
 
 #[cfg(unix)]
+fn install_crash_interrupt_recovery_signal_default(mode: CrashInterruptRecoveryMode) {
+    use std::sync::atomic::AtomicBool;
+
+    let signal = match mode {
+        CrashInterruptRecoveryMode::Crash => return,
+        CrashInterruptRecoveryMode::Sigint => signal_hook::consts::SIGINT,
+        CrashInterruptRecoveryMode::Sighup => signal_hook::consts::SIGHUP,
+    };
+    signal_hook::flag::register_conditional_default(signal, Arc::new(AtomicBool::new(true)))
+        .unwrap_or_else(|error| {
+            exit_crash_interrupt_worker(format!(
+                "install default {} handler: {error}",
+                mode.as_str()
+            ));
+        });
+}
+
+#[cfg(unix)]
 #[test]
 fn crash_interrupt_recovery_worker_process_entrypoint() {
     if std::env::var_os(CRASH_INTERRUPT_RECOVERY_WORKER_ENV).is_none() {
@@ -1504,7 +1728,7 @@ fn crash_interrupt_recovery_worker_process_entrypoint() {
 #[cfg(unix)]
 #[test]
 #[allow(clippy::too_many_lines)]
-fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() {
+fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() -> std::io::Result<()> {
     let harness = TestHarness::new("crash_interrupt_recovery_soak_harness");
     let logger = harness.log();
     let current_exe = std::env::current_exe().expect("current test binary path");
@@ -1523,7 +1747,7 @@ fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() {
             crash_interrupt_artifact_path(&artifact_dir, "active", cycle, mode, "json");
         let restart_summary_path =
             crash_interrupt_artifact_path(&artifact_dir, "restart", cycle, mode, "json");
-        let active_worker = spawn_crash_interrupt_recovery_worker(
+        let mut active_worker = spawn_crash_interrupt_recovery_worker(
             &current_exe,
             "active",
             cycle,
@@ -1535,10 +1759,11 @@ fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() {
             &active_summary_path,
             None,
         );
-        let ready = wait_for_crash_interrupt_checkpoint(
+        let ready = wait_for_crash_interrupt_worker_checkpoint(
+            &mut active_worker,
             &ready_path,
             CRASH_INTERRUPT_RECOVERY_DEFAULT_TIMEOUT,
-        );
+        )?;
         signal_crash_interrupt_recovery_worker(&active_worker, mode);
         let active_result = wait_crash_interrupt_recovery_worker(
             active_worker,
@@ -1614,8 +1839,39 @@ fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() {
             Some(0),
             "restart worker index refresh should be clean: {restart_summary}"
         );
+        let ready_session_id = ready
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .expect("ready session ID");
+        let recovered_session_id = restart_summary
+            .get("sessionIdBeforeRestart")
+            .and_then(Value::as_str)
+            .expect("recovered session ID");
+        assert_eq!(
+            recovered_session_id, ready_session_id,
+            "restart must continue the exact interrupted session"
+        );
+        let message_count_before_interrupt = ready
+            .get("messageCountBeforeInterrupt")
+            .and_then(Value::as_u64)
+            .expect("ready message count");
+        let message_count_before_restart = restart_summary
+            .get("messageCountBeforeRestart")
+            .and_then(Value::as_u64)
+            .expect("recovered message count");
+        assert_eq!(
+            message_count_before_restart, message_count_before_interrupt,
+            "restart must preserve the exact pre-interrupt message count"
+        );
+        assert_eq!(
+            restart_summary
+                .get("preInterruptPromptPreserved")
+                .and_then(Value::as_bool),
+            Some(true),
+            "restart must preserve the pre-interrupt prompt"
+        );
         assert_lock_released(&session_lock_path(&session_path));
-        assert_lock_released(&sessions_root.join("session-index.lock"));
+        assert_dir_lock_released(&sessions_root.join("session-index.lock"));
 
         let parent_session_path_display = crash_interrupt_display_path(&session_path);
         let parent_session_path_display_for_log = crash_interrupt_display_path(&session_path);
@@ -1629,14 +1885,23 @@ fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() {
             "parent reopen should not skip entries after {}: {diagnostics:?}",
             mode.as_str()
         );
-        let parent_message_count = reopened.to_messages_for_current_path().len();
+        let parent_message_count = reopened
+            .entries_for_current_path()
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Message(_)))
+            .count();
         let restart_message_count = restart_summary
             .get("messageCountAfterRestart")
             .and_then(Value::as_u64)
             .expect("restart message count");
         assert!(
-            restart_message_count >= 1,
-            "restart should observe messages after recovery"
+            restart_message_count > message_count_before_restart,
+            "restart should append messages after the recovered baseline"
+        );
+        assert_eq!(
+            u64::try_from(parent_message_count).unwrap_or(u64::MAX),
+            restart_message_count,
+            "parent reopen must observe the exact post-restart message count"
         );
 
         harness.record_artifact(
@@ -1689,7 +1954,7 @@ fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() {
         "temp artifact growth exceeded one file per cycle: tempish_files={tempish_files}, cycles={}",
         schedule.len()
     );
-    assert_lock_released(&sessions_root.join("session-index.lock"));
+    assert_dir_lock_released(&sessions_root.join("session-index.lock"));
 
     let summary_path = harness.temp_path("crash-interrupt-recovery-soak-summary.json");
     let summary = json!({
@@ -1709,6 +1974,159 @@ fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() {
     });
     write_json_atomic(&summary_path, &summary);
     harness.record_artifact("crash-interrupt-recovery-soak-summary.json", &summary_path);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_binary_sigint_exits_orderly_and_preserves_session() -> std::io::Result<()> {
+    let harness = TestHarness::new("rpc_binary_sigint_orderly_shutdown");
+    let project_dir = harness.temp_path("project");
+    let sessions_root = harness.temp_path("sessions");
+    let agent_dir = harness.temp_path("agent");
+    let package_dir = harness.temp_path("packages");
+    let config_path = harness.temp_path("settings.json");
+    let marker_path = harness.temp_path("sigint-marker.txt");
+    std::fs::create_dir_all(&project_dir)?;
+    std::fs::create_dir_all(&sessions_root)?;
+    std::fs::create_dir_all(&agent_dir)?;
+    std::fs::create_dir_all(&package_dir)?;
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi")); // ubs:ignore Cargo-provided test binary path, not user input.
+    command
+        .args([
+            "--rpc",
+            "--provider",
+            "ollama",
+            "--model",
+            "qwen2.5:0.5b",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-migrations",
+            "--session-dir",
+        ])
+        .arg(&sessions_root)
+        .env("PI_CODING_AGENT_DIR", &agent_dir)
+        .env("PI_CONFIG_PATH", &config_path)
+        .env("PI_SESSIONS_DIR", &sessions_root)
+        .env("PI_PACKAGE_DIR", &package_dir)
+        .env("PI_TEST_MODE", "1")
+        .current_dir(&project_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn()?;
+    let mut worker = capture_crash_interrupt_worker(child);
+
+    let marker_content = "real-rpc-sigint-persistence";
+    let bash_command = format!(
+        "printf {} > {}",
+        shell_single_quote(marker_content),
+        shell_single_quote(&marker_path.display().to_string())
+    );
+    let bash_request = json!({
+        "id": "real-rpc-sigint-bash",
+        "type": "bash",
+        "command": bash_command,
+    });
+    {
+        use std::io::Write as _;
+
+        let stdin = worker.child.stdin.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pi RPC stdin was not piped")
+        })?;
+        writeln!(stdin, "{bash_request}")?;
+        stdin.flush()?;
+    }
+
+    let index = SessionIndex::for_sessions_root(&sessions_root);
+    let cwd = project_dir.display().to_string();
+    let started_at = Instant::now();
+    let persisted_meta = loop {
+        if marker_path.exists()
+            && let Ok(indexed) = index.list_sessions(Some(&cwd))
+            && let Some(meta) = indexed.into_iter().find(|meta| meta.message_count >= 1)
+        {
+            break meta;
+        }
+
+        if let Some(status) = worker.child.try_wait()? {
+            let (stdout, stderr) = collect_crash_interrupt_worker_output(&mut worker);
+            return Err(std::io::Error::other(format!(
+                "pi --rpc exited before persisting the SIGINT fixture: status={status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            )));
+        }
+        if started_at.elapsed() > CRASH_INTERRUPT_RECOVERY_DEFAULT_TIMEOUT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out waiting for pi --rpc to persist the SIGINT fixture",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    // The soak worker intentionally restores default signal death. This sends
+    // SIGINT to the real binary so `run_rpc_mode` takes its orderly Ctrl-C path.
+    signal_crash_interrupt_recovery_worker(&worker, CrashInterruptRecoveryMode::Sigint);
+    let result =
+        wait_crash_interrupt_recovery_worker(worker, CRASH_INTERRUPT_RECOVERY_DEFAULT_TIMEOUT);
+    assert!(
+        !result.timed_out,
+        "real pi --rpc SIGINT shutdown timed out: {}",
+        result.stderr
+    );
+    assert_eq!(
+        result.exit_signal, None,
+        "real pi --rpc must handle SIGINT instead of dying by signal: stdout={} stderr={}",
+        result.stdout, result.stderr
+    );
+    assert_eq!(
+        result.exit_code, 0,
+        "real pi --rpc SIGINT shutdown should succeed: stdout={} stderr={}",
+        result.stdout, result.stderr
+    );
+
+    let session_path = PathBuf::from(&persisted_meta.path);
+    let (reopened, diagnostics) = common::run_async(async move {
+        Session::open_with_diagnostics(session_path.to_string_lossy().as_ref()).await
+    })
+    .expect("reopen session after orderly RPC SIGINT");
+    assert!(
+        diagnostics.skipped_entries.is_empty(),
+        "orderly RPC SIGINT should leave a clean session: {diagnostics:?}"
+    );
+    assert_eq!(
+        reopened.header.id, persisted_meta.id,
+        "orderly RPC SIGINT must preserve the indexed session identity"
+    );
+    assert_eq!(
+        u64::try_from(reopened.to_messages_for_current_path().len()).unwrap_or(u64::MAX),
+        persisted_meta.message_count,
+        "orderly RPC SIGINT must preserve the indexed message count"
+    );
+    assert!(
+        reopened
+            .entries_for_current_path()
+            .iter()
+            .copied()
+            .any(|entry| {
+                matches!(
+                    entry,
+                    SessionEntry::Message(message)
+                        if matches!(
+                            &message.message,
+                            SessionMessage::BashExecution { command, .. }
+                                if command == &bash_command
+                        )
+                )
+            }),
+        "orderly RPC SIGINT must preserve the completed bash message"
+    );
+    assert_eq!(std::fs::read_to_string(marker_path)?, marker_content);
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2258,6 +2676,7 @@ fn rpc_get_last_assistant_text_with_assistant() {
                 model: "test-model".to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: now,
             },
@@ -2430,6 +2849,125 @@ fn rpc_bash_echo() {
         assert!(
             output.contains("hello_rpc"),
             "bash output should contain hello_rpc, got: {output}"
+        );
+        assert_eq!(resp["data"]["persisted"], false);
+        assert_eq!(
+            resp["data"]["persistenceStatus"]["event"],
+            "session.persistence.disabled"
+        );
+        assert!(
+            resp["data"]["persistenceStatus"]["pendingMessageCount"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "the in-memory BashExecution mutation must remain observable: {resp}"
+        );
+        assert!(
+            resp["data"]["persistenceWarning"].is_null(),
+            "disabled persistence is an expected mode, not a save failure"
+        );
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+#[test]
+fn rpc_bash_persistence_failure_reports_real_backlog_without_retryable_error() {
+    let harness = TestHarness::new("rpc_bash_persistence_failure_reports_real_backlog");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let blocked_session_dir = harness.create_file("not-a-session-directory", b"blocked");
+        let session = Session::create_with_dir(Some(blocked_session_dir));
+        let metrics_before = session.autosave_metrics();
+        let provider: Arc<dyn Provider> = Arc::new(KeylessReplayProvider::new(
+            "keyless-rpc-replay",
+            KEYLESS_REPLAY_ABORT_WINDOW,
+        ));
+        let tools = ToolRegistry::new(&[], &harness.temp_path("worktree"), None);
+        let agent = Agent::new(provider, tools, AgentConfig::default());
+        let session = Arc::new(asupersync::sync::Mutex::new(session));
+        let agent_session = AgentSession::new(
+            agent,
+            Arc::clone(&session),
+            true,
+            pi::compaction::ResolvedCompactionSettings::default(),
+        );
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = rpc_output_channel();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let resp = send_recv(
+            &in_tx,
+            &out_rx,
+            r#"{"id":"1","type":"bash","command":"echo persistence_failure_probe"}"#,
+            "bash(persistence failure)",
+        )
+        .await;
+        assert_ok(&resp, "bash");
+        assert_eq!(resp["data"]["exitCode"], 0);
+        assert!(
+            resp["data"]["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("persistence_failure_probe")),
+            "the command result must survive the independent save failure: {resp}"
+        );
+        assert_eq!(resp["data"]["persisted"], false);
+        assert_eq!(
+            resp["data"]["persistenceStatus"]["event"],
+            "session.persistence.backlog"
+        );
+        let metrics_cx = asupersync::Cx::for_testing();
+        let metrics_after = session
+            .lock(&metrics_cx)
+            .await
+            .expect("lock failed-persistence session")
+            .autosave_metrics();
+        let live_pending_mutations = metrics_after.pending_mutations as u64;
+        assert!(
+            live_pending_mutations > 0,
+            "the failed flush must retain the appended BashExecution mutation"
+        );
+        assert_eq!(
+            resp["data"]["persistenceStatus"]["pendingMessageCount"], live_pending_mutations,
+            "the response must expose the retained autosave backlog: {resp}"
+        );
+        assert!(
+            resp["data"]["persistenceWarning"].is_string(),
+            "the successful command response must carry a non-retryable save warning: {resp}"
+        );
+        assert_eq!(
+            metrics_after.coalesced_mutations, metrics_before.coalesced_mutations,
+            "the first pending BashExecution mutation must not be reported as coalesced"
+        );
+        assert_eq!(
+            metrics_after.pending_mutations,
+            metrics_before
+                .pending_mutations
+                .saturating_add(1)
+                .min(metrics_before.max_pending_mutations),
+            "the failed flush must retain the appended mutation"
+        );
+        assert_eq!(
+            metrics_after.flush_started,
+            metrics_before.flush_started + 1,
+            "the backlog response must follow a real flush attempt"
+        );
+        assert_eq!(
+            metrics_after.flush_failed,
+            metrics_before.flush_failed + 1,
+            "the real flush attempt must record its failure"
+        );
+        assert_eq!(
+            metrics_after.flush_succeeded, metrics_before.flush_succeeded,
+            "the failed flush must not claim durable success"
         );
 
         drop(in_tx);
@@ -2791,6 +3329,7 @@ fn rpc_get_state_reflects_session_stats() {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: now,
             },
@@ -2819,6 +3358,14 @@ fn rpc_get_state_reflects_session_stats() {
         assert_eq!(resp["data"]["tokens"]["input"], 10);
         assert_eq!(resp["data"]["tokens"]["output"], 5);
         assert_eq!(resp["data"]["tokens"]["total"], 15);
+        assert_eq!(
+            resp["data"]["persistenceStatus"]["event"],
+            "session.persistence.disabled"
+        );
+        assert_eq!(
+            resp["data"]["persistenceStatus"]["pendingMessageCount"], 2,
+            "in-memory mutations remain observable without being mislabeled as a durable backlog"
+        );
 
         // get_messages should return the 2 messages
         let resp = send_recv(
@@ -3290,10 +3837,10 @@ async fn recv_ui_request(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> 
 
         match recv_result {
             Ok(line) => {
-                if let Ok(val) = serde_json::from_str::<Value>(&line) {
-                    if val.get("type").and_then(Value::as_str) == Some("extension_ui_request") {
-                        return val;
-                    }
+                if let Ok(val) = serde_json::from_str::<Value>(&line)
+                    && val.get("type").and_then(Value::as_str) == Some("extension_ui_request")
+                {
+                    return val;
                 }
                 // Not our event — keep waiting.
             }
@@ -3309,6 +3856,69 @@ async fn recv_ui_request(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> 
             start.elapsed() <= RPC_E2E_WAIT_TIMEOUT,
             "{label}: timed out waiting for extension_ui_request"
         );
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(5)).await;
+    }
+}
+
+fn ui_request_generation(event: &Value) -> u64 {
+    event
+        .get("requestGeneration")
+        .and_then(Value::as_u64)
+        .expect("extension UI request must carry its correlation generation")
+}
+
+// Fixture helper; taking ownership keeps the json! call sites terse.
+#[allow(clippy::needless_pass_by_value)]
+fn extension_ui_response_command(
+    command_id: &str,
+    request_id: &str,
+    request_generation: u64,
+    response_fields: Value,
+) -> String {
+    let mut command = json!({
+        "id": command_id,
+        "type": "extension_ui_response",
+        "requestId": request_id,
+        "requestGeneration": request_generation,
+    });
+    let command = command
+        .as_object_mut()
+        .expect("extension UI response command is an object");
+    let response_fields = response_fields
+        .as_object()
+        .expect("extension UI response fields are an object");
+    command.extend(response_fields.clone());
+    Value::Object(command.clone()).to_string()
+}
+
+async fn assert_no_ui_request_with_id(
+    out_rx: &Arc<Mutex<Receiver<String>>>,
+    request_id: &str,
+    duration: Duration,
+) {
+    let deadline = Instant::now() + duration;
+    loop {
+        let recv_result = {
+            let rx = out_rx.lock().expect("lock rpc output receiver");
+            rx.try_recv()
+        };
+        match recv_result {
+            Ok(line) => {
+                if let Ok(value) = serde_json::from_str::<Value>(&line)
+                    && value.get("type").and_then(Value::as_str) == Some("extension_ui_request")
+                    && value.get("id").and_then(Value::as_str) == Some(request_id)
+                {
+                    panic!("unexpected stale extension UI request: {value}");
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                panic!("RPC output disconnected while checking for stale UI request")
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(5)).await;
     }
 }
@@ -3616,17 +4226,17 @@ fn rpc_extension_ui_confirm_roundtrip() {
         // Spawn a request_ui call from the extension side.
         let mgr = manager.clone();
         let ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-confirm-1".to_string(),
-                method: "confirm".to_string(),
-                payload: json!({
+            let request = ExtensionUiRequest::new(
+                "req-confirm-1",
+                "confirm",
+                json!({
                     "title": "Delete file?",
                     "message": "This cannot be undone.",
                     "timeout": 5000
                 }),
-                timeout_ms: Some(5000),
-                extension_id: Some("test-ext".to_string()),
-            };
+            )
+            .with_timeout_ms(5000)
+            .with_extension_id(Some("test-ext".to_string()));
             mgr.request_ui(request).await
         });
 
@@ -3636,15 +4246,20 @@ fn rpc_extension_ui_confirm_roundtrip() {
         assert_eq!(ui_event["id"], "req-confirm-1");
         assert_eq!(ui_event["method"], "confirm");
         assert_eq!(ui_event["title"], "Delete file?");
+        let request_generation = ui_event["requestGeneration"]
+            .as_u64()
+            .expect("extension UI event carries its correlation generation");
 
         // Respond with confirmed = true.
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            r#"{"id":"cmd-1","type":"extension_ui_response","requestId":"req-confirm-1","confirmed":true}"#,
-            "confirm_response",
-        )
-        .await;
+        let response = json!({
+            "id": "cmd-1",
+            "type": "extension_ui_response",
+            "requestId": "req-confirm-1",
+            "requestGeneration": request_generation,
+            "confirmed": true,
+        })
+        .to_string();
+        let resp = send_recv(&in_tx, &out_rx, &response, "confirm_response").await;
         assert_ok(&resp, "extension_ui_response");
         assert_eq!(resp["data"]["resolved"], true);
 
@@ -3688,13 +4303,12 @@ fn rpc_extension_ui_confirm_denied() {
 
         let mgr = manager.clone();
         let ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-deny-1".to_string(),
-                method: "confirm".to_string(),
-                payload: json!({ "title": "Do risky thing?", "timeout": 5000 }),
-                timeout_ms: Some(5000),
-                extension_id: None,
-            };
+            let request = ExtensionUiRequest::new(
+                "req-deny-1",
+                "confirm",
+                json!({ "title": "Do risky thing?", "timeout": 5000 }),
+            )
+            .with_timeout_ms(5000);
             mgr.request_ui(request).await
         });
 
@@ -3702,13 +4316,13 @@ fn rpc_extension_ui_confirm_denied() {
         assert_eq!(ui_event["id"], "req-deny-1");
 
         // Respond with confirmed = false.
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            r#"{"id":"cmd-2","type":"extension_ui_response","requestId":"req-deny-1","value":false}"#,
-            "confirm_denied_response",
-        )
-        .await;
+        let response = extension_ui_response_command(
+            "cmd-2",
+            "req-deny-1",
+            ui_request_generation(&ui_event),
+            json!({"value": false}),
+        );
+        let resp = send_recv(&in_tx, &out_rx, &response, "confirm_denied_response").await;
         assert_ok(&resp, "extension_ui_response");
 
         let ui_result = ui_task.await;
@@ -3753,17 +4367,17 @@ fn rpc_extension_ui_select_roundtrip() {
 
         let mgr = manager.clone();
         let ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-select-1".to_string(),
-                method: "select".to_string(),
-                payload: json!({
+            let request = ExtensionUiRequest::new(
+                "req-select-1",
+                "select",
+                json!({
                     "title": "Pick a model",
                     "options": ["claude-sonnet", "gpt-4o", "gemini-pro"],
                     "timeout": 5000
                 }),
-                timeout_ms: Some(5000),
-                extension_id: Some("model-picker-ext".to_string()),
-            };
+            )
+            .with_timeout_ms(5000)
+            .with_extension_id(Some("model-picker-ext".to_string()));
             mgr.request_ui(request).await
         });
 
@@ -3774,13 +4388,13 @@ fn rpc_extension_ui_select_roundtrip() {
         assert!(ui_event["options"].is_array());
 
         // Select the second option.
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            r#"{"id":"cmd-3","type":"extension_ui_response","requestId":"req-select-1","value":"gpt-4o"}"#,
-            "select_response",
-        )
-        .await;
+        let response = extension_ui_response_command(
+            "cmd-3",
+            "req-select-1",
+            ui_request_generation(&ui_event),
+            json!({"value": "gpt-4o"}),
+        );
+        let resp = send_recv(&in_tx, &out_rx, &response, "select_response").await;
         assert_ok(&resp, "extension_ui_response");
 
         let ui_result = ui_task.await;
@@ -3825,17 +4439,17 @@ fn rpc_extension_ui_input_roundtrip() {
 
         let mgr = manager.clone();
         let ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-input-1".to_string(),
-                method: "input".to_string(),
-                payload: json!({
+            let request = ExtensionUiRequest::new(
+                "req-input-1",
+                "input",
+                json!({
                     "title": "Enter API key",
                     "message": "Paste your key below",
                     "timeout": 5000
                 }),
-                timeout_ms: Some(5000),
-                extension_id: Some("api-key-ext".to_string()),
-            };
+            )
+            .with_timeout_ms(5000)
+            .with_extension_id(Some("api-key-ext".to_string()));
             mgr.request_ui(request).await
         });
 
@@ -3844,13 +4458,13 @@ fn rpc_extension_ui_input_roundtrip() {
         assert_eq!(ui_event["method"], "input");
 
         // Respond with typed text.
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            r#"{"id":"cmd-4","type":"extension_ui_response","requestId":"req-input-1","value":"sk-test-12345"}"#,
-            "input_response",
-        )
-        .await;
+        let response = extension_ui_response_command(
+            "cmd-4",
+            "req-input-1",
+            ui_request_generation(&ui_event),
+            json!({"value": "sk-test-12345"}),
+        );
+        let resp = send_recv(&in_tx, &out_rx, &response, "input_response").await;
         assert_ok(&resp, "extension_ui_response");
 
         let ui_result = ui_task.await;
@@ -3895,17 +4509,16 @@ fn rpc_extension_ui_editor_roundtrip() {
 
         let mgr = manager.clone();
         let ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-editor-1".to_string(),
-                method: "editor".to_string(),
-                payload: json!({
+            let request = ExtensionUiRequest::new(
+                "req-editor-1",
+                "editor",
+                json!({
                     "title": "Edit config",
                     "message": "Modify the YAML below",
                     "timeout": 5000
                 }),
-                timeout_ms: Some(5000),
-                extension_id: None,
-            };
+            )
+            .with_timeout_ms(5000);
             mgr.request_ui(request).await
         });
 
@@ -3914,13 +4527,13 @@ fn rpc_extension_ui_editor_roundtrip() {
         assert_eq!(ui_event["method"], "editor");
 
         // Respond with edited text.
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            r#"{"id":"cmd-5","type":"extension_ui_response","requestId":"req-editor-1","value":"key: new_value"}"#,
-            "editor_response",
-        )
-        .await;
+        let response = extension_ui_response_command(
+            "cmd-5",
+            "req-editor-1",
+            ui_request_generation(&ui_event),
+            json!({"value": "key: new_value"}),
+        );
+        let resp = send_recv(&in_tx, &out_rx, &response, "editor_response").await;
         assert_ok(&resp, "extension_ui_response");
 
         let ui_result = ui_task.await;
@@ -3965,13 +4578,12 @@ fn rpc_extension_ui_cancel_response() {
 
         let mgr = manager.clone();
         let ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-cancel-1".to_string(),
-                method: "confirm".to_string(),
-                payload: json!({ "title": "Proceed?", "timeout": 5000 }),
-                timeout_ms: Some(5000),
-                extension_id: None,
-            };
+            let request = ExtensionUiRequest::new(
+                "req-cancel-1",
+                "confirm",
+                json!({ "title": "Proceed?", "timeout": 5000 }),
+            )
+            .with_timeout_ms(5000);
             mgr.request_ui(request).await
         });
 
@@ -3979,13 +4591,13 @@ fn rpc_extension_ui_cancel_response() {
         assert_eq!(ui_event["id"], "req-cancel-1");
 
         // Respond with cancelled: true.
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            r#"{"id":"cmd-6","type":"extension_ui_response","requestId":"req-cancel-1","cancelled":true}"#,
-            "cancel_response",
-        )
-        .await;
+        let response = extension_ui_response_command(
+            "cmd-6",
+            "req-cancel-1",
+            ui_request_generation(&ui_event),
+            json!({"cancelled": true}),
+        );
+        let resp = send_recv(&in_tx, &out_rx, &response, "cancel_response").await;
         assert_ok(&resp, "extension_ui_response");
 
         let ui_result = ui_task.await;
@@ -4031,7 +4643,7 @@ fn rpc_extension_ui_response_without_extensions() {
         let resp = send_recv(
             &in_tx,
             &out_rx,
-            r#"{"id":"cmd-7","type":"extension_ui_response","requestId":"req-x","confirmed":true}"#,
+            r#"{"id":"cmd-7","type":"extension_ui_response","requestId":"req-x","requestGeneration":0,"confirmed":true}"#,
             "no_extensions",
         )
         .await;
@@ -4074,27 +4686,27 @@ fn rpc_extension_ui_mismatched_request_id() {
 
         let mgr = manager.clone();
         let _ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-real-1".to_string(),
-                method: "confirm".to_string(),
-                payload: json!({ "title": "Do it?", "timeout": 5000 }),
-                timeout_ms: Some(5000),
-                extension_id: None,
-            };
+            let request = ExtensionUiRequest::new(
+                "req-real-1",
+                "confirm",
+                json!({ "title": "Do it?", "timeout": 5000 }),
+            )
+            .with_timeout_ms(5000);
             mgr.request_ui(request).await
         });
 
         let ui_event = recv_ui_request(&out_rx, "mismatch").await;
         assert_eq!(ui_event["id"], "req-real-1");
+        let request_generation = ui_request_generation(&ui_event);
 
         // Send response with WRONG request ID.
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            r#"{"id":"cmd-8","type":"extension_ui_response","requestId":"req-WRONG","confirmed":true}"#,
-            "wrong_id_response",
-        )
-        .await;
+        let wrong_response = extension_ui_response_command(
+            "cmd-8",
+            "req-WRONG",
+            request_generation,
+            json!({"confirmed": true}),
+        );
+        let resp = send_recv(&in_tx, &out_rx, &wrong_response, "wrong_id_response").await;
         assert_err(&resp, "extension_ui_response");
         let error_msg = resp["error"].as_str().unwrap_or("");
         assert!(
@@ -4103,13 +4715,13 @@ fn rpc_extension_ui_mismatched_request_id() {
         );
 
         // Now send the correct one to clean up.
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            r#"{"id":"cmd-9","type":"extension_ui_response","requestId":"req-real-1","confirmed":true}"#,
-            "correct_id_response",
-        )
-        .await;
+        let correct_response = extension_ui_response_command(
+            "cmd-9",
+            "req-real-1",
+            request_generation,
+            json!({"confirmed": true}),
+        );
+        let resp = send_recv(&in_tx, &out_rx, &correct_response, "correct_id_response").await;
         assert_ok(&resp, "extension_ui_response");
 
         drop(in_tx);
@@ -4198,29 +4810,30 @@ fn rpc_extension_ui_id_alias_roundtrip() {
 
         let mgr = manager.clone();
         let ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-legacy-1".to_string(),
-                method: "confirm".to_string(),
-                payload: json!({ "title": "Legacy id alias?", "timeout": 5000 }),
-                timeout_ms: Some(5000),
-                extension_id: None,
-            };
+            let request = ExtensionUiRequest::new(
+                "req-legacy-1",
+                "confirm",
+                json!({ "title": "Legacy id alias?", "timeout": 5000 }),
+            )
+            .with_timeout_ms(5000);
             mgr.request_ui(request).await
         });
 
         let ui_event = recv_ui_request(&out_rx, "id_alias").await;
         assert_eq!(ui_event["id"], "req-legacy-1");
         assert_eq!(ui_event["method"], "confirm");
+        let request_generation = ui_request_generation(&ui_event);
 
         // Upstream accepts top-level "id" as a requestId alias for
         // extension_ui_response.
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            r#"{"id":"req-legacy-1","type":"extension_ui_response","confirmed":true}"#,
-            "id_alias_response",
-        )
-        .await;
+        let response = json!({
+            "id": "req-legacy-1",
+            "type": "extension_ui_response",
+            "requestGeneration": request_generation,
+            "confirmed": true,
+        })
+        .to_string();
+        let resp = send_recv(&in_tx, &out_rx, &response, "id_alias_response").await;
         assert_ok(&resp, "extension_ui_response");
         assert_eq!(resp["id"], "req-legacy-1");
         assert_eq!(resp["data"]["resolved"], true);
@@ -4230,6 +4843,188 @@ fn rpc_extension_ui_id_alias_roundtrip() {
         let response = response.expect("should have a response");
         assert_eq!(response.value, Some(json!(true)));
         assert!(!response.cancelled);
+
+        drop(in_tx);
+        let _ = server.await;
+    });
+}
+
+#[test]
+fn rpc_extension_ui_generation_rejects_late_response_after_public_id_reuse() {
+    let _harness =
+        TestHarness::new("rpc_extension_ui_generation_rejects_late_response_after_public_id_reuse");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let (agent_session, manager) =
+            build_agent_session_with_extensions(Session::in_memory(), &cassette_dir);
+        let options = build_options(
+            &handle,
+            PathBuf::from("/tmp/auth_ui_generation_aba.json"),
+            vec![],
+            vec![],
+        );
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = rpc_output_channel();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
+
+        let first_manager = manager.clone();
+        let first_task = handle.spawn(async move {
+            first_manager
+                .request_ui(
+                    ExtensionUiRequest::new("reused-id", "confirm", json!({"title": "first"}))
+                        .with_timeout_ms(40),
+                )
+                .await
+        });
+        let first_event = recv_ui_request(&out_rx, "same-id first").await;
+        let first_generation = ui_request_generation(&first_event);
+        let _ = first_task.await;
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(20)).await;
+
+        let second_manager = manager.clone();
+        let second_task = handle.spawn(async move {
+            second_manager
+                .request_ui(
+                    ExtensionUiRequest::new("reused-id", "confirm", json!({"title": "second"}))
+                        .with_timeout_ms(5_000),
+                )
+                .await
+        });
+        let second_event = recv_ui_request(&out_rx, "same-id second").await;
+        let second_generation = ui_request_generation(&second_event);
+        assert_ne!(first_generation, second_generation);
+
+        let late_response = extension_ui_response_command(
+            "late-a",
+            "reused-id",
+            first_generation,
+            json!({"confirmed": false}),
+        );
+        let rejected = send_recv(&in_tx, &out_rx, &late_response, "late same-id response").await;
+        assert_err(&rejected, "extension_ui_response");
+        assert!(
+            rejected["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("Unexpected requestGeneration"))
+        );
+        assert!(manager.ui_request_is_pending("reused-id"));
+
+        let current_response = extension_ui_response_command(
+            "current-b",
+            "reused-id",
+            second_generation,
+            json!({"confirmed": true}),
+        );
+        let accepted = send_recv(
+            &in_tx,
+            &out_rx,
+            &current_response,
+            "current same-id response",
+        )
+        .await;
+        assert_ok(&accepted, "extension_ui_response");
+        let second = second_task
+            .await
+            .expect("second request succeeds")
+            .expect("second request has response");
+        assert_eq!(second.value, Some(json!(true)));
+
+        drop(in_tx);
+        let _ = server.await;
+    });
+}
+
+#[test]
+fn rpc_queued_deadline_does_not_emit_after_unbounded_predecessor_resolves() {
+    let _harness =
+        TestHarness::new("rpc_queued_deadline_does_not_emit_after_unbounded_predecessor_resolves");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let (agent_session, manager) =
+            build_agent_session_with_extensions(Session::in_memory(), &cassette_dir);
+        let options = build_options(
+            &handle,
+            PathBuf::from("/tmp/auth_ui_queued_deadline.json"),
+            vec![],
+            vec![],
+        );
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = rpc_output_channel();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
+
+        let active_manager = manager.clone();
+        let active_task = handle.spawn(async move {
+            active_manager
+                .request_ui(ExtensionUiRequest::new(
+                    "unbounded-active",
+                    "confirm",
+                    json!({"title": "active"}),
+                ))
+                .await
+        });
+        let active_event = recv_ui_request(&out_rx, "unbounded active").await;
+        let active_generation = ui_request_generation(&active_event);
+
+        let queued_manager = manager.clone();
+        let queued_task = handle.spawn(async move {
+            queued_manager
+                .request_ui(
+                    ExtensionUiRequest::new_capability_prompt(
+                        "bounded-queued",
+                        "trusted-extension",
+                        "exec",
+                        json!({"title": "queued"}),
+                    )
+                    .with_timeout_ms(40),
+                )
+                .await
+        });
+        let queued_response = queued_task
+            .await
+            .expect("queued capability timeout is a typed response")
+            .expect("capability prompt expects a response");
+        assert_eq!(queued_response.id, "bounded-queued");
+        assert_eq!(
+            queued_response.value,
+            Some(json!({
+                "allow": false,
+                "persist": false,
+                "remember": false,
+                "reason": "auto_deny",
+            }))
+        );
+
+        let active_response = extension_ui_response_command(
+            "resolve-active",
+            "unbounded-active",
+            active_generation,
+            json!({"confirmed": true}),
+        );
+        let accepted = send_recv(
+            &in_tx,
+            &out_rx,
+            &active_response,
+            "resolve unbounded active",
+        )
+        .await;
+        assert_ok(&accepted, "extension_ui_response");
+        let _ = active_task.await;
+
+        assert_no_ui_request_with_id(&out_rx, "bounded-queued", Duration::from_millis(100)).await;
 
         drop(in_tx);
         let _ = server.await;
@@ -4268,29 +5063,30 @@ fn rpc_extension_ui_sequential_ordering() {
         // Fire two requests concurrently.
         let mgr1 = manager.clone();
         let ui_task_1 = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-seq-1".to_string(),
-                method: "confirm".to_string(),
-                payload: json!({ "title": "First?", "timeout": 5000 }),
-                timeout_ms: Some(5000),
-                extension_id: Some("ext-a".to_string()),
-            };
+            let request = ExtensionUiRequest::new(
+                "req-seq-1",
+                "confirm",
+                json!({ "title": "First?", "timeout": 5000 }),
+            )
+            .with_timeout_ms(5000)
+            .with_extension_id(Some("ext-a".to_string()));
             mgr1.request_ui(request).await
         });
 
         // Wait for the first to be emitted before sending the second.
         let first_event = recv_ui_request(&out_rx, "seq_first").await;
         assert_eq!(first_event["id"], "req-seq-1");
+        let first_generation = ui_request_generation(&first_event);
 
         let mgr2 = manager.clone();
         let ui_task_2 = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-seq-2".to_string(),
-                method: "input".to_string(),
-                payload: json!({ "title": "Second?", "timeout": 5000 }),
-                timeout_ms: Some(5000),
-                extension_id: Some("ext-b".to_string()),
-            };
+            let request = ExtensionUiRequest::new(
+                "req-seq-2",
+                "input",
+                json!({ "title": "Second?", "timeout": 5000 }),
+            )
+            .with_timeout_ms(5000)
+            .with_extension_id(Some("ext-b".to_string()));
             mgr2.request_ui(request).await
         });
 
@@ -4298,13 +5094,13 @@ fn rpc_extension_ui_sequential_ordering() {
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(100)).await;
 
         // Respond to the first — this should dequeue the second.
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            r#"{"id":"cmd-11","type":"extension_ui_response","requestId":"req-seq-1","confirmed":true}"#,
-            "seq_first_response",
-        )
-        .await;
+        let first_response = extension_ui_response_command(
+            "cmd-11",
+            "req-seq-1",
+            first_generation,
+            json!({"confirmed": true}),
+        );
+        let resp = send_recv(&in_tx, &out_rx, &first_response, "seq_first_response").await;
         assert_ok(&resp, "extension_ui_response");
 
         let r1 = ui_task_1
@@ -4317,15 +5113,16 @@ fn rpc_extension_ui_sequential_ordering() {
         let second_event = recv_ui_request(&out_rx, "seq_second").await;
         assert_eq!(second_event["id"], "req-seq-2");
         assert_eq!(second_event["method"], "input");
+        let second_generation = ui_request_generation(&second_event);
 
         // Respond to the second.
-        let resp = send_recv(
-            &in_tx,
-            &out_rx,
-            r#"{"id":"cmd-12","type":"extension_ui_response","requestId":"req-seq-2","value":"hello"}"#,
-            "seq_second_response",
-        )
-        .await;
+        let second_response = extension_ui_response_command(
+            "cmd-12",
+            "req-seq-2",
+            second_generation,
+            json!({"value": "hello"}),
+        );
+        let resp = send_recv(&in_tx, &out_rx, &second_response, "seq_second_response").await;
         assert_ok(&resp, "extension_ui_response");
 
         let r2 = ui_task_2
@@ -4371,7 +5168,7 @@ fn rpc_extension_ui_no_active_request() {
         let resp = send_recv(
             &in_tx,
             &out_rx,
-            r#"{"id":"cmd-13","type":"extension_ui_response","requestId":"req-ghost","confirmed":true}"#,
+            r#"{"id":"cmd-13","type":"extension_ui_response","requestId":"req-ghost","requestGeneration":0,"confirmed":true}"#,
             "no_active",
         )
         .await;
@@ -4419,16 +5216,15 @@ fn rpc_extension_ui_notify_fire_and_forget() {
         // Send a "notify" request — fire-and-forget, no response expected.
         let mgr = manager.clone();
         let ui_task = handle.spawn(async move {
-            let request = ExtensionUiRequest {
-                id: "req-notify-1".to_string(),
-                method: "notify".to_string(),
-                payload: json!({
+            let request = ExtensionUiRequest::new(
+                "req-notify-1",
+                "notify",
+                json!({
                     "title": "Heads up!",
                     "message": "Something happened"
                 }),
-                timeout_ms: None,
-                extension_id: Some("notifier-ext".to_string()),
-            };
+            )
+            .with_extension_id(Some("notifier-ext".to_string()));
             mgr.request_ui(request).await
         });
 
@@ -4445,5 +5241,231 @@ fn rpc_extension_ui_notify_fire_and_forget() {
 
         drop(in_tx);
         let _ = server.await;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint / rewind / fresh / retry RPC commands (bd-cv653.3.7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rpc_checkpoint_rewind_fresh_retry_cycle() {
+    let harness = TestHarness::new("rpc_checkpoint_rewind_fresh_retry_cycle");
+    let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+        .blocking_threads(1, 8)
+        .enable_parking(false)
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let project_dir = harness.temp_path("project");
+        let sessions_root = harness.temp_path("sessions");
+        let auth_path = harness.temp_path("auth.json");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+
+        let mut session = Session::create_with_dir(Some(sessions_root));
+        session.header.cwd = project_dir.display().to_string();
+        session.header.provider = Some("keyless-replay".to_string());
+        session.header.model_id = Some("keyless-rpc-replay".to_string());
+        session.header.thinking_level = Some("off".to_string());
+        let agent_session = build_persistent_keyless_agent_session(session, &project_dir);
+        let options = build_options(&handle, auth_path, vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = rpc_output_channel();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        // A turn so there is something to checkpoint around.
+        let prompt = json!({
+            "id": "cp-prompt",
+            "type": "prompt",
+            "message": "first turn content",
+        })
+        .to_string();
+        let prompt_resp = send_recv(&in_tx, &out_rx, &prompt, "prompt(turn)").await;
+        assert_ok(&prompt_resp, "prompt");
+        let _idle = wait_for_non_streaming_state(&in_tx, &out_rx, "cp-idle-1", "idle after turn").await;
+
+        // Checkpoint at the current leaf.
+        let checkpoint = json!({
+            "id": "cp-mark",
+            "type": "checkpoint",
+            "name": "alpha",
+            "note": "before more work",
+        })
+        .to_string();
+        let checkpoint_resp = send_recv(&in_tx, &out_rx, &checkpoint, "checkpoint(mark)").await;
+        assert_ok(&checkpoint_resp, "checkpoint");
+        assert_eq!(
+            data_field(&checkpoint_resp, "name").and_then(Value::as_str),
+            Some("alpha")
+        );
+        let marked_count =
+            require_response_field_u64(&checkpoint_resp, "messageCount", "checkpoint mark");
+
+        // Another turn past the checkpoint.
+        let prompt2 = json!({
+            "id": "cp-prompt-2",
+            "type": "prompt",
+            "message": "second turn content after the checkpoint",
+        })
+        .to_string();
+        let prompt2_resp = send_recv(&in_tx, &out_rx, &prompt2, "prompt(turn 2)").await;
+        assert_ok(&prompt2_resp, "prompt");
+        let _idle2 = wait_for_non_streaming_state(&in_tx, &out_rx, "cp-idle-2", "idle after turn 2").await;
+
+        // Rewind to the checkpoint: the second turn collapses into a report.
+        let rewind = json!({
+            "id": "cp-rewind",
+            "type": "rewind",
+            "name": "alpha",
+        })
+        .to_string();
+        let rewind_resp = send_recv(&in_tx, &out_rx, &rewind, "rewind(to alpha)").await;
+        assert_ok(&rewind_resp, "rewind");
+        let collapsed =
+            require_response_field_u64(&rewind_resp, "collapsedMessages", "rewind");
+        assert!(
+            collapsed > 0,
+            "rewind must collapse the post-checkpoint span (marked at {marked_count}): {rewind_resp}"
+        );
+        assert_eq!(
+            data_field(&rewind_resp, "treePreserved").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // Fresh: provider stream state rotates; transcript untouched.
+        let fresh = json!({ "id": "cp-fresh", "type": "fresh" }).to_string();
+        let fresh_resp = send_recv(&in_tx, &out_rx, &fresh, "fresh").await;
+        assert_ok(&fresh_resp, "fresh");
+        let new_id = require_response_field_str(&fresh_resp, "newSessionId", "fresh");
+        assert!(new_id.starts_with("fresh-"), "{new_id}");
+
+        // Retry: re-EXECUTES the last user turn immediately (a queued-only
+        // retry silently waited for, then polluted, the next prompt).
+        let retry = json!({ "id": "cp-retry", "type": "retry" }).to_string();
+        let retry_resp = send_recv(&in_tx, &out_rx, &retry, "retry").await;
+        assert_ok(&retry_resp, "retry");
+        assert_eq!(
+            data_field(&retry_resp, "rerunning").and_then(Value::as_bool),
+            Some(true)
+        );
+        // The retried turn is a real run: wait for it to finish so shutdown
+        // doesn't race an in-flight stream.
+        let _idle3 =
+            wait_for_non_streaming_state(&in_tx, &out_rx, "cp-idle-3", "idle after retry").await;
+
+        drop(in_tx);
+        let _ = server.await;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Tests: late extension MCP registrations reach the RPC session (bd-1wr1n)
+// ---------------------------------------------------------------------------
+
+/// The RPC loop owns the session and, when MCP is enabled, the session-owned
+/// MCP manager. A server an extension registers after startup (what the
+/// `registerMcpServer` hostcall does from a later callback) must reach that
+/// manager at the next prompt: once, with extension provenance, pending trust
+/// (nothing mounts), and never twice. Removing the sync from
+/// `run_prompt_with_retry` fails this test.
+#[test]
+fn rpc_late_extension_mcp_registration_reaches_the_session_at_the_next_prompt() {
+    let harness = TestHarness::new(
+        "rpc_late_extension_mcp_registration_reaches_the_session_at_the_next_prompt",
+    );
+    let cwd = harness.temp_dir().to_path_buf();
+    let global_dir = harness.temp_path("mcp-global");
+    std::fs::create_dir_all(&global_dir).expect("create MCP global dir");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let mut session = Session::in_memory();
+        session.header.cwd = cwd.display().to_string();
+        session.header.provider = Some("keyless-replay".to_string());
+        session.header.model_id = Some("keyless-rpc-replay".to_string());
+        let provider: Arc<dyn Provider> = Arc::new(KeylessReplayProvider::new(
+            "keyless-rpc-replay",
+            Duration::from_millis(10),
+        ));
+        let tools = ToolRegistry::new(&[], &cwd, None);
+        let agent = Agent::new(provider, tools, AgentConfig::default());
+        let session = Arc::new(asupersync::sync::Mutex::new(session));
+        let mut agent_session = AgentSession::new(
+            agent,
+            session,
+            false,
+            pi::compaction::ResolvedCompactionSettings::default(),
+        );
+        let manager = ExtensionManager::default();
+        agent_session.extensions = Some(ExtensionRegion::new(manager.clone()));
+        let mcp_manager = Arc::new(
+            pi::mcp::bootstrap_with_project_trust(&cwd, &global_dir, &[], true)
+                .expect("bootstrap MCP manager"),
+        );
+        agent_session.set_mcp_manager(Arc::clone(&mcp_manager));
+
+        let options = build_options(
+            &handle,
+            harness.temp_path("auth_late_mcp.json"),
+            vec![],
+            vec![],
+        );
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = rpc_output_channel();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        // What the `registerMcpServer` hostcall does once startup is over.
+        manager.register_mcp_server(json!({
+            "name": "late-fixture",
+            "command": "pi-mcp-late-fixture-does-not-exist",
+            "extension_id": "late-extension"
+        }));
+        assert!(
+            mcp_manager
+                .list()
+                .iter()
+                .all(|row| row.name != "late-fixture"),
+            "the extension snapshot alone must not reach the MCP manager"
+        );
+
+        for (id, label) in [("late-1", "first prompt"), ("late-2", "second prompt")] {
+            let prompt = json!({
+                "id": id,
+                "type": "prompt",
+                "message": format!("late mcp {label}"),
+            })
+            .to_string();
+            let send_cx = asupersync::Cx::for_testing();
+            require_send(in_tx.send(&send_cx, prompt).await, label);
+            let (response, _agent_end) = recv_response_and_agent_end(&out_rx, id, label).await;
+            assert_ok(&response, "prompt");
+            let rows = mcp_manager
+                .list()
+                .into_iter()
+                .filter(|row| row.name == "late-fixture")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows.len(),
+                1,
+                "{label}: the late server is registered exactly once"
+            );
+            assert_eq!(rows[0].provenance, "extension", "{label}");
+            assert_eq!(
+                rows[0].trust, "pending",
+                "{label}: a server first seen at runtime waits for acknowledgement"
+            );
+        }
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
     });
 }

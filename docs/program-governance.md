@@ -12,10 +12,10 @@ maintenance cadence for the Pi extension platform.
 | Runtime (PiJS, QuickJS, hostcalls) | Primary maintainer | AI agent review (Claude/Codex) |
 | Extension API surface | Primary maintainer | AI agent review |
 | Capability policy (safe/balanced/permissive) | Primary maintainer | Security review required |
-| CI/CD pipelines | Primary maintainer | Self-healing via gate promotion |
+| DSR quality and release recipes | Primary maintainer | Reproducible local and native-host evidence |
 | Conformance corpus (223 extensions) | Automated via conformance harness | Manual triage for new failures |
 | Documentation | Primary maintainer + agents | Automated staleness checks |
-| Sibling crates (asupersync, rich_rust, charmed, sqlmodel) | Independently versioned | Cross-repo coordination via bead dependencies |
+| Sibling crates (asupersync, rich_rust, charmed, fsqlite) | Independently versioned | Cross-repo coordination via bead dependencies |
 
 ### Decision Authority
 
@@ -31,21 +31,25 @@ maintenance cadence for the Pi extension platform.
 
 ## Quality Gates
 
-### CI Gates (Enforced on Every PR)
+### DSR Quality Gates (Required Before Integration and Release)
 
 | Gate | Threshold | Enforcement |
 |------|-----------|-------------|
-| `cargo fmt` | Zero diff | `.github/workflows/ci.yml` |
-| `cargo clippy -D warnings` | Zero warnings | `.github/workflows/ci.yml` |
-| Unit tests | 100% pass | `.github/workflows/ci.yml` |
-| VCR/fixture tests | 100% pass | `.github/workflows/ci.yml` |
-| No-mock dependency guard | Zero violations | `.github/workflows/ci.yml` |
-| Suite classification guard | All files classified | `.github/workflows/ci.yml` |
-| Traceability matrix guard | All classified tests traced | `.github/workflows/ci.yml` |
-| VCR leak guard | No cassettes in wrong suite | `.github/workflows/ci.yml` |
-| PR Definition-of-Done evidence guard | Required for feature-surface PRs | `.github/workflows/ci.yml` |
+| `cargo fmt` | Zero diff | `dsr quality --tool pi_agent_rust` |
+| `cargo clippy -D warnings` | Zero warnings | `dsr quality --tool pi_agent_rust` |
+| Unit tests | 100% pass | `dsr quality --tool pi_agent_rust` |
+| VCR/fixture tests | 100% pass | DSR quality recipe |
+| No-mock dependency guard | Zero violations | DSR quality recipe |
+| Suite classification guard | All files classified | DSR quality recipe |
+| Traceability matrix guard | All classified tests traced | DSR quality recipe |
+| VCR leak guard | No cassettes in wrong suite | DSR quality recipe |
+| Definition-of-Done evidence | Required for feature-surface changes | DSR quality output |
 
-### Conformance Gates (Nightly + Release)
+GitHub Actions is permanently disabled for this repository and is never a
+quality or release authority. RCH may offload development compilation, but only
+DSR can authorize cross-platform build or release claims.
+
+### Conformance Gates (DSR Quality + Release)
 
 | Gate | Threshold | Source |
 |------|-----------|--------|
@@ -63,14 +67,14 @@ maintenance cadence for the Pi extension platform.
 | Cold extension load | < 200ms p95 | `budget_summary.json` |
 | Warm extension load | < 50ms p95 | `budget_summary.json` |
 | Event dispatch latency | < 10ms p95 | `budget_summary.json` |
-| Binary size | < 50MB | CI artifact check |
+| Binary size | < 50MB | DSR release-artifact check |
 
 See [BENCHMARKS.md](../BENCHMARKS.md) for full budget definitions.
 
 ### Release Gates (1.0 Criteria)
 
 Per [releasing.md](releasing.md):
-- CI green on Linux/macOS/Windows
+- DSR quality and native builds green on Linux/macOS/Windows
 - Core CLI modes stable (print + interactive + RPC)
 - Extension runtime surface and security policy stable
 - Conformance gates met at release thresholds
@@ -79,21 +83,20 @@ Per [releasing.md](releasing.md):
 
 Feature-surface PRs (runtime/provider/tooling behavior changes) are not mergeable until:
 
-1. PR body includes checked evidence for unit, e2e, and extension validation.
-2. PR body links directly to structured artifacts/logs for those runs.
-3. PR body includes reproduction commands for both passing validation and the most recent failing path.
-4. PR body contains no unresolved checklist placeholders.
+1. The change records checked evidence for unit, e2e, and extension validation.
+2. The evidence links directly to DSR or focused development output for those runs.
+3. The handoff includes reproduction commands for both passing validation and the most recent failing path.
+4. The change contains no unresolved placeholders.
 
-The canonical checklist source is `.github/pull_request_template.md`, and CI enforces it in
-the Linux PR lane.
+DSR is the enforcement authority; GitHub Actions must not be used.
 
 #### Migration Guidance for Existing Feature Branches
 
 1. Rebase on latest `main`.
 2. Replace PR body with `.github/pull_request_template.md`.
-3. Backfill evidence links from latest CI/local runs.
+3. Backfill evidence links from the latest DSR/focused development runs.
 4. Include explicit failing-path artifact links plus exact rerun commands.
-5. Re-run CI and merge only after DoD guard passes.
+5. Run the required DSR quality gate before integration.
 
 ---
 
@@ -123,8 +126,8 @@ See [releasing.md](releasing.md) for the full release process.
 
 | Task | Owner | Verification |
 |------|-------|-------------|
-| Dependency audit (`cargo audit`) | Automated | CI gate |
-| Conformance regression review | Agent triage | Nightly CI reports |
+| Dependency audit (`cargo audit`) | DSR | DSR quality gate |
+| Conformance regression review | Agent triage | DSR conformance output |
 | Bead backlog grooming | Primary maintainer | `bv --robot-plan` + `br ready --json` |
 
 ### Weekly QA Burndown (bd-1f42, as of 2026-02-10)
@@ -148,9 +151,9 @@ Top blocker graph pressure (open blockers):
 | Blocked target | Root cause analysis | Accountable owner | Unblock action (next checkpoint) |
 |----------------|---------------------|-------------------|----------------------------------|
 | `bd-1f42.3` (E2E harness track) | Critical-path concentration on runner core (`bd-1f42.3.1`) and versioned logging contract (`bd-1f42.3.6`) keeps scenario/replay beads from starting. | `TopazForest` | Close `bd-1f42.3.1`, then land `bd-1f42.3.6` logging contract to unlock downstream scenario/replay work. |
-| `bd-1f42.4` (208-extension matrix track) | Fixture corpus + executor + gate/reporting work is still serial (`bd-1f42.4.2`/`.4.3`/`.4.4`), so downstream compatibility and dossier beads remain blocked. | `OrangeBarn` | Prioritize `bd-1f42.4.3` sharded executor completion, then wire `bd-1f42.4.4` CI must-pass gate immediately after. |
-| `bd-1f42.6.5` (final full-suite gate) | Final release-blocking gate depends on unfinished deliverables across CI, unit, e2e, extension, and reliability tracks. | `PearlRaven` (coordination owner for `bd-1f42.6.*`) | Keep prerequisite checklist explicit and sequence completion `bd-1f42.6.1` -> `bd-1f42.6.8` -> `bd-1f42.6.5` with owner check-ins each burndown cycle. |
-| `bd-1f42.7.3` (final certification) | Certification is evidence-gated: governance cadence (`bd-1f42.7.2`) plus runbook and CI evidence-bundle dependencies are still open. | `BrightValley` | Maintain weekly burndown updates, close `bd-1f42.7.4` runbook, then assemble certification once `bd-1f42.6.8` and `bd-1f42.4.5` are complete. |
+| `bd-1f42.4` (208-extension matrix track) | Fixture corpus + executor + gate/reporting work is still serial (`bd-1f42.4.2`/`.4.3`/`.4.4`), so downstream compatibility and dossier beads remain blocked. | `OrangeBarn` | Prioritize `bd-1f42.4.3` sharded executor completion, then wire `bd-1f42.4.4` into the DSR must-pass recipe immediately after. |
+| `bd-1f42.6.5` (final full-suite gate) | Final release-blocking gate depends on unfinished deliverables across DSR quality, unit, e2e, extension, and reliability tracks. | `PearlRaven` (coordination owner for `bd-1f42.6.*`) | Keep prerequisite checklist explicit and sequence completion `bd-1f42.6.1` -> `bd-1f42.6.8` -> `bd-1f42.6.5` with owner check-ins each burndown cycle. |
+| `bd-1f42.7.3` (final certification) | Certification is evidence-gated: governance cadence (`bd-1f42.7.2`) plus runbook and DSR evidence-bundle dependencies are still open. | `BrightValley` | Maintain weekly burndown updates, close `bd-1f42.7.4` runbook, then assemble certification once `bd-1f42.6.8` and `bd-1f42.4.5` are complete. |
 
 Next burndown checkpoint: `2026-02-17` (UTC), with updated blocker counts and owner-level action status.
 
@@ -176,7 +179,7 @@ Sequencing gates (ordered):
 1. **Gate A - Native parity evidence complete**
 Criteria: `bd-3uqg.3.8.4` includes provider-level pass/fail matrix with links to unit/e2e logs and explicit deviation notes.
 2. **Gate B - Core provider test harnesses**
-Criteria: `bd-3uqg.8.2`, `bd-3uqg.8.3`, and `bd-3uqg.8.4` land with deterministic fixtures, event-parity assertions, and CI artifact hooks.
+Criteria: `bd-3uqg.8.2`, `bd-3uqg.8.3`, and `bd-3uqg.8.4` land with deterministic fixtures, event-parity assertions, and DSR artifact hooks.
 3. **Gate C - Provider docs evidence closure**
 Criteria: `bd-3uqg.9.1.2`, `bd-3uqg.9.1.3`, `bd-3uqg.9.2`, `bd-3uqg.9.3`, `bd-3uqg.9.4`, and `bd-3uqg.9.5` reference concrete test artifacts rather than narrative-only claims.
 4. **Gate D - Rollup certification path**
@@ -197,13 +200,13 @@ Next provider rollup checkpoint: `2026-02-13` (UTC), focused on `bd-3uqg.3.8.4` 
 | Performance budget review | Primary maintainer | `budget_summary.json` trends |
 | Extension corpus update | Automated discovery | `extension-inclusion-list.json` |
 | Documentation staleness check | Traceability tests | `traceability_staleness.rs` |
-| CI gate threshold review | Primary maintainer | Gate promotion workflow |
+| DSR gate threshold review | Primary maintainer | DSR recipe review |
 
 ### Quarterly
 
 | Task | Owner | Verification |
 |------|-------|-------------|
-| Full conformance campaign (223 extensions) | Automated | `conformance.yml` nightly |
+| Full conformance campaign (223 extensions) | Primary maintainer | DSR quality/campaign receipt |
 | Security review of capability policies | Primary maintainer | Threat model doc |
 | Dependency major version updates | Primary maintainer | `cargo update` + full test |
 | Roadmap review and bead reprioritization | Primary maintainer | `bv --robot-plan` + `bv --robot-priority` |
@@ -282,7 +285,7 @@ Use this path only when at least one condition is true:
 | 1 | Open an emergency tracking bead with label `operations` and link the triggering incident. | `br show <id> --json` |
 | 2 | Confirm the activating condition with the out-of-band maintainer contact roster stored outside this repo. | Emergency log entry, not committed |
 | 3 | Have the designated emergency repo admin accept temporary operational ownership. | GitHub organization or repo audit log |
-| 4 | Freeze non-emergency merges until CI, release tags, and installer distribution are verified. | Branch ruleset/audit-log snapshot |
+| 4 | Freeze non-emergency merges until DSR quality, release tags, and installer distribution are verified. | DSR receipts plus branch-ruleset snapshot |
 | 5 | Record every action in the emergency bead and in release notes if a user-visible build ships. | Bead comments, CHANGELOG entry |
 
 The private roster must identify at least two emergency contacts: one GitHub
@@ -298,9 +301,9 @@ activation criteria are met.
 | Secret or authority | Recovery/rotation action | Verification |
 |---------------------|--------------------------|--------------|
 | GitHub repository/admin access | Rotate compromised credentials, review SSH/GPG keys, revoke unknown tokens, and confirm branch rulesets still protect `main`. | GitHub security log + ruleset snapshot |
-| `CARGO_REGISTRY_TOKEN` | Revoke the old crates.io token, issue a least-privilege replacement, and update the Actions secret. | `Publish` workflow dry-run or pre-release tag |
-| Release workflow authority | Verify `.github/workflows/release.yml` permissions still use GitHub-scoped release rights only. | Workflow run log |
-| Installer artifact integrity | Regenerate release assets, `SHA256SUMS`, and Sigstore/checksum evidence before advising users to install. | GitHub Release artifact list + checksum proof |
+| `CARGO_REGISTRY_TOKEN` | Revoke the old crates.io token, issue a least-privilege replacement, and update the DSR secret source outside Git. | DSR publication dry-run or pre-release receipt |
+| Release authority | Verify the DSR recipe, credentials, signing identity, and native-host inventory before publication. | DSR status and release receipts |
+| Installer artifact integrity | Regenerate the exact DSR release assets and per-asset `.sha256` sidecars before advising users to install. | DSR release-verification receipt + public asset list |
 | Local signing or recovery material | Rotate outside Git, then document only the rotation event and operator identity. | Private escrow audit log |
 
 After rotation, invalidate all emergency session tokens, remove temporary
@@ -310,13 +313,13 @@ normal governance.
 ### Emergency Release Process
 
 1. Rebase on latest `main` and keep the patch scoped to the emergency.
-2. Run the mandatory local gates from [AGENTS.md](../AGENTS.md), including
-   `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`,
-   `cargo fmt --check`, and `./scripts/reconcile_beads_ledger.sh`.
+2. Run the mandatory DSR gate from [AGENTS.md](../AGENTS.md):
+   `dsr quality --tool pi_agent_rust`. The retired strict drop-in ledger is not
+   an emergency-release gate.
 3. Cut a pre-release tag first when time allows: `vX.Y.Z-rc.N`.
-4. Verify the `Publish` and `Release (GitHub binaries)` workflows in
-   [releasing.md](releasing.md), including installer regression and checksum
-   artifacts.
+4. Complete the DSR build/release/verify sequence in
+   [releasing.md](releasing.md), including installer regression and exact
+   per-asset checksum sidecars. Never invoke a GitHub Actions workflow.
 5. Promote to the final SemVer tag only after the release artifact path and
    installer path both pass smoke tests.
 6. Document the reason for emergency authority in `CHANGELOG.md` and the
@@ -329,12 +332,12 @@ protection, code review evidence, or release artifact verification.
 ### Branch-Protection Authority
 
 Only the primary maintainer or the designated emergency repo admin may change
-branch protection, required checks, release workflow permissions, or tag
+branch protection, required checks, DSR release authority, or tag
 protection. During an emergency, any such change requires:
 
 1. A linked emergency bead.
 2. A second human or agent review recorded in the bead.
-3. A before/after snapshot of the GitHub ruleset or workflow permission diff.
+3. A before/after snapshot of the GitHub ruleset or DSR authority change.
 4. Immediate restoration of the stricter rule after the emergency release.
 
 Branch protection must never be relaxed to make unrelated work mergeable during
@@ -350,15 +353,18 @@ Run this review quarterly or after any release-process change:
 3. Walk through credential rotation for `CARGO_REGISTRY_TOKEN` as a dry run:
    do not rotate unless there is a real incident, but verify the owner and
    storage location are known.
-4. Trigger or inspect a non-publishing release rehearsal, preferably a
-   pre-release tag or workflow dry run.
-5. Confirm the installer path verifies `SHA256SUMS` and does not require
-   `--no-verify` in published instructions.
-6. File beads for any missing role, stale secret owner, failing workflow, or
+4. Inspect a non-publishing DSR rehearsal with
+   `dsr build pi_agent_rust --dry-run`; do not dispatch any workflow.
+5. Confirm the installer path verifies the selected asset's exact `.sha256`
+   sidecar and published install
+   commands never pass the installer's testing-only `--no-verify` flag. This is
+   distinct from the credential-scoped Cargo upload described in the release
+   runbook.
+6. File beads for any missing role, stale secret owner, failing DSR recipe, or
    ambiguous branch-protection authority.
 
 The tabletop outcome is pass only when every role is named in private escrow,
-the release workflow can be rehearsed without publishing a final release, and
+the DSR release lane can be rehearsed without publishing a final release, and
 no unresolved Critical/High operations gap remains untracked.
 
 ---
@@ -396,13 +402,13 @@ no unresolved Critical/High operations gap remains untracked.
 | Conformance evidence (bd-k5q5.2) | In progress | 223 scenarios green or documented |
 | Node/Bun compatibility (bd-k5q5.3) | Closed | 18+ Node modules shimmed |
 | Capability policy (bd-k5q5.4) | Closed | Safe/balanced/permissive profiles |
-| CI gates (bd-k5q5.5) | In progress | Regression prevention |
+| DSR quality gates (bd-k5q5.5) | In progress | Regression prevention |
 | Documentation (bd-k5q5.6) | In progress | Architecture + operator docs |
 | Verification program (bd-k5q5.7) | In progress | Unit + E2E + diagnostics |
 
 ### 1.0 Milestones
 
-1. All CI gates green on Linux/macOS/Windows.
+1. All DSR quality and native build gates green on Linux/macOS/Windows.
 2. Extension conformance >= 90% with documented exceptions.
 3. Performance budgets met consistently over 30 days.
 4. Public documentation complete (compatibility matrix, playbook, governance).

@@ -16,10 +16,10 @@ use crate::cli;
 use crate::config::Config;
 use crate::model::{self, AssistantMessage, ContentBlock, ImageContent, TextContent};
 use crate::models::{
-    ModelEntry, ModelRegistry, default_models_path, model_entry_is_ready,
+    ModelEntry, ModelRegistry, ModelRole, default_models_path, model_entry_is_ready,
     model_requires_configured_credential, normalize_api_key_opt,
 };
-use crate::provider::{StreamOptions, ThinkingBudgets};
+use crate::provider::{CacheRetention, StreamOptions, ThinkingBudgets};
 use crate::provider_metadata::{
     canonical_provider_id, provider_ids_match, split_provider_model_spec,
 };
@@ -30,6 +30,9 @@ use crate::tools::process_file_arguments;
 pub struct InitialMessage {
     pub text: String,
     pub images: Vec<ImageContent>,
+    /// Prose eligible for behavior-changing magic-keyword scans. Generated
+    /// attachment wrappers and file bytes are deliberately excluded.
+    pub keyword_scan_source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -116,17 +119,21 @@ pub fn prepare_initial_message(
     file_args: &[String],
     messages: &mut Vec<String>,
     auto_resize_images: bool,
+    workspace: &crate::workspace::WorkspaceHandle,
 ) -> Result<Option<InitialMessage>> {
     if file_args.is_empty() {
         return Ok(None);
     }
 
-    let processed = process_file_arguments(file_args, cwd, auto_resize_images)?;
+    let processed = process_file_arguments(file_args, cwd, auto_resize_images, workspace)?;
     let mut initial_message = processed.text;
     let has_message = !messages.is_empty();
-    if has_message {
-        initial_message.push_str(&messages.remove(0));
-    }
+    let keyword_scan_source = if has_message {
+        messages.remove(0)
+    } else {
+        String::new()
+    };
+    initial_message.push_str(&keyword_scan_source);
 
     if initial_message.is_empty() && processed.images.is_empty() && !has_message {
         return Ok(None);
@@ -135,6 +142,7 @@ pub fn prepare_initial_message(
     Ok(Some(InitialMessage {
         text: initial_message,
         images: processed.images,
+        keyword_scan_source,
     }))
 }
 
@@ -157,10 +165,13 @@ pub fn build_system_prompt(
     package_dir: &Path,
     test_mode: bool,
     include_cwd: bool,
+    foreign_rules: Option<&crate::context_files::ForeignRules>,
+    config: &Config,
 ) -> Result<String> {
     use std::fmt::Write as _;
 
     let custom_prompt = resolve_prompt_input(cli.system_prompt.as_deref(), "system prompt")?;
+    let has_custom_prompt = custom_prompt.is_some();
     let append_prompt =
         resolve_prompt_input(cli.append_system_prompt.as_deref(), "append system prompt")?;
     let context_files = if test_mode {
@@ -171,6 +182,21 @@ pub fn build_system_prompt(
 
     let mut prompt =
         custom_prompt.unwrap_or_else(|| default_system_prompt(enabled_tools, package_dir));
+
+    // Discoverable-tool index (bd-cv653.1.6): a compact name + one-liner
+    // listing so the model knows xdev exists and what it can reach.
+    let discoverable_index = crate::xdev::prompt_index_for(enabled_tools, Some(config));
+    if !discoverable_index.is_empty() && !has_custom_prompt {
+        prompt.push_str(
+            "\n\nAdditional tools are available via the `xdev` dispatcher (not in your schema):\n",
+        );
+        for (name, line) in &discoverable_index {
+            let _ = std::fmt::Write::write_fmt(&mut prompt, format_args!("- {name}: {line}\n"));
+        }
+        prompt.push_str(
+            "Use `xdev` with action describe/run/promote to inspect, call, or promote them.\n",
+        );
+    }
 
     if let Some(append_prompt) = append_prompt {
         prompt.push_str("\n\n");
@@ -183,6 +209,28 @@ pub fn build_system_prompt(
         for file in &context_files {
             let _ = write!(prompt, "## {}\n\n{}\n\n", file.path, file.content);
         }
+    }
+
+    // Foreign-format rules import (bd-cv653.6.2): always-apply rules join the
+    // system block; scoped rules are advertised and delivered on activation.
+    if let Some(block) =
+        foreign_rules.and_then(crate::context_files::ForeignRules::system_prompt_block)
+    {
+        prompt.push_str("\n\n");
+        prompt.push_str(&block);
+    }
+
+    // Memory bank mental model (bd-cv653.4.1): budget-capped block of the
+    // project's top active facts/lessons on the first turn. Appended (never
+    // inserted mid-history) so provider prompt caches stay valid.
+    if !test_mode
+        && config.memory_backend() == "local"
+        && let Ok(store) = crate::memory::MemoryStore::open(cwd)
+        && let Ok(model) = store.mental_model()
+        && !model.is_empty()
+    {
+        prompt.push_str("\n\n# Project Memory\n\nWhat you remember about this project:\n\n");
+        prompt.push_str(&model);
     }
 
     if let Some(skills_prompt) = skills_prompt {
@@ -241,6 +289,14 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
             "hashline_edit",
             "Apply precise file edits using LINE#HASH tags from read or grep with hashline=true",
         ),
+        (
+            "subagent",
+            "Delegate isolated work to a named Rust Pi child agent; supports single, bounded parallel, and chained workflows",
+        ),
+        (
+            "current_time",
+            "Get the host's current wall-clock time (UTC and local ISO-8601, offset, Unix epoch, weekday); takes no arguments",
+        ),
     ];
 
     let mut tools = Vec::new();
@@ -296,6 +352,13 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
             "When summarizing your actions, output plain text directly - do NOT use cat or bash to display what you did",
         );
     }
+    if has_tool("current_time") {
+        // The prompt carries only the date (#103); point the model at the
+        // clock for anything time-of-day dependent (#207).
+        guidelines_list.push(
+            "The date below is not a clock: call current_time whenever a task depends on the current time of day",
+        );
+    }
 
     guidelines_list.push("Be concise in your responses");
     guidelines_list.push("Show file paths clearly when working with files");
@@ -306,13 +369,137 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let readme_path = package_dir.join("README.md").display().to_string();
-    let docs_path = package_dir.join("docs").display().to_string();
-    let examples_path = package_dir.join("examples").display().to_string();
+    let mut prompt = format!(
+        "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n{tools_list}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n{guidelines}"
+    );
+    if let Some(docs) = pi_docs_prompt_section(&stable_package_dir(package_dir, None)) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&docs);
+    }
+    prompt
+}
 
-    format!(
-        "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n{tools_list}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n{guidelines}\n\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: {readme_path}\n- Additional docs: {docs_path}\n- Examples: {examples_path} (extensions, custom tools, SDK)\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)"
+/// Resolve a configured package dir into ONE stable absolute location so
+/// prompt discovery and downstream tool reads cannot reinterpret a relative
+/// value from different working directories (bd-jtehj). Absolute inputs pass
+/// through untouched; textual identity is preserved (no symlink collapse) so
+/// advertised paths stay deterministic across main and SDK.
+pub(crate) fn stable_package_dir(
+    package_dir: &Path,
+    interpretation_cwd: Option<&Path>,
+) -> std::path::PathBuf {
+    if package_dir.is_absolute() {
+        return package_dir.to_path_buf();
+    }
+    interpretation_cwd.map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        |cwd| cwd.join(package_dir),
     )
+}
+
+/// The "Pi documentation" block of the default system prompt, listing only
+/// documentation that is actually present under the resolved package root.
+///
+/// Upstream pi ships `README.md`, `docs/`, and `examples/` inside its npm
+/// package, so its prompt can point at them unconditionally. A standalone
+/// `pi` binary provisions none of them, and instructing the model to read
+/// files that do not exist just wastes a tool call and confuses the model
+/// (gh #183). Returns `None` when nothing is available.
+fn pi_docs_prompt_section(package_dir: &Path) -> Option<String> {
+    const SINGLE_FILE_TOPICS: [(&str, &str); 9] = [
+        ("themes", "docs/themes.md"),
+        ("skills", "docs/skills.md"),
+        ("prompt templates", "docs/prompt-templates.md"),
+        ("TUI components", "docs/tui.md"),
+        ("keybindings", "docs/keybindings.md"),
+        ("SDK integrations", "docs/sdk.md"),
+        ("custom providers", "docs/custom-provider.md"),
+        ("adding models", "docs/models.md"),
+        ("pi packages", "docs/packages.md"),
+    ];
+
+    // Callers hand us an already-stable absolute root (bd-jtehj); every
+    // advertised path below is verified to exist right here so empty or
+    // partial installs never point the model at fiction.
+    let readme = package_dir.join("README.md");
+    let docs = package_dir.join("docs");
+    let examples = package_dir.join("examples");
+    let has_readme = readme.is_file();
+    let has_docs = docs.is_dir();
+    let has_examples = examples.is_dir();
+    if !has_readme && !has_docs && !has_examples {
+        return None;
+    }
+
+    let exists_file = |relative: &str| -> bool { docs.join(relative).is_file() };
+
+    let mut lines = vec![String::from(
+        "Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):",
+    )];
+    if has_readme {
+        lines.push(format!("- Main documentation: {}", readme.display()));
+    }
+    if has_docs {
+        lines.push(format!("- Additional docs: {}", docs.display()));
+    }
+    if has_examples {
+        let examples_extensions = examples.join("extensions").is_dir();
+        if examples_extensions {
+            lines.push(format!(
+                "- Examples: {} (extensions, custom tools, SDK)",
+                examples.display()
+            ));
+        } else {
+            lines.push(format!("- Examples: {}", examples.display()));
+        }
+    }
+
+    // Topic index: one entry per label whose documented file(s) actually
+    // exist. The old behavior advertised all ten unconditionally.
+    let mut surfaces: Vec<String> = Vec::new();
+    {
+        let ext_doc = has_docs && exists_file("extensions.md");
+        let ext_examples = has_examples && examples.join("extensions").is_dir();
+        match (ext_doc, ext_examples) {
+            (true, true) => {
+                surfaces.push("extensions (docs/extensions.md, examples/extensions/)".to_string());
+            }
+            (true, false) => surfaces.push("extensions (docs/extensions.md)".to_string()),
+            (false, true) => surfaces.push("extensions (examples/extensions/)".to_string()),
+            (false, false) => {}
+        }
+    }
+    for (label, file) in SINGLE_FILE_TOPICS {
+        let Some(file_name) = file.strip_prefix("docs/") else {
+            continue;
+        };
+        if exists_file(file_name) {
+            surfaces.push(format!("{label} ({file})"));
+        }
+    }
+    if !surfaces.is_empty() {
+        lines.push(format!("- When asked about: {}", surfaces.join(", ")));
+    }
+
+    lines.push(String::from(match (has_docs, has_examples) {
+        (true, true) => "- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing",
+        (true, false) | (false, true) => {
+            "- When working on pi topics, read the installed documentation surface, and follow .md cross-references before implementing"
+        }
+        (false, false) => {
+            "- When working on pi topics, read the documentation and follow .md cross-references before implementing"
+        }
+    }));
+    if exists_file("tui.md") {
+        lines.push(String::from(
+            "- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)",
+        ));
+    } else {
+        lines.push(String::from(
+            "- Always read pi .md files completely and follow links to related docs",
+        ));
+    }
+    Some(lines.join("\n"))
 }
 
 fn load_project_context_files(cwd: &Path, global_dir: &Path) -> Vec<ContextFile> {
@@ -328,10 +515,10 @@ fn load_project_context_files(cwd: &Path, global_dir: &Path) -> Vec<ContextFile>
     let mut current = cwd.to_path_buf();
 
     loop {
-        if let Some(context) = load_context_file_from_dir(&current) {
-            if seen.insert(context.path.clone()) {
-                ancestor_files.push(context);
-            }
+        if let Some(context) = load_context_file_from_dir(&current)
+            && seen.insert(context.path.clone())
+        {
+            ancestor_files.push(context);
         }
 
         if !current.pop() {
@@ -472,31 +659,53 @@ pub fn select_model_and_thinking(
             if matches.is_empty() {
                 bail!("Model {model_id} not found");
             }
-            if let Some(default_provider) = config.default_provider.as_deref() {
-                if let Some(found) = matches
+            if let Some(default_provider) = config.default_provider.as_deref()
+                && let Some(found) = matches
                     .iter()
                     .find(|m| provider_ids_match(&m.model.provider, default_provider))
-                {
-                    selected_model = Some(found.clone());
-                }
+            {
+                selected_model = Some(found.clone());
             }
             if selected_model.is_none() {
                 selected_model = select_preferred_exact_id_match(&matches);
+            }
+
+            // gh #189: when a bare model id also matches a custom provider
+            // entry that was passed over because it is unready (missing
+            // credentials), say so instead of silently routing to a
+            // built-in. Exact `provider/model` selection is unaffected —
+            // it is custom-first.
+            if let Some(chosen) = &selected_model
+                && fallback_message.is_none()
+                && let Some(skipped) = matches.iter().find(|m| {
+                    !provider_ids_match(&m.model.provider, &chosen.model.provider)
+                        && canonical_provider_id(&m.model.provider).is_none()
+                        && !model_entry_is_ready(m)
+                })
+            {
+                fallback_message = Some(format!(
+                    "Model id '{model_id}' also matches custom provider '{skipped_provider}', \
+                     which was skipped because its credentials are not configured; \
+                     using {chosen_provider}/{chosen_id}. To use the custom provider, \
+                     configure its API key or select it explicitly as \
+                     {skipped_provider}/{model_id}.",
+                    skipped_provider = skipped.model.provider,
+                    chosen_provider = chosen.model.provider,
+                    chosen_id = chosen.model.id,
+                ));
             }
         }
     } else if !scoped_models.is_empty() && !is_continuing {
         if let (Some(default_provider), Some(default_model)) = (
             config.default_provider.as_deref(),
             config.default_model.as_deref(),
-        ) {
-            if let Some(found) = scoped_models.iter().find(|sm| {
-                provider_ids_match(&sm.model.model.provider, default_provider)
-                    && sm.model.model.id.eq_ignore_ascii_case(default_model)
-            }) {
-                selected_model = Some(found.model.clone());
-                if cli.thinking.is_none() {
-                    scoped_thinking = found.thinking_level;
-                }
+        ) && let Some(found) = scoped_models.iter().find(|sm| {
+            provider_ids_match(&sm.model.model.provider, default_provider)
+                && sm.model.model.id.eq_ignore_ascii_case(default_model)
+        }) {
+            selected_model = Some(found.model.clone());
+            if cli.thinking.is_none() {
+                scoped_thinking = found.thinking_level;
             }
         }
         if selected_model.is_none() {
@@ -508,37 +717,52 @@ pub fn select_model_and_thinking(
         }
     }
 
-    if selected_model.is_none() {
-        if let Some((provider, model_id)) = model_from_session_state(session) {
-            let restore = restore_model_from_session(&provider, &model_id, None, registry);
-            selected_model = restore.model;
-            fallback_message = restore.fallback_message;
-            deferred_restore_warning = restore.deferred_warning;
+    if selected_model.is_none()
+        && let Some((provider, model_id)) = model_from_session_state(session)
+    {
+        let restore = restore_model_from_session(&provider, &model_id, None, registry);
+        selected_model = restore.model;
+        fallback_message = restore.fallback_message;
+        deferred_restore_warning = restore.deferred_warning;
+    }
+
+    if selected_model.is_none()
+        && let Some(resolution) = resolve_role_model(ModelRole::Default, cli, config, registry)
+    {
+        // `modelRoles.default` outranks defaultProvider/defaultModel (bd-cv653.3.1).
+        if let Some(warning) = resolution.warning {
+            if fallback_message.is_none() {
+                fallback_message = Some(warning);
+            }
+        } else {
+            if cli.thinking.is_none() {
+                scoped_thinking = resolution.thinking_level.or(scoped_thinking);
+            }
+            selected_model = Some(resolution.model_entry);
         }
     }
 
-    if selected_model.is_none() {
-        if let (Some(default_provider), Some(default_model)) = (
+    if selected_model.is_none()
+        && let (Some(default_provider), Some(default_model)) = (
             config.default_provider.as_deref(),
             config.default_model.as_deref(),
-        ) {
-            if let Some(found) = registry.find(default_provider, default_model) {
-                selected_model = Some(found);
-            }
-        }
+        )
+        && let Some(found) = registry.find(default_provider, default_model)
+    {
+        selected_model = Some(found);
     }
 
     if selected_model.is_none() {
         let available = registry.get_available();
         if !available.is_empty() {
             let fallback = default_model_from_available(&available);
-            if fallback_message.is_none() {
-                if let Some(warning) = deferred_restore_warning.take() {
-                    fallback_message = Some(format!(
-                        "{warning} Using {}/{}.",
-                        fallback.model.provider, fallback.model.id
-                    ));
-                }
+            if fallback_message.is_none()
+                && let Some(warning) = deferred_restore_warning.take()
+            {
+                fallback_message = Some(format!(
+                    "{warning} Using {}/{}.",
+                    fallback.model.provider, fallback.model.id
+                ));
             }
             selected_model = Some(fallback);
         }
@@ -589,13 +813,13 @@ pub fn select_model_and_thinking(
     // and avoids the misleading "No models configured" path when built-ins exist.
     if selected_model.is_none() && !registry.models().is_empty() {
         let fallback = default_model_from_catalog(registry.models());
-        if fallback_message.is_none() {
-            if let Some(warning) = deferred_restore_warning.take() {
-                fallback_message = Some(format!(
-                    "{warning} Defaulting to {}/{} for setup.",
-                    fallback.model.provider, fallback.model.id
-                ));
-            }
+        if fallback_message.is_none()
+            && let Some(warning) = deferred_restore_warning.take()
+        {
+            fallback_message = Some(format!(
+                "{warning} Defaulting to {}/{} for setup.",
+                fallback.model.provider, fallback.model.id
+            ));
         }
         selected_model = Some(fallback);
     }
@@ -621,10 +845,8 @@ pub fn select_model_and_thinking(
         thinking_level = Some(parse_thinking_level(cli_thinking)?);
     } else if scoped_thinking.is_some() {
         thinking_level = scoped_thinking;
-    } else if is_continuing {
-        if let Some(saved) = thinking_level_from_session_state(session) {
-            thinking_level = Some(saved);
-        }
+    } else if is_continuing && let Some(saved) = thinking_level_from_session_state(session) {
+        thinking_level = Some(saved);
     }
 
     if thinking_level.is_none() {
@@ -653,6 +875,195 @@ fn parse_thinking_level(value: &str) -> Result<model::ThinkingLevel> {
 
 fn parse_thinking_level_opt(value: &str) -> Option<model::ThinkingLevel> {
     value.parse().ok()
+}
+
+// === Model roles (bd-cv653.3.1) ===
+
+/// Result of resolving a model role to a concrete model entry.
+#[derive(Debug, Clone)]
+pub struct RoleModelResolution {
+    pub model_entry: ModelEntry,
+    pub thinking_level: Option<model::ThinkingLevel>,
+    /// Where the winning spec came from: `cli`, `settings`, or `default-role`.
+    pub source: &'static str,
+    /// Non-fatal resolution warning (unresolvable specs fall through loudly
+    /// here instead of failing the session).
+    pub warning: Option<String>,
+}
+
+/// Parse a role model spec of the form `provider/model[:thinking]` (or a bare
+/// model id) into a registry entry, tolerating ad-hoc provider/model pairs.
+fn resolve_role_spec(
+    spec: &str,
+    registry: &ModelRegistry,
+) -> Option<(ModelEntry, Option<model::ThinkingLevel>)> {
+    let (model_part, thinking) = match spec.rsplit_once(':') {
+        Some((prefix, suffix)) if parse_thinking_level_opt(suffix).is_some() => {
+            (prefix, parse_thinking_level_opt(suffix))
+        }
+        _ => (spec, None),
+    };
+    let model_part = model_part.trim();
+    if model_part.is_empty() {
+        return None;
+    }
+    let entry = if let Some((provider, model_id)) = split_provider_model_spec(model_part) {
+        registry
+            .find(provider, model_id)
+            .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id))
+    } else {
+        registry.find_by_id(model_part)
+    };
+    entry.map(|entry| (entry, thinking))
+}
+
+/// The spec string configured for a role in merged settings, if any.
+pub fn role_spec_from_settings(
+    roles: &crate::config::ModelRoleSettings,
+    role: ModelRole,
+) -> Option<&str> {
+    let spec = match role {
+        ModelRole::Default => roles.default.as_deref(),
+        ModelRole::Smol => roles.smol.as_deref(),
+        ModelRole::Slow => roles.slow.as_deref(),
+        ModelRole::Plan => roles.plan.as_deref(),
+        ModelRole::Commit => roles.commit.as_deref(),
+        ModelRole::Vision => roles.vision.as_deref(),
+        ModelRole::Designer => roles.designer.as_deref(),
+        ModelRole::Task => roles.task.as_deref(),
+        ModelRole::Advisor => roles.advisor.as_deref(),
+        ModelRole::Tiny => roles.tiny.as_deref(),
+    };
+    spec.filter(|s| !s.trim().is_empty())
+}
+
+/// The spec string configured for a role via CLI flag (`--smol`/`--slow`/
+/// `--plan`; other roles have no CLI flags), if any.
+fn role_spec_from_cli(cli: &cli::Cli, role: ModelRole) -> Option<&str> {
+    let spec = match role {
+        ModelRole::Smol => cli.smol.as_deref(),
+        ModelRole::Slow => cli.slow.as_deref(),
+        ModelRole::Plan => cli.plan.as_deref(),
+        ModelRole::Advisor => cli.advisor.as_deref(),
+        _ => None,
+    };
+    spec.filter(|s| !s.trim().is_empty())
+}
+
+/// Resolve a model role to a concrete model entry.
+///
+/// Precedence: CLI role flag > settings `modelRoles.<role>` > (non-default
+/// roles) the `default` role's own resolution. Returns `None` when nothing
+/// configures the role and `role == ModelRole::Default` (the caller then runs
+/// the legacy default-provider/default-model/auto-select flow). Unresolvable
+/// specs never fail the session: they fall through with a warning.
+pub fn resolve_role_model(
+    role: ModelRole,
+    cli: &cli::Cli,
+    config: &Config,
+    registry: &ModelRegistry,
+) -> Option<RoleModelResolution> {
+    if let Some(spec) = role_spec_from_cli(cli, role) {
+        match resolve_role_spec(spec, registry) {
+            Some((model_entry, thinking_level)) => {
+                return Some(RoleModelResolution {
+                    model_entry,
+                    thinking_level,
+                    source: "cli",
+                    warning: None,
+                });
+            }
+            None => {
+                return Some(RoleModelResolution {
+                    model_entry: registry.models().first()?.clone(),
+                    thinking_level: None,
+                    source: "cli",
+                    warning: Some(format!(
+                        "CLI --{role} spec \"{spec}\" did not resolve to a known model; falling back."
+                    )),
+                });
+            }
+        }
+    }
+    if let Some(roles) = config.model_roles.as_ref()
+        && let Some(spec) = role_spec_from_settings(roles, role)
+    {
+        match resolve_role_spec(spec, registry) {
+            Some((model_entry, thinking_level)) => {
+                return Some(RoleModelResolution {
+                    model_entry,
+                    thinking_level,
+                    source: "settings",
+                    warning: None,
+                });
+            }
+            None => {
+                return Some(RoleModelResolution {
+                    model_entry: registry.models().first()?.clone(),
+                    thinking_level: None,
+                    source: "settings",
+                    warning: Some(format!(
+                        "modelRoles.{role} spec \"{spec}\" did not resolve to a known model; falling back."
+                    )),
+                });
+            }
+        }
+    }
+    if role != ModelRole::Default {
+        return resolve_role_model(ModelRole::Default, cli, config, registry).map(
+            |mut resolution| {
+                resolution.source = "default-role";
+                resolution
+            },
+        );
+    }
+    None
+}
+
+/// The model spec a subagent child should run with when its agent definition
+/// does not pin `model:`.
+///
+/// Resolution order: the `task` role, else `smol`, else `None` (child
+/// inherits the parent ambient environment). Returns the raw spec string; the
+/// child process resolves it through its own startup registry.
+pub fn subagent_role_spec(config: &Config) -> Option<String> {
+    let roles = config.model_roles.as_ref()?;
+    role_spec_from_settings(roles, ModelRole::Task)
+        .or_else(|| role_spec_from_settings(roles, ModelRole::Smol))
+        .map(str::to_string)
+}
+
+/// Resolve the model entry used for automatic session titling.
+///
+/// (bd-cv653.3.1 round-4): the explicitly configured `tiny` role, else
+/// `smol`, else `None`. Deliberately does NOT fall back to the default role —
+/// titling must stay cheap; when no cheap role resolves, it disables silently.
+/// Honors CLI `--smol` (tiny has no CLI flag).
+pub fn titling_model_entry(
+    cli: &cli::Cli,
+    config: &Config,
+    registry: &ModelRegistry,
+) -> Option<ModelEntry> {
+    if !config.auto_title_enabled() {
+        return None;
+    }
+    for role in [ModelRole::Tiny, ModelRole::Smol] {
+        let spec = role_spec_from_cli(cli, role)
+            .map(str::to_string)
+            .or_else(|| {
+                config
+                    .model_roles
+                    .as_ref()
+                    .and_then(|roles| role_spec_from_settings(roles, role))
+                    .map(str::to_string)
+            });
+        if let Some(spec) = spec
+            && let Some((entry, _thinking)) = resolve_role_spec(&spec, registry)
+        {
+            return Some(entry);
+        }
+    }
+    None
 }
 
 fn last_model_from_session(session: &Session) -> Option<(String, String)> {
@@ -822,8 +1233,13 @@ const PROVIDER_DEFAULT_MODELS: &[(&str, &str)] = &[
     ("openai", "gpt-5.3-codex"),
     ("openai", "gpt-5.2-codex"),
     ("openai", "gpt-5.1-codex"),
-    ("amazon-bedrock", "us.anthropic.claude-opus-4-20250514-v1:0"),
     ("anthropic", "claude-opus-4-5"),
+    // Bedrock is credential-exempt (structured AWS credentials resolve at
+    // request time, so it always counts as "available"). Rank it BELOW
+    // providers whose availability proves a configured key — otherwise a
+    // user holding only an Anthropic key gets defaulted onto Bedrock and
+    // fails at the first request (66fdd46f regression).
+    ("amazon-bedrock", "us.anthropic.claude-opus-4-20250514-v1:0"),
     ("azure-openai-responses", "gpt-5.2"),
     ("google", "gemini-2.5-pro"),
     ("google-gemini-cli", "gemini-2.5-pro"),
@@ -922,16 +1338,87 @@ pub fn resolve_api_key(
     Ok(key)
 }
 
+/// Resolve the prompt-cache retention preference for agent requests.
+///
+/// Parity with pi-mono (`packages/ai/src/providers/anthropic.ts`,
+/// `resolveCacheRetention`): caching defaults to short-lived retention
+/// ("ephemeral", ~5 minutes on Anthropic) and the `PI_CACHE_RETENTION`
+/// environment variable can override it (`"long"` for ~1 hour TTL, `"none"`
+/// to disable). Providers that do not support prompt caching ignore the
+/// option entirely, so applying the default globally is safe.
+pub fn cache_retention_from_env(value: Option<&str>) -> CacheRetention {
+    match value.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("long") => CacheRetention::Long,
+        Some(v) if v.eq_ignore_ascii_case("none") => CacheRetention::None,
+        _ => CacheRetention::Short,
+    }
+}
+
+/// Resolve the cache-affinity key sent as `prompt_cache_key` on OpenAI-shaped
+/// requests.
+///
+/// Parity with pi-mono (`packages/ai/src/providers/openai-responses.ts`):
+/// `prompt_cache_key: cacheRetention === "none" ? undefined : options?.sessionId`
+/// — the key defaults to the session id so every request in a session lands on
+/// the same provider cache shard, and disabling caching (`PI_CACHE_RETENTION=none`)
+/// suppresses the key entirely.
+///
+/// `PI_PROMPT_CACHE_KEY` overrides the default: `off`/`none` disables the
+/// field; any other non-empty value is sent verbatim (a shared key across
+/// sessions). The retention gate still applies — with caching disabled no key
+/// is sent at all.
+pub fn resolve_prompt_cache_key(
+    env_value: Option<&str>,
+    cache_retention: CacheRetention,
+    session_id: Option<&str>,
+) -> Option<String> {
+    if cache_retention == CacheRetention::None {
+        return None;
+    }
+    match env_value.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") => None,
+        Some(v) if !v.is_empty() => Some(v.to_string()),
+        _ => session_id.map(str::to_string),
+    }
+}
+
+/// Re-point live stream options at a different session (`/new`, RPC
+/// `switch-session`, …).
+///
+/// Updates `session_id` and re-derives the session-scoped `prompt_cache_key`
+/// (gh #188) so cache affinity tracks the *current* session — matching TS,
+/// which reads `options?.sessionId` at request-build time.
+pub fn rebind_stream_options_session(options: &mut StreamOptions, session_id: &str) {
+    options.session_id = Some(session_id.to_string());
+    options.prompt_cache_key = resolve_prompt_cache_key(
+        std::env::var("PI_PROMPT_CACHE_KEY").ok().as_deref(),
+        options.cache_retention,
+        Some(session_id),
+    );
+}
+
 pub fn build_stream_options(
     config: &Config,
     api_key: Option<String>,
     selection: &ModelSelection,
     session: &Session,
 ) -> StreamOptions {
+    // Enable prompt caching by default (matches pi-mono's "short" default).
+    // Without this, Anthropic requests never set cache_control and users pay
+    // full input-token price on every turn.
+    let cache_retention =
+        cache_retention_from_env(std::env::var("PI_CACHE_RETENTION").ok().as_deref());
     let mut options = StreamOptions {
         api_key,
         headers: selection.model_entry.headers.clone(),
         session_id: Some(session.header.id.clone()),
+        cache_retention,
+        // Session-scoped cache affinity for OpenAI-shaped requests (gh #188).
+        prompt_cache_key: resolve_prompt_cache_key(
+            std::env::var("PI_PROMPT_CACHE_KEY").ok().as_deref(),
+            cache_retention,
+            Some(session.header.id.as_str()),
+        ),
         // Seed the per-request output cap from the model registry's `maxTokens`
         // so the value users configure in `models.json` actually takes effect.
         // Without this every provider falls back to its hardcoded per-request
@@ -952,6 +1439,7 @@ pub fn build_stream_options(
             medium: budgets.medium.unwrap_or(defaults.medium),
             high: budgets.high.unwrap_or(defaults.high),
             xhigh: budgets.xhigh.unwrap_or(defaults.xhigh),
+            max: budgets.max.unwrap_or(defaults.max),
         });
     }
 
@@ -986,11 +1474,11 @@ pub fn resolve_model_scope(
         if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
             let mut glob_pattern = pattern.as_str();
             let mut thinking_level = None;
-            if let Some((prefix, suffix)) = pattern.rsplit_once(':') {
-                if let Some(parsed) = parse_thinking_level_opt(suffix) {
-                    thinking_level = Some(parsed);
-                    glob_pattern = prefix;
-                }
+            if let Some((prefix, suffix)) = pattern.rsplit_once(':')
+                && let Some(parsed) = parse_thinking_level_opt(suffix)
+            {
+                thinking_level = Some(parsed);
+                glob_pattern = prefix;
             }
 
             let glob = match Pattern::new(&glob_pattern.to_lowercase()) {
@@ -1053,20 +1541,20 @@ fn parse_model_pattern(pattern: &str, available_models: &[ModelEntry]) -> Parsed
     // Try stripping a valid thinking-level suffix FIRST. This prevents
     // `provider/model:high` from being swallowed by `ad_hoc_model_entry`
     // which would create a model with id `model:high` instead of `model`.
-    if let Some((prefix, suffix)) = pattern.rsplit_once(':') {
-        if let Some(thinking_level) = parse_thinking_level_opt(suffix) {
-            let result = parse_model_pattern(prefix, available_models);
-            if result.model.is_some() {
-                return ParsedModelResult {
-                    model: result.model,
-                    thinking_level: if result.warning.is_some() {
-                        None
-                    } else {
-                        Some(thinking_level)
-                    },
-                    warning: result.warning,
-                };
-            }
+    if let Some((prefix, suffix)) = pattern.rsplit_once(':')
+        && let Some(thinking_level) = parse_thinking_level_opt(suffix)
+    {
+        let result = parse_model_pattern(prefix, available_models);
+        if result.model.is_some() {
+            return ParsedModelResult {
+                model: result.model,
+                thinking_level: if result.warning.is_some() {
+                    None
+                } else {
+                    Some(thinking_level)
+                },
+                warning: result.warning,
+            };
         }
     }
 
@@ -1464,6 +1952,182 @@ mod tests {
         assert!(!selection.model_entry.model.id.is_empty());
     }
 
+    // === Model roles (bd-cv653.3.1) ===
+
+    fn role_test_registry() -> ModelRegistry {
+        registry_with_entries(vec![
+            test_model_entry("gpt-5.5", "openai", true),
+            test_model_entry("gpt-5-mini", "openai", true),
+            test_model_entry("claude-haiku-4-5", "anthropic", true),
+        ])
+    }
+
+    fn config_with_roles(roles: crate::config::ModelRoleSettings) -> Config {
+        Config {
+            model_roles: Some(roles),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn resolve_role_model_cli_flag_beats_settings() {
+        let cli = cli::Cli::parse_from(["pi", "--smol", "openai/gpt-5.5"]);
+        let config = config_with_roles(crate::config::ModelRoleSettings {
+            smol: Some("anthropic/claude-haiku-4-5".to_string()),
+            ..Default::default()
+        });
+        let registry = role_test_registry();
+        let resolution = resolve_role_model(ModelRole::Smol, &cli, &config, &registry)
+            .expect("smol should resolve");
+        assert_eq!(resolution.model_entry.model.id, "gpt-5.5");
+        assert_eq!(resolution.source, "cli");
+        assert!(resolution.warning.is_none());
+    }
+
+    #[test]
+    fn resolve_role_model_uses_settings_spec_with_thinking_suffix() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let config = config_with_roles(crate::config::ModelRoleSettings {
+            slow: Some("openai/gpt-5.5:max".to_string()),
+            ..Default::default()
+        });
+        let registry = role_test_registry();
+        let resolution = resolve_role_model(ModelRole::Slow, &cli, &config, &registry)
+            .expect("slow should resolve");
+        assert_eq!(resolution.model_entry.model.id, "gpt-5.5");
+        assert_eq!(resolution.source, "settings");
+        assert_eq!(
+            resolution.thinking_level,
+            Some(model::ThinkingLevel::Max),
+            "spec :thinking suffix must be honored"
+        );
+    }
+
+    #[test]
+    fn resolve_role_model_nondefault_falls_back_to_default_role() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let config = config_with_roles(crate::config::ModelRoleSettings {
+            default: Some("anthropic/claude-haiku-4-5".to_string()),
+            ..Default::default()
+        });
+        let registry = role_test_registry();
+        let resolution = resolve_role_model(ModelRole::Advisor, &cli, &config, &registry)
+            .expect("advisor falls back to default role");
+        assert_eq!(resolution.model_entry.model.id, "claude-haiku-4-5");
+        assert_eq!(resolution.source, "default-role");
+    }
+
+    #[test]
+    fn resolve_role_model_unresolvable_spec_warns_never_aborts() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let config = config_with_roles(crate::config::ModelRoleSettings {
+            commit: Some("nosuch/ghost-model".to_string()),
+            ..Default::default()
+        });
+        let registry = role_test_registry();
+        let resolution = resolve_role_model(ModelRole::Commit, &cli, &config, &registry)
+            .expect("falls through to a registry entry");
+        assert!(
+            resolution.warning.is_some(),
+            "unresolvable spec must carry a warning"
+        );
+    }
+
+    #[test]
+    fn resolve_role_model_default_role_unconfigured_returns_none() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let config = Config::default();
+        let registry = role_test_registry();
+        assert!(
+            resolve_role_model(ModelRole::Default, &cli, &config, &registry).is_none(),
+            "unconfigured default role defers to the legacy default flow"
+        );
+    }
+
+    #[test]
+    fn subagent_role_spec_prefers_task_then_smol() {
+        let both = config_with_roles(crate::config::ModelRoleSettings {
+            task: Some("openai/gpt-5.5".to_string()),
+            smol: Some("openai/gpt-5-mini".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            subagent_role_spec(&both).as_deref(),
+            Some("openai/gpt-5.5"),
+            "task role wins when both are set"
+        );
+        let smol_only = config_with_roles(crate::config::ModelRoleSettings {
+            smol: Some("openai/gpt-5-mini".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            subagent_role_spec(&smol_only).as_deref(),
+            Some("openai/gpt-5-mini"),
+            "smol is the task fallback"
+        );
+        assert!(
+            subagent_role_spec(&Config::default()).is_none(),
+            "no roles configured → None (ambient inheritance)"
+        );
+    }
+
+    #[test]
+    fn titling_model_entry_never_falls_back_to_default_role() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        // Default role configured but tiny/smol unset: titling stays off.
+        let config = config_with_roles(crate::config::ModelRoleSettings {
+            default: Some("openai/gpt-5.5".to_string()),
+            ..Default::default()
+        });
+        let registry = role_test_registry();
+        assert!(
+            titling_model_entry(&cli, &config, &registry).is_none(),
+            "titling must not burn the (possibly expensive) default model"
+        );
+
+        let config = config_with_roles(crate::config::ModelRoleSettings {
+            default: Some("openai/gpt-5.5".to_string()),
+            smol: Some("openai/gpt-5-mini".to_string()),
+            ..Default::default()
+        });
+        let entry = titling_model_entry(&cli, &config, &registry).expect("smol resolves");
+        assert_eq!(entry.model.id, "gpt-5-mini");
+    }
+
+    #[test]
+    fn titling_model_entry_disabled_by_setting() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let mut config = config_with_roles(crate::config::ModelRoleSettings {
+            tiny: Some("openai/gpt-5-mini".to_string()),
+            ..Default::default()
+        });
+        config.titling = Some(crate::config::TitlingSettings {
+            auto_title: Some(false),
+        });
+        let registry = role_test_registry();
+        assert!(titling_model_entry(&cli, &config, &registry).is_none());
+    }
+
+    #[test]
+    fn select_model_and_thinking_model_roles_default_outranks_legacy_defaults() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let mut config = config_with_roles(crate::config::ModelRoleSettings {
+            default: Some("anthropic/claude-haiku-4-5".to_string()),
+            ..Default::default()
+        });
+        config.default_provider = Some("openai".to_string());
+        config.default_model = Some("gpt-5.5".to_string());
+        let session = Session::in_memory();
+        let registry = role_test_registry();
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("selection");
+        assert_eq!(
+            selection.model_entry.model.id, "claude-haiku-4-5",
+            "modelRoles.default must outrank defaultProvider/defaultModel"
+        );
+    }
+
     #[test]
     fn select_model_and_thinking_provider_only_prefers_ready_model() {
         let cli = cli::Cli::parse_from(["pi", "--provider", "acme"]);
@@ -1485,6 +2149,55 @@ mod tests {
 
         assert_eq!(selection.model_entry.model.provider, "acme");
         assert_eq!(selection.model_entry.model.id, "local-model");
+    }
+
+    #[test]
+    fn select_model_and_thinking_exact_custom_provider_selection_is_custom_first() {
+        // gh #189 regression pin: an exact `<custom-provider>/<model-id>`
+        // selection must route to the custom provider even when a built-in
+        // provider lists a model with the identical id.
+        let cli = cli::Cli::parse_from(["pi", "--model", "my-proxy/gpt-4o"]);
+        let config = Config::default();
+        let session = Session::in_memory();
+
+        let builtin = test_model_entry("gpt-4o", "openai", false);
+        let custom = test_model_entry("gpt-4o", "my-proxy", false);
+        let registry = registry_with_entries(vec![builtin, custom]);
+
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("exact custom provider selection should resolve");
+
+        assert_eq!(selection.model_entry.model.provider, "my-proxy");
+        assert_eq!(selection.model_entry.model.id, "gpt-4o");
+        assert!(selection.fallback_message.is_none());
+    }
+
+    #[test]
+    fn select_model_and_thinking_bare_id_warns_when_unready_custom_entry_skipped() {
+        // gh #189: bare-id selection prefers ready entries; when the same id
+        // also belongs to a custom provider that is unready (missing
+        // credentials), the silent fall-through to a built-in must at least
+        // be called out.
+        let cli = cli::Cli::parse_from(["pi", "--model", "shared-model"]);
+        let config = Config::default();
+        let session = Session::in_memory();
+
+        let builtin = test_model_entry("shared-model", "openai", false);
+        let mut custom = test_model_entry("shared-model", "my-proxy", false);
+        custom.api_key = None; // unready: requires a credential it doesn't have
+        let registry = registry_with_entries(vec![builtin, custom]);
+
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("bare id selection should resolve to the ready entry");
+
+        assert_eq!(selection.model_entry.model.provider, "openai");
+        let warning = selection
+            .fallback_message
+            .expect("skipping an unready custom provider should warn");
+        assert!(warning.contains("my-proxy"), "warning: {warning}");
+        assert!(warning.contains("shared-model"), "warning: {warning}");
     }
 
     #[test]
@@ -1759,6 +2472,106 @@ mod tests {
                 .expect("active branch thinking level should restore");
 
         assert_eq!(selection.thinking_level, model::ThinkingLevel::High);
+    }
+
+    #[test]
+    fn resolve_prompt_cache_key_resolution() {
+        // Default: the session id, so a session's requests share a cache shard.
+        assert_eq!(
+            resolve_prompt_cache_key(None, CacheRetention::Short, Some("sess-1")),
+            Some("sess-1".to_string())
+        );
+        assert_eq!(
+            resolve_prompt_cache_key(None, CacheRetention::Long, Some("sess-1")),
+            Some("sess-1".to_string())
+        );
+        // TS parity gate: cacheRetention "none" suppresses the key entirely,
+        // even when an explicit override is set.
+        assert_eq!(
+            resolve_prompt_cache_key(None, CacheRetention::None, Some("sess-1")),
+            None
+        );
+        assert_eq!(
+            resolve_prompt_cache_key(Some("shared"), CacheRetention::None, Some("sess-1")),
+            None
+        );
+        // Explicit env value wins verbatim (shared key across sessions).
+        assert_eq!(
+            resolve_prompt_cache_key(Some("shared"), CacheRetention::Short, Some("sess-1")),
+            Some("shared".to_string())
+        );
+        // "off"/"none" (any case) disable the field.
+        assert_eq!(
+            resolve_prompt_cache_key(Some("off"), CacheRetention::Short, Some("sess-1")),
+            None
+        );
+        assert_eq!(
+            resolve_prompt_cache_key(Some("NONE"), CacheRetention::Short, Some("sess-1")),
+            None
+        );
+        // Blank env falls back to the session id.
+        assert_eq!(
+            resolve_prompt_cache_key(Some("  "), CacheRetention::Short, Some("sess-1")),
+            Some("sess-1".to_string())
+        );
+        // No env, no session id: nothing to send.
+        assert_eq!(
+            resolve_prompt_cache_key(None, CacheRetention::Short, None),
+            None
+        );
+    }
+
+    #[test]
+    fn cache_retention_from_env_defaults_to_short() {
+        assert_eq!(cache_retention_from_env(None), CacheRetention::Short);
+        assert_eq!(cache_retention_from_env(Some("")), CacheRetention::Short);
+        assert_eq!(
+            cache_retention_from_env(Some("short")),
+            CacheRetention::Short
+        );
+        // Unrecognized values fall back to the default rather than disabling
+        // caching (mirrors pi-mono, which only honors "long" via env).
+        assert_eq!(
+            cache_retention_from_env(Some("weekly")),
+            CacheRetention::Short
+        );
+    }
+
+    #[test]
+    fn cache_retention_from_env_honors_overrides() {
+        assert_eq!(cache_retention_from_env(Some("long")), CacheRetention::Long);
+        assert_eq!(cache_retention_from_env(Some("none")), CacheRetention::None);
+        assert_eq!(
+            cache_retention_from_env(Some(" LONG ")),
+            CacheRetention::Long
+        );
+        assert_eq!(cache_retention_from_env(Some("None")), CacheRetention::None);
+    }
+
+    #[test]
+    fn build_stream_options_enables_prompt_caching_by_default() {
+        let config = Config::default();
+        let session = Session::in_memory();
+        let selection = ModelSelection {
+            model_entry: test_model_entry("gpt-5.4", "openai-codex", true),
+            thinking_level: model::ThinkingLevel::High,
+            scoped_models: Vec::new(),
+            fallback_message: None,
+        };
+
+        let options =
+            build_stream_options(&config, Some("test-key".to_string()), &selection, &session);
+
+        // The default must track PI_CACHE_RETENTION exactly as the pure
+        // resolver does; when the variable is unset (the normal case, and the
+        // CI case) that means Short — matching pi-mono's default so Anthropic
+        // requests carry cache_control breakpoints out of the box.
+        let expected =
+            cache_retention_from_env(std::env::var("PI_CACHE_RETENTION").ok().as_deref());
+        assert_eq!(options.cache_retention, expected);
+        if std::env::var_os("PI_CACHE_RETENTION").is_none() {
+            assert_eq!(options.cache_retention, CacheRetention::Short);
+        }
     }
 
     #[test]
@@ -2325,5 +3138,143 @@ mod tests {
             let right = test_model_entry("OPENAI/GPT-4O-MINI", "open-router", false);
             assert!(models_equal(&left, &right));
         }
+    }
+    /// gh #183 + bd-jtehj: the default prompt must list each documentation
+    /// surface and topic file only when it actually exists.
+    #[test]
+    fn default_system_prompt_omits_docs_block_when_package_dir_has_no_docs() {
+        let dir = tempdir().expect("tempdir");
+        let prompt = default_system_prompt(&["read", "bash"], dir.path());
+        assert!(
+            !prompt.contains("Pi documentation"),
+            "docs block leaked into prompt: {prompt}"
+        );
+        assert!(!prompt.contains("README.md"));
+        assert!(!prompt.contains("docs/extensions.md"));
+        assert!(prompt.ends_with("- Show file paths clearly when working with files"));
+
+        // A package dir that does not exist at all behaves the same.
+        let missing = dir.path().join("does-not-exist");
+        let prompt = default_system_prompt(&["read"], &missing);
+        assert!(!prompt.contains("Pi documentation"));
+
+        // Empty directory placeholders must NOT resurrect the block either.
+        std::fs::create_dir(dir.path().join("docs")).expect("mkdir docs");
+        std::fs::create_dir(dir.path().join("examples")).expect("mkdir examples");
+        let prompt = default_system_prompt(&["read"], dir.path());
+        assert!(prompt.contains("Pi documentation"));
+        assert!(
+            !prompt.contains("When asked about:"),
+            "empty dirs must not advertise any topic files: {prompt}"
+        );
+        assert!(!prompt.contains("docs/extensions.md"));
+
+        // A README that is a directory (or docs that is a file) does not count.
+        let odd = tempdir().expect("tempdir");
+        std::fs::create_dir(odd.path().join("README.md")).expect("mkdir README.md");
+        std::fs::write(odd.path().join("docs"), "").expect("write docs file");
+        let prompt = default_system_prompt(&["read"], odd.path());
+        assert!(!prompt.contains("Pi documentation"));
+    }
+
+    /// Partial installs advertise exactly the files that exist — nothing more.
+    #[test]
+    fn default_system_prompt_partial_install_lists_only_existing_topic_files() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("README.md"), "# pi\n").expect("write readme");
+        let docs = dir.path().join("docs");
+        std::fs::create_dir(&docs).expect("mkdir docs");
+        for present in ["extensions.md", "tui.md"] {
+            std::fs::write(docs.join(present), "#\n").expect("write topic");
+        }
+
+        let prompt = default_system_prompt(&["read"], dir.path());
+        assert!(prompt.contains("extensions (docs/extensions.md)"));
+        assert!(
+            !prompt.contains(", examples/extensions/"),
+            "no examples surface exists"
+        );
+        assert!(prompt.contains("TUI components (docs/tui.md)"));
+        // Every absent topic stays out of the roster.
+        assert!(!prompt.contains("docs/themes.md"));
+        assert!(!prompt.contains("docs/skills.md"));
+        assert!(!prompt.contains("docs/packages.md"));
+        assert!(prompt.contains("(e.g., tui.md for TUI API details)"));
+        // No examples surface exists, so guidance names the installed one only.
+        assert!(prompt.contains("read the installed documentation surface"));
+        assert!(!prompt.contains("read the docs and examples"));
+    }
+
+    /// Docs-only and examples-only installs speak about what is installed.
+    #[test]
+    fn default_system_prompt_names_only_installed_surfaces() {
+        let docs_only = tempdir().expect("tempdir");
+        std::fs::create_dir(docs_only.path().join("docs")).expect("mkdir docs");
+        let prompt = default_system_prompt(&["read"], docs_only.path());
+        assert!(prompt.contains("Pi documentation"));
+        assert!(prompt.contains("- Additional docs:"));
+        assert!(!prompt.contains("- Main documentation:"));
+        assert!(!prompt.contains("- Examples:"));
+        assert!(prompt.contains("read the installed documentation surface"));
+
+        let examples_only = tempdir().expect("tempdir");
+        let examples = examples_only.path().join("examples");
+        std::fs::create_dir_all(examples.join("extensions")).expect("mkdir examples/ext");
+        let prompt = default_system_prompt(&["read"], examples_only.path());
+        assert!(prompt.contains(&format!(
+            "- Examples: {} (extensions, custom tools, SDK)",
+            examples.display()
+        )));
+        assert!(prompt.contains("extensions (examples/extensions/)"));
+        assert!(!prompt.contains("- Additional docs:"));
+        assert!(!prompt.contains("docs/extensions.md"));
+    }
+
+    /// A fully provisioned package advertises every topic and the composite
+    /// extensions entry, with the stable absolute root shown on each path.
+    #[test]
+    fn default_system_prompt_full_package_advertises_every_surface() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("README.md"), "# pi\n").expect("write readme");
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).expect("mkdir docs");
+        let files = [
+            "extensions.md",
+            "themes.md",
+            "skills.md",
+            "prompt-templates.md",
+            "tui.md",
+            "keybindings.md",
+            "sdk.md",
+            "custom-provider.md",
+            "models.md",
+            "packages.md",
+        ];
+        for file in files {
+            std::fs::write(docs.join(file), "#\n").expect("write doc file");
+        }
+        std::fs::create_dir_all(dir.path().join("examples").join("extensions"))
+            .expect("mkdir examples/ext");
+
+        let prompt = default_system_prompt(&["read"], dir.path());
+        assert!(prompt.contains(&format!(
+            "- Main documentation: {}",
+            dir.path().join("README.md").display()
+        )));
+        assert!(prompt.contains("extensions (docs/extensions.md, examples/extensions/)"));
+        for label in [
+            "themes (docs/themes.md)",
+            "skills (docs/skills.md)",
+            "prompt templates (docs/prompt-templates.md)",
+            "TUI components (docs/tui.md)",
+            "keybindings (docs/keybindings.md)",
+            "SDK integrations (docs/sdk.md)",
+            "custom providers (docs/custom-provider.md)",
+            "adding models (docs/models.md)",
+            "pi packages (docs/packages.md)",
+        ] {
+            assert!(prompt.contains(label), "missing topic entry {label}");
+        }
+        assert!(prompt.contains("read the docs and examples, and follow .md cross-references"));
     }
 }

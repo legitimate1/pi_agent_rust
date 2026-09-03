@@ -97,6 +97,17 @@ pub enum SetupStep {
     /// Run a command
     #[serde(rename = "run_command")]
     RunCommand { command: String },
+    /// Seed the isolated project memory bank before constructing a memory tool.
+    #[serde(rename = "retain_memory")]
+    RetainMemory {
+        content: String,
+        kind: String,
+        #[serde(default)]
+        tags: Vec<String>,
+    },
+    /// Configure the initial state for a session-coupled `submit_plan` fixture.
+    #[serde(rename = "set_plan_mode")]
+    SetPlanMode { mode: String },
 }
 
 /// Expected results for a test case.
@@ -142,6 +153,9 @@ pub struct TestResult {
     pub message: Option<String>,
     pub actual_content: Option<String>,
     pub actual_details: Option<serde_json::Value>,
+    /// Tool error observed for an expected-error case. Retained so the
+    /// structured conformance log records the actual error taxonomy.
+    pub actual_error: Option<String>,
 }
 
 impl TestResult {
@@ -152,6 +166,7 @@ impl TestResult {
             message: None,
             actual_content: None,
             actual_details: None,
+            actual_error: None,
         }
     }
 
@@ -162,6 +177,7 @@ impl TestResult {
             message: Some(message.into()),
             actual_content: None,
             actual_details: None,
+            actual_error: None,
         }
     }
 }
@@ -228,12 +244,12 @@ pub fn validate_expected(
     }
 
     // Check content_exact
-    if let Some(exact) = &expected.content_exact {
-        if content != exact {
-            return Err(format!(
-                "Content mismatch.\nExpected:\n{exact}\nActual:\n{content}"
-            ));
-        }
+    if let Some(exact) = &expected.content_exact
+        && content != exact
+    {
+        return Err(format!(
+            "Content mismatch.\nExpected:\n{exact}\nActual:\n{content}"
+        ));
     }
 
     // Check content_regex
@@ -710,7 +726,7 @@ mod tests {
             ..Default::default()
         };
         let details = serde_json::json!({
-            "tools": "read,bash,edit,write,grep,find,ls,hashline_edit",
+            "tools": "read,bash,edit,write,grep,find,ls,hashline_edit,web_search,ast_grep,ast_edit,lsp,debug,ask,todo,submit_plan,jobs,hub,current_time",
             "extension": [],
             "extension_flags": [],
             "theme_path": [],

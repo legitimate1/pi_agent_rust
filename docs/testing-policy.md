@@ -205,12 +205,12 @@ The report tags test-double usage by:
 - `double_identifier` and `double_type`
 - `risk` and rationale
 
-Current baseline snapshot (from `report_id=bd-1f42.8.1-test-double-inventory-v2`, generated `2026-02-13T04:24:50Z`):
+Current baseline snapshot (from `report_id=bd-1f42.8.1-test-double-inventory-v2`, generated `2026-02-13T04:24:50Z`; extension-decomposition locators refreshed `2026-08-06`):
 
-- `entry_count`: 267
+- `entry_count`: 265
 - `module_count`: 21
 - suite distribution:
-  - `unit-inline`: 116
+  - `unit-inline`: 114
   - `vcr`: 73
   - `unit`: 16
   - `e2e`: 26
@@ -219,7 +219,7 @@ Current baseline snapshot (from `report_id=bd-1f42.8.1-test-double-inventory-v2`
 Top risk clusters:
 
 - `src/extension_dispatcher` (86 entries, high)
-- `src/extensions` (22 entries, high)
+- `src/extensions/tests` (20 entries, high)
 - `tests/extensions_provider_oauth` (28 entries, high)
 - `tests/e2e_provider_scenarios` (23 entries, high)
 - `tests/mock_spec_validation` (11 entries, high)
@@ -262,7 +262,7 @@ Each mock/stub usage outside Suite 1 must be explicitly allowlisted here with ra
 | `PackageCommandStubs` | `tests/e2e_cli.rs` | 3 | Offline npm/git stubs for CLI E2E; logged to JSONL. | infra | Permanent: real npm/git operations are non-deterministic. |
 | `RecordingSession` | `tests/extensions_message_session.rs` | 2 | Session API surface testing. | bd-m9rk | Replace with `SessionHandle` (real session). Most usages already migrated. |
 | `RecordingHostActions` | `tests/e2e_message_session_control.rs` | 2 | Extension host action recording; needed where agent loop provides host actions. | bd-m9rk | Evaluate if agent-loop integration test can replace recording. |
-| `MockHostActions` | `src/extensions.rs` (unit tests) | 2 | In-module stub for `sendMessage`/`sendUserMessage`. | bd-m9rk | Replace with real session-based dispatch once full integration test exists. |
+| `MockHostActions` | `src/extensions/tests/registration.rs` (unit tests) | 2 | In-module stub for `sendMessage`/`sendUserMessage`. | bd-m9rk | Replace with real session-based dispatch once full integration test exists. |
 
 **Process for adding new exceptions:** Open a bead with rationale. Get review. Add to this table
 with the bead ID. Add the `<path>:<Identifier>` entry to `.no-mock-allowlist` at repo root (the
@@ -341,9 +341,20 @@ waiver audit, and produces a verdict with promotion rules and rerun guidance. Co
 cargo test --test ci_full_suite_gate -- full_certification --nocapture --exact
 ```
 
-**Drop-in contract gate (bd-35t7i):** strict drop-in release language is only allowed when
-`docs/contracts/dropin-certification-contract.json` evaluates to all hard gates `pass` and the emitted
-`docs/evidence/dropin-certification-verdict.json` has `overall_verdict = CERTIFIED`.
+**Extension must-pass authority:** The release-blocking `ext_must_pass` corpus is
+the exact selection in `docs/extension-inclusion-list.json` (`tier1` plus
+`tier1_review`). `tests/ext_conformance/VALIDATED_MANIFEST.json` supplies the
+corresponding artifact metadata, but its numeric tier labels do not independently
+define or shrink the release set. A passing extension gate is necessary release
+evidence; it does not by itself authorize a strict drop-in claim.
+
+**Drop-in contract gate (bd-35t7i):** strict drop-in release language is only
+allowed when `docs/contracts/dropin-certification-contract.json` evaluates to
+all hard gates `pass` and the emitted
+`docs/evidence/dropin-certification-verdict.json` has
+`overall_verdict = CERTIFIED` with `git_commit` naming the clean release source
+commit. The final release ref must equal that commit or descend from it only
+through allowlisted evidence-only commits.
 Operational incident response for parity regressions is documented in
 `docs/ci-operator-runbook.md` under **Parity Incident Response (DROPIN-162)**.
 
@@ -467,15 +478,43 @@ Normative rules:
    - `bd-3ar8v.6.3` extension conformance + perf stress certification
    - `bd-3ar8v.6.6` unified certification dossier lane
 
+#### Release-budget measurement negative controls
+
+`pi.perf.budget_summary.v2` admits a numeric release-budget input only when its
+measurement-specific negative control verifies. A present number without the
+control is `NO_DATA`; strict CI may additionally fail because required data is
+missing, but it must never compare the unproven number with a threshold.
+
+- `binary_size_release` requires a `pi.perf.binary_size_measurement.v1` record
+  that binds the exact binary path, SHA-256, and byte length to Cargo profile
+  `release`, profile family `release`, `opt-level = "z"`, and `strip = true`.
+- `idle_memory_rss` requires a `pi.perf.idle_rss_measurement.v1` record with the
+  Cargo release build command, allocator (`system` or `jemalloc`), measured
+  executable path and SHA-256, and at least five distinct interactive `pi`
+  process samples after the declared idle settle interval. The control reports
+  the conservative maximum RSS and exact max-minus-min spread, identifies the
+  PID carrying that maximum, and hash-binds the `benches/bench_env.rs`
+  fingerprint used during sampling.
+- `ext_cold_load_simple_p95` and `ext_cold_load_complex_p95` require a
+  `pi.perf.cold_load_measurement.v1` record that hashes each Criterion estimate
+  and embeds the `benches/bench_env.rs` governor, ASLR, THP, and noise-score
+  fingerprint. The release gate admits only `noise_score = 0`.
+
+The producer and consumer must both validate these controls. Missing, malformed,
+hash-mismatched, wrong-profile, wrong-process, or noisy evidence produces a named
+data-contract failure and cannot authorize a performance claim.
+
 #### Practical-finish checkpoint policy (bd-3ar8v.6.9)
 
 Release/certification decisions must apply a docs-last contract before final report wrap-up:
 
 1. `practical_finish_checkpoint` must pass before declaring final PERF-3X completion.
 2. `parameter_sweeps_integrity`, `extension_remediation_backlog`, and `conformance_stress_lineage` are co-required release gates.
-3. Remaining open PERF-3X work is allowed only for docs/report scope (`docs`, `docs-last`,
-   `documentation`, `report`, or `runbook` labels). Any technical open PERF-3X issue is
-   fail-closed and blocks GO.
+3. Remaining open PERF-3X work is allowed only when the Beads `issue_type` is explicitly
+   `docs`. Generic labels such as `docs-last`, `documentation`, `report`, or `runbook` do
+   not prove that a task is documentation-only. For this contract, **docs/report scope**
+   means exactly `issue_type = docs`; any technical open PERF-3X issue is fail-closed and
+   blocks GO.
 
 Required evidence artifacts for this policy:
 
@@ -842,3 +881,177 @@ Proposed fix:
 Verification plan:
   <How will we confirm the fix works? (e.g., 3 clean CI runs)>
 ```
+
+## Multi-Run N-Run Evidence Protocol (RI-NRUN, DROPIN-R14)
+
+### Purpose & Anti-Peeking Principle
+
+Release-integrity performance budgets must not be evaluated on single test runs or selective single measurements (which introduces peeking statistics and false-pass risk). The N-Run Evidence Protocol mandates that release-deciding performance budgets be evaluated over multi-run series with rigorous statistical estimation.
+
+### Protocol Requirements
+
+1. **Repetitions**: Every evaluated budget must include at least $N \ge 10$ distinct measurement runs.
+2. **Correlation Isolation**: Every measurement run must record a distinct, unique `correlation_id` across separate executions.
+3. **Environment & Noise Gating**: Each sample records environment metadata and a `noise_score` ($\le 15$ required for valid samples).
+4. **Statistical Estimation**:
+   - **Weighted Mean**: $\bar{x}_w = \frac{\sum w_i x_i}{\sum w_i}$
+   - **Effective Sample Size**: $n_{\text{eff}} = \frac{(\sum w_i)^2}{\sum w_i^2}$
+   - **Bootstrap 95% Confidence Intervals**: $B = 1000$ resamples with replacement produce empirical percentile bounds $[\text{CI}_{95,\text{lower}}, \text{CI}_{95,\text{upper}}]$.
+5. **Decision Rule**:
+   - For `maximum` budgets (latency, size, memory): Budget passes only when $\text{CI}_{95,\text{upper}} \le \text{threshold}$.
+   - For `minimum` budgets (throughput, QPS): Budget passes only when $\text{CI}_{95,\text{lower}} \ge \text{threshold}$.
+
+### Enforced Contracts & Artifacts
+
+- **Contract**: `docs/contracts/nrun-evidence-protocol-contract.json` (`pi.nrun.evidence_protocol.contract.v1`)
+- **Evaluation Evidence**: `docs/evidence/nrun-budget-evaluation.json` (`pi.nrun.budget_evaluation.v1`)
+- **Evaluator Tool**: `examples/nrun_evidence_evaluator.rs`
+- **Verification Gate**: `tests/nrun_evidence_protocol.rs`
+
+## Anytime-Valid Sequential Budget Decision Gate (RI-SEQ, DROPIN-R15)
+
+### Purpose & Theoretical Error Control
+
+Fixed-sample testing suffers from severe inflation of false-pass rates when evaluations are monitored continuously across builds or checkpoints. The sequential budget decision gate implements anytime-valid sequential hypothesis testing via **e-processes** and **sequential probability ratio testing (SPRT)**.
+
+By **Ville's inequality for non-negative supermartingales**:
+$$\mathbb{P}_{H_0}\left(\exists n \ge 1: E_n \ge \frac{1}{\alpha}\right) \le \alpha$$
+
+This provides guaranteed Type I error control ($\alpha \le 0.05$) regardless of stopping time or arbitrary evaluation frequency.
+
+### Sequential Decision Trajectory
+
+For each sample $X_i$ with standardized relative margin $z_i = \frac{T - X_i}{\sigma_0}$ (for maximum budgets) or $z_i = \frac{X_i - T}{\sigma_0}$ (for minimum budgets):
+- **Step Log-Likelihood Ratio**: $\Delta_i = w_i \cdot \left[ (\mu_1 - \mu_0) z_i - \frac{\mu_1^2 - \mu_0^2}{2} \right]$
+- **Accumulated e-value**: $E_n = \prod_{i=1}^n \exp(\Delta_i)$
+- **Early Pass Threshold**: $E_n \ge 1/\alpha = 20.0 \implies \text{EARLY\_PASS}$ (sufficient evidence of compliance without requiring further runs).
+- **Early Reject Threshold**: $E_n \le \beta = 0.01 \implies \text{EARLY\_REJECT}$ (decisive evidence of budget violation).
+- **Max Steps Boundary**: If sample budget $N_{\max} = 50$ is exhausted without crossing early thresholds, decision is made on whether $E_n \ge 1.0$.
+
+### Enforced Contracts & Artifacts
+
+- **Contract**: `docs/contracts/sequential-budget-gate-contract.json` (`pi.sequential_gate.contract.v1`)
+- **Evaluation Evidence**: `docs/evidence/sequential-budget-gate-evaluations.json` (`pi.sequential_gate.evaluation.v1`)
+- **Evaluator Tool**: `examples/sequential_budget_gate.rs`
+- **Verification Gate**: `tests/sequential_budget_gate.rs`
+
+## Performance Budget Regime Drift Watch (RI-DRIFT, DROPIN-R19)
+
+### Purpose & Early Warning Principle
+
+Performance regressions rarely appear instantly without warning; they often exhibit persistent slow creep (e.g. binary size creeping toward 48 MiB) or sudden discrete regime changes across dependency updates. The regime drift monitor runs two complementary statistical detectors over historical budget time-series:
+
+1. **Two-Sided CUSUM (Cumulative Sum)**:
+   - Tracks standardized deviations $z_i = \frac{X_i - \bar{\mu}}{\sigma}$ against allowance parameter $k = 0.5\sigma$.
+   - Positive drift accumulator: $S_n^+ = \max(0, S_{n-1}^+ + z_n - k)$.
+   - Negative drift accumulator: $S_n^- = \max(0, S_{n-1}^- - z_n - k)$.
+   - Alarms when $S_n^+ \ge h = 4.0\sigma$ or $S_n^- \ge h$, indicating steady multi-run drift before gates fail.
+
+2. **Bayesian Online Changepoint Detection (BOCPD)**:
+   - Models run-length probability $P(r_t | x_{1:t})$ with constant hazard function $H(r) = \frac{1}{\lambda}$ ($\lambda = 50$).
+   - Calculates changepoint posterior probability $P(r_t = 0 | x_t) = \frac{H}{H + (1-H) L_{\text{same}}}$.
+   - Alarms when $P(r_t = 0) \ge 0.5$, detecting immediate step-function regime shifts.
+
+3. **Zero Mutation & Advisory Status**:
+   - The detector is purely read-only and advisory, outputting `pi.perf.drift_watch.v1` artifacts consumed by preflight and runpack tools with zero side effects on scheduler, git, or beads state.
+
+### Enforced Contracts & Artifacts
+
+- **Contract**: `docs/contracts/drift-watch-contract.json` (`pi.perf.drift_watch.contract.v1`)
+- **Evaluation Evidence**: `docs/evidence/perf-drift-watch.json` (`pi.perf.drift_watch.v1`)
+- **Evaluator Tool**: `examples/perf_drift_watch.rs`
+- **Verification Gate**: `tests/perf_drift_watch.rs`
+
+## Data-Derived Conformal Budget Calibration (RI-CONFORMAL, DROPIN-R20)
+
+### Purpose & Theoretical Coverage Guarantee
+
+Traditional performance engineering relies on round-number "folklore" budgets (e.g. 5ms cold-load, 100ms startup) set without empirical statistical foundations. When systems fail these arbitrary thresholds, teams are forced into subjective negotiation.
+
+Conformal budget calibration applies **split-conformal prediction** (Vovk et al. 2005) to compute rigorous, distribution-free performance thresholds with guaranteed finite-sample coverage $1 - \alpha \ge 95\%$:
+
+$$\mathbb{P}(X_{n+1} \le \hat{T}_{\text{conformal}}) \ge 1 - \alpha$$
+
+For $n$ sorted calibration samples $X_{(1)} \le \dots \le X_{(n)}$, the conformal quantile index is:
+$$k = \min\left(n, \left\lceil (n + 1)(1 - \alpha) \right\rceil\right)$$
+$$\hat{T}_{\text{conformal}} = X_{(k)} \times \text{padding\_multiplier}$$
+
+### Distinction: Data-Derived vs Folklore Policy Choice
+
+Every performance budget in the system must be explicitly classified:
+1. `DATA_DERIVED_CONFORMAL`: Statistically calibrated from $N \ge 10$ empirical measurement runs at guaranteed $\ge 95\%$ coverage.
+2. `FOLKLORE_POLICY_CHOICE`: Explicit policy decisions (e.g. 48 MiB binary size limit, hard CI timeout) where business or platform constraints supersede empirical distribution.
+
+### Formal Budget Amendment Workflow
+
+When an amended threshold is needed (e.g. for `ext_cold_load_simple_p95` in the risk register), the amendment procedure requires:
+- Cryptographic provenance series hash (`evidence_provenance_hash`).
+- Calibration over $N \ge 10$ clean runs with $\ge 95\%$ coverage guarantee.
+- A 95% bootstrap confidence interval for the measured p95 that excludes the superseded threshold.
+- Formal justification rationale recorded in the calibration artifact.
+- Named approver role and identity, bound to an auditable Agent Mail approval message.
+
+The approved `ext_cold_load_simple_p95` amendment is recorded in
+`docs/evidence/ext-cold-load-budget-amendment.json`. It uses 20 independent
+Criterion processes on a clean RCH-built perf binary. The consumer's historical
+metric name says p95, but its implementation reads Criterion's
+`mean.point_estimate`; the amendment preserves that exact comparison seam and
+states the mismatch explicitly. The amended threshold is the 95% split-conformal
+upper quantile with 1.10 safety padding, rounded upward to six decimal places.
+This amendment changes only that named CI budget and does not authorize release
+or strict replacement claims.
+
+### Enforced Contracts & Artifacts
+
+- **Contract**: `docs/contracts/conformal-budget-calibration-contract.json` (`pi.conformal_calibration.contract.v1`)
+- **Evaluation Evidence**: `docs/evidence/conformal-budget-calibration.json` (`pi.conformal_calibration.v1`)
+- **Approved Amendment**: `docs/evidence/ext-cold-load-budget-amendment.json` (`pi.conformal_budget_amendment.v1`)
+- **Evaluator Tool**: `examples/conformal_budget_calibration.rs`
+- **Verification Gate**: `tests/conformal_budget_calibration.rs`
+
+## Fresh Release Startup & Binary Size Benchmark (RI-STARTUP, DROPIN-R10)
+
+### Purpose & Measurement Methodology
+
+To ensure shipping releases satisfy performance claims without regression or measurement gap:
+1. **Startup Latency ($N \ge 10$)**:
+   - `pi --version`: Minimal fast-path startup (<100ms p95, typically ~5-7ms).
+   - `pi --help`: Full argument parser and help formatting path (<150ms p95, typically ~12-15ms).
+   - `pi --list-models`: Provider catalog and model registry resolution path (<200ms p95, typically ~20-25ms).
+2. **Release Binary Size**:
+   - Release profile artifacts are budgeted at $\le 48\text{ MiB}$ (enforced across Darwin and Linux release binaries).
+3. **Environment & Provenance Fingerprinting**:
+   - Every startup benchmark run captures OS, CPU topology, memory size, noise score, and source git commit hash.
+
+### Enforced Contracts & Artifacts
+
+- **Contract**: `docs/contracts/startup-benchmark-contract.json` (`pi.perf.startup_benchmark.contract.v1`)
+- **Evaluation Evidence**: `docs/evidence/startup-benchmark-report.json` (`pi.perf.startup_benchmark.v1`)
+- **Evaluator Tool**: `examples/startup_benchmark_runner.rs`
+- **Verification Gate**: `tests/startup_benchmark.rs`
+
+## Performance Benchmark Variance Gating & Host Topology Fingerprints (RI-VARGATE, DROPIN-R17)
+
+### Noise Score Rejection & NO_DATA Invariant
+
+To ensure benchmark integrity and prevent noisy host environments from producing invalid compliance:
+1. **Noise Score Calculation**:
+   - Measures governor mode, CPU turbo boost, transparent huge pages (THP), and address space layout randomization (ASLR).
+   - Scoring: governor != performance (+3), turbo enabled (+2), THP != never (+1), ASLR enabled (+1). Range: 0 (optimal) to 7 (worst).
+2. **Rejection Policy**:
+   - Inputs with `noise_score > max_admissible_noise_score` (default $\le 0$ for strict CI, $\le 3$ for developer runs) are **rejected as `NO_DATA`**.
+   - **Forbid Averaging into Compliance**: Noisy runs are strictly forbidden from being averaged with clean runs to satisfy budgets.
+3. **Host Topology Fingerprint**:
+   - Mandates embedding `pi.perf.host_topology_fingerprint.v1` alongside all performance measurement artifacts.
+
+### Enforced Contracts & Artifacts
+
+- **Contract**: `docs/contracts/variance-gating-contract.json` (`pi.perf.variance_gating.contract.v1`)
+- **Evaluation Evidence**: `docs/evidence/variance-gate-evaluations.json` (`pi.perf.variance_gate_report.v1`)
+- **Evaluator Tool**: `examples/variance_gate.rs`
+- **Verification Gate**: `tests/variance_gating.rs`
+
+
+
+
+

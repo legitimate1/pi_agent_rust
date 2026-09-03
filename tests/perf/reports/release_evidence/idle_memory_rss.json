@@ -1,0 +1,45 @@
+{
+  "schema": "pi.perf.idle_memory_rss.v1",
+  "generated_at": "2026-08-28T09:23:47.912759+00:00",
+  "pid": 17113,
+  "process_name": "pi",
+  "allocator": "system",
+  "binary_path": "/Users/jemanuel/projects/pi_agent_rust/target/release/pi",
+  "binary_sha256": "27689834b77579e04b10dd2ac934a2d211e3080fef0f7cbf964e64d3cdad52b4",
+  "rss_bytes": 8388608,
+  "idle_state": "startup_before_user_input",
+  "cargo_profile": "release",
+  "build_command": "cargo build --bin pi --release",
+  "sample_count": 5,
+  "samples": [
+    {
+      "pid": 17113,
+      "rss_bytes": 8388608
+    },
+    {
+      "pid": 17113,
+      "rss_bytes": 8388608
+    },
+    {
+      "pid": 17113,
+      "rss_bytes": 8388608
+    },
+    {
+      "pid": 17113,
+      "rss_bytes": 8388608
+    },
+    {
+      "pid": 17113,
+      "rss_bytes": 8388608
+    }
+  ],
+  "rss_spread_bytes": 0,
+  "settle_ms": 5000,
+  "bench_env_source": "scripts/perf/measure_idle_memory.py",
+  "bench_env": {
+    "arch": "arm64",
+    "os": "Darwin 25.2.0",
+    "rch_diagnose_head": "rch diagnose unavailable"
+  },
+  "bench_env_sha256": "3f9d05f77c9bb7c90bfcd4fb8ae633224d0966973f99af701099676e78fe2f18"
+}

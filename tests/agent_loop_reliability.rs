@@ -52,6 +52,7 @@ fn make_assistant(text: &str, stop: StopReason, total_tokens: u64) -> AssistantM
             ..Usage::default()
         },
         stop_reason: stop,
+        stop_details: None,
         error_message: None,
         timestamp: 0,
     }
@@ -69,6 +70,7 @@ fn make_tool_call_message(tools: Vec<ToolCall>, total_tokens: u64) -> AssistantM
             ..Usage::default()
         },
         stop_reason: StopReason::ToolUse,
+        stop_details: None,
         error_message: None,
         timestamp: 0,
     }
@@ -110,7 +112,11 @@ const fn event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::AutoCompactionEnd { .. } => "auto_compaction_end",
         AgentEvent::AutoRetryStart { .. } => "auto_retry_start",
         AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
+        AgentEvent::FailoverStart { .. } => "failover_start",
+        AgentEvent::FailoverEnd { .. } => "failover_end",
         AgentEvent::ExtensionError { .. } => "extension_error",
+        AgentEvent::AdvisorNote { .. } => "advisor_note",
+        AgentEvent::ProviderError { .. } => "provider_error",
     }
 }
 
@@ -225,6 +231,13 @@ fn make_agent(provider: Arc<dyn Provider>, cwd: &std::path::Path, max_iters: usi
         block_images: false,
         fail_closed_hooks: false,
         tool_approval: None,
+        keyword_settings: None,
+        max_time: None,
+        turn_recovery: pi::turn_recovery::TurnRecoveryMode::default(),
+        approval_state: None,
+        bash_settings: None,
+        secrets: None,
+        model_accepts_images: true,
     };
     Agent::new(provider, tools, config)
 }
@@ -330,6 +343,7 @@ fn make_partial(text: &str) -> AssistantMessage {
         model: "test-model".to_string(),
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
+        stop_details: None,
         error_message: None,
         timestamp: 0,
     }
@@ -801,6 +815,7 @@ impl Provider for ToolCallThenHangProvider {
             let msg = make_tool_call_message(self.tool_calls.clone(), 30);
             let partial = AssistantMessage {
                 content: Vec::new(),
+                stop_details: None,
                 ..msg.clone()
             };
             let events = vec![
@@ -1215,6 +1230,7 @@ fn max_tool_iterations_exceeded_returns_clean_stop() {
         let msg = make_tool_call_message(vec![tool_call.clone()], 20);
         let partial = AssistantMessage {
             content: Vec::new(),
+            stop_details: None,
             ..msg.clone()
         };
 
@@ -1396,6 +1412,13 @@ fn repeated_interruption_cycles_no_corruption() {
                 block_images: false,
                 fail_closed_hooks: false,
                 tool_approval: None,
+                keyword_settings: None,
+                max_time: None,
+                turn_recovery: pi::turn_recovery::TurnRecoveryMode::default(),
+                approval_state: None,
+                bash_settings: None,
+                secrets: None,
+                model_accepts_images: true,
             };
             let agent = Agent::new(provider, tools, config);
             let mut agent_session = AgentSession::new(
@@ -1519,6 +1542,13 @@ fn session_resume_after_interruption() {
             block_images: false,
             fail_closed_hooks: false,
             tool_approval: None,
+            keyword_settings: None,
+            max_time: None,
+            turn_recovery: pi::turn_recovery::TurnRecoveryMode::default(),
+            approval_state: None,
+            bash_settings: None,
+            secrets: None,
+            model_accepts_images: true,
         };
         let agent1 = Agent::new(provider1, tools, config.clone());
         let mut session1 = AgentSession::new(
@@ -1906,6 +1936,7 @@ fn partial_write_tool_failure_recovers_without_state_corruption() {
         );
         let first_partial = AssistantMessage {
             content: Vec::new(),
+            stop_details: None,
             ..first_turn.clone()
         };
         let second_turn = make_assistant(
@@ -1954,6 +1985,13 @@ fn partial_write_tool_failure_recovers_without_state_corruption() {
                 block_images: false,
                 fail_closed_hooks: false,
                 tool_approval: None,
+                keyword_settings: None,
+                max_time: None,
+                turn_recovery: pi::turn_recovery::TurnRecoveryMode::default(),
+                approval_state: None,
+                bash_settings: None,
+                secrets: None,
+                model_accepts_images: true,
             },
         );
         let session = make_session(&harness);

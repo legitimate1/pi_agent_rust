@@ -17,24 +17,12 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 use futures::executor::block_on;
 use pi::extensions::{
     ExtensionEventName, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
+    SessionActionOrigin,
 };
 use pi::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntime, PiJsRuntimeConfig};
 use pi::scheduler::HostcallOutcome;
 use pi::tools::ToolRegistry;
 use serde_json::{Value, json};
-
-const BENCH_TOOL_SETUP: &str = r#"
-__pi_begin_extension("ext.bench", { name: "Bench" });
-pi.registerTool({
-  name: "bench_tool",
-  description: "Benchmark tool",
-  parameters: { type: "object", properties: { value: { type: "number" } } },
-  execute: async (_callId, input) => {
-    return { ok: true, value: input.value };
-  },
-});
-__pi_end_extension();
-"#;
 
 const BENCH_TOOL_CALL: &str = r#"
 globalThis.__bench_done = false;
@@ -82,11 +70,19 @@ impl pi::extensions::ExtensionSession for BenchSession {
         Vec::new()
     }
 
-    async fn set_name(&self, _name: String) -> pi::error::Result<()> {
+    async fn set_name(
+        &self,
+        _name: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         Ok(())
     }
 
-    async fn append_message(&self, _message: pi::session::SessionMessage) -> pi::error::Result<()> {
+    async fn append_message(
+        &self,
+        _message: pi::session::SessionMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         Ok(())
     }
 
@@ -94,11 +90,17 @@ impl pi::extensions::ExtensionSession for BenchSession {
         &self,
         _custom_type: String,
         _data: Option<Value>,
+        _origin: Option<SessionActionOrigin>,
     ) -> pi::error::Result<()> {
         Ok(())
     }
 
-    async fn set_model(&self, _provider: String, _model_id: String) -> pi::error::Result<()> {
+    async fn set_model(
+        &self,
+        _provider: String,
+        _model_id: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         Ok(())
     }
 
@@ -106,7 +108,11 @@ impl pi::extensions::ExtensionSession for BenchSession {
         (None, None)
     }
 
-    async fn set_thinking_level(&self, _level: String) -> pi::error::Result<()> {
+    async fn set_thinking_level(
+        &self,
+        _level: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         Ok(())
     }
 
@@ -114,7 +120,12 @@ impl pi::extensions::ExtensionSession for BenchSession {
         None
     }
 
-    async fn set_label(&self, _target_id: String, _label: Option<String>) -> pi::error::Result<()> {
+    async fn set_label(
+        &self,
+        _target_id: String,
+        _label: Option<String>,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         Ok(())
     }
 }
@@ -650,13 +661,15 @@ fn bench_js_runtime(c: &mut Criterion) {
         });
     });
 
-    let tool_runtime = block_on(PiJsRuntime::new()).unwrap();
-    block_on(async {
-        tool_runtime
-            .eval(BENCH_TOOL_SETUP)
-            .await
-            .expect("register bench tool");
-    });
+    let tool_runtime = block_on(
+        PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+            pi::scheduler::WallClock,
+            PiJsRuntimeConfig::default(),
+            None,
+            "ext.bench".to_string(),
+        ),
+    )
+    .unwrap();
     group.bench_function("tool_call_roundtrip", |b| {
         b.iter(|| {
             block_on(async {
@@ -947,6 +960,7 @@ fn bench_dispatch_shared_session(c: &mut Criterion) {
             manager: Some(manager.clone()),
             policy: &policy,
             js_runtime: None,
+            session_action_origin: None,
             interceptor: None,
         };
         let call = call.clone();
@@ -1029,6 +1043,7 @@ fn bench_dispatch_shared_events(c: &mut Criterion) {
             manager: Some(manager.clone()),
             policy: &policy,
             js_runtime: None,
+            session_action_origin: None,
             interceptor: None,
         };
         let call = call.clone();
@@ -1053,9 +1068,17 @@ fn bench_dispatch_shared_events(c: &mut Criterion) {
 /// We measure this indirectly via the `complete_hostcall` + `tick` path with
 /// varying payload sizes.
 fn bench_js_serde_bridge(c: &mut Criterion) {
-    // Set up a PiJsRuntime with the tool-calling shim installed.
-    let rt = block_on(PiJsRuntime::new()).unwrap();
-    block_on(rt.eval(BENCH_TOOL_SETUP)).expect("register bench tool");
+    // Use an immutable benchmark principal so hostcall attribution follows the
+    // same Rust-owned identity boundary as production extension shards.
+    let rt = block_on(
+        PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+            pi::scheduler::WallClock,
+            PiJsRuntimeConfig::default(),
+            None,
+            "ext.bench".to_string(),
+        ),
+    )
+    .unwrap();
 
     let payloads: Vec<(&str, Value)> = vec![
         ("null", Value::Null),
@@ -1171,6 +1194,7 @@ fn bench_dispatch_overhead_breakdown(c: &mut Criterion) {
             manager: None,
             policy,
             js_runtime: None,
+            session_action_origin: None,
             interceptor: None,
         };
         let call = call.clone();
@@ -1198,6 +1222,7 @@ fn bench_dispatch_overhead_breakdown(c: &mut Criterion) {
             manager: Some(manager.clone()),
             policy,
             js_runtime: None,
+            session_action_origin: None,
             interceptor: None,
         };
         let call = call.clone();

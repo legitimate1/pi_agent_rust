@@ -25,6 +25,8 @@ use std::future::Future;
 use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::path::Path;
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -36,6 +38,57 @@ fn run_async<T>(future: impl Future<Output = T>) -> T {
         .build()
         .expect("build runtime");
     runtime.block_on(future)
+}
+
+#[cfg(unix)]
+struct UnixModeGuard {
+    path: PathBuf,
+    original: Option<std::fs::Permissions>,
+}
+
+#[cfg(unix)]
+impl UnixModeGuard {
+    fn apply(path: &Path, mode: u32) -> Self {
+        let original = std::fs::metadata(path)
+            .expect("permission fixture metadata")
+            .permissions();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .expect("apply permission fixture mode");
+        Self {
+            path: path.to_path_buf(),
+            original: Some(original),
+        }
+    }
+
+    fn restore(&mut self) {
+        if let Some(original) = self.original.as_ref() {
+            std::fs::set_permissions(&self.path, original.clone())
+                .expect("restore permission fixture mode");
+            self.original = None;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixModeGuard {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            let _ = std::fs::set_permissions(&self.path, original);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn assert_permission_denied(error: &pi::Error) {
+    let kind = match error {
+        pi::Error::Io(io_error) => Some(io_error.kind()),
+        _ => None,
+    };
+    assert_eq!(
+        kind,
+        Some(std::io::ErrorKind::PermissionDenied),
+        "expected typed PermissionDenied error, got {error}"
+    );
 }
 
 fn make_msg(text: &str) -> SessionMessage {
@@ -203,48 +256,73 @@ fn fault_inject_multi_phase_append_crash_recover_continue() {
         trace.dump()
     );
 
-    // Phase 5: Heal the file — after recovery from corruption, the persisted
-    // entry count may include corrupt lines, so force a full rewrite first.
+    // Phase 5: A session recovered with skipped rows is read-only. Neither a
+    // dirty-header rewrite nor an incremental append may persist it, because
+    // either would commit a lossy view of the file (fail-closed contract
+    // since 2026-08-27, see session.rs crash_corrupt_middle_refuses_lossy_continue).
     trace.log(
         "CONTINUE",
-        "healing_rewrite",
-        "forcing full rewrite to clean up corrupt entries on disk",
+        "rewrite_attempt",
+        "attempting a full rewrite from the recovered session",
     );
     let mut continued = recovered;
     continued.session_dir = Some(temp_dir.path().to_path_buf());
     continued.set_model_header(Some("healing-model".to_string()), None, None);
-    run_async(async { continued.save().await }).unwrap();
-
-    // Phase 6: Post-healing append — incremental save should now work correctly.
-    trace.log(
-        "CONTINUE",
-        "post_recovery_append",
-        "adding entries after recovery",
-    );
-    continued.append_message(make_msg("phase5-msg-10"));
-    continued.append_message(make_msg("phase5-msg-11"));
-    run_async(async { continued.save().await }).unwrap();
-
-    // Phase 6: Final verification — clean load.
-    trace.log(
-        "VERIFY",
-        "final_load",
-        "clean load after continued operation",
-    );
-    let final_session =
-        run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
-
-    assert_eq!(
-        final_session.entries.len(),
-        12,
-        "12 entries should survive full lifecycle\nTrace:\n{}",
+    let rewrite_error = run_async(async { continued.save().await })
+        .expect_err("a recovered session with skipped rows must not be rewritten");
+    assert!(
+        rewrite_error
+            .to_string()
+            .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED"),
+        "unexpected rewrite error: {rewrite_error}\nTrace:\n{}",
         trace.dump()
     );
 
     trace.log(
+        "CONTINUE",
+        "append_attempt",
+        "attempting to append from the recovered session",
+    );
+    continued.append_message(make_msg("phase5-msg-10"));
+    continued.append_message(make_msg("phase5-msg-11"));
+    let append_error = run_async(async { continued.save().await })
+        .expect_err("a recovered session with skipped rows must not append");
+    assert!(
+        append_error
+            .to_string()
+            .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED"),
+        "unexpected append error: {append_error}\nTrace:\n{}",
+        trace.dump()
+    );
+
+    // Phase 6: Final verification — the file still holds the ten valid
+    // entries and the torn record; nothing was laundered or lost.
+    trace.log(
+        "VERIFY",
+        "final_load",
+        "load after the refused continuation",
+    );
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        raw.contains("crash-victim"),
+        "the torn record must be preserved on disk\nTrace:\n{}",
+        trace.dump()
+    );
+    let (final_session, final_diagnostics) =
+        run_async(async { Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await })
+            .unwrap();
+    assert_eq!(
+        final_session.entries.len(),
+        10,
+        "the ten valid entries survive; refused writes added nothing\nTrace:\n{}",
+        trace.dump()
+    );
+    assert_eq!(final_diagnostics.skipped_entries.len(), 1);
+
+    trace.log(
         "VERIFY",
         "success",
-        "multi-phase fault injection test passed",
+        "multi-phase fault injection test passed (lossy continuation refused)",
     );
     trace.assert_no_errors();
 }
@@ -288,37 +366,53 @@ fn fault_inject_checkpoint_heals_corruption_via_header_dirty() {
         "garbage injected between saves",
     );
 
-    // Dirty the header to force full rewrite on next save — this is the
-    // checkpoint mechanism that heals accumulated corruption.
+    // Dirty the header to force a full rewrite on the next save. A checkpoint
+    // is not allowed to launder externally corrupted rows: the rewrite
+    // re-reads the file, finds rows it must skip, and refuses (fail-closed
+    // contract since 2026-08-27).
     session.set_model_header(Some("checkpoint-provider".to_string()), None, None);
     session.append_message(make_msg("post-checkpoint"));
-    run_async(async { session.save().await }).unwrap();
+    let error = run_async(async { session.save().await })
+        .expect_err("checkpoint rewrite over corrupted rows must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED"),
+        "unexpected error: {error}\nTrace:\n{}",
+        trace.dump()
+    );
     trace.log(
         "CHECKPOINT",
-        "header_dirty_rewrite",
-        "full rewrite via dirty header",
+        "header_dirty_rewrite_refused",
+        "full rewrite via dirty header refused by the integrity guard",
     );
 
-    // Verify clean file after checkpoint.
+    // The garbage stays on disk and every valid entry stays recoverable.
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(
-        !content.contains("GARBAGE_PRE_CHECKPOINT"),
-        "checkpoint should eliminate garbage\nTrace:\n{}",
+        content.contains("GARBAGE_PRE_CHECKPOINT"),
+        "refused checkpoint must preserve the corrupt row\nTrace:\n{}",
         trace.dump()
     );
 
-    let loaded = run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+    let (loaded, diagnostics) =
+        run_async(async { Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await })
+            .unwrap();
     assert_eq!(
         loaded.entries.len(),
-        7,
-        "all 7 entries (1 initial + 5 incremental + 1 post-checkpoint) should be clean\nTrace:\n{}",
+        6,
+        "1 initial + 5 incremental entries stay recoverable; the refused post-checkpoint entry was never written\nTrace:\n{}",
         trace.dump()
+    );
+    assert!(
+        !diagnostics.skipped_entries.is_empty(),
+        "the corrupt row is reported in diagnostics"
     );
 
     trace.log(
         "VERIFY",
-        "checkpoint_healed",
-        "corruption healed by dirty-header checkpoint",
+        "checkpoint_refused",
+        "corruption preserved and reported instead of healed",
     );
     trace.assert_no_errors();
 }
@@ -385,6 +479,7 @@ fn fault_inject_stale_temp_file_after_interrupted_rewrite() {
 // Phase 4: Autosave queue state machine under fault injection
 // ===========================================================================
 
+#[cfg(unix)]
 #[test]
 fn fault_inject_autosave_queue_mutation_tracking_through_faults() {
     let mut trace = TraceLog::new();
@@ -427,11 +522,9 @@ fn fault_inject_autosave_queue_mutation_tracking_through_faults() {
 
     // Enqueue more mutations then force a save failure.
     session.append_message(make_msg("will-fail"));
-    // Simulate IO failure: make the file read-only.
-    let original_permissions = std::fs::metadata(&path).unwrap().permissions();
-    let mut readonly = original_permissions.clone();
-    readonly.set_mode(0o444);
-    std::fs::set_permissions(&path, readonly).unwrap();
+    // Simulate a real append failure. Session persistence honors explicit Unix
+    // mode bits even for UID 0, so the same fault reaches every test identity.
+    let mut mode_guard = UnixModeGuard::apply(&path, 0o444);
     trace.log("FAULT", "make_readonly", "set session file to read-only");
 
     // Attempt save — should fail.
@@ -442,15 +535,18 @@ fn fault_inject_autosave_queue_mutation_tracking_through_faults() {
         format!("result: {}", if result.is_ok() { "ok" } else { "err" }),
     );
 
-    // Restore permissions.
-    let mut writable = original_permissions;
-    writable.set_mode(0o644);
-    std::fs::set_permissions(&path, writable).unwrap();
+    mode_guard.restore();
     trace.log(
         "RECOVER",
         "restore_permissions",
         "restored write permissions",
     );
+
+    let error = result.expect_err("save of a mode-0444 session must fail");
+    assert_permission_denied(&error);
+    let metrics_after_fault = session.autosave_metrics();
+    assert_eq!(metrics_after_fault.flush_failed, 1);
+    assert!(metrics_after_fault.pending_mutations > 0);
 
     // Retry save — should succeed now.
     let result = run_async(async { session.save().await });
@@ -471,6 +567,9 @@ fn fault_inject_autosave_queue_mutation_tracking_through_faults() {
             final_metrics.pending_mutations,
         ),
     );
+    assert_eq!(final_metrics.flush_succeeded, 2);
+    assert_eq!(final_metrics.flush_failed, 1);
+    assert_eq!(final_metrics.pending_mutations, 0);
 
     // Verify full round-trip.
     let loaded = run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
@@ -487,6 +586,41 @@ fn fault_inject_autosave_queue_mutation_tracking_through_faults() {
 // ===========================================================================
 // Phase 5: Durability mode fault behavior matrix
 // ===========================================================================
+
+#[cfg(unix)]
+#[test]
+fn fault_inject_first_save_denial_leaves_no_partial_session_tree() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let sessions_root = temp_dir.path().join("sessions");
+    std::fs::create_dir(&sessions_root).expect("create sessions root");
+
+    let mut session = Session::create();
+    session.session_dir = Some(sessions_root.clone());
+    session.append_message(make_msg("pending-first-save"));
+
+    // The fixture owner lacks write while group/other are writable. The same
+    // strict assertion therefore exercises effective-class policy under both
+    // UID 0 and UID 1000, with RAII restoration and no conditional skip.
+    let mut mode_guard = UnixModeGuard::apply(&sessions_root, 0o577);
+    let result = run_async(async { session.save().await });
+    mode_guard.restore();
+
+    let error = result.expect_err("first save must fail before directory creation");
+    assert_permission_denied(&error);
+    assert!(session.path.is_none(), "failed save must not assign a path");
+    assert_eq!(
+        session.entries.len(),
+        1,
+        "pending entry must remain in memory"
+    );
+    assert_eq!(
+        std::fs::read_dir(&sessions_root)
+            .expect("read restored sessions root")
+            .count(),
+        0,
+        "permission denial must leave no partial project directory"
+    );
+}
 
 #[test]
 fn fault_inject_durability_strict_fails_on_io_error() {
@@ -583,20 +717,18 @@ fn fault_inject_rapid_crash_recover_cycles() {
     let mut trace = TraceLog::new();
     let temp_dir = tempfile::tempdir().unwrap();
 
-    let mut session = Session::create();
-    session.session_dir = Some(temp_dir.path().to_path_buf());
-    session.append_message(make_msg("seed"));
-    run_async(async { session.save().await }).unwrap();
-    let path = session.path.clone().unwrap();
-
-    let mut expected_entries = 1;
-
+    // Ten independent crash/recover cycles, one session file each: once a
+    // file carries a torn fragment, every further write to it is refused
+    // (fail-closed contract since 2026-08-27), so a cycle cannot continue on
+    // the same file. What must hold in every cycle: recovery finds every
+    // valid entry, reports the fragment, and refuses to persist from the
+    // recovered copy; the fragment stays on disk.
     for cycle in 0..10 {
-        trace.log(
-            "CYCLE",
-            format!("start_{cycle}"),
-            format!("entries_so_far={expected_entries}"),
-        );
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+        session.append_message(make_msg("seed"));
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
 
         // Add entries.
         let new_count = (cycle % 3) + 1;
@@ -604,9 +736,14 @@ fn fault_inject_rapid_crash_recover_cycles() {
             session.append_message(make_msg(&format!("cycle{cycle}-msg{j}")));
         }
         run_async(async { session.save().await }).unwrap();
-        expected_entries += new_count;
+        let expected_entries = 1 + new_count;
+        trace.log(
+            "CYCLE",
+            format!("start_{cycle}"),
+            format!("entries={expected_entries}"),
+        );
 
-        // Inject corruption (simulating crash during next append).
+        // Inject corruption (simulating a crash during the next append).
         {
             let mut file = std::fs::OpenOptions::new()
                 .append(true)
@@ -629,41 +766,59 @@ fn fault_inject_rapid_crash_recover_cycles() {
             recovered.entries.len(),
             trace.dump(),
         );
-        assert!(
-            !diag.skipped_entries.is_empty(),
-            "cycle {cycle}: should have skipped the injected corruption"
+        assert_eq!(
+            diag.skipped_entries.len(),
+            1,
+            "cycle {cycle}: the injected fragment is reported once"
         );
 
-        // Continue from recovered session.
-        session = recovered;
-        session.session_dir = Some(temp_dir.path().to_path_buf());
+        // The recovered copy is read-only.
+        let mut recovered = recovered;
+        recovered.session_dir = Some(temp_dir.path().to_path_buf());
+        recovered.set_model_header(Some(format!("provider-cycle-{cycle}")), None, None);
+        let error = run_async(async { recovered.save().await })
+            .expect_err("a recovered session with skipped rows must not persist");
+        assert!(
+            error
+                .to_string()
+                .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED"),
+            "cycle {cycle}: unexpected error: {error}\nTrace:\n{}",
+            trace.dump(),
+        );
 
-        // Re-save to clean up the corruption via full rewrite (dirty header).
-        session.set_model_header(Some(format!("provider-cycle-{cycle}")), None, None);
-        run_async(async { session.save().await }).unwrap();
+        // The healthy writer is refused too: the file itself is tainted.
+        session.append_message(make_msg(&format!("cycle{cycle}-after-crash")));
+        let error = run_async(async { session.save().await })
+            .expect_err("appending to a file with a torn fragment must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED"),
+            "cycle {cycle}: unexpected append error: {error}\nTrace:\n{}",
+            trace.dump(),
+        );
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains(&format!("crash-{cycle}")),
+            "cycle {cycle}: the torn fragment must stay on disk\nTrace:\n{}",
+            trace.dump(),
+        );
 
         trace.log(
             "RECOVER",
-            format!("healed_{cycle}"),
-            format!("entries={}, clean rewrite done", session.entries.len()),
+            format!("refused_{cycle}"),
+            format!(
+                "entries={}, writes refused, fragment preserved",
+                recovered.entries.len()
+            ),
         );
     }
-
-    // Final verification.
-    let final_load =
-        run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
-
-    assert_eq!(
-        final_load.entries.len(),
-        expected_entries,
-        "all entries survived 10 crash-recover cycles\nTrace:\n{}",
-        trace.dump(),
-    );
 
     trace.log(
         "VERIFY",
         "all_cycles_passed",
-        format!("total_entries={expected_entries}"),
+        "10 independent crash/recover cycles verified",
     );
     trace.assert_no_errors();
 }
@@ -702,7 +857,11 @@ fn fault_inject_header_dirty_forces_clean_rewrite() {
     }
     trace.log("FAULT", "inject_corruption", "2 garbage lines appended");
 
-    // Dirty the header — this forces full rewrite on next save.
+    // Dirty the header — this forces a full rewrite on the next save. The
+    // rewrite re-reads the file, sees rows it had to skip, and refuses: a
+    // full rewrite would silently launder the corruption away (fail-closed
+    // contract since 2026-08-27, see session.rs
+    // crash_disk_corruption_after_clean_open_blocks_full_rewrite).
     session.set_model_header(Some("dirty-provider".to_string()), None, None);
     session.append_message(make_msg("after-corruption"));
     trace.log(
@@ -711,27 +870,42 @@ fn fault_inject_header_dirty_forces_clean_rewrite() {
         "model header changed, forcing full rewrite",
     );
 
-    run_async(async { session.save().await }).unwrap();
-
-    // Verify clean file — the corruption should be gone.
-    let clean = std::fs::read_to_string(&path).unwrap();
+    let error = run_async(async { session.save().await })
+        .expect_err("a full rewrite over externally corrupted rows must be refused");
     assert!(
-        !clean.contains("CORRUPTION_LINE"),
-        "full rewrite should eliminate injected corruption\nTrace:\n{}",
+        error
+            .to_string()
+            .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED"),
+        "unexpected error: {error}\nTrace:\n{}",
         trace.dump()
     );
 
-    let loaded = run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+    // The corrupt bytes are preserved for inspection, not rewritten away.
+    let preserved = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        preserved.contains("CORRUPTION_LINE_1") && preserved.contains("CORRUPTION_LINE_2"),
+        "refused rewrite must leave the corrupt rows in place\nTrace:\n{}",
+        trace.dump()
+    );
+
+    let (loaded, diagnostics) =
+        run_async(async { Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await })
+            .unwrap();
     assert_eq!(
         loaded.entries.len(),
-        4,
-        "4 entries after dirty-header rewrite"
+        3,
+        "the three entries persisted before the corruption stay recoverable"
+    );
+    assert_eq!(
+        diagnostics.skipped_entries.len(),
+        2,
+        "both corrupt rows are reported, not hidden"
     );
 
     trace.log(
         "VERIFY",
-        "corruption_eliminated",
-        "full rewrite cleaned corruption",
+        "corruption_preserved",
+        "rewrite refused; corrupt rows preserved and reported",
     );
     trace.assert_no_errors();
 }
@@ -802,7 +976,7 @@ fn fault_inject_v2_store_segment_corruption_recovery() {
     );
 
     // Create checkpoint to snapshot known-good state.
-    let checkpoint = store.create_checkpoint(1, "post-fault-checkpoint");
+    let checkpoint = store.create_checkpoint(1, "recovery");
     trace.log(
         "CHECKPOINT",
         "create",
@@ -816,6 +990,7 @@ fn fault_inject_v2_store_segment_corruption_recovery() {
 // Phase 9: Save to read-only directory simulating filesystem error
 // ===========================================================================
 
+#[cfg(unix)]
 #[test]
 fn fault_inject_save_to_readonly_filesystem() {
     let mut trace = TraceLog::new();
@@ -828,30 +1003,11 @@ fn fault_inject_save_to_readonly_filesystem() {
     let path = session.path.clone().unwrap();
     trace.log("SETUP", "initial_save", "1 entry saved");
 
-    // Make parent directory read-only to simulate ENOSPC-like conditions.
+    // Make the parent directory non-writable. Session persistence honors the
+    // explicit mode bits even for UID 0, keeping this fault deterministic.
     let parent = path.parent().unwrap();
-    let orig_perms = std::fs::metadata(parent).unwrap().permissions();
-    let mut readonly_perms = orig_perms.clone();
-    readonly_perms.set_mode(0o555);
-    std::fs::set_permissions(parent, readonly_perms).unwrap();
+    let mut mode_guard = UnixModeGuard::apply(parent, 0o555);
     trace.log("FAULT", "make_parent_readonly", "directory set to r-x");
-
-    // Some execution environments (for example root-capable workers) can still
-    // create files after chmod 0555. Probe this so assertions stay deterministic.
-    let probe_path = parent.join(".readonly-probe");
-    let readonly_enforced = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&probe_path)
-        .map_or(true, |_| {
-            let _ = std::fs::remove_file(&probe_path);
-            false
-        });
-    trace.log(
-        "FAULT",
-        "readonly_probe",
-        format!("readonly_enforced={readonly_enforced}"),
-    );
 
     // Force full rewrite by dirtying header.
     session.set_model_header(Some("test".to_string()), None, None);
@@ -863,40 +1019,22 @@ fn fault_inject_save_to_readonly_filesystem() {
         format!("result: {}", if result.is_ok() { "ok" } else { "err" }),
     );
 
-    if readonly_enforced {
-        // The save should fail because we can't create temp files in readonly dir.
-        assert!(
-            result.is_err(),
-            "save to read-only directory should fail\nTrace:\n{}",
-            trace.dump()
-        );
-    } else {
-        // Root-capable environments may bypass directory mode restrictions.
-        assert!(
-            result.is_ok(),
-            "save unexpectedly failed in readonly-bypass environment\nTrace:\n{}",
-            trace.dump()
-        );
-    }
-
-    // Restore permissions.
-    let mut restored_perms = orig_perms;
-    restored_perms.set_mode(0o755);
-    std::fs::set_permissions(parent, restored_perms).unwrap();
+    mode_guard.restore();
     trace.log(
         "RECOVER",
         "restore_permissions",
         "directory permissions restored",
     );
 
-    // Original file should still be intact if the readonly fault was enforced.
-    // Otherwise, expect the save to have succeeded with the new entry present.
+    let error = result.expect_err("full rewrite in a mode-0555 directory must fail");
+    assert_permission_denied(&error);
+
+    // Atomic rewrite failure must leave the original file intact.
     let loaded = run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
-    let expected_len = if readonly_enforced { 1 } else { 2 };
     assert_eq!(
         loaded.entries.len(),
-        expected_len,
-        "unexpected persisted entry count after readonly fault probe\nTrace:\n{}",
+        1,
+        "unexpected persisted entry count after read-only fault\nTrace:\n{}",
         trace.dump()
     );
 
@@ -974,24 +1112,43 @@ fn fault_inject_mixed_entry_types_through_crash_cycle() {
     );
     assert_eq!(diag.skipped_entries.len(), 1);
 
-    // Heal the file — force full rewrite to flush corrupt entries from disk.
+    // The recovered session is read-only: rewriting or appending from it
+    // would commit a lossy view of the file (fail-closed contract since
+    // 2026-08-27), so both are refused and the diverse entries stay intact.
     let mut cont = recovered;
     cont.session_dir = Some(temp_dir.path().to_path_buf());
     cont.set_model_header(Some("healing-model".to_string()), None, None);
-    run_async(async { cont.save().await }).unwrap();
-
-    // Now append after healing.
-    cont.append_message(make_msg("post-recovery"));
-    run_async(async { cont.save().await }).unwrap();
-
-    let final_load =
-        run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
-    assert_eq!(
-        final_load.entries.len(),
-        6,
-        "6 entries after recovery + continuation\nTrace:\n{}",
+    let rewrite_error = run_async(async { cont.save().await })
+        .expect_err("a recovered session with skipped rows must not be rewritten");
+    assert!(
+        rewrite_error
+            .to_string()
+            .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED"),
+        "unexpected rewrite error: {rewrite_error}\nTrace:\n{}",
         trace.dump()
     );
+
+    cont.append_message(make_msg("post-recovery"));
+    let append_error = run_async(async { cont.save().await })
+        .expect_err("a recovered session with skipped rows must not append");
+    assert!(
+        append_error
+            .to_string()
+            .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED"),
+        "unexpected append error: {append_error}\nTrace:\n{}",
+        trace.dump()
+    );
+
+    let (final_load, final_diag) =
+        run_async(async { Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await })
+            .unwrap();
+    assert_eq!(
+        final_load.entries.len(),
+        5,
+        "the 5 diverse entries survive; refused writes added nothing\nTrace:\n{}",
+        trace.dump()
+    );
+    assert_eq!(final_diag.skipped_entries.len(), 1);
 
     trace.assert_no_errors();
 }
@@ -1022,36 +1179,63 @@ fn fault_inject_corruption_healed_at_checkpoint() {
     }
     trace.log("FAULT", "inject_garbage", "garbage injected between saves");
 
-    // Do incremental appends — corruption accumulates in the file.
-    for i in 0..3 {
-        session.append_message(make_msg(&format!("incremental-{i}")));
-        run_async(async { session.save().await }).unwrap();
-    }
+    // Every write after external corruption is refused: the incremental
+    // append re-validates the on-disk tail and finds a row it would have to
+    // skip, and a dirty-header checkpoint would launder that row away. Both
+    // fail closed (contract since 2026-08-27; see session.rs
+    // crash_disk_corruption_after_clean_open_blocks_full_rewrite).
+    session.append_message(make_msg("incremental-0"));
+    let append_error = run_async(async { session.save().await })
+        .expect_err("an incremental append over a corrupt row must be refused");
+    assert!(
+        append_error
+            .to_string()
+            .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED"),
+        "unexpected append error: {append_error}\nTrace:\n{}",
+        trace.dump()
+    );
+    trace.log(
+        "APPEND",
+        "refused",
+        "incremental append refused by the integrity guard",
+    );
 
-    // Force checkpoint via header dirty flag.
     session.set_model_header(Some("force-checkpoint".to_string()), None, None);
-    session.append_message(make_msg("triggers-checkpoint"));
-    run_async(async { session.save().await }).unwrap();
+    let checkpoint_error = run_async(async { session.save().await })
+        .expect_err("a checkpoint rewrite over a corrupt row must be refused");
+    assert!(
+        checkpoint_error
+            .to_string()
+            .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED"),
+        "unexpected checkpoint error: {checkpoint_error}\nTrace:\n{}",
+        trace.dump()
+    );
     trace.log(
         "CHECKPOINT",
-        "forced",
-        "checkpoint triggered via dirty header to heal corruption",
+        "refused",
+        "checkpoint via dirty header refused by the integrity guard",
     );
 
-    // Verify clean file after checkpoint.
+    // The garbage stays on disk and the seed entry stays recoverable.
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(
-        !content.contains("GARBAGE_WILL_BE_HEALED"),
-        "checkpoint should eliminate garbage\nTrace:\n{}",
+        content.contains("GARBAGE_WILL_BE_HEALED"),
+        "refused writes must preserve the corrupt row\nTrace:\n{}",
         trace.dump()
     );
 
-    let loaded = run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+    let (loaded, diagnostics) =
+        run_async(async { Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await })
+            .unwrap();
     assert_eq!(
         loaded.entries.len(),
-        5,
-        "all 5 entries should be clean\nTrace:\n{}",
+        1,
+        "the seed entry stays recoverable; the refused writes added nothing\nTrace:\n{}",
         trace.dump()
+    );
+    assert!(
+        !diagnostics.skipped_entries.is_empty(),
+        "the corrupt row is reported in diagnostics"
     );
 
     trace.assert_no_errors();
@@ -1148,27 +1332,52 @@ fn fault_inject_save_idempotency_after_recovery() {
             .unwrap();
     recovered.session_dir = Some(temp_dir.path().to_path_buf());
 
-    // Save twice without modifications — second save should be no-op.
-    run_async(async { recovered.save().await }).unwrap();
+    // A session recovered with a skipped row is read-only (fail-closed
+    // contract since 2026-08-27): every save attempt is refused, and the
+    // refusal is idempotent — the file bytes never change.
+    let content_before = std::fs::read_to_string(&path).unwrap();
+    let first_error = run_async(async { recovered.save().await })
+        .expect_err("a recovered session with skipped rows must not persist");
+    assert!(
+        first_error
+            .to_string()
+            .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED"),
+        "unexpected first error: {first_error}\nTrace:\n{}",
+        trace.dump()
+    );
     let content_after_first = std::fs::read_to_string(&path).unwrap();
     trace.log(
         "IDEMPOTENCY",
-        "first_save",
+        "first_save_refused",
         format!("size={}", content_after_first.len()),
     );
 
-    run_async(async { recovered.save().await }).unwrap();
+    let second_error =
+        run_async(async { recovered.save().await }).expect_err("the refusal must hold on retry");
+    assert!(
+        second_error
+            .to_string()
+            .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED"),
+        "unexpected second error: {second_error}\nTrace:\n{}",
+        trace.dump()
+    );
     let content_after_second = std::fs::read_to_string(&path).unwrap();
     trace.log(
         "IDEMPOTENCY",
-        "second_save",
+        "second_save_refused",
         format!("size={}", content_after_second.len()),
     );
 
     assert_eq!(
+        content_before,
+        content_after_first,
+        "a refused save must not touch the file\nTrace:\n{}",
+        trace.dump()
+    );
+    assert_eq!(
         content_after_first,
         content_after_second,
-        "second save should be no-op\nTrace:\n{}",
+        "the refusal is idempotent\nTrace:\n{}",
         trace.dump()
     );
 

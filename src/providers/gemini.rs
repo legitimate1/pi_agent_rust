@@ -344,14 +344,14 @@ impl Provider for GeminiProvider {
             }
 
             // Apply provider-specific custom headers from compat config.
-            if let Some(compat) = &self.compat {
-                if let Some(custom_headers) = &compat.custom_headers {
-                    request = super::apply_headers_ignoring_blank_auth_overrides(
-                        request,
-                        custom_headers,
-                        &["authorization", "x-goog-api-key"],
-                    );
-                }
+            if let Some(compat) = &self.compat
+                && let Some(custom_headers) = &compat.custom_headers
+            {
+                request = super::apply_headers_ignoring_blank_auth_overrides(
+                    request,
+                    custom_headers,
+                    &["authorization", "x-goog-api-key"],
+                );
             }
 
             // Per-request headers from StreamOptions (highest priority).
@@ -361,10 +361,35 @@ impl Provider for GeminiProvider {
                 &["authorization", "x-goog-api-key"],
             );
 
+            // Offer the inner Gemini request (not the CloudCodeAssist
+            // wrapper) to the rewrite hook: the wrapper is transport detail
+            // and its project/user-agent fields must stay host-controlled.
+            let rewritten_inner = super::offer_before_provider_request(
+                options,
+                self.name(),
+                self.api(),
+                self.model_id(),
+                &url,
+                &request_body,
+                |value| super::validate_streamed_json_rewrite(value, &[], &["contents"], &[]),
+            )
+            .await;
             let cli_request =
                 build_google_cli_request(&self.model, &project_id, request_body, is_antigravity)
                     .map_err(|message| Error::provider(self.name(), message.to_string()))?;
-            let request = request.json(&cli_request)?;
+            let request = match rewritten_inner {
+                Some(inner) => {
+                    let mut wrapper = serde_json::to_value(&cli_request).map_err(|err| {
+                        Error::provider(
+                            self.name(),
+                            format!("Failed to serialize Gemini CLI request: {err}"),
+                        )
+                    })?;
+                    wrapper["request"] = inner;
+                    request.json(&wrapper)?
+                }
+                None => request.json(&cli_request)?,
+            };
             let response = Box::pin(request.send()).await?;
             let status = response.status();
             if !(200..300).contains(&status) {
@@ -484,14 +509,14 @@ impl Provider for GeminiProvider {
         }
 
         // Apply provider-specific custom headers from compat config.
-        if let Some(compat) = &self.compat {
-            if let Some(custom_headers) = &compat.custom_headers {
-                request = super::apply_headers_ignoring_blank_auth_overrides(
-                    request,
-                    custom_headers,
-                    &["authorization", "x-goog-api-key"],
-                );
-            }
+        if let Some(compat) = &self.compat
+            && let Some(custom_headers) = &compat.custom_headers
+        {
+            request = super::apply_headers_ignoring_blank_auth_overrides(
+                request,
+                custom_headers,
+                &["authorization", "x-goog-api-key"],
+            );
         }
 
         // Per-request headers from StreamOptions (highest priority).
@@ -501,7 +526,20 @@ impl Provider for GeminiProvider {
             &["authorization", "x-goog-api-key"],
         );
 
-        let request = request.json(&request_body)?;
+        let rewritten_body = super::offer_before_provider_request(
+            options,
+            self.name(),
+            self.api(),
+            self.model_id(),
+            &url,
+            &request_body,
+            |value| super::validate_streamed_json_rewrite(value, &[], &["contents"], &[]),
+        )
+        .await;
+        let request = match &rewritten_body {
+            Some(body) => request.json(body)?,
+            None => request.json(&request_body)?,
+        };
 
         let response = Box::pin(request.send()).await?;
         let status = response.status();
@@ -621,6 +659,7 @@ where
                 model,
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             },
@@ -646,10 +685,10 @@ where
         }
 
         // Process candidates
-        if let Some(candidates) = response.candidates {
-            if let Some(candidate) = candidates.into_iter().next() {
-                self.process_candidate(candidate)?;
-            }
+        if let Some(candidates) = response.candidates
+            && let Some(candidate) = candidates.into_iter().next()
+        {
+            self.process_candidate(candidate)?;
         }
 
         Ok(())
@@ -746,8 +785,11 @@ where
                         self.ensure_started();
 
                         // Emit full ToolCallStart → ToolCallDelta → ToolCallEnd sequence
-                        self.pending_events
-                            .push_back(StreamEvent::ToolCallStart { content_index });
+                        self.pending_events.push_back(StreamEvent::ToolCallStart {
+                            content_index,
+                            id: tool_call.id.clone(),
+                            name: tool_call.name.clone(),
+                        });
                         self.pending_events.push_back(StreamEvent::ToolCallDelta {
                             content_index,
                             delta: args_str,
@@ -1540,6 +1582,8 @@ mod tests {
             StopReason::Stop => "stop",
             StopReason::Length => "length",
             StopReason::ToolUse => "tool_use",
+            StopReason::PauseTurn => "pause_turn",
+            StopReason::Refusal => "refusal",
             StopReason::Error => "error",
             StopReason::Aborted => "aborted",
         }
@@ -1752,6 +1796,7 @@ mod tests {
             model: "gemini-2.0-flash".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         });
@@ -1783,6 +1828,7 @@ mod tests {
             model: "gemini-2.0-flash".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         });
@@ -1951,6 +1997,7 @@ mod tests {
                     model: "gemini-2.0-flash".to_string(),
                     usage: Usage::default(),
                     stop_reason: StopReason::ToolUse,
+                    stop_details: None,
                     error_message: None,
                     timestamp: 1,
                 }),

@@ -10,6 +10,7 @@ use pi::providers::anthropic::AnthropicProvider;
 use pi::providers::openai::OpenAIProvider;
 use pi::session::Session;
 use pi::tools::ToolRegistry;
+use pi::turn_recovery::TurnRecoveryMode;
 use pi::vcr::{VcrMode, VcrRecorder};
 use serde_json::json;
 use std::fs::File;
@@ -30,6 +31,7 @@ const fn message_role(message: &Message) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn format_event(event: &AgentEvent) -> serde_json::Value {
     match event {
         AgentEvent::AgentStart { .. } => json!({ "event": "agent_start" }),
@@ -110,6 +112,34 @@ fn format_event(event: &AgentEvent) -> serde_json::Value {
             "attempt": attempt,
             "finalError": final_error,
         }),
+        AgentEvent::FailoverStart {
+            from_provider,
+            from_model,
+            to_provider,
+            to_model,
+            class,
+            attempt,
+        } => json!({
+            "event": "failover_start",
+            "fromProvider": from_provider,
+            "fromModel": from_model,
+            "toProvider": to_provider,
+            "toModel": to_model,
+            "class": class,
+            "attempt": attempt,
+        }),
+        AgentEvent::FailoverEnd {
+            success,
+            provider,
+            model,
+            restored_primary,
+        } => json!({
+            "event": "failover_end",
+            "success": success,
+            "provider": provider,
+            "model": model,
+            "restoredPrimary": restored_primary,
+        }),
         AgentEvent::ExtensionError {
             extension_id,
             event,
@@ -120,10 +150,13 @@ fn format_event(event: &AgentEvent) -> serde_json::Value {
             "hookEvent": event,
             "error": error,
         }),
+        AgentEvent::AdvisorNote { .. } => json!({ "event": "advisor_note" }),
+        AgentEvent::ProviderError { .. } => json!({ "event": "provider_error" }),
     }
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn agent_loop_openai_vcr_basic() {
     let test_name = "agent_loop_openai_basic";
     let harness = TestHarness::new(test_name);
@@ -162,6 +195,13 @@ fn agent_loop_openai_vcr_basic() {
             block_images: false,
             fail_closed_hooks: false,
             tool_approval: None,
+            keyword_settings: None,
+            max_time: None,
+            turn_recovery: TurnRecoveryMode::default(),
+            approval_state: None,
+            bash_settings: None,
+            secrets: None,
+            model_accepts_images: true,
         };
         let agent = Agent::new(Arc::new(provider), tools, agent_config);
 
@@ -345,6 +385,13 @@ fn agent_loop_anthropic_simple_text() {
             block_images: false,
             fail_closed_hooks: false,
             tool_approval: None,
+            keyword_settings: None,
+            max_time: None,
+            turn_recovery: TurnRecoveryMode::default(),
+            approval_state: None,
+            bash_settings: None,
+            secrets: None,
+            model_accepts_images: true,
         };
         let agent = Agent::new(Arc::new(provider), tools, agent_config);
 
@@ -445,6 +492,13 @@ fn agent_loop_anthropic_error_stream() {
             block_images: false,
             fail_closed_hooks: false,
             tool_approval: None,
+            keyword_settings: None,
+            max_time: None,
+            turn_recovery: TurnRecoveryMode::default(),
+            approval_state: None,
+            bash_settings: None,
+            secrets: None,
+            model_accepts_images: true,
         };
         let agent = Agent::new(Arc::new(provider), tools, agent_config);
 
@@ -528,6 +582,13 @@ fn agent_loop_anthropic_tool_call_stop() {
             block_images: false,
             fail_closed_hooks: false,
             tool_approval: None,
+            keyword_settings: None,
+            max_time: None,
+            turn_recovery: TurnRecoveryMode::default(),
+            approval_state: None,
+            bash_settings: None,
+            secrets: None,
+            model_accepts_images: true,
         };
         let agent = Agent::new(Arc::new(provider), tools, agent_config);
 

@@ -40,6 +40,7 @@ use pi::session::Session;
 use pi::tools::{
     Tool, ToolOutput, ToolRegistry, ToolUpdate, TruncatedBy, truncate_head, truncate_tail,
 };
+use pi::turn_recovery::TurnRecoveryMode;
 use serde_json::json;
 use std::io::Write as _;
 use std::pin::Pin;
@@ -50,6 +51,42 @@ use std::time::Instant;
 // ===========================================================================
 // Helpers
 // ===========================================================================
+
+#[cfg(unix)]
+struct UnixModeGuard {
+    path: std::path::PathBuf,
+    original: std::fs::Permissions,
+}
+
+#[cfg(unix)]
+impl UnixModeGuard {
+    fn set(path: &std::path::Path, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let original = std::fs::metadata(path)
+            .expect("stat permission fixture")
+            .permissions();
+        let mut restricted = original.clone();
+        restricted.set_mode(mode);
+        std::fs::set_permissions(path, restricted).expect("set permission fixture mode");
+        Self {
+            path: path.to_path_buf(),
+            original,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixModeGuard {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::set_permissions(&self.path, self.original.clone()) {
+            eprintln!(
+                "failed to restore permissions for {}: {err}",
+                self.path.display()
+            );
+        }
+    }
+}
 
 /// Unified result from a tool execute() call: either Ok(ToolOutput) or Err(Error).
 /// For testing we treat both as "the tool produced a result" - either explicit
@@ -110,7 +147,11 @@ const fn event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::AutoCompactionEnd { .. } => "auto_compaction_end",
         AgentEvent::AutoRetryStart { .. } => "auto_retry_start",
         AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
+        AgentEvent::FailoverStart { .. } => "failover_start",
+        AgentEvent::FailoverEnd { .. } => "failover_end",
         AgentEvent::ExtensionError { .. } => "extension_error",
+        AgentEvent::AdvisorNote { .. } => "advisor_note",
+        AgentEvent::ProviderError { .. } => "provider_error",
     }
 }
 
@@ -170,8 +211,15 @@ fn make_agent(provider: Arc<dyn Provider>, cwd: &std::path::Path, max_iters: usi
             ..StreamOptions::default()
         },
         block_images: false,
+        model_accepts_images: true,
         fail_closed_hooks: false,
         tool_approval: None,
+        keyword_settings: None,
+        max_time: None,
+        turn_recovery: TurnRecoveryMode::default(),
+        approval_state: None,
+        bash_settings: None,
+        secrets: None,
     };
     Agent::new(provider, tools, config)
 }
@@ -286,6 +334,7 @@ impl Provider for MixedToolCallProvider {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::ToolUse,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -296,6 +345,7 @@ impl Provider for MixedToolCallProvider {
                 model: self.model_id().to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -355,6 +405,7 @@ impl Provider for MixedToolCallProvider {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -365,6 +416,7 @@ impl Provider for MixedToolCallProvider {
                 model: self.model_id().to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -560,35 +612,25 @@ fn tool_write_deeply_nested_dirs() {
 #[cfg(unix)]
 #[test]
 fn tool_read_permission_denied() {
-    use std::os::unix::fs::PermissionsExt;
-
     asupersync::test_utils::run_test(|| async {
         let h = TestHarness::new("read_perm_denied");
         let target = h.create_file("noperm.txt", b"secret\n");
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _mode_guard = UnixModeGuard::set(&target, 0o000);
 
         let tool = pi::tools::ReadTool::new(h.temp_dir());
         let input = json!({ "path": target.to_string_lossy() });
         let result = exec_tool(&tool, "read-perm-1", input).await;
 
-        // Restore permissions for cleanup
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        // If the process is running as root (or in a container with root privileges),
-        // the read might succeed despite 0o000 permissions. We shouldn't fail the test then.
-        if !result.is_error {
-            assert!(result.text.contains("secret"));
-            return;
-        }
-
         assert!(result.is_error, "reading no-permission file should error");
         let text_lower = result.text.to_lowercase();
         assert!(
-            text_lower.contains("permission")
-                || text_lower.contains("denied")
-                || text_lower.contains("error"),
+            text_lower.contains("permission denied"),
             "should mention permission denied: got {}",
             result.text
+        );
+        assert!(
+            !result.text.contains("secret"),
+            "permission failure must not disclose file content"
         );
     });
 }
@@ -597,25 +639,30 @@ fn tool_read_permission_denied() {
 #[cfg(unix)]
 #[test]
 fn tool_edit_permission_denied() {
-    use std::os::unix::fs::PermissionsExt;
-
     asupersync::test_utils::run_test(|| async {
         let h = TestHarness::new("edit_perm_denied");
         let target = h.create_file("readonly.txt", b"old content\n");
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let _mode_guard = UnixModeGuard::set(&target, 0o444);
 
         let tool = pi::tools::EditTool::new(h.temp_dir());
         let input = json!({
             "path": target.to_string_lossy(),
-            "old": "old content",
-            "new": "new content"
+            "oldText": "old content",
+            "newText": "new content"
         });
         let result = exec_tool(&tool, "edit-perm-1", input).await;
 
-        // Restore permissions for cleanup
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
-
         assert!(result.is_error, "editing read-only file should error");
+        assert!(
+            result.text.to_lowercase().contains("permission denied"),
+            "edit should report PermissionDenied: {}",
+            result.text
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read unchanged fixture"),
+            "old content\n",
+            "permission failure must leave the file unchanged"
+        );
     });
 }
 
@@ -1029,6 +1076,7 @@ impl Provider for FailingToolProvider {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::ToolUse,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -1039,6 +1087,7 @@ impl Provider for FailingToolProvider {
                 model: self.model_id().to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -1086,6 +1135,7 @@ impl Provider for FailingToolProvider {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -1096,6 +1146,7 @@ impl Provider for FailingToolProvider {
                 model: self.model_id().to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -1139,8 +1190,15 @@ fn agent_tool_execution_error_wraps_in_output() {
                 ..StreamOptions::default()
             },
             block_images: false,
+            model_accepts_images: true,
             fail_closed_hooks: false,
             tool_approval: None,
+            keyword_settings: None,
+            max_time: None,
+            turn_recovery: TurnRecoveryMode::default(),
+            approval_state: None,
+            bash_settings: None,
+            secrets: None,
         };
 
         let agent = Agent::new(provider, tools, config);
@@ -1210,8 +1268,15 @@ fn agent_queue_follow_up_only_at_idle() {
                 ..StreamOptions::default()
             },
             block_images: false,
+            model_accepts_images: true,
             fail_closed_hooks: false,
             tool_approval: None,
+            keyword_settings: None,
+            max_time: None,
+            turn_recovery: TurnRecoveryMode::default(),
+            approval_state: None,
+            bash_settings: None,
+            secrets: None,
         };
         let mut agent = Agent::new(provider, tools, config);
 
@@ -1308,6 +1373,7 @@ impl Provider for SimpleStopProvider {
                 ..Usage::default()
             },
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         };
@@ -1318,6 +1384,7 @@ impl Provider for SimpleStopProvider {
             model: self.model_id().to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         };
@@ -1517,4 +1584,27 @@ fn tool_bash_stdout_stderr_capture() {
             result.text
         );
     });
+}
+
+/// Keep the user-facing limitation table aligned with the shipped default
+/// tool surface. Provider availability may vary; the capability itself is not
+/// absent from Pi.
+#[test]
+fn readme_describes_default_web_search_without_obsolete_no_browsing_claim() {
+    let defaults = pi::xdev::default_enabled_tools();
+    assert!(
+        defaults.contains(&"web_search"),
+        "production defaults must still expose web_search before README can advertise it"
+    );
+
+    let readme = include_str!("../README.md");
+    assert!(
+        !readme.to_ascii_lowercase().contains("no web browsing"),
+        "README restored the obsolete no-web-browsing limitation"
+    );
+    assert!(
+        readme.contains("**Search backend availability varies**")
+            && readme.contains("`web_search` uses the configured ranked providers"),
+        "README must describe provider availability without denying the shipped capability"
+    );
 }

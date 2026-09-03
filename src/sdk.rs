@@ -22,7 +22,6 @@
 use crate::app;
 use crate::auth::AuthStorage;
 use crate::cli::Cli;
-use crate::compaction::ResolvedCompactionSettings;
 use crate::models::default_models_path;
 use crate::provider::ThinkingBudgets;
 use crate::providers;
@@ -39,14 +38,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub use crate::agent::{
     AbortHandle, AbortSignal, Agent, AgentConfig, AgentEvent, AgentSession, QueueMode,
 };
+pub use crate::compaction::ResolvedCompactionSettings;
 pub use crate::config::Config;
 pub use crate::error::{Error, Result};
-pub use crate::extensions::{ExtensionManager, ExtensionPolicy, ExtensionRegion};
+pub use crate::extension_dispatcher::ExtensionUiHandler;
+pub use crate::extensions::{
+    ExtensionManager, ExtensionPolicy, ExtensionRegion, ExtensionUiRequest, ExtensionUiResponse,
+};
 pub use crate::model::ThinkingLevel;
 pub use crate::model::{
-    AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, Message, StopReason,
-    StreamEvent, TextContent, ThinkingContent, ToolCall, ToolResultMessage, Usage, UserContent,
-    UserMessage,
+    AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, Message, StopDetails,
+    StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall, ToolResultMessage, Usage,
+    UserContent, UserMessage,
 };
 pub use crate::models::{ModelEntry, ModelRegistry};
 pub use crate::provider::{
@@ -67,7 +70,10 @@ use crate::tools::{
     BashTool, EditTool, FindTool, GrepTool, HashlineEditTool, LsTool, ReadTool, WriteTool,
 };
 
-/// All built-in tool names.
+/// Built-in tool names included in the default non-delegating SDK registry.
+///
+/// The opt-in `subagent` tool is configured through the CLI/session delegation
+/// surface and is intentionally not constructed by [`create_all_tools`].
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "read",
     "bash",
@@ -119,7 +125,7 @@ pub fn create_hashline_edit_tool(cwd: &Path) -> Box<dyn Tool> {
     Box::new(HashlineEditTool::new(cwd))
 }
 
-/// Create all built-in tools configured for `cwd`.
+/// Create the default non-delegating built-in tools configured for `cwd`.
 pub fn create_all_tools(cwd: &Path) -> Vec<Box<dyn Tool>> {
     vec![
         create_read_tool(cwd),
@@ -142,7 +148,7 @@ pub fn tool_to_definition(tool: &dyn Tool) -> ToolDefinition {
     }
 }
 
-/// Return [`ToolDefinition`] schemas for all built-in tools.
+/// Return schemas for the default non-delegating built-in tools.
 pub fn all_tool_definitions(cwd: &Path) -> Vec<ToolDefinition> {
     create_all_tools(cwd)
         .iter()
@@ -275,10 +281,24 @@ impl std::fmt::Debug for EventListeners {
     }
 }
 
+/// MCP discovery inputs for one SDK-owned session.
+#[derive(Debug, Clone, Default)]
+pub struct McpSessionOptions {
+    /// Explicit MCP configuration files, ordered after discovered project and
+    /// global configuration in the same way as CLI `--mcp-config` values.
+    pub config_paths: Vec<PathBuf>,
+    /// Optional global directory override. Embedders and tests can keep trust
+    /// state isolated; normal CLI callers use [`Config::global_dir`].
+    pub global_dir: Option<PathBuf>,
+}
+
 /// SDK session construction options.
 ///
 /// These options provide the programmatic equivalent of the core CLI startup
 /// path used in `src/main.rs`.
+// Independent on/off toggles mirroring CLI flags; an enum or builder state
+// machine would obscure the flag-to-field mapping.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone)]
 pub struct SessionOptions {
     pub provider: Option<String>,
@@ -289,14 +309,34 @@ pub struct SessionOptions {
     pub append_system_prompt: Option<String>,
     pub enabled_tools: Option<Vec<String>>,
     pub working_directory: Option<PathBuf>,
+    /// Whether project-local configuration under the working directory may
+    /// be loaded. Programmatic callers default to fail-closed; CLI hosts pass
+    /// the decision produced by `workspace_trust::establish`.
+    pub workspace_trusted: bool,
     pub no_session: bool,
     pub session_path: Option<PathBuf>,
     pub session_dir: Option<PathBuf>,
+    /// Optional override for the package directory (`PI_PACKAGE_DIR`
+    /// equivalent) used for prompt documentation discovery. Relative values
+    /// are resolved against the session's working directory so advertised
+    /// paths stay readable through the same roots the tools use (bd-jtehj).
+    pub package_dir: Option<PathBuf>,
     pub extension_paths: Vec<PathBuf>,
     pub extension_policy: Option<String>,
     pub repair_policy: Option<String>,
+    /// Pre-parsed extension CLI flags to apply to this session's live runtime
+    /// after extension registration and before dependent startup bridges.
+    pub extension_flags: Vec<crate::cli::ExtensionCliFlag>,
     pub include_cwd_in_prompt: bool,
     pub max_tool_iterations: usize,
+
+    /// Opt in to MCP discovery for this SDK session.
+    ///
+    /// The manager is constructed inside [`create_agent_session`] so the
+    /// session's own extension runtime can register contributed servers before
+    /// the single connect-and-mount pass. This avoids cross-wiring tools from
+    /// a different, already-dropped session (bd-vjfol).
+    pub mcp: Option<McpSessionOptions>,
 
     /// Optional factory for the session's [`ToolRegistry`].
     ///
@@ -316,6 +356,11 @@ pub struct SessionOptions {
     /// the options struct.
     pub tool_factory: Option<Arc<dyn ToolFactory>>,
 
+    /// Optional multi-root workspace handle (bd-cv653.3.12). When set, the
+    /// session's tool registry confines paths to primary + additional roots
+    /// and `/add-dir` // `/remove-dir` mutate the shared set live.
+    pub workspace: Option<crate::workspace::WorkspaceHandle>,
+
     /// Session-level event listener invoked for every [`AgentEvent`].
     ///
     /// Unlike the per-prompt callback passed to [`AgentSessionHandle::prompt`],
@@ -330,6 +375,63 @@ pub struct SessionOptions {
 
     /// Callback for raw provider [`StreamEvent`]s.
     pub on_stream_event: Option<OnStreamEvent>,
+
+    /// Optional UI handler bridging extension UI requests (including
+    /// capability prompts) to the host application.
+    ///
+    /// In interactive mode the TUI answers these prompts; without a handler,
+    /// SDK sessions keep the historical fail-closed behavior: extension UI
+    /// requests error out and capability prompts resolve to deny.
+    ///
+    /// Only consulted when [`SessionOptions::extension_paths`] loads at least
+    /// one extension. A capability prompt arrives as a `"confirm"` request;
+    /// respond with `value: Value::Bool(allow)` for the default persistence
+    /// behavior, or `value: json!({"allow": bool, "persist": bool})` to
+    /// control whether the decision is persisted across sessions
+    /// (`persist: false` keeps it scoped to this session).
+    pub extension_ui_handler: Option<Arc<dyn ExtensionUiHandler>>,
+
+    /// Whether extension capability prompt decisions are persisted to the
+    /// on-disk permission store (`~/.pi/extension-permissions.json`).
+    ///
+    /// `true` (the default) matches the CLI/TUI behavior. `false` scopes all
+    /// prompt decisions for this session to the in-memory cache, unless an
+    /// individual handler response overrides with `persist: true`.
+    pub persist_extension_permissions: bool,
+
+    /// Optional per-session compaction settings override.
+    ///
+    /// When `Some`, the settings are used verbatim for this session. When
+    /// `None` (the default), settings derive from the global config and the
+    /// selected model's context window exactly as before. Either way the
+    /// settings are fixed at session creation: a later
+    /// [`AgentSessionHandle::set_model`] does not re-derive them (in
+    /// particular, `context_window_tokens` is not updated to the new model's
+    /// window).
+    pub compaction_settings: Option<ResolvedCompactionSettings>,
+
+    /// Graduated approval gating for this session (issue #196).
+    ///
+    /// When `Some`, tool calls are evaluated against the mode
+    /// (`ask`/`write`/`yolo`) exactly as in the classic CLI stack. Calls that
+    /// require approval are routed to [`SessionOptions::tool_approval`] when
+    /// set; otherwise, when the session's ask tool is enabled, an approval
+    /// card is bridged through the interactive ask surface
+    /// ([`crate::ask::approval_handler_via_ask`]). With neither available the
+    /// call is denied with an explicit reason (fail closed).
+    ///
+    /// `None` (the default) preserves the historical SDK behavior: no
+    /// approval gating.
+    pub approval_state: Option<crate::approval::ApprovalState>,
+
+    /// Explicit tool-approval prompt handler.
+    ///
+    /// Takes precedence over the ask-surface bridge that
+    /// [`SessionOptions::approval_state`] would otherwise install. Only
+    /// consulted for calls that `approval_state` gates (or, matching
+    /// `AgentConfig` semantics, for every tool call when `approval_state` is
+    /// `None`).
+    pub tool_approval: Option<crate::agent::ToolApprovalHandler>,
 }
 
 impl Default for SessionOptions {
@@ -343,19 +445,29 @@ impl Default for SessionOptions {
             append_system_prompt: None,
             enabled_tools: None,
             working_directory: None,
+            workspace_trusted: false,
+            package_dir: None,
             no_session: true,
             session_path: None,
             session_dir: None,
             extension_paths: Vec::new(),
             extension_policy: None,
+            extension_flags: Vec::new(),
+            tool_factory: None,
+            workspace: None,
             repair_policy: None,
             include_cwd_in_prompt: true,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
-            tool_factory: None,
+            mcp: None,
             on_event: None,
             on_tool_start: None,
             on_tool_end: None,
             on_stream_event: None,
+            extension_ui_handler: None,
+            persist_extension_permissions: true,
+            compaction_settings: None,
+            approval_state: None,
+            tool_approval: None,
         }
     }
 }
@@ -406,6 +518,16 @@ pub fn default_tool_registry(enabled: &[&str], cwd: &Path, config: &Config) -> T
 pub struct AgentSessionHandle {
     session: AgentSession,
     listeners: EventListeners,
+    /// Ask tool handle when the session enabled it (bd-cv653.3.8). `AskTool`
+    /// is `Clone` over shared state, so a host can install a channel UI and
+    /// resolve pending cards via `respond_ui` — without it the tool falls
+    /// back to its non-interactive policy.
+    ask_tool: Option<crate::ask::AskTool>,
+    /// Multi-root workspace handle when the session was created with one
+    /// (bd-cv653.3.12). Clones share the live root set.
+    workspace: Option<crate::workspace::WorkspaceHandle>,
+    /// MCP manager owned by this exact SDK session, when enabled.
+    mcp_manager: Option<Arc<crate::mcp::McpManager>>,
 }
 
 /// Snapshot of the current agent session state.
@@ -422,14 +544,14 @@ pub struct AgentSessionState {
 /// Prompt completion payload returned by `SessionTransport`.
 #[derive(Debug, Clone)]
 pub enum SessionPromptResult {
-    InProcess(AssistantMessage),
+    InProcess(Box<AssistantMessage>),
     RpcEvents(Vec<Value>),
 }
 
 /// Event wrapper used by the unified `SessionTransport` callback.
 #[derive(Debug, Clone)]
 pub enum SessionTransportEvent {
-    InProcess(AgentEvent),
+    InProcess(Box<AgentEvent>),
     Rpc(Value),
 }
 
@@ -563,6 +685,11 @@ pub struct RpcCompactionResult {
     pub summary: String,
     pub first_kept_entry_id: String,
     pub tokens_before: u64,
+    /// Estimated tokens the next provider request will see after this
+    /// compaction is applied. Additive/backward-compatible: defaults to `0`
+    /// when deserializing payloads emitted before this field existed.
+    #[serde(default)]
+    pub tokens_after: u64,
     #[serde(default)]
     pub details: Value,
 }
@@ -692,10 +819,10 @@ impl SessionTransport {
                 let on_event = Arc::clone(&on_event);
                 let assistant = handle
                     .prompt(input, move |event| {
-                        (on_event)(SessionTransportEvent::InProcess(event));
+                        (on_event)(SessionTransportEvent::InProcess(Box::new(event)));
                     })
                     .await?;
-                Ok(SessionPromptResult::InProcess(assistant))
+                Ok(SessionPromptResult::InProcess(Box::new(assistant)))
             }
             Self::RpcSubprocess(client) => {
                 let events = client.prompt(input).await?;
@@ -1007,6 +1134,7 @@ impl RpcTransportClient {
     pub async fn extension_ui_response(
         &mut self,
         request_id: &str,
+        request_generation: u64,
         response: RpcExtensionUiResponse,
     ) -> Result<bool> {
         #[derive(Deserialize)]
@@ -1018,6 +1146,10 @@ impl RpcTransportClient {
         payload.insert(
             "requestId".to_string(),
             Value::String(request_id.to_string()),
+        );
+        payload.insert(
+            "requestGeneration".to_string(),
+            Value::from(request_generation),
         );
 
         match response {
@@ -1188,6 +1320,64 @@ fn rpc_error_from_response(response: &Value, command: &str) -> Error {
     Error::api(format!("RPC {command} failed: {error}"))
 }
 
+/// Proof that replacement preflight completed without mutating runtime
+/// resources. The caller must install the prepared candidate before consuming
+/// the old handle with `commit_resource_shutdown`.
+pub(crate) struct PreparedSessionShutdown {
+    owner_session_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum McpShutdownOutcome {
+    #[default]
+    NotOwned,
+    Released,
+    Indeterminate,
+}
+
+/// Outcome of exhaustively stopping resources owned by one SDK session handle.
+#[derive(Debug, Default)]
+pub(crate) struct SessionResourceShutdown {
+    failures: Vec<String>,
+    mcp: McpShutdownOutcome,
+}
+
+const SESSION_MCP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl SessionResourceShutdown {
+    #[must_use]
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    #[must_use]
+    pub(crate) const fn completed_cleanly(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    /// A replacement may start its MCP manager only after the previous
+    /// manager's absence or complete release has been established.
+    #[must_use]
+    pub(crate) const fn permits_replacement_mcp_activation(&self) -> bool {
+        matches!(
+            self.mcp,
+            McpShutdownOutcome::NotOwned | McpShutdownOutcome::Released
+        )
+    }
+
+    pub(crate) fn failures(&self) -> impl Iterator<Item = &str> {
+        self.failures.iter().map(String::as_str)
+    }
+
+    pub(crate) fn messages(&self) -> impl Iterator<Item = &str> {
+        self.failures.iter().map(String::as_str)
+    }
+
+    pub(crate) fn fail(&mut self, message: String) {
+        self.failures.push(message);
+    }
+}
+
 impl AgentSessionHandle {
     /// Create a handle from a pre-built `AgentSession` with custom listeners.
     ///
@@ -1197,7 +1387,256 @@ impl AgentSessionHandle {
         session: AgentSession,
         listeners: EventListeners,
     ) -> Self {
-        Self { session, listeners }
+        Self {
+            session,
+            listeners,
+            ask_tool: None,
+            workspace: None,
+            mcp_manager: None,
+        }
+    }
+
+    /// Ask tool handle, when this session enabled the ask tool. Cloning is
+    /// cheap (shared state); hosts use it to install a picker surface via
+    /// `install_channel_ui` and resolve cards via `respond_ui`.
+    #[must_use]
+    pub fn ask_tool(&self) -> Option<crate::ask::AskTool> {
+        self.ask_tool.clone()
+    }
+
+    /// Multi-root workspace handle, when the session was created with one
+    /// (bd-cv653.3.12). Clones share the live root set.
+    #[must_use]
+    pub fn workspace(&self) -> Option<crate::workspace::WorkspaceHandle> {
+        self.workspace.clone()
+    }
+
+    /// MCP manager owned by this session, when MCP discovery was enabled.
+    #[must_use]
+    pub fn mcp_manager(&self) -> Option<Arc<crate::mcp::McpManager>> {
+        self.mcp_manager.clone()
+    }
+
+    /// Permanently remove this deferred session's MCP manager when the
+    /// predecessor's singleton transports were not proven released.
+    pub(crate) fn disable_mcp(&mut self) {
+        self.mcp_manager = None;
+    }
+
+    /// Flush durable state and capture session ownership without stopping any
+    /// runtime resource. On success the caller can synchronously install its
+    /// prepared replacement before cleanup reaches an irreversible step.
+    // `&mut self` is deliberate: the preflight must hold exclusive access to
+    // the handle while ownership is captured, even though no field is mutated.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    pub(crate) async fn preflight_replacement(
+        &mut self,
+    ) -> std::result::Result<PreparedSessionShutdown, SessionResourceShutdown> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let mut session = match asupersync::sync::OwnedMutexGuard::lock(
+            Arc::clone(&self.session.session),
+            cx.cx(),
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                let warning = format!("failed to lock session for resource shutdown: {err}");
+                tracing::warn!(
+                    event = "sdk.session.shutdown.jobs_owner_failed",
+                    "{warning}"
+                );
+                let mut report = SessionResourceShutdown::default();
+                report.fail(warning);
+                return Err(report);
+            }
+        };
+        let owner_session_id = session.header.id.clone();
+        if self.session.save_enabled()
+            && let Err(err) = session.flush_autosave_on_shutdown().await
+        {
+            let warning = format!("failed to flush session autosave: {err}");
+            tracing::warn!(event = "sdk.session.shutdown.autosave_failed", "{warning}");
+            let mut report = SessionResourceShutdown::default();
+            report.fail(warning);
+            return Err(report);
+        }
+        Ok(PreparedSessionShutdown { owner_session_id })
+    }
+
+    async fn shutdown_runtime_resources(
+        self,
+        owner_session_id: Option<&str>,
+        mut report: SessionResourceShutdown,
+    ) -> SessionResourceShutdown {
+        if let Some(owner_session_id) = owner_session_id
+            && let Err(err) = crate::jobs::kill_session(owner_session_id).await
+        {
+            let warning = format!("failed to stop session-owned background jobs: {err}");
+            tracing::warn!(event = "sdk.session.shutdown.jobs_failed", "{warning}");
+            report.fail(warning);
+        }
+
+        if let Some(region) = self.session.extensions.as_ref()
+            && !region.shutdown().await
+        {
+            let warning = "extension runtime did not stop within its shutdown budget".to_string();
+            tracing::warn!(
+                event = "sdk.session.shutdown.extension_timeout",
+                "{warning}"
+            );
+            report.fail(warning);
+        }
+
+        if let Some(manager) = self.mcp_manager.clone() {
+            report.mcp = McpShutdownOutcome::Indeterminate;
+            if asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                SESSION_MCP_SHUTDOWN_TIMEOUT,
+                manager.shutdown_all(),
+            )
+            .await
+            .is_ok()
+            {
+                report.mcp = McpShutdownOutcome::Released;
+            } else {
+                let warning = format!(
+                    "MCP manager did not stop within {} seconds",
+                    SESSION_MCP_SHUTDOWN_TIMEOUT.as_secs()
+                );
+                tracing::warn!(event = "sdk.session.shutdown.mcp_timeout", "{warning}");
+                report.fail(warning);
+            }
+        }
+
+        report
+    }
+
+    /// Consume an old handle after its prepared replacement has become current,
+    /// attempting every independent runtime resource family even after errors.
+    pub(crate) async fn commit_resource_shutdown(
+        self,
+        prepared: PreparedSessionShutdown,
+    ) -> SessionResourceShutdown {
+        self.shutdown_runtime_resources(
+            Some(prepared.owner_session_id.as_str()),
+            SessionResourceShutdown::default(),
+        )
+        .await
+    }
+
+    /// Exhaustively discard a newly prepared handle that was never committed.
+    /// Its session state is intentionally not autosaved, but every owner-scoped
+    /// runtime family is still attempted without process-wide job cleanup.
+    pub(crate) async fn discard_uncommitted_resources(self) -> SessionResourceShutdown {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let mut report = SessionResourceShutdown::default();
+        let owner_session_id = match asupersync::sync::OwnedMutexGuard::lock(
+            Arc::clone(&self.session.session),
+            cx.cx(),
+        )
+        .await
+        {
+            Ok(session) => Some(session.header.id.clone()),
+            Err(err) => {
+                let warning = format!("failed to resolve discarded session ownership: {err}");
+                tracing::warn!(event = "sdk.session.discard.owner_failed", "{warning}");
+                report.fail(warning);
+                None
+            }
+        };
+        self.shutdown_runtime_resources(owner_session_id.as_deref(), report)
+            .await
+    }
+
+    /// Await shutdown of every runtime resource owned by this session.
+    ///
+    /// Final driver exit uses this exhaustive seam: persistence or ownership
+    /// failures are reported, but they never skip later independent cleanup.
+    pub(crate) async fn shutdown_owned_resources(self) -> SessionResourceShutdown {
+        let mut report = SessionResourceShutdown::default();
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let owner_session_id = match asupersync::sync::OwnedMutexGuard::lock(
+            Arc::clone(&self.session.session),
+            cx.cx(),
+        )
+        .await
+        {
+            Ok(mut session) => {
+                let owner_session_id = session.header.id.clone();
+                if self.session.save_enabled()
+                    && let Err(err) = session.flush_autosave_on_shutdown().await
+                {
+                    let warning = format!("failed to flush session autosave: {err}");
+                    tracing::warn!(event = "sdk.session.shutdown.autosave_failed", "{warning}");
+                    report.fail(warning);
+                }
+                Some(owner_session_id)
+            }
+            Err(err) => {
+                let warning = format!("failed to lock session for resource shutdown: {err}");
+                tracing::warn!(
+                    event = "sdk.session.shutdown.jobs_owner_failed",
+                    "{warning}"
+                );
+                report.fail(warning);
+                None
+            }
+        };
+        self.shutdown_runtime_resources(owner_session_id.as_deref(), report)
+            .await
+    }
+
+    /// Mount cached tools for one MCP server, skipping exact names already
+    /// present in this Agent. Returns the number of wrappers added.
+    ///
+    /// Runtime trust/test controls use this shared seam so repeated commands
+    /// cannot duplicate provider-visible tool definitions (bd-vjfol).
+    #[must_use]
+    pub fn mount_mcp_server_tools_if_absent(&mut self, server_name: &str) -> usize {
+        let Some(manager) = self.mcp_manager.clone() else {
+            return 0;
+        };
+        let mut wrappers = crate::mcp::mount_server_tools(&manager, server_name);
+        wrappers.retain(|tool| !self.session.agent.has_tool(tool.name()));
+        let mounted = wrappers.len();
+        self.session.agent.extend_tools(wrappers);
+        mounted
+    }
+
+    /// Start acknowledged MCP servers and mount their cached tools into this
+    /// exact Agent. Session replacement calls this only after the previous
+    /// handle has been dropped, preventing overlapping singleton transports.
+    pub(crate) async fn activate_mcp(&mut self) {
+        let Some(manager) = self.mcp_manager.clone() else {
+            return;
+        };
+        let mut wrappers = crate::mcp::connect_trusted_and_mount_tools(&manager).await;
+        wrappers.retain(|tool| !self.session.agent.has_tool(tool.name()));
+        self.session.agent.extend_tools(wrappers);
+    }
+
+    /// Bring MCP servers that extensions registered after startup into the
+    /// live session (bd-8m21l).
+    ///
+    /// Startup copies the extension-registered server definitions into the
+    /// MCP manager once; a `registerMcpServer` call from a later extension
+    /// callback only updated the extension manager's snapshot and stayed
+    /// unreachable until restart. This drains the snapshot: every definition
+    /// whose name the MCP manager does not know yet is registered under the
+    /// same trust gate as at startup, and when anything was new the trusted
+    /// servers are connected and only tool names not already mounted are
+    /// added. Returns the number of newly registered definitions. Called at
+    /// the start of every prompt; cheap when nothing changed.
+    pub async fn sync_extension_mcp_registrations(&mut self) -> usize {
+        let Some(manager) = self.mcp_manager.clone() else {
+            return 0;
+        };
+        let Some(extensions) = self.extension_manager().cloned() else {
+            return 0;
+        };
+        crate::mcp::sync_extension_registrations(&manager, &extensions, &mut self.session.agent)
+            .await
     }
 
     /// Send one user prompt through the agent loop.
@@ -1210,6 +1649,7 @@ impl AgentSessionHandle {
         input: impl Into<String>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.sync_extension_mcp_registrations().await;
         let combined = self.make_combined_callback(on_event);
         self.session.run_text(input.into(), combined).await
     }
@@ -1221,6 +1661,7 @@ impl AgentSessionHandle {
         abort_signal: AbortSignal,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.sync_extension_mcp_registrations().await;
         let combined = self.make_combined_callback(on_event);
         self.session
             .run_text_with_abort(input.into(), Some(abort_signal), combined)
@@ -1324,6 +1765,14 @@ impl AgentSessionHandle {
         self.session.extensions.as_ref()
     }
 
+    /// The compaction settings this session resolved at creation time.
+    ///
+    /// Reflects [`SessionOptions::compaction_settings`] when an override was
+    /// supplied, or the config/model-derived defaults otherwise.
+    pub const fn compaction_settings(&self) -> &ResolvedCompactionSettings {
+        self.session.compaction_settings()
+    }
+
     // -----------------------------------------------------------------
     // Provider & Model
     // -----------------------------------------------------------------
@@ -1399,6 +1848,69 @@ impl AgentSessionHandle {
         self.session.agent.stream_options_mut().max_tokens = max_tokens;
     }
 
+    /// `/add-dir` driver (bd-cv653.3.12): validate + add an additional
+    /// workspace root on the shared handle and persist the canonical set
+    /// into the session header. Returns a user-facing status line.
+    pub async fn add_workspace_root(&mut self, dir: impl AsRef<Path>) -> Result<String> {
+        let canonical = crate::workspace::validate_new_root(dir.as_ref())?;
+        let mut workspace = self
+            .workspace
+            .clone()
+            .ok_or_else(|| Error::validation("no workspace handle in this session"))?;
+        let already = workspace
+            .snapshot_or(Path::new("."))
+            .contains_canonical(&canonical);
+        if !already {
+            workspace.add_root(&canonical);
+        }
+        let roots = workspace.additional_roots();
+        let cx = crate::agent_cx::AgentCx::for_request();
+        {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            guard.set_additional_roots(&roots);
+        }
+        let display = canonical.display().to_string();
+        Ok(if already {
+            format!("Already a workspace root: {display}")
+        } else {
+            format!("Workspace root added: {display}")
+        })
+    }
+
+    /// `/remove-dir` driver (bd-cv653.3.12): revoke an additional root on
+    /// the shared handle (immediate for every tool holding a clone) and
+    /// persist. Returns a user-facing status line.
+    pub async fn remove_workspace_root(&mut self, dir: impl AsRef<Path>) -> Result<String> {
+        let mut workspace = self
+            .workspace
+            .clone()
+            .ok_or_else(|| Error::validation("no workspace handle in this session"))?;
+        let removed = workspace.remove_root(dir.as_ref());
+        if !removed {
+            return Ok(format!("Not a workspace root: {}", dir.as_ref().display()));
+        }
+        let roots = workspace.additional_roots();
+        let cx = crate::agent_cx::AgentCx::for_request();
+        {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            guard.set_additional_roots(&roots);
+        }
+        Ok(format!(
+            "Workspace root removed: {}",
+            dir.as_ref().display()
+        ))
+    }
+
     /// Return all model messages for the current session path.
     pub async fn messages(&self) -> Result<Vec<Message>> {
         let cx = crate::agent_cx::AgentCx::for_request();
@@ -1434,6 +1946,26 @@ impl AgentSessionHandle {
             save_enabled,
             message_count,
         })
+    }
+
+    /// Run a read-only closure against the locked session.
+    ///
+    /// Lets embedding hosts take arbitrary snapshots (message history, header
+    /// fields, usage) without the SDK growing one accessor per shape — e.g.
+    /// the ftui launch path rebuilds its transcript after a session resume
+    /// via `interactive::conversation_from_session`.
+    pub async fn with_session<R>(
+        &self,
+        f: impl FnOnce(&crate::session::Session) -> R,
+    ) -> Result<R> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let guard = self
+            .session
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        Ok(f(&guard))
     }
 
     /// Trigger an immediate compaction pass (if compaction is enabled).
@@ -1553,9 +2085,22 @@ fn stream_event_from_assistant_message_event(
             content_index: *content_index,
             content: content.clone(),
         }),
-        AME::ToolCallStart { content_index, .. } => Some(StreamEvent::ToolCallStart {
-            content_index: *content_index,
-        }),
+        AME::ToolCallStart {
+            content_index,
+            partial,
+        } => {
+            // #129: recover the tool-call id/name from the partial so the
+            // reconstructed stream stays correlatable from the start.
+            let (id, name) = match partial.content.get(*content_index) {
+                Some(ContentBlock::ToolCall(tc)) => (tc.id.clone(), tc.name.clone()),
+                _ => (String::new(), String::new()),
+            };
+            Some(StreamEvent::ToolCallStart {
+                content_index: *content_index,
+                id,
+                name,
+            })
+        }
         AME::ToolCallDelta {
             content_index,
             delta,
@@ -1592,17 +2137,40 @@ fn resolve_path_for_cwd(path: &Path, cwd: &Path) -> PathBuf {
     }
 }
 
+fn load_session_config(
+    cwd: &Path,
+    global_dir: &Path,
+    config_override: Option<&Path>,
+    workspace_trusted: bool,
+) -> Result<Config> {
+    Config::load_with_roots_and_project_trust(config_override, global_dir, cwd, workspace_trusted)
+}
+
 fn build_stream_options_with_optional_key(
     config: &Config,
     api_key: Option<String>,
     selection: &app::ModelSelection,
     session: &Session,
 ) -> StreamOptions {
+    // Match the CLI path (`app::build_stream_options`): prompt caching
+    // defaults to short retention, so SDK embedders get the same
+    // Anthropic cache breakpoints instead of silently paying full input
+    // price. `PI_CACHE_RETENTION` overrides ("long"/"none").
+    let cache_retention =
+        app::cache_retention_from_env(std::env::var("PI_CACHE_RETENTION").ok().as_deref());
     let mut options = StreamOptions {
         api_key,
         headers: selection.model_entry.headers.clone(),
         session_id: Some(session.header.id.clone()),
         thinking_level: Some(selection.thinking_level),
+        cache_retention,
+        // Session-scoped cache affinity for OpenAI-shaped requests (gh #188),
+        // matching the CLI path.
+        prompt_cache_key: app::resolve_prompt_cache_key(
+            std::env::var("PI_PROMPT_CACHE_KEY").ok().as_deref(),
+            cache_retention,
+            Some(session.header.id.as_str()),
+        ),
         // Seed the per-request output cap from the model registry's `maxTokens`
         // so embedders inherit the configured limit by default; they can still
         // override it via `set_max_tokens`.
@@ -1618,6 +2186,7 @@ fn build_stream_options_with_optional_key(
             medium: budgets.medium.unwrap_or(defaults.medium),
             high: budgets.high.unwrap_or(defaults.high),
             xhigh: budgets.xhigh.unwrap_or(defaults.xhigh),
+            max: budgets.max.unwrap_or(defaults.max),
         });
     }
 
@@ -1628,8 +2197,22 @@ fn build_stream_options_with_optional_key(
 ///
 /// This is the programmatic entrypoint for non-CLI consumers that want to run
 /// Pi sessions in-process.
-#[allow(clippy::too_many_lines)]
 pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessionHandle> {
+    let mut handle = create_agent_session_deferred_mcp(options).await?;
+    handle.activate_mcp().await;
+    Ok(handle)
+}
+
+/// Build a session without starting acknowledged MCP transports.
+///
+/// The default FTUI uses this only for atomic `/new` and `/resume` handoff:
+/// construct every fallible session component first, await shutdown of the
+/// old handle, then call [`AgentSessionHandle::activate_mcp`] so singleton MCP
+/// servers are never live in both sessions at once (bd-vjfol).
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn create_agent_session_deferred_mcp(
+    options: SessionOptions,
+) -> Result<AgentSessionHandle> {
     let process_cwd =
         std::env::current_dir().map_err(|e| Error::config(format!("cwd lookup failed: {e}")))?;
     let cwd = options.working_directory.as_deref().map_or_else(
@@ -1670,13 +2253,25 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         }
     }
 
-    let config = Config::load()?;
+    let global_dir = Config::global_dir();
+    let config_override = Config::config_path_override_from_env(&cwd);
+    let config = load_session_config(
+        &cwd,
+        &global_dir,
+        config_override.as_deref(),
+        options.workspace_trusted,
+    )?;
 
     let mut auth = AuthStorage::load_async(Config::auth_path()).await?;
     auth.refresh_expired_oauth_tokens().await?;
 
-    let global_dir = Config::global_dir();
-    let package_dir = Config::package_dir();
+    let raw_package_dir = options
+        .package_dir
+        .clone()
+        .unwrap_or_else(crate::config::Config::package_dir);
+    // bd-jtehj: interpret relative package roots against the session cwd —
+    // never the ambient process cwd — before prompt discovery sees them.
+    let package_dir = crate::app::stable_package_dir(&raw_package_dir, Some(&cwd));
     let models_path = default_models_path(&global_dir);
     let model_registry = ModelRegistry::load(&auth, Some(models_path));
 
@@ -1716,6 +2311,14 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         .map(String::as_str)
         .collect::<Vec<_>>();
 
+    let sdk_test_mode = std::env::var_os("PI_TEST_MODE").is_some();
+    // Foreign-format workspace rules (bd-cv653.6.2), shared with the agent's
+    // scoped-rule activation below.
+    let foreign_rules = if config.foreign_rules_enabled() && !sdk_test_mode {
+        crate::context_files::discover_foreign_rules(&cwd)
+    } else {
+        crate::context_files::ForeignRules::default()
+    };
     let system_prompt = app::build_system_prompt(
         &cli,
         &cwd,
@@ -1723,8 +2326,10 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         None,
         &global_dir,
         &package_dir,
-        std::env::var_os("PI_TEST_MODE").is_some(),
+        sdk_test_mode,
         options.include_cwd_in_prompt,
+        Some(&foreign_rules),
+        &config,
     )
     .map_err(|err| Error::validation(err.to_string()))?;
 
@@ -1742,27 +2347,54 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         max_tool_iterations: options.max_tool_iterations,
         stream_options,
         block_images: config.image_block_images(),
+        model_accepts_images: selection
+            .model_entry
+            .model
+            .input
+            .contains(&crate::provider::InputType::Image),
         fail_closed_hooks: config.fail_closed_hooks(),
-        tool_approval: None,
+        tool_approval: options.tool_approval.clone(),
+        keyword_settings: config.keywords.clone(),
+        max_time: None,
+        turn_recovery: config.turn_recovery_mode(),
+        approval_state: options.approval_state.clone(),
+        bash_settings: config.bash.clone(),
+        secrets: None,
     };
 
     let tools = options.tool_factory.as_ref().map_or_else(
-        || ToolRegistry::new(&enabled_tools, &cwd, Some(&config)),
+        // The default registry carries an undo recorder (bd-cv653.3.13) so
+        // SDK-driven surfaces (ftui, embedders) can offer /undo //redo too.
+        || {
+            ToolRegistry::with_mutation_recorder(
+                &enabled_tools,
+                &cwd,
+                Some(&config),
+                Some(std::sync::Arc::new(
+                    crate::undo::FileMutationRecorder::default(),
+                )),
+                options.workspace.as_ref(),
+            )
+        },
         |factory| factory.create_tool_registry(&enabled_tools, &cwd, &config),
     );
     let session_arc = Arc::new(asupersync::sync::Mutex::new(session));
 
-    let context_window_tokens = if selection.model_entry.model.context_window == 0 {
-        ResolvedCompactionSettings::default().context_window_tokens
-    } else {
-        selection.model_entry.model.context_window
-    };
-    let compaction_settings = ResolvedCompactionSettings {
-        enabled: config.compaction_enabled(),
-        reserve_tokens: config.compaction_reserve_tokens(),
-        keep_recent_tokens: config.compaction_keep_recent_tokens(),
-        context_window_tokens,
-    };
+    let compaction_settings = options.compaction_settings.clone().unwrap_or_else(|| {
+        let context_window_tokens = if selection.model_entry.model.context_window == 0 {
+            ResolvedCompactionSettings::default().context_window_tokens
+        } else {
+            selection.model_entry.model.context_window
+        };
+        ResolvedCompactionSettings {
+            enabled: config.compaction_enabled(),
+            reserve_tokens: config.compaction_reserve_tokens(),
+            keep_recent_tokens: config.compaction_keep_recent_tokens(),
+            context_window_tokens,
+            mode: config.compaction_mode(),
+            render_mode: config.compaction_render_mode(),
+        }
+    });
 
     let mut agent_session = AgentSession::new(
         Agent::new(provider, tools, agent_config),
@@ -1771,6 +2403,46 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         compaction_settings,
     );
     agent_session.set_api_key_override(options.api_key.clone());
+    if foreign_rules.scoped_rules().next().is_some() {
+        agent_session
+            .agent
+            .set_foreign_scoped_rules(foreign_rules.rules.clone(), cwd.clone());
+    }
+    // Session-coupled todo tool joins after construction (opt-in), matching
+    // the CLI wiring in main.rs.
+    if enabled_tools.contains(&"todo") {
+        let todo_session = Arc::clone(&agent_session.session);
+        agent_session.agent.extend_tools(vec![
+            Box::new(crate::todo::TodoTool::new(todo_session)) as Box<dyn crate::tools::Tool>
+        ]);
+    }
+    // Ask tool (opt-in): without a host-installed picker surface it resolves
+    // via ask_policy (recommended auto-answer by default, bd-cv653.3.8). A
+    // clone is kept on the returned handle so embedders (e.g. the ftui launch
+    // path) can install a channel UI and pair respond_ui replies.
+    let mut ask_tool_handle = None;
+    if enabled_tools.contains(&"ask") {
+        let ask = crate::ask::AskTool::new(crate::ask::AskPolicy::from_config(
+            config.ask_policy.as_deref(),
+        ));
+        ask_tool_handle = Some(ask.clone());
+        agent_session
+            .agent
+            .extend_tools(vec![Box::new(ask) as Box<dyn crate::tools::Tool>]);
+    }
+    // Approval prompts (issue #196): when this session gates tool calls and
+    // the embedder supplied no explicit handler, bridge approval requests
+    // through the ask surface the host installs (`install_channel_ui`). The
+    // bridge never auto-answers — with no surface installed it denies with an
+    // explicit reason instead of prompting nobody and denying silently.
+    if options.approval_state.is_some()
+        && options.tool_approval.is_none()
+        && let Some(ask) = &ask_tool_handle
+    {
+        agent_session
+            .agent
+            .set_tool_approval(Some(crate::ask::approval_handler_via_ask(ask.clone())));
+    }
 
     if !options.extension_paths.is_empty() {
         let extension_paths = options
@@ -1792,9 +2464,39 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
                 Some(resolved_ext_policy.policy),
                 Some(resolved_repair_policy.effective_mode),
                 None,
+                crate::agent::ExtensionHostConfiguration {
+                    ui_handler: options.extension_ui_handler.clone(),
+                    persist_permission_decisions: options.persist_extension_permissions,
+                    cli_flags: options.extension_flags.clone(),
+                },
             )
             .await?;
     }
+
+    let mcp_manager = if let Some(mcp) = &options.mcp {
+        let global_dir = mcp.global_dir.clone().unwrap_or_else(Config::global_dir);
+        let manager = Arc::new(crate::mcp::bootstrap_with_project_trust(
+            &cwd,
+            &global_dir,
+            &mcp.config_paths,
+            options.workspace_trusted,
+        )?);
+        if let Some(extension_manager) = agent_session
+            .extensions
+            .as_ref()
+            .map(ExtensionRegion::manager)
+        {
+            for spec in extension_manager.extension_mcp_servers() {
+                let name = spec.get("name").and_then(Value::as_str).unwrap_or_default();
+                if !name.is_empty() {
+                    manager.register_extension_server(name, &spec);
+                }
+            }
+        }
+        Some(manager)
+    } else {
+        None
+    };
 
     agent_session.set_model_registry(model_registry.clone());
     agent_session.set_auth_storage(auth);
@@ -1818,10 +2520,12 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     listeners.on_tool_start = options.on_tool_start;
     listeners.on_tool_end = options.on_tool_end;
     listeners.on_stream_event = options.on_stream_event;
-
     Ok(AgentSessionHandle {
         session: agent_session,
         listeners,
+        ask_tool: ask_tool_handle,
+        workspace: options.workspace.clone(),
+        mcp_manager,
     })
 }
 
@@ -1832,7 +2536,7 @@ mod tests {
     use asupersync::runtime::reactor::create_reactor;
     use asupersync::sync::Mutex as AsyncMutex;
     use std::env;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
     fn run_async<F>(future: F) -> F::Output
@@ -1848,10 +2552,7 @@ mod tests {
     }
 
     fn current_dir_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::test_current_dir_lock()
     }
 
     struct CurrentDirGuard {
@@ -1884,6 +2585,33 @@ mod tests {
     }
 
     #[test]
+    fn sdk_config_loader_uses_session_root_and_workspace_trust() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let global_dir = tmp.path().join("global");
+        std::fs::create_dir_all(cwd.join(".pi")).expect("create project config dir");
+        std::fs::create_dir_all(&global_dir).expect("create global config dir");
+        std::fs::write(
+            global_dir.join("settings.json"),
+            r#"{"defaultThinkingLevel":"low"}"#,
+        )
+        .expect("write global settings");
+        std::fs::write(
+            cwd.join(".pi/settings.json"),
+            r#"{"defaultThinkingLevel":"high"}"#,
+        )
+        .expect("write project settings");
+
+        let untrusted =
+            load_session_config(&cwd, &global_dir, None, false).expect("load untrusted config");
+        assert_eq!(untrusted.default_thinking_level.as_deref(), Some("low"));
+
+        let trusted =
+            load_session_config(&cwd, &global_dir, None, true).expect("load trusted config");
+        assert_eq!(trusted.default_thinking_level.as_deref(), Some("high"));
+    }
+
+    #[test]
     fn create_agent_session_with_explicit_test_provider_succeeds() {
         let tmp = tempdir().expect("tempdir");
         let options = hermetic_session_options(tmp.path());
@@ -1894,6 +2622,56 @@ mod tests {
         assert!(!provider.model_id().is_empty());
         assert_eq!(handle.model().0, provider.name());
         assert_eq!(handle.model().1, provider.model_id());
+    }
+
+    /// bd-jtehj: a RELATIVE `SessionOptions::package_dir` must resolve
+    /// against the SESSION's working directory rather than the ambient
+    /// process cwd, so prompt-advertised paths are the same absolute
+    /// locations the session tools read. Mutation-sensitive: before the fix,
+    /// prompt discovery ran from the process cwd — where `relpkgs` does not
+    /// exist — and the docs block was silently omitted.
+    #[test]
+    fn create_agent_session_resolves_relative_package_dir_against_working_directory() {
+        let _lock = current_dir_lock();
+        // Ambient process cwd differs from the session root on purpose.
+        let process_cwd = tempdir().expect("process cwd");
+        let sdk_cwd = tempdir().expect("sdk cwd");
+        let _guard = CurrentDirGuard::new(process_cwd.path());
+
+        let pkg_root = sdk_cwd.path().join("relpkgs");
+        std::fs::create_dir_all(pkg_root.join("docs")).expect("mkdir relpkgs/docs");
+        std::fs::write(pkg_root.join("README.md"), "# pi\n").expect("write readme");
+        std::fs::write(pkg_root.join("docs").join("extensions.md"), "#\n")
+            .expect("write extensions.md");
+
+        let handle = run_async(create_agent_session(SessionOptions {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4o".to_string()),
+            api_key: Some("dummy-key".to_string()),
+            working_directory: Some(sdk_cwd.path().to_path_buf()),
+            no_session: true,
+            // Deliberately relative: stabilization must anchor it to sdk_cwd.
+            package_dir: Some(PathBuf::from("relpkgs")),
+            ..SessionOptions::default()
+        }))
+        .expect("create session");
+        let system_prompt = handle
+            .session()
+            .agent
+            .system_prompt()
+            .expect("default system prompt present")
+            .to_string();
+        assert!(system_prompt.contains("Pi documentation"));
+        let advertised_readme = pkg_root.join("README.md");
+        assert!(
+            system_prompt.contains(&advertised_readme.display().to_string()),
+            "prompt must advertise the session-root-resolved README: {system_prompt}"
+        );
+        // The prompt's marker paths must be real files reachable through the
+        // same root the tools read from.
+        assert!(advertised_readme.is_file());
+        assert!(pkg_root.join("docs").join("extensions.md").is_file());
+        assert!(system_prompt.contains("extensions (docs/extensions.md)"));
     }
 
     #[test]
@@ -2101,8 +2879,15 @@ mod tests {
                 max_tool_iterations: 50,
                 stream_options: StreamOptions::default(),
                 block_images: false,
+                model_accepts_images: true,
                 fail_closed_hooks: false,
                 tool_approval: None,
+                keyword_settings: None,
+                max_time: None,
+                turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
+                approval_state: None,
+                bash_settings: None,
+                secrets: None,
             },
         );
 
@@ -2171,6 +2956,59 @@ mod tests {
     }
 
     #[test]
+    fn sdk_stream_options_enable_prompt_caching_by_default() {
+        let config = crate::config::Config::default();
+        let session = crate::session::Session::in_memory();
+        let selection = app::ModelSelection {
+            model_entry: ModelEntry {
+                model: Model {
+                    id: "plain-model".to_string(),
+                    name: "Plain Model".to_string(),
+                    api: "anthropic-messages".to_string(),
+                    provider: "anthropic".to_string(),
+                    base_url: "https://api.anthropic.com/v1/messages".to_string(),
+                    reasoning: false,
+                    input: vec![InputType::Text],
+                    cost: ModelCost {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    context_window: 128_000,
+                    max_tokens: 8_192,
+                    headers: HashMap::new(),
+                },
+                api_key: None,
+                headers: HashMap::new(),
+                auth_header: false,
+                compat: None,
+                oauth_config: None,
+            },
+            thinking_level: crate::model::ThinkingLevel::Off,
+            scoped_models: Vec::new(),
+            fallback_message: None,
+        };
+
+        let options = build_stream_options_with_optional_key(&config, None, &selection, &session);
+
+        // SDK embedders must get the same prompt-caching default as the CLI
+        // path (`app::build_stream_options`); the assertion tracks the pure
+        // env resolver so it stays correct if PI_CACHE_RETENTION is set in
+        // the environment running the tests.
+        assert_eq!(
+            options.cache_retention,
+            app::cache_retention_from_env(std::env::var("PI_CACHE_RETENTION").ok().as_deref())
+        );
+        if std::env::var("PI_CACHE_RETENTION").is_err() {
+            assert_eq!(
+                options.cache_retention,
+                crate::provider::CacheRetention::Short
+            );
+        }
+    }
+
+    #[test]
     fn from_session_with_listeners_set_thinking_level_uses_session_header_target() {
         let dir = tempdir().expect("tempdir");
         let auth_path = dir.path().join("auth.json");
@@ -2214,8 +3052,15 @@ mod tests {
                 max_tool_iterations: 50,
                 stream_options: StreamOptions::default(),
                 block_images: false,
+                model_accepts_images: true,
                 fail_closed_hooks: false,
                 tool_approval: None,
+                keyword_settings: None,
+                max_time: None,
+                turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
+                approval_state: None,
+                bash_settings: None,
+                secrets: None,
             },
         );
 
@@ -2513,6 +3358,7 @@ mod tests {
             model: String::new(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         });
@@ -2546,6 +3392,7 @@ mod tests {
             model: String::new(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         });
@@ -2577,6 +3424,235 @@ mod tests {
         );
         assert!(handle.extension_manager().is_none());
         assert!(handle.extension_region().is_none());
+    }
+
+    #[test]
+    fn session_options_new_fields_default_to_current_behavior() {
+        let options = SessionOptions::default();
+        assert!(options.extension_ui_handler.is_none());
+        assert!(options.persist_extension_permissions);
+        assert!(options.compaction_settings.is_none());
+        assert!(options.mcp.is_none());
+        assert!(options.extension_flags.is_empty());
+    }
+
+    #[test]
+    fn create_agent_session_uses_compaction_override_verbatim() {
+        let tmp = tempdir().expect("tempdir");
+        let custom = ResolvedCompactionSettings {
+            enabled: false,
+            context_window_tokens: 55_555,
+            reserve_tokens: 1_234,
+            keep_recent_tokens: 4_321,
+            mode: crate::compaction::AutoCompactionMode::default(),
+            render_mode: crate::compaction::CompactionRenderMode::default(),
+        };
+        let options = SessionOptions {
+            compaction_settings: Some(custom.clone()),
+            ..hermetic_session_options(tmp.path())
+        };
+
+        let handle = run_async(create_agent_session(options)).expect("create session");
+        let resolved = handle.compaction_settings();
+        assert!(!resolved.enabled);
+        assert_eq!(resolved.context_window_tokens, custom.context_window_tokens);
+        assert_eq!(resolved.reserve_tokens, custom.reserve_tokens);
+        assert_eq!(resolved.keep_recent_tokens, custom.keep_recent_tokens);
+    }
+
+    #[test]
+    fn create_agent_session_derives_compaction_without_override() {
+        let tmp = tempdir().expect("tempdir");
+        let options = hermetic_session_options(tmp.path());
+
+        let handle = run_async(create_agent_session(options)).expect("create session");
+        let resolved = handle.compaction_settings();
+        assert!(
+            resolved.context_window_tokens > 0,
+            "derived settings must resolve a context window"
+        );
+    }
+
+    #[test]
+    fn replacement_mcp_activation_requires_proven_predecessor_release() {
+        let no_predecessor_manager = SessionResourceShutdown::default();
+        assert!(no_predecessor_manager.permits_replacement_mcp_activation());
+
+        let released = SessionResourceShutdown {
+            mcp: McpShutdownOutcome::Released,
+            ..Default::default()
+        };
+        assert!(released.permits_replacement_mcp_activation());
+
+        let mut indeterminate = SessionResourceShutdown {
+            mcp: McpShutdownOutcome::Indeterminate,
+            ..Default::default()
+        };
+        indeterminate.fail(String::from("MCP shutdown timed out"));
+        assert!(!indeterminate.permits_replacement_mcp_activation());
+        assert!(!indeterminate.completed_cleanly());
+    }
+
+    #[test]
+    fn shutdown_skips_autosave_for_ephemeral_session() {
+        let tmp = tempdir().expect("tempdir");
+        let warnings = run_async(async {
+            let handle = create_agent_session(hermetic_session_options(tmp.path()))
+                .await
+                .expect("create session");
+            let cx = crate::agent_cx::AgentCx::for_request();
+            {
+                let mut session = handle
+                    .session
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .expect("lock session");
+                session
+                    .set_autosave_durability_mode(crate::session::AutosaveDurabilityMode::Strict);
+                session.append_session_info(Some("ephemeral mutation".to_string()));
+            }
+            handle.shutdown_owned_resources().await
+        });
+
+        assert!(
+            warnings.is_empty(),
+            "ephemeral sessions have no persistence path and must not attempt autosave: {warnings:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_stops_background_jobs_owned_by_the_session() {
+        let tmp = tempdir().expect("tempdir");
+        let (warnings, session_id, job_id) = run_async(async {
+            let handle = create_agent_session(hermetic_session_options(tmp.path()))
+                .await
+                .expect("create session");
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let session_id = handle
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("lock session")
+                .header
+                .id
+                .clone();
+            let job = crate::jobs::spawn_background(
+                &session_id,
+                tmp.path(),
+                None,
+                None,
+                "sleep 300",
+                Some(300),
+                None,
+            )
+            .expect("spawn session-owned background job");
+            let warnings = handle.shutdown_owned_resources().await;
+            (warnings, session_id, job.id)
+        });
+
+        assert!(
+            warnings.is_empty(),
+            "clean session shutdown must not report warnings: {warnings:?}"
+        );
+        let jobs = crate::jobs::list(&session_id).expect("list session jobs");
+        assert!(jobs.iter().any(|job| {
+            job.id == job_id && job.status == crate::jobs::JobStatus::Killed.as_str()
+        }));
+        let _ = crate::jobs::take_completion_notices(&session_id);
+    }
+
+    struct SdkRecordingUiHandler {
+        prompts: Mutex<Vec<ExtensionUiRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExtensionUiHandler for SdkRecordingUiHandler {
+        async fn request_ui(
+            &self,
+            request: ExtensionUiRequest,
+        ) -> Result<Option<ExtensionUiResponse>> {
+            let id = request.id.clone();
+            self.prompts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request);
+            Ok(Some(ExtensionUiResponse {
+                id,
+                value: Some(Value::Bool(true)),
+                cancelled: false,
+            }))
+        }
+    }
+
+    #[test]
+    fn create_agent_session_wires_extension_ui_handler_before_startup() {
+        let tmp = tempdir().expect("tempdir");
+        let ext_path = tmp.path().join("noop_ext.js");
+        std::fs::write(
+            &ext_path,
+            r#"
+export default function init(pi) {
+    pi.on("startup", async (_event, ctx) => {
+        await ctx.ui.confirm("Startup prompt", "Allow startup initialization?");
+    });
+}
+"#,
+        )
+        .expect("write extension");
+
+        let handler = Arc::new(SdkRecordingUiHandler {
+            prompts: Mutex::new(Vec::new()),
+        });
+        let options = SessionOptions {
+            extension_paths: vec![ext_path],
+            extension_ui_handler: Some(handler.clone()),
+            persist_extension_permissions: false,
+            ..hermetic_session_options(tmp.path())
+        };
+
+        let handle = run_async(create_agent_session(options)).expect("create session");
+        let manager = handle.extension_manager().expect("extensions loaded");
+        assert!(
+            !manager.policy_prompt_persistence(),
+            "persist_extension_permissions: false must scope decisions to the session"
+        );
+
+        {
+            let prompts = handler
+                .prompts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                prompts.len(),
+                1,
+                "the UI bridge must be installed before the startup hook runs"
+            );
+            assert_eq!(prompts[0].method, "confirm");
+            assert_eq!(prompts[0].payload["title"], "Startup prompt");
+        }
+
+        let response = run_async(async {
+            manager
+                .request_ui(ExtensionUiRequest::new(
+                    "",
+                    "confirm",
+                    serde_json::json!({ "title": "Allow?", "message": "capability" }),
+                ))
+                .await
+        })
+        .expect("request_ui")
+        .expect("handler response");
+        assert_eq!(response.value, Some(Value::Bool(true)));
+
+        let prompts = handler
+            .prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(prompts.len(), 2, "handler must receive both UI requests");
+        assert_eq!(prompts[1].method, "confirm");
     }
 
     // =====================================================================

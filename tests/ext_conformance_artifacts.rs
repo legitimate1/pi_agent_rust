@@ -48,12 +48,10 @@ fn digest_artifact_dir(dir: &Path) -> io::Result<String> {
         hasher.update(b"file\0");
         hasher.update(rel.as_bytes());
         hasher.update(b"\0");
-        // Strip \r so CRLF (Windows autocrlf) hashes the same as LF (Unix)
-        let content: Vec<u8> = fs::read(&path)?
-            .into_iter()
-            .filter(|&b| b != b'\r')
-            .collect();
-        hasher.update(&content);
+        // Keep this independent implementation byte-for-byte identical to the
+        // library protocol: provenance binds exact on-disk content, including
+        // CRLF text and carriage-return bytes inside binary artifacts.
+        hasher.update(fs::read(&path)?);
         hasher.update(b"\0");
     }
 
@@ -1255,10 +1253,18 @@ fn test_scan_all_ts_entry_points() {
         results.push(scan);
     }
 
-    // Write the full JSON manifest.
+    // Keep ordinary test runs read-only. The ignored manifest is a maintenance
+    // artifact, not a source input; writing it by default would contaminate the
+    // fail-closed must-pass provenance snapshot when test binaries share a tree.
     let manifest_path = artifacts_dir.join("entry-point-scan.json");
     let json = serde_json::to_string_pretty(&results).expect("serialize scan results");
-    fs::write(&manifest_path, &json).expect("write entry-point-scan.json");
+    let generate = matches!(
+        std::env::var("PI_GENERATE_EXT_ENTRY_SCAN").as_deref(),
+        Ok("1")
+    );
+    if generate {
+        fs::write(&manifest_path, &json).expect("write entry-point-scan.json");
+    }
 
     // Verify classification distribution is reasonable.
     let entry_count = results
@@ -1292,7 +1298,11 @@ fn test_scan_all_ts_entry_points() {
     eprintln!("Sub-modules:     {sub_count}");
     eprintln!("Non-extensions:  {non_ext_count}");
     eprintln!("Unknown:         {unknown_count}");
-    eprintln!("Manifest:        {}", manifest_path.display());
+    if generate {
+        eprintln!("Manifest:        {}", manifest_path.display());
+    } else {
+        eprintln!("Manifest:        not written (set PI_GENERATE_EXT_ENTRY_SCAN=1)");
+    }
 
     // Sanity: we should have a reasonable number of entry points.
     // The catalog has ~205 extensions, so we expect at least ~100 entry points
@@ -1567,37 +1577,37 @@ fn extract_registrations(content: &str) -> ManifestRegistrations {
 
     for (idx, _) in content.match_indices("registerTool(") {
         let window = safe_window(content, idx, 500);
-        if let Some(name) = extract_quoted_after(window, "name:") {
-            if !tools.contains(&name) {
-                tools.push(name);
-            }
+        if let Some(name) = extract_quoted_after(window, "name:")
+            && !tools.contains(&name)
+        {
+            tools.push(name);
         }
     }
 
     for (idx, _) in content.match_indices("registerCommand(") {
         let window = safe_window(content, idx, 200);
-        if let Some(name) = extract_first_string_arg(window, "registerCommand(") {
-            if !commands.contains(&name) {
-                commands.push(name);
-            }
+        if let Some(name) = extract_first_string_arg(window, "registerCommand(")
+            && !commands.contains(&name)
+        {
+            commands.push(name);
         }
     }
 
     for (idx, _) in content.match_indices("registerFlag(") {
         let window = safe_window(content, idx, 500);
-        if let Some(name) = extract_quoted_after(window, "name:") {
-            if !flags.contains(&name) {
-                flags.push(name);
-            }
+        if let Some(name) = extract_quoted_after(window, "name:")
+            && !flags.contains(&name)
+        {
+            flags.push(name);
         }
     }
 
     for (idx, _) in content.match_indices(".on(") {
         let window = safe_window(content, idx, 100);
-        if let Some(name) = extract_first_string_arg(window, ".on(") {
-            if !event_handlers.contains(&name) {
-                event_handlers.push(name);
-            }
+        if let Some(name) = extract_first_string_arg(window, ".on(")
+            && !event_handlers.contains(&name)
+        {
+            event_handlers.push(name);
         }
     }
 
@@ -1803,15 +1813,14 @@ fn discover_extension_dirs(artifacts_dir: &Path) -> Vec<(String, PathBuf)> {
 fn find_entry_point(ext_dir: &Path, artifacts_dir: &Path) -> Option<String> {
     // Check package.json for explicit declaration.
     let pkg_path = ext_dir.join("package.json");
-    if pkg_path.is_file() {
-        if let Ok(bytes) = fs::read(&pkg_path) {
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                for entry in package_declared_entry_points(&json) {
-                    let candidate = ext_dir.join(entry);
-                    if candidate.is_file() {
-                        return Some(relative_posix(artifacts_dir, &candidate));
-                    }
-                }
+    if pkg_path.is_file()
+        && let Ok(bytes) = fs::read(&pkg_path)
+        && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes)
+    {
+        for entry in package_declared_entry_points(&json) {
+            let candidate = ext_dir.join(entry);
+            if candidate.is_file() {
+                return Some(relative_posix(artifacts_dir, &candidate));
             }
         }
     }
@@ -1934,7 +1943,26 @@ fn test_generate_validated_manifest() {
 
     let manifest_path = repo_root.join("tests/ext_conformance/VALIDATED_MANIFEST.json");
     let json = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
-    fs::write(&manifest_path, &json).expect("write VALIDATED_MANIFEST.json");
+    let generate = matches!(
+        std::env::var("PI_GENERATE_VALIDATED_MANIFEST").as_deref(),
+        Ok("1")
+    );
+    if generate {
+        fs::write(&manifest_path, format!("{json}\n")).expect("write VALIDATED_MANIFEST.json");
+    } else {
+        let committed_json =
+            fs::read_to_string(&manifest_path).expect("read committed VALIDATED_MANIFEST.json");
+        let committed: serde_json::Value =
+            serde_json::from_str(&committed_json).expect("parse committed VALIDATED_MANIFEST.json");
+        let computed: serde_json::Value =
+            serde_json::from_str(&json).expect("parse computed VALIDATED_MANIFEST.json");
+        assert_eq!(
+            committed, computed,
+            "committed validated manifest is stale; regenerate explicitly with \
+             PI_GENERATE_VALIDATED_MANIFEST=1 cargo test \
+             --test ext_conformance_artifacts test_generate_validated_manifest -- --exact"
+        );
+    }
 
     eprintln!("=== Validated Manifest Summary ===");
     eprintln!("Extensions:          {}", manifest.extensions.len());
@@ -1961,7 +1989,11 @@ fn test_generate_validated_manifest() {
         eprintln!("  Source {tier}: {count}");
     }
 
-    eprintln!("Manifest: {}", manifest_path.display());
+    eprintln!(
+        "Manifest {}: {}",
+        if generate { "written" } else { "verified" },
+        manifest_path.display()
+    );
 
     assert!(
         manifest.extensions.len() >= 150,

@@ -16,7 +16,6 @@
 mod common;
 
 use common::tmux::TuiSession;
-use fs4::fs_std::FileExt as _;
 use serde_json::json;
 use std::fs::{self, OpenOptions};
 use std::time::Duration;
@@ -26,6 +25,8 @@ use std::time::Duration;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const SHARE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Overall budget for resending `/share` while the session reports busy.
+const SHARE_RETRY_BUDGET: Duration = Duration::from_secs(30);
 
 /// Standard CLI args for interactive mode with minimal features (no API calls).
 fn minimal_interactive_args() -> Vec<&'static str> {
@@ -39,6 +40,9 @@ fn minimal_interactive_args() -> Vec<&'static str> {
         "--no-prompt-templates",
         "--no-extensions",
         "--no-themes",
+        // Classic charmed stack: these scenarios assert its pane text; the
+        // default FTUI stack has its own coverage in tests/e2e_ftui.rs.
+        "--classic",
         "--thinking",
         "off",
         "--system-prompt",
@@ -59,15 +63,47 @@ impl TmuxE2eLock {
             .truncate(false)
             .open(&path)
             .expect("open tmux e2e lock file");
-        file.lock_exclusive().expect("lock tmux e2e lock file");
+        fs4::FileExt::lock(&file).expect("lock tmux e2e lock file");
         Self(file)
     }
 }
 
 impl Drop for TmuxE2eLock {
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        let _ = fs4::FileExt::unlock(&self.0);
     }
+}
+
+/// Send `/share`, resending while each attempt draws a fresh "Session is busy"
+/// refusal (the documented client contract while a session update is still
+/// persisting), and return the pane once the success message's last paragraph
+/// ("Share URL:") is on screen, plus the attempt and refusal counts.
+fn send_share_until_ready(session: &TuiSession) -> (String, usize, usize) {
+    let share_deadline = std::time::Instant::now() + SHARE_RETRY_BUDGET;
+    let mut busy_replies = 0usize;
+    let mut attempts = 0usize;
+    let pane = loop {
+        attempts += 1;
+        session.tmux.send_literal("/share");
+        session.tmux.send_key("Enter");
+        let pane = session
+            .tmux
+            .wait_for_pane_contains_any(&["Share URL:", "Session is busy"], SHARE_TIMEOUT);
+        if pane.contains("Share URL:") {
+            break pane;
+        }
+        let busy_now = pane.matches("Session is busy").count();
+        if busy_now > busy_replies && std::time::Instant::now() < share_deadline {
+            busy_replies = busy_now;
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        // No fresh refusal: the share is in flight, wait for its URL.
+        break session
+            .tmux
+            .wait_for_pane_contains("Share URL:", SHARE_TIMEOUT);
+    };
+    (pane, attempts, busy_replies)
 }
 
 fn new_locked_tui_session(name: &str) -> Option<(TmuxE2eLock, TuiSession)> {
@@ -93,6 +129,7 @@ fn log_test_event(test_name: &str, event: &str, data: &serde_json::Value) {
 fn write_mock_gh_script(dir: &std::path::Path, gist_url: &str) -> std::path::PathBuf {
     let gh_path = dir.join("gh");
     let args_path = dir.join("gh_args.log");
+    let uploaded_path = dir.join("uploaded.html");
     let script = format!(
         r#"#!/bin/sh
 set -e
@@ -105,6 +142,11 @@ if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
 fi
 
 if [ "$1" = "gist" ] && [ "$2" = "create" ]; then
+  upload_path=""
+  for arg in "$@"; do
+    upload_path="$arg"
+  done
+  cp "$upload_path" "{uploaded}"
   echo "{gist_url}"
   exit 0
 fi
@@ -113,6 +155,7 @@ echo "unexpected gh args: $@" >&2
 exit 2
 "#,
         args_log = args_path.display(),
+        uploaded = uploaded_path.display(),
         gist_url = gist_url,
     );
     fs::write(&gh_path, script).expect("write mock gh");
@@ -129,15 +172,16 @@ exit 2
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
-/// E2E: `/share` creates gist and shows viewer URL.
+/// E2E: `/share` creates a secret, unlisted gist and shows viewer URL.
 #[test]
-fn e2e_tui_share_creates_gist_with_privacy_and_description() {
+#[allow(clippy::too_many_lines)]
+fn e2e_tui_share_creates_secret_gist_with_visibility_warning() {
     let Some((_lock, mut session)) = new_locked_tui_session("e2e_tui_share_creates_gist") else {
         eprintln!("Skipping: tmux not available");
         return;
     };
 
-    let test_name = "e2e_tui_share_creates_gist_with_privacy_and_description";
+    let test_name = "e2e_tui_share_creates_secret_gist_with_visibility_warning";
     log_test_event(test_name, "test_start", &json!({}));
 
     // Set up mock gh in a temporary bin directory.
@@ -164,31 +208,71 @@ fn e2e_tui_share_creates_gist_with_privacy_and_description() {
         "PI_CONFIG_PATH",
         &pi_dir.join("settings.json").display().to_string(),
     );
+    // `.pi/settings.json` inside the tmux working directory is a workspace
+    // trust surface; without the automation override the classic TUI shows
+    // the trust prompt instead of the welcome banner.
+    session.set_env("PI_WORKSPACE_TRUST", "trusted");
 
     session.harness.section("launch");
     session.launch(&minimal_interactive_args());
     session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
 
-    log_test_event(test_name, "share_initiated", &json!({"privacy": "private"}));
-
-    // Issue /share command (default: private).
-    let pane = session.send_text_and_wait(
-        "share_private",
-        "/share",
-        "Created private gist",
-        SHARE_TIMEOUT,
+    session.send_text_and_wait(
+        "name_shared_session",
+        "/name share-upload-sentinel",
+        "Session name: share-upload-sentinel",
+        COMMAND_TIMEOUT,
     );
 
+    log_test_event(
+        test_name,
+        "share_initiated",
+        &json!({"visibility": "secret"}),
+    );
+
+    // Issue /share command (secret/unlisted, but not access-controlled).
+    // The preceding /name update may still be persisting, in which case the
+    // product answers "Session is busy; retry `/share` after the current
+    // session update finishes". Retrying is the documented contract, so
+    // resend while each attempt draws a fresh refusal, then wait for the last
+    // paragraph of the success message ("Share URL:") so the capture is not
+    // taken between two frames of the same message.
+    let (pane, attempts, busy_replies) = send_share_until_ready(&session);
+    log_test_event(
+        test_name,
+        "share_sent",
+        &json!({"attempts": attempts, "busy_replies": busy_replies}),
+    );
+
+    assert!(
+        pane.contains("Created secret gist"),
+        "Expected the secret-gist notice in output: {pane}"
+    );
     assert!(pane.contains("Share URL:"), "Expected share URL in output");
     assert!(
         pane.contains("https://buildwithpi.ai/session/#e2e_share_id_123"),
         "Expected viewer URL"
     );
 
+    let uploaded_html = fs::read_to_string(session.harness.temp_path("mock_bin/uploaded.html"))
+        .expect("mock gh must preserve the exact uploaded HTML");
+    assert!(
+        uploaded_html.contains("share-upload-sentinel"),
+        "uploaded HTML omitted current session content"
+    );
+    assert!(
+        !uploaded_html.contains(session.harness.temp_dir().to_string_lossy().as_ref()),
+        "uploaded HTML leaked local cwd: {uploaded_html}"
+    );
+    assert!(
+        !uploaded_html.contains("cwd:"),
+        "uploaded HTML retained cwd metadata: {uploaded_html}"
+    );
+
     log_test_event(
         test_name,
         "share_completed",
-        &json!({"privacy": "private", "gist_url": gist_url}),
+        &json!({"visibility": "secret", "access_controlled": false, "gist_url": gist_url}),
     );
 
     // Verify mock gh was called with --public=false and --desc.
@@ -213,15 +297,17 @@ fn e2e_tui_share_creates_gist_with_privacy_and_description() {
     session.write_artifacts();
 }
 
-/// E2E: `/share public` creates a public gist.
+/// E2E: `/share` rejects public sharing before invoking `gh`.
 #[test]
-fn e2e_tui_share_public_flag() {
-    let Some((_lock, mut session)) = new_locked_tui_session("e2e_tui_share_public_flag") else {
+fn e2e_tui_share_rejects_public_argument_without_invoking_gh() {
+    let Some((_lock, mut session)) =
+        new_locked_tui_session("e2e_tui_share_rejects_public_argument")
+    else {
         eprintln!("Skipping: tmux not available");
         return;
     };
 
-    let test_name = "e2e_tui_share_public_flag";
+    let test_name = "e2e_tui_share_rejects_public_argument_without_invoking_gh";
     log_test_event(test_name, "test_start", &json!({}));
 
     let mock_bin = session.harness.temp_path("mock_bin");
@@ -245,37 +331,40 @@ fn e2e_tui_share_public_flag() {
         "PI_CONFIG_PATH",
         &pi_dir.join("settings.json").display().to_string(),
     );
+    // `.pi/settings.json` inside the tmux working directory is a workspace
+    // trust surface; without the automation override the classic TUI shows
+    // the trust prompt instead of the welcome banner.
+    session.set_env("PI_WORKSPACE_TRUST", "trusted");
 
     session.harness.section("launch");
     session.launch(&minimal_interactive_args());
     session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
 
-    log_test_event(test_name, "share_initiated", &json!({"privacy": "public"}));
+    log_test_event(test_name, "public_share_rejected", &json!({}));
 
     let pane = session.send_text_and_wait(
-        "share_public",
+        "share_public_rejected",
         "/share public",
-        "Created public gist",
+        "public sharing is disabled",
         SHARE_TIMEOUT,
     );
 
     assert!(
-        pane.contains("Created public gist"),
-        "Expected 'Created public gist' in output"
+        pane.contains("public sharing is disabled"),
+        "Expected explicit secret-gist guidance"
     );
 
-    // Verify mock gh was called with --public=true.
     let args_log = session.harness.temp_path("mock_bin/gh_args.log");
-    let args_content = fs::read_to_string(&args_log).unwrap_or_default();
     assert!(
-        args_content.contains("--public=true"),
-        "Expected --public=true in gh args: {args_content}"
+        !args_log.exists(),
+        "rejected public share unexpectedly invoked gh: {}",
+        fs::read_to_string(&args_log).unwrap_or_default()
     );
 
     log_test_event(
         test_name,
-        "share_completed",
-        &json!({"privacy": "public", "public_flag_passed": true}),
+        "gh_not_invoked",
+        &json!({"secret_by_construction": true}),
     );
 
     session.exit_gracefully();
@@ -310,6 +399,10 @@ fn e2e_tui_share_missing_gh_shows_install_instructions() {
         "PI_CONFIG_PATH",
         &pi_dir.join("settings.json").display().to_string(),
     );
+    // `.pi/settings.json` inside the tmux working directory is a workspace
+    // trust surface; without the automation override the classic TUI shows
+    // the trust prompt instead of the welcome banner.
+    session.set_env("PI_WORKSPACE_TRUST", "trusted");
 
     session.harness.section("launch");
     session.launch(&minimal_interactive_args());

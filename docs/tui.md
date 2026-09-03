@@ -3,6 +3,17 @@
 Pi's interactive mode provides a full-screen terminal UI for chatting, streaming
 responses, and managing sessions.
 
+## Stacks and launch flags
+
+| Invocation | Stack | Notes |
+|---|---|---|
+| `pi` | FrankenTUI (`ftui`, default since v0.4.0) | Alternate screen; markdown render cache; busy spinner chain; inline ask cards |
+| `pi --inline` | FrankenTUI, inline | UI drawn at the bottom of the terminal; shell scrollback preserved |
+| `pi --classic` | charmed_rust / bubbletea (`src/interactive.rs`) | Previous stack, kept until removal; aliases `--classic-tui`, `--charmed`, `--bubbletea` |
+
+Both stacks share the agent-event vocabulary (`PiMsg`), keybinding catalog,
+slash commands, autocomplete, overlays, and session persistence.
+
 ## Layout
 
 ### Header
@@ -72,7 +83,7 @@ command surface implemented in `src/interactive.rs`.
 | `/logout [provider]` | Remove stored OAuth credentials. |
 | `/clear` (`/cls`) | Clear conversation view/history. |
 | `/model [id|provider/id]` (`/m`) | Show or change the current model. |
-| `/thinking [level]` (`/think`, `/t`) | Set thinking level (`off|minimal|low|medium|high|xhigh`). |
+| `/thinking [level]` (`/think`, `/t`) | Set thinking level (`off|minimal|low|medium|high|xhigh|max`). |
 | `/scoped-models [patterns\|clear]` (`/scoped`) | Show or set model patterns used for Ctrl+P cycling. |
 | `/history` (`/hist`) | Show input history. |
 | `/export [path]` | Export conversation to HTML. |
@@ -90,7 +101,7 @@ command surface implemented in `src/interactive.rs`.
 | `/compact [notes]` | Compact older context with optional instructions. |
 | `/reload` | Reload skills/prompts from disk. |
 | `/template <name> [args]` | Expand a prompt template by name. |
-| `/share` | Upload session HTML to a secret GitHub gist and show URL. |
+| `/share` | Upload the current branch as bounded HTML to a secret, unlisted GitHub gist and show its URL. Secret gists are not private; anyone with the URL can view them. Pi redacts recognized secrets and the exact workspace cwd, but the transcript may still contain other sensitive local context. |
 | `/exit` (`/quit`, `/q`) | Exit Pi. |
 
 ### Model selection

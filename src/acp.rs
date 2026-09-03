@@ -45,7 +45,7 @@ use crate::session::{Session, SessionStoreKind};
 use crate::tools::ToolRegistry;
 use asupersync::channel::oneshot;
 use asupersync::runtime::RuntimeHandle;
-use asupersync::sync::Mutex;
+use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::time::{timeout, wall_now};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -634,10 +634,10 @@ async fn run(
                     continue;
                 };
 
-                if let Ok(guard) = active_prompts.lock(&cx).await {
-                    if let Some(handle) = guard.get(&session_id) {
-                        handle.abort();
-                    }
+                if let Ok(guard) = active_prompts.lock(&cx).await
+                    && let Some(handle) = guard.get(&session_id)
+                {
+                    handle.abort();
                 }
 
                 if request.id.is_some() {
@@ -1118,8 +1118,9 @@ async fn validate_file_path(
         }
     };
 
-    let guard = sessions
-        .lock(cx)
+    // OwnedMutexGuard: the sessions guard is held across the per-session
+    // lock awaits below, and the borrowed guard is !Send (future_not_send).
+    let guard = OwnedMutexGuard::lock(Arc::clone(sessions), cx)
         .await
         .map_err(|e| format!("Lock failed: {e}"))?;
 
@@ -1130,7 +1131,7 @@ async fn validate_file_path(
     let allowed_cwds: Vec<PathBuf> = if let Some(sid) = session_id {
         match guard.get(sid) {
             Some(state) => {
-                if let Ok(s) = state.lock(cx).await {
+                if let Ok(s) = OwnedMutexGuard::lock(Arc::clone(state), cx).await {
                     vec![s.cwd.clone()]
                 } else {
                     return Err("Session lock failed".to_string());
@@ -1141,7 +1142,7 @@ async fn validate_file_path(
     } else {
         let mut cwds = Vec::new();
         for state in guard.values() {
-            if let Ok(s) = state.lock(cx).await {
+            if let Ok(s) = OwnedMutexGuard::lock(Arc::clone(state), cx).await {
                 cwds.push(s.cwd.clone());
             }
         }
@@ -1150,10 +1151,10 @@ async fn validate_file_path(
 
     // Canonicalize each cwd and check if the resolved path starts with it.
     for cwd in &allowed_cwds {
-        if let Ok(canonical_cwd) = cwd.canonicalize() {
-            if resolved.starts_with(&canonical_cwd) {
-                return Ok(());
-            }
+        if let Ok(canonical_cwd) = cwd.canonicalize()
+            && resolved.starts_with(&canonical_cwd)
+        {
+            return Ok(());
         }
         // Also check without canonicalization for cwd (it may not exist on disk).
         if resolved.starts_with(cwd) {
@@ -1206,31 +1207,27 @@ fn select_acp_model_entry(config: &Config, available_models: &[ModelEntry]) -> O
     if let (Some(default_provider), Some(default_model)) = (
         config.default_provider.as_deref(),
         config.default_model.as_deref(),
-    ) {
-        if let Some(entry) = available_models.iter().find(|entry| {
-            provider_ids_match(&entry.model.provider, default_provider)
-                && entry.model.id.eq_ignore_ascii_case(default_model)
-        }) {
-            return Some(entry.clone());
-        }
+    ) && let Some(entry) = available_models.iter().find(|entry| {
+        provider_ids_match(&entry.model.provider, default_provider)
+            && entry.model.id.eq_ignore_ascii_case(default_model)
+    }) {
+        return Some(entry.clone());
     }
 
-    if let Some(default_provider) = config.default_provider.as_deref() {
-        if let Some(entry) = available_models
+    if let Some(default_provider) = config.default_provider.as_deref()
+        && let Some(entry) = available_models
             .iter()
             .find(|entry| provider_ids_match(&entry.model.provider, default_provider))
-        {
-            return Some(entry.clone());
-        }
+    {
+        return Some(entry.clone());
     }
 
-    if let Some(default_model) = config.default_model.as_deref() {
-        if let Some(entry) = available_models
+    if let Some(default_model) = config.default_model.as_deref()
+        && let Some(entry) = available_models
             .iter()
             .find(|entry| entry.model.id.eq_ignore_ascii_case(default_model))
-        {
-            return Some(entry.clone());
-        }
+    {
+        return Some(entry.clone());
     }
 
     available_models.first().cloned()
@@ -1281,10 +1278,10 @@ fn build_acp_system_prompt(cwd: &std::path::Path, enabled_tools: &[&str]) -> Str
     // Load project context files (pi.md, AGENTS.md) if they exist.
     for filename in &["pi.md", "AGENTS.md", ".pi"] {
         let path = cwd.join(filename);
-        if path.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                let _ = write!(prompt, "\n## {filename}\n\n{content}\n\n");
-            }
+        if path.is_file()
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            let _ = write!(prompt, "\n## {filename}\n\n{content}\n\n");
         }
     }
 
@@ -1375,9 +1372,19 @@ fn handle_session_new(
         max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
         stream_options,
         block_images: options.config.image_block_images(),
+        model_accepts_images: model_entry
+            .model
+            .input
+            .contains(&crate::provider::InputType::Image),
         fail_closed_hooks: options.config.fail_closed_hooks(),
         tool_approval: permission_client
             .map(|client| client.handler_for_session(session_id.clone())),
+        keyword_settings: options.config.keywords.clone(),
+        max_time: None,
+        turn_recovery: options.config.turn_recovery_mode(),
+        approval_state: None,
+        bash_settings: options.config.bash.clone(),
+        secrets: None,
     };
 
     let agent = crate::agent::Agent::new(provider, tools, agent_config);
@@ -1386,6 +1393,8 @@ fn handle_session_new(
         enabled: options.config.compaction_enabled(),
         reserve_tokens: options.config.compaction_reserve_tokens(),
         keep_recent_tokens: options.config.compaction_keep_recent_tokens(),
+        mode: options.config.compaction_mode(),
+        render_mode: options.config.compaction_render_mode(),
         context_window_tokens: if model_entry.model.context_window == 0 {
             ResolvedCompactionSettings::default().context_window_tokens
         } else {
@@ -1428,7 +1437,7 @@ fn handle_session_new(
 //   * thinking level     — controls reasoning effort. Accepted option names:
 //                          `thought_level`, `thinking_level`, `thinking`,
 //                          `reasoning`, `effort`, `reasoning_effort`. Values:
-//                          off|none|minimal|low|medium|high|xhigh (the level is
+//                          off|none|minimal|low|medium|high|xhigh|max (the level is
 //                          clamped to what the active model supports — e.g. a
 //                          non-reasoning model is forced to `off`).
 //
@@ -1523,13 +1532,13 @@ fn parse_config_option(
             });
             let Some(raw) = raw else {
                 return Err(format!(
-                    "Invalid value for config option '{name}': expected a string or integer thinking level (off|minimal|low|medium|high|xhigh)"
+                    "Invalid value for config option '{name}': expected a string or integer thinking level (off|minimal|low|medium|high|xhigh|max)"
                 ));
             };
             raw.parse::<crate::model::ThinkingLevel>().map_or_else(
                 |_| {
                     Err(format!(
-                        "Invalid value for config option '{name}': '{raw}' (expected off|minimal|low|medium|high|xhigh)"
+                        "Invalid value for config option '{name}': '{raw}' (expected off|minimal|low|medium|high|xhigh|max)"
                     ))
                 },
                 |level| Ok(RuntimeConfigOption::ThinkingLevel(level)),
@@ -1552,7 +1561,9 @@ async fn apply_set_model(
     model: &str,
     cx: &AgentCx,
 ) -> std::result::Result<(String, String), String> {
-    let Ok(mut guard) = session_state.lock(cx).await else {
+    // OwnedMutexGuard: the guard is held across the awaits below, and the
+    // borrowed MutexGuard is !Send (clippy::future_not_send).
+    let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(session_state), cx).await else {
         return Err("session state lock unavailable".to_string());
     };
     let Some(agent_session) = guard.agent_session.as_mut() else {
@@ -1571,7 +1582,8 @@ async fn apply_set_config_option(
     option: RuntimeConfigOption,
     cx: &AgentCx,
 ) -> std::result::Result<(), String> {
-    let Ok(mut guard) = session_state.lock(cx).await else {
+    // OwnedMutexGuard: held across the set_* awaits below (future_not_send).
+    let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(session_state), cx).await else {
         return Err("session state lock unavailable".to_string());
     };
     let Some(agent_session) = guard.agent_session.as_mut() else {
@@ -1639,7 +1651,9 @@ const ACP_STOP_REASON_ERROR: &str = "end_turn";
 const fn map_stop_reason(reason: crate::model::StopReason) -> &'static str {
     use crate::model::StopReason;
     match reason {
-        StopReason::Stop | StopReason::ToolUse => ACP_STOP_REASON_END_TURN,
+        StopReason::Stop | StopReason::ToolUse | StopReason::PauseTurn | StopReason::Refusal => {
+            ACP_STOP_REASON_END_TURN
+        }
         StopReason::Length => ACP_STOP_REASON_MAX_TOKENS,
         StopReason::Aborted => ACP_STOP_REASON_CANCELLED,
         StopReason::Error => ACP_STOP_REASON_ERROR,
@@ -2440,8 +2454,15 @@ mod tests {
                 max_tool_iterations: 50,
                 stream_options: StreamOptions::default(),
                 block_images: false,
+                model_accepts_images: true,
                 fail_closed_hooks: false,
                 tool_approval: None,
+                keyword_settings: None,
+                max_time: None,
+                turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
+                approval_state: None,
+                bash_settings: None,
+                secrets: None,
             },
         );
 

@@ -1,136 +1,31 @@
 {
   "schema": "pi.ext.health_delta.v1",
-  "generated_at": "2026-05-13T03:37:59.568Z",
-  "baseline_path": "/data/projects/pi_agent_rust/tests/ext_conformance/reports/conformance_baseline.json",
-  "baseline_date": "2026-02-07T23:31:53Z",
+  "generated_at": "2026-08-17T17:05:27.000Z",
+  "baseline_path": "/Users/jemanuel/projects/pi_agent_rust/.claude/worktrees/fsqlite-cutover/tests/ext_conformance/reports/conformance_baseline.json",
+  "baseline_date": "2026-08-04T03:26:54Z",
   "current_summary": {
     "excluded": 1,
-    "failed": 0,
-    "manifest_count": 224,
-    "pass_rate_pct": 100.0,
-    "passed": 223,
+    "failed": 10,
+    "manifest_count": 227,
+    "pass_rate_pct": 95.57522123893806,
+    "passed": 216,
     "skipped": 1,
-    "tested": 223
+    "tested": 226
   },
   "baseline_summary": {
-    "failed": 14,
-    "pass_rate_pct": 93.7,
-    "passed": 209,
+    "failed": 0,
+    "pass_rate_pct": 100.0,
+    "passed": 223,
     "tested": 223
   },
   "aggregate_delta": {
-    "fail_delta": -14,
-    "net_change": 13,
-    "pass_delta": 14,
-    "rate_delta_pct": 6.299999999999997
+    "fail_delta": 10,
+    "net_change": 0,
+    "pass_delta": -7,
+    "rate_delta_pct": -4.424778761061944
   },
   "regressions": [],
-  "fixes": [
-    {
-      "id": "community/nicobailon-interview-tool",
-      "tier": 4,
-      "delta_type": "fix",
-      "current_status": "pass",
-      "baseline_status": "fail",
-      "baseline_failure_reason": "Extension crashes during initialization (missing data, broken API, FS dependency)."
-    },
-    {
-      "id": "community/qualisero-background-notify",
-      "tier": 3,
-      "delta_type": "fix",
-      "current_status": "pass",
-      "baseline_status": "fail",
-      "baseline_failure_reason": "Extension uses relative imports to unbundled sibling/parent modules."
-    },
-    {
-      "id": "community/qualisero-pi-agent-scip",
-      "tier": 3,
-      "delta_type": "fix",
-      "current_status": "pass",
-      "baseline_status": "fail",
-      "baseline_failure_reason": "Extension uses relative imports to unbundled sibling/parent modules."
-    },
-    {
-      "id": "community/qualisero-safe-git",
-      "tier": 3,
-      "delta_type": "fix",
-      "current_status": "pass",
-      "baseline_status": "fail",
-      "baseline_failure_reason": "Extension uses relative imports to unbundled sibling/parent modules."
-    },
-    {
-      "id": "npm/aliou-pi-guardrails",
-      "tier": 3,
-      "delta_type": "fix",
-      "current_status": "pass",
-      "baseline_status": "fail",
-      "baseline_failure_reason": "Extension crashes during initialization (missing data, broken API, FS dependency)."
-    },
-    {
-      "id": "npm/aliou-pi-processes",
-      "tier": 3,
-      "delta_type": "fix",
-      "current_status": "pass",
-      "baseline_status": "fail",
-      "baseline_failure_reason": "Extension uses relative imports to unbundled sibling/parent modules."
-    },
-    {
-      "id": "npm/aliou-pi-toolchain",
-      "tier": 3,
-      "delta_type": "fix",
-      "current_status": "pass",
-      "baseline_status": "fail",
-      "baseline_failure_reason": "Extension crashes during initialization (missing data, broken API, FS dependency)."
-    },
-    {
-      "id": "npm/marckrenn-pi-sub-core",
-      "tier": 3,
-      "delta_type": "fix",
-      "current_status": "pass",
-      "baseline_status": "fail",
-      "baseline_failure_reason": "Extension crashes during initialization (missing data, broken API, FS dependency)."
-    },
-    {
-      "id": "npm/pi-search-agent",
-      "tier": 3,
-      "delta_type": "fix",
-      "current_status": "pass",
-      "baseline_status": "fail",
-      "baseline_failure_reason": "Extension requires an npm package not available as a virtual module stub."
-    },
-    {
-      "id": "npm/pi-wakatime",
-      "tier": 3,
-      "delta_type": "fix",
-      "current_status": "pass",
-      "baseline_status": "fail",
-      "baseline_failure_reason": "Extension requires an npm package not available as a virtual module stub."
-    },
-    {
-      "id": "npm/pi-web-access",
-      "tier": 3,
-      "delta_type": "fix",
-      "current_status": "pass",
-      "baseline_status": "fail",
-      "baseline_failure_reason": "Extension requires an npm package not available as a virtual module stub."
-    },
-    {
-      "id": "npm/qualisero-pi-agent-scip",
-      "tier": 3,
-      "delta_type": "fix",
-      "current_status": "pass",
-      "baseline_status": "fail",
-      "baseline_failure_reason": "Extension requires an npm package not available as a virtual module stub."
-    },
-    {
-      "id": "third-party/qualisero-pi-agent-scip",
-      "tier": 3,
-      "delta_type": "fix",
-      "current_status": "pass",
-      "baseline_status": "fail",
-      "baseline_failure_reason": "Extension requires an npm package not available as a virtual module stub."
-    }
-  ],
+  "fixes": [],
   "new_extensions": [
     {
       "id": "agents-mikeastock/extensions",
@@ -331,6 +226,12 @@
       "current_status": "pass"
     },
     {
+      "id": "community/nicobailon-interview-tool",
+      "tier": 4,
+      "delta_type": "new_pass",
+      "current_status": "pass"
+    },
+    {
       "id": "community/nicobailon-mcp-adapter",
       "tier": 3,
       "delta_type": "new_pass",
@@ -397,8 +298,26 @@
       "current_status": "pass"
     },
     {
+      "id": "community/qualisero-background-notify",
+      "tier": 3,
+      "delta_type": "new_pass",
+      "current_status": "pass"
+    },
+    {
       "id": "community/qualisero-compact-config",
       "tier": 2,
+      "delta_type": "new_pass",
+      "current_status": "pass"
+    },
+    {
+      "id": "community/qualisero-pi-agent-scip",
+      "tier": 3,
+      "delta_type": "new_pass",
+      "current_status": "pass"
+    },
+    {
+      "id": "community/qualisero-safe-git",
+      "tier": 3,
       "delta_type": "new_pass",
       "current_status": "pass"
     },
@@ -651,11 +570,18 @@
     {
       "id": "npm/agentsbox",
       "tier": 3,
+      "delta_type": "new_failure",
+      "current_status": "fail",
+      "failure_reason": "Extension 'npm/agentsbox': manifest commands capability=false, but runtime registered 3 commands: {\"agentsbox-help\", \"agentsbox-search\", \"agentsbox-status\"}"
+    },
+    {
+      "id": "npm/aliou-pi-extension-dev",
+      "tier": 3,
       "delta_type": "new_pass",
       "current_status": "pass"
     },
     {
-      "id": "npm/aliou-pi-extension-dev",
+      "id": "npm/aliou-pi-guardrails",
       "tier": 3,
       "delta_type": "new_pass",
       "current_status": "pass"
@@ -667,7 +593,19 @@
       "current_status": "pass"
     },
     {
+      "id": "npm/aliou-pi-processes",
+      "tier": 3,
+      "delta_type": "new_pass",
+      "current_status": "pass"
+    },
+    {
       "id": "npm/aliou-pi-synthetic",
+      "tier": 3,
+      "delta_type": "new_pass",
+      "current_status": "pass"
+    },
+    {
+      "id": "npm/aliou-pi-toolchain",
       "tier": 3,
       "delta_type": "new_pass",
       "current_status": "pass"
@@ -729,14 +667,22 @@
     {
       "id": "npm/marckrenn-pi-sub-bar",
       "tier": 3,
+      "delta_type": "new_failure",
+      "current_status": "fail",
+      "failure_reason": "Extension 'npm/marckrenn-pi-sub-bar': runtime commands identities differ from the manifest; missing declared identities=[\"sub-core:settings\"], unexpected runtime identities=[], expected={\"sub-bar:import\", \"sub-bar:settings\", \"sub-core:settings\"}, actual={\"sub-bar:import\", \"sub-bar:settings\"}"
+    },
+    {
+      "id": "npm/marckrenn-pi-sub-core",
+      "tier": 3,
       "delta_type": "new_pass",
       "current_status": "pass"
     },
     {
       "id": "npm/mitsupi",
       "tier": 5,
-      "delta_type": "new_pass",
-      "current_status": "pass"
+      "delta_type": "new_failure",
+      "current_status": "fail",
+      "failure_reason": "Extension 'npm/mitsupi': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"session-control\"], expected={}, actual={\"session-control\"}"
     },
     {
       "id": "npm/ogulcancelik-pi-sketch",
@@ -747,8 +693,9 @@
     {
       "id": "npm/oh-my-pi-basics",
       "tier": 3,
-      "delta_type": "new_pass",
-      "current_status": "pass"
+      "delta_type": "new_failure",
+      "current_status": "fail",
+      "failure_reason": "Extension 'npm/oh-my-pi-basics': event-handler identities differ from the manifest; expected={\"close\", \"data\", \"error\", \"session_start\"}, actual={\"session_start\"}"
     },
     {
       "id": "npm/permission-pi",
@@ -801,8 +748,9 @@
     {
       "id": "npm/pi-extensions",
       "tier": 3,
-      "delta_type": "new_pass",
-      "current_status": "pass"
+      "delta_type": "new_failure",
+      "current_status": "fail",
+      "failure_reason": "Extension 'npm/pi-extensions': event-handler identities differ from the manifest; expected={\"agent_end\", \"before_agent_start\", \"session_shutdown\", \"session_start\", \"session_switch\", \"tool_result\"}, actual={\"agent_end\", \"agent_start\", \"before_agent_start\", \"session_shutdown\", \"session_start\", \"session_switch\", \"tool_call\", \"tool_result\", \"turn_start\"}"
     },
     {
       "id": "npm/pi-ghostty-theme-sync",
@@ -813,8 +761,9 @@
     {
       "id": "npm/pi-interactive-shell",
       "tier": 3,
-      "delta_type": "new_pass",
-      "current_status": "pass"
+      "delta_type": "new_failure",
+      "current_status": "fail",
+      "failure_reason": "Extension 'npm/pi-interactive-shell': runtime tools identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"interactive_shell\"], expected={}, actual={\"interactive_shell\"}"
     },
     {
       "id": "npm/pi-interview",
@@ -825,8 +774,9 @@
     {
       "id": "npm/pi-mcp-adapter",
       "tier": 3,
-      "delta_type": "new_pass",
-      "current_status": "pass"
+      "delta_type": "new_failure",
+      "current_status": "fail",
+      "failure_reason": "Extension 'npm/pi-mcp-adapter': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"mcp-config\"], expected={}, actual={\"mcp-config\"}"
     },
     {
       "id": "npm/pi-md-export",
@@ -885,8 +835,9 @@
     {
       "id": "npm/pi-powerline-footer",
       "tier": 3,
-      "delta_type": "new_pass",
-      "current_status": "pass"
+      "delta_type": "new_failure",
+      "current_status": "fail",
+      "failure_reason": "Extension 'npm/pi-powerline-footer': event-handler identities differ from the manifest; expected={\"agent_end\", \"agent_start\", \"before_agent_start\", \"close\", \"data\", \"error\", \"session_start\", \"tool_call\", \"tool_result\", \"user_bash\", \"user_message\"}, actual={\"agent_end\", \"agent_start\", \"before_agent_start\", \"session_start\", \"tool_call\", \"tool_result\", \"user_bash\", \"user_message\"}"
     },
     {
       "id": "npm/pi-prompt-template-model",
@@ -908,6 +859,12 @@
     },
     {
       "id": "npm/pi-screenshots-picker",
+      "tier": 3,
+      "delta_type": "new_pass",
+      "current_status": "pass"
+    },
+    {
+      "id": "npm/pi-search-agent",
       "tier": 3,
       "delta_type": "new_pass",
       "current_status": "pass"
@@ -967,7 +924,25 @@
       "current_status": "pass"
     },
     {
+      "id": "npm/pi-wakatime",
+      "tier": 3,
+      "delta_type": "new_pass",
+      "current_status": "pass"
+    },
+    {
       "id": "npm/pi-watch",
+      "tier": 3,
+      "delta_type": "new_pass",
+      "current_status": "pass"
+    },
+    {
+      "id": "npm/pi-web-access",
+      "tier": 3,
+      "delta_type": "new_pass",
+      "current_status": "pass"
+    },
+    {
+      "id": "npm/qualisero-pi-agent-scip",
       "tier": 3,
       "delta_type": "new_pass",
       "current_status": "pass"
@@ -987,8 +962,9 @@
     {
       "id": "npm/shitty-extensions",
       "tier": 3,
-      "delta_type": "new_pass",
-      "current_status": "pass"
+      "delta_type": "new_failure",
+      "current_status": "fail",
+      "failure_reason": "Extension 'npm/shitty-extensions': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"plan\"], expected={}, actual={\"plan\"}"
     },
     {
       "id": "npm/tmustier-pi-arcade",
@@ -1071,6 +1047,18 @@
     {
       "id": "permission-gate",
       "tier": 2,
+      "delta_type": "new_pass",
+      "current_status": "pass"
+    },
+    {
+      "id": "pi_ai_fail_closed",
+      "tier": 1,
+      "delta_type": "new_pass",
+      "current_status": "pass"
+    },
+    {
+      "id": "pi_ai_provider_bridge",
+      "tier": 1,
       "delta_type": "new_pass",
       "current_status": "pass"
     },
@@ -1261,6 +1249,12 @@
       "current_status": "pass"
     },
     {
+      "id": "third-party/lll9p-pi-better-compaction",
+      "tier": 3,
+      "delta_type": "new_pass",
+      "current_status": "pass"
+    },
+    {
       "id": "third-party/lsj5031-pi-notification-extension",
       "tier": 2,
       "delta_type": "new_pass",
@@ -1269,8 +1263,9 @@
     {
       "id": "third-party/marckrenn-pi-sub",
       "tier": 3,
-      "delta_type": "new_pass",
-      "current_status": "pass"
+      "delta_type": "new_failure",
+      "current_status": "fail",
+      "failure_reason": "Extension 'third-party/marckrenn-pi-sub': runtime commands identities differ from the manifest; missing declared identities=[\"sub-core:settings\"], unexpected runtime identities=[], expected={\"sub-bar:import\", \"sub-bar:settings\", \"sub-core:settings\"}, actual={\"sub-bar:import\", \"sub-bar:settings\"}"
     },
     {
       "id": "third-party/michalvavra-agents",
@@ -1292,6 +1287,12 @@
     },
     {
       "id": "third-party/pasky-pi-amplike",
+      "tier": 3,
+      "delta_type": "new_pass",
+      "current_status": "pass"
+    },
+    {
+      "id": "third-party/qualisero-pi-agent-scip",
       "tier": 3,
       "delta_type": "new_pass",
       "current_status": "pass"
@@ -1403,6 +1404,6 @@
     }
   ],
   "total_regressions": 0,
-  "total_fixes": 13,
-  "net_change": 13
+  "total_fixes": 0,
+  "net_change": 0
 }

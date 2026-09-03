@@ -10,6 +10,7 @@ pub(super) struct InteractiveExtensionHostActions {
     pub(super) extension_streaming: Arc<AtomicBool>,
     pub(super) user_queue: Arc<StdMutex<InteractiveMessageQueue>>,
     pub(super) injected_queue: Arc<StdMutex<InjectedMessageQueue>>,
+    pub(super) session_action_admission: SessionActionAdmissionGate,
 }
 
 impl InteractiveExtensionHostActions {
@@ -18,6 +19,13 @@ impl InteractiveExtensionHostActions {
         trigger_turn: bool,
     ) -> bool {
         trigger_turn && !matches!(deliver_as, Some(ExtensionDeliverAs::NextTurn))
+    }
+
+    async fn acquire_session_action_admission(
+        &self,
+        origin: Option<crate::extensions::SessionActionOrigin>,
+    ) -> crate::error::Result<OwnedMutexGuard<()>> {
+        acquire_session_action_admission(&self.session_action_admission, origin).await
     }
 
     #[allow(clippy::unnecessary_wraps)]
@@ -41,21 +49,45 @@ impl InteractiveExtensionHostActions {
         Ok(())
     }
 
-    async fn append_to_session(&self, message: ModelMessage) -> crate::error::Result<()> {
+    async fn append_idle_message(&self, message: ModelMessage) -> crate::error::Result<String> {
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
-        let mut session_guard = self
-            .session
+        // Match session-transition lock order (Agent, then Session) and hold
+        // both through the mutation so an idle extension message cannot land
+        // in one session log and another session's Agent history.
+        let mut agent_guard = self
+            .agent
             .lock(&cx)
             .await
             .map_err(|e| crate::error::Error::session(e.to_string()))?;
-        session_guard.append_model_message(message);
-        Ok(())
+        let Ok(mut session_guard) = self.session.try_lock() else {
+            return Err(crate::error::Error::session(
+                "session busy while delivering an extension message".to_string(),
+            ));
+        };
+        let session_id = session_guard.header.id.clone();
+        session_guard.append_model_message(message.clone());
+        agent_guard.add_message(message);
+        Ok(session_id)
+    }
+
+    fn current_session_id(&self) -> crate::error::Result<String> {
+        let Ok(session) = self.session.try_lock() else {
+            return Err(crate::error::Error::session(
+                "session busy while queuing extension input".to_string(),
+            ));
+        };
+        Ok(session.header.id.clone())
     }
 }
 
 #[async_trait]
 impl ExtensionHostActions for InteractiveExtensionHostActions {
-    async fn send_message(&self, message: ExtensionSendMessage) -> crate::error::Result<()> {
+    async fn send_message(
+        &self,
+        message: ExtensionSendMessage,
+        origin: Option<crate::extensions::SessionActionOrigin>,
+    ) -> crate::error::Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission(origin).await?;
         let custom_message = ModelMessage::Custom(CustomMessage {
             content: message.content,
             custom_type: message.custom_type,
@@ -69,42 +101,48 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
         if is_streaming {
             // Queue into the agent loop; session persistence happens when the message is delivered.
             self.queue_custom_message(message.deliver_as, custom_message.clone())?;
-            if let ModelMessage::Custom(custom) = &custom_message {
-                if custom.display {
-                    let _ = enqueue_pi_event(
-                        &self.event_tx,
-                        &cx,
-                        PiMsg::SystemNote(custom.content.clone()),
-                    )
-                    .await;
-                }
+            if let ModelMessage::Custom(custom) = &custom_message
+                && custom.display
+            {
+                let owner_session_id = self.current_session_id()?;
+                let _ = enqueue_pi_event(
+                    &self.event_tx,
+                    &cx,
+                    PiMsg::SessionSystemNote {
+                        owner_session_id,
+                        message: custom.content.clone(),
+                    },
+                )
+                .await;
             }
             return Ok(());
         }
 
         // Agent is idle: persist immediately and update in-memory history so it affects the next run.
-        self.append_to_session(custom_message.clone()).await?;
+        let session_id = self.append_idle_message(custom_message.clone()).await?;
 
-        if let Ok(mut agent_guard) = self.agent.lock(&cx).await {
-            agent_guard.add_message(custom_message.clone());
-        }
-
-        if let ModelMessage::Custom(custom) = &custom_message {
-            if custom.display {
-                let _ = enqueue_pi_event(
-                    &self.event_tx,
-                    &cx,
-                    PiMsg::SystemNote(custom.content.clone()),
-                )
-                .await;
-            }
+        if let ModelMessage::Custom(custom) = &custom_message
+            && custom.display
+        {
+            let _ = enqueue_pi_event(
+                &self.event_tx,
+                &cx,
+                PiMsg::SessionSystemNote {
+                    owner_session_id: session_id.clone(),
+                    message: custom.content.clone(),
+                },
+            )
+            .await;
         }
 
         if Self::should_trigger_turn(message.deliver_as, message.trigger_turn) {
             let _ = enqueue_pi_event(
                 &self.event_tx,
                 &cx,
-                PiMsg::EnqueuePendingInput(PendingInput::Continue),
+                PiMsg::EnqueuePendingInput {
+                    session_id,
+                    input: PendingInput::Continue,
+                },
             )
             .await;
         }
@@ -115,27 +153,34 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
     async fn send_user_message(
         &self,
         message: ExtensionSendUserMessage,
+        origin: Option<crate::extensions::SessionActionOrigin>,
     ) -> crate::error::Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission(origin).await?;
         let is_streaming = self.extension_streaming.load(Ordering::SeqCst);
         if is_streaming {
             let deliver_as = message.deliver_as.unwrap_or(ExtensionDeliverAs::Steer);
             let Ok(mut queue) = self.user_queue.lock() else {
                 return Ok(());
             };
+            let queued = QueuedAgentMessage::generated(build_user_message(message.text));
             match deliver_as {
-                ExtensionDeliverAs::FollowUp => queue.push_follow_up(message.text),
+                ExtensionDeliverAs::FollowUp => queue.push_follow_up(queued),
                 ExtensionDeliverAs::Steer | ExtensionDeliverAs::NextTurn => {
-                    queue.push_steering(message.text);
+                    queue.push_steering(queued);
                 }
             }
             return Ok(());
         }
 
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
+        let session_id = self.current_session_id()?;
         let _ = enqueue_pi_event(
             &self.event_tx,
             &cx,
-            PiMsg::EnqueuePendingInput(PendingInput::Text(message.text)),
+            PiMsg::EnqueuePendingInput {
+                session_id,
+                input: PendingInput::GeneratedText(message.text),
+            },
         )
         .await;
         Ok(())
@@ -149,6 +194,24 @@ pub(super) struct InteractiveExtensionSession {
     pub(super) is_compacting: Arc<AtomicBool>,
     pub(super) config: Config,
     pub(super) save_enabled: bool,
+    pub(super) session_action_admission: SessionActionAdmissionGate,
+}
+
+async fn acquire_session_action_admission(
+    gate: &SessionActionAdmissionGate,
+    origin: Option<crate::extensions::SessionActionOrigin>,
+) -> crate::error::Result<OwnedMutexGuard<()>> {
+    let origin = origin.ok_or_else(|| {
+        crate::error::Error::session("extension Session action is missing trusted task provenance")
+    })?;
+    let cx = crate::agent_cx::AgentCx::for_current_or_request();
+    let permit = gate.acquire(cx.cx()).await?;
+    if !gate.origin_source().accepts(&origin) {
+        return Err(crate::error::Error::session(
+            "active Session changed before the extension action could be applied",
+        ));
+    }
+    Ok(permit)
 }
 
 fn current_path_model_pair(session: &Session) -> Option<(String, String)> {
@@ -183,6 +246,21 @@ fn session_model_state_value(shared_model: &ModelEntry, session: &Session) -> Va
     }
 }
 
+impl InteractiveExtensionSession {
+    async fn acquire_session_action_admission(
+        &self,
+        origin: Option<crate::extensions::SessionActionOrigin>,
+    ) -> crate::error::Result<OwnedMutexGuard<()>> {
+        acquire_session_action_admission(&self.session_action_admission, origin).await
+    }
+}
+
+// Note on `OwnedMutexGuard` below: `asupersync::sync::MutexGuard` is `!Send` as
+// of asupersync 0.3.9, while `#[async_trait]` boxes every method here as
+// `dyn Future + Send`. The mutating methods hold the session lock across
+// `Session::save().await` — deliberately, so the mutation and its persist stay
+// one critical section — so they must take an *owned* guard, which is `Send`.
+// Read-only methods that never await under the lock keep the cheaper borrow.
 #[async_trait]
 impl ExtensionSession for InteractiveExtensionSession {
     async fn get_state(&self) -> Value {
@@ -335,12 +413,16 @@ impl ExtensionSession for InteractiveExtensionSession {
             .collect()
     }
 
-    async fn set_name(&self, name: String) -> crate::error::Result<()> {
+    async fn set_name(
+        &self,
+        name: String,
+        origin: Option<crate::extensions::SessionActionOrigin>,
+    ) -> crate::error::Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission(origin).await?;
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
-        let mut guard =
-            self.session.lock(&cx).await.map_err(|err| {
-                crate::error::Error::session(format!("session lock failed: {err}"))
-            })?;
+        let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
+            .await
+            .map_err(|err| crate::error::Error::session(format!("session lock failed: {err}")))?;
         guard.set_name(&name);
         if self.save_enabled {
             guard.save().await?;
@@ -348,12 +430,16 @@ impl ExtensionSession for InteractiveExtensionSession {
         Ok(())
     }
 
-    async fn append_message(&self, message: SessionMessage) -> crate::error::Result<()> {
+    async fn append_message(
+        &self,
+        message: SessionMessage,
+        origin: Option<crate::extensions::SessionActionOrigin>,
+    ) -> crate::error::Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission(origin).await?;
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
-        let mut guard =
-            self.session.lock(&cx).await.map_err(|err| {
-                crate::error::Error::session(format!("session lock failed: {err}"))
-            })?;
+        let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
+            .await
+            .map_err(|err| crate::error::Error::session(format!("session lock failed: {err}")))?;
         guard.append_message(message);
         if self.save_enabled {
             guard.save().await?;
@@ -365,17 +451,18 @@ impl ExtensionSession for InteractiveExtensionSession {
         &self,
         custom_type: String,
         data: Option<Value>,
+        origin: Option<crate::extensions::SessionActionOrigin>,
     ) -> crate::error::Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission(origin).await?;
         if custom_type.trim().is_empty() {
             return Err(crate::error::Error::validation(
                 "customType must not be empty",
             ));
         }
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
-        let mut guard =
-            self.session.lock(&cx).await.map_err(|err| {
-                crate::error::Error::session(format!("session lock failed: {err}"))
-            })?;
+        let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
+            .await
+            .map_err(|err| crate::error::Error::session(format!("session lock failed: {err}")))?;
         guard.append_custom_entry(custom_type, data);
         if self.save_enabled {
             guard.save().await?;
@@ -383,12 +470,17 @@ impl ExtensionSession for InteractiveExtensionSession {
         Ok(())
     }
 
-    async fn set_model(&self, provider: String, model_id: String) -> crate::error::Result<()> {
+    async fn set_model(
+        &self,
+        provider: String,
+        model_id: String,
+        origin: Option<crate::extensions::SessionActionOrigin>,
+    ) -> crate::error::Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission(origin).await?;
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
-        let mut guard =
-            self.session.lock(&cx).await.map_err(|err| {
-                crate::error::Error::session(format!("session lock failed: {err}"))
-            })?;
+        let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
+            .await
+            .map_err(|err| crate::error::Error::session(format!("session lock failed: {err}")))?;
         let normalized_provider = canonical_provider_id(&provider)
             .unwrap_or(&provider)
             .to_string();
@@ -419,13 +511,17 @@ impl ExtensionSession for InteractiveExtensionSession {
         current_path_model_fields(&guard)
     }
 
-    async fn set_thinking_level(&self, level: String) -> crate::error::Result<()> {
+    async fn set_thinking_level(
+        &self,
+        level: String,
+        origin: Option<crate::extensions::SessionActionOrigin>,
+    ) -> crate::error::Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission(origin).await?;
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
         let shared_model = self.model_entry.lock().map(|entry| entry.clone()).ok();
-        let mut guard =
-            self.session.lock(&cx).await.map_err(|err| {
-                crate::error::Error::session(format!("session lock failed: {err}"))
-            })?;
+        let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
+            .await
+            .map_err(|err| crate::error::Error::session(format!("session lock failed: {err}")))?;
         let effective_level = level.parse::<crate::model::ThinkingLevel>().map_or_else(
             |_| level.clone(),
             |parsed| match (shared_model.as_ref(), current_path_model_pair(&guard)) {
@@ -463,12 +559,13 @@ impl ExtensionSession for InteractiveExtensionSession {
         &self,
         target_id: String,
         label: Option<String>,
+        origin: Option<crate::extensions::SessionActionOrigin>,
     ) -> crate::error::Result<()> {
+        let _session_action_permit = self.acquire_session_action_admission(origin).await?;
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
-        let mut guard =
-            self.session.lock(&cx).await.map_err(|err| {
-                crate::error::Error::session(format!("session lock failed: {err}"))
-            })?;
+        let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
+            .await
+            .map_err(|err| crate::error::Error::session(format!("session lock failed: {err}")))?;
         if guard.add_label(&target_id, label).is_none() {
             return Err(crate::error::Error::validation(format!(
                 "target entry '{target_id}' not found in session"
@@ -493,16 +590,34 @@ pub fn format_extension_ui_prompt(request: &ExtensionUiRequest) -> String {
         .and_then(Value::as_str)
         .unwrap_or("");
 
-    // Show provenance: which extension is making this request.
-    let provenance = request
-        .extension_id
-        .as_deref()
+    // Capability provenance is host-authenticated metadata. Generic requests
+    // retain the explicit/payload fallback used by the extension UI protocol.
+    let capability_identity = request.capability_prompt_identity();
+    let provenance = capability_identity
+        .map(|(extension_id, _)| extension_id)
+        .or(request.extension_id.as_deref())
         .or_else(|| request.payload.get("extension_id").and_then(Value::as_str))
         .unwrap_or("unknown");
 
+    // This prompt is written directly to a terminal in the line-oriented
+    // surface. Sanitize every extension-controlled display string before
+    // formatting so OSC/DCS/CSI sequences cannot escape the prompt.
+    let title = super::tool_render::sanitize_terminal_line(title);
+    let message = super::tool_render::sanitize_terminal_text(message);
+    let provenance = super::tool_render::sanitize_terminal_line(provenance);
+    let capability = capability_identity
+        .map(|(_, capability)| super::tool_render::sanitize_terminal_line(capability));
+
     match request.method.as_str() {
         "confirm" => {
-            format!("[{provenance}] confirm: {title}\n{message}\n\nEnter yes/no, or 'cancel'.")
+            capability.as_deref().map_or_else(
+                || format!("[{provenance}] confirm: {title}\n{message}\n\nEnter yes/no, or 'cancel'."),
+                |capability| {
+                    format!(
+                        "[{provenance}] capability request: {capability}\n{message}\n\nEnter yes/no, or 'cancel'."
+                    )
+                },
+            )
         }
         "select" => {
             let options = request
@@ -524,6 +639,7 @@ pub fn format_extension_ui_prompt(request: &ExtensionUiRequest) -> String {
                     .or_else(|| opt.get("value").and_then(Value::as_str))
                     .or_else(|| opt.as_str())
                     .unwrap_or("");
+                let label = super::tool_render::sanitize_terminal_line(label);
                 let _ = writeln!(&mut out, "  {}) {label}", idx + 1);
             }
             out.push_str("\nEnter a number, label, or 'cancel'.");
@@ -560,7 +676,15 @@ pub fn parse_extension_ui_response(
             };
             Ok(ExtensionUiResponse {
                 id: request.id.clone(),
-                value: Some(Value::Bool(value)),
+                value: Some(if request.is_capability_prompt() {
+                    json!({
+                        "allow": value,
+                        "persist": false,
+                        "remember": false,
+                    })
+                } else {
+                    Value::Bool(value)
+                }),
                 cancelled: false,
             })
         }
@@ -573,32 +697,33 @@ pub fn parse_extension_ui_response(
                     "Invalid selection. Enter a number, label, or 'cancel'.".to_string()
                 })?;
 
-            if let Ok(index) = trimmed.parse::<usize>() {
-                if index > 0 && index <= options.len() {
-                    let chosen = &options[index - 1];
-                    let value = chosen
-                        .get("value")
-                        .cloned()
-                        .or_else(|| chosen.get("label").cloned())
-                        .or_else(|| chosen.as_str().map(|s| Value::String(s.to_string())));
-                    return Ok(ExtensionUiResponse {
-                        id: request.id.clone(),
-                        value,
-                        cancelled: false,
-                    });
-                }
+            if let Ok(index) = trimmed.parse::<usize>()
+                && index > 0
+                && index <= options.len()
+            {
+                let chosen = &options[index - 1];
+                let value = chosen
+                    .get("value")
+                    .cloned()
+                    .or_else(|| chosen.get("label").cloned())
+                    .or_else(|| chosen.as_str().map(|s| Value::String(s.to_string())));
+                return Ok(ExtensionUiResponse {
+                    id: request.id.clone(),
+                    value,
+                    cancelled: false,
+                });
             }
 
             let lowered = trimmed.to_lowercase();
             for option in options {
-                if let Some(value_str) = option.as_str() {
-                    if value_str.to_lowercase() == lowered {
-                        return Ok(ExtensionUiResponse {
-                            id: request.id.clone(),
-                            value: Some(Value::String(value_str.to_string())),
-                            cancelled: false,
-                        });
-                    }
+                if let Some(value_str) = option.as_str()
+                    && value_str.to_lowercase() == lowered
+                {
+                    return Ok(ExtensionUiResponse {
+                        id: request.id.clone(),
+                        value: Some(Value::String(value_str.to_string())),
+                        cancelled: false,
+                    });
                 }
 
                 let label = option.get("label").and_then(Value::as_str).unwrap_or("");
@@ -616,14 +741,14 @@ pub fn parse_extension_ui_response(
                     });
                 }
 
-                if let Some(value_str) = option.get("value").and_then(Value::as_str) {
-                    if value_str.to_lowercase() == lowered {
-                        return Ok(ExtensionUiResponse {
-                            id: request.id.clone(),
-                            value: Some(Value::String(value_str.to_string())),
-                            cancelled: false,
-                        });
-                    }
+                if let Some(value_str) = option.get("value").and_then(Value::as_str)
+                    && value_str.to_lowercase() == lowered
+                {
+                    return Ok(ExtensionUiResponse {
+                        id: request.id.clone(),
+                        value: Some(Value::String(value_str.to_string())),
+                        cancelled: false,
+                    });
                 }
             }
 
@@ -643,6 +768,8 @@ mod tests {
 
     use crate::agent::{Agent, AgentConfig};
     use crate::config::Config;
+    use crate::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
+    use crate::extensions_js::PiJsRuntimeConfig;
     use crate::model::StreamEvent;
     use crate::models::ModelEntry;
     use crate::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
@@ -718,6 +845,7 @@ mod tests {
                     QueueMode::OneAtATime,
                     QueueMode::OneAtATime,
                 ))),
+                session_action_admission: SessionActionAdmissionGate::default(),
             },
             event_rx,
             session,
@@ -754,6 +882,45 @@ mod tests {
     }
 
     #[test]
+    fn format_generic_confirm_sanitizes_hostile_title_on_one_line() {
+        let request = ExtensionUiRequest::new(
+            "req-confirm",
+            "confirm",
+            json!({
+                "title": "Approve\nforged\u{1b}]0;owned\u{7}\u{009b}31mred",
+                "message": "Continue?",
+            }),
+        )
+        .with_extension_id(Some("trusted-extension".to_string()));
+
+        assert_eq!(
+            format_extension_ui_prompt(&request),
+            "[trusted-extension] confirm: Approve forgedred\nContinue?\n\nEnter yes/no, or 'cancel'."
+        );
+    }
+
+    #[test]
+    fn format_generic_select_sanitizes_hostile_option_label_on_one_line() {
+        let request = ExtensionUiRequest::new(
+            "req-select",
+            "select",
+            json!({
+                "title": "Choose",
+                "options": [{
+                    "label": "First\nforged\u{009d}0;owned\u{009c}\tvisible",
+                    "value": "first",
+                }],
+            }),
+        )
+        .with_extension_id(Some("trusted-extension".to_string()));
+
+        assert_eq!(
+            format_extension_ui_prompt(&request),
+            "[trusted-extension] select: Choose\n  1) First forged visible\n\nEnter a number, label, or 'cancel'."
+        );
+    }
+
+    #[test]
     fn interactive_extension_session_get_messages_includes_custom_messages() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -780,6 +947,7 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                session_action_admission: SessionActionAdmissionGate::default(),
             };
 
             let messages = ext_session.get_messages().await;
@@ -820,6 +988,7 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                session_action_admission: SessionActionAdmissionGate::default(),
             };
 
             let hold_cx = Cx::for_request();
@@ -831,13 +1000,18 @@ mod tests {
             let inner = asupersync::time::timeout(
                 asupersync::time::wall_now(),
                 Duration::from_millis(100),
-                ext_session.set_name("cancelled-name".to_string()),
+                ext_session.set_name(
+                    "cancelled-name".to_string(),
+                    Some(ext_session.session_action_admission.capture_origin()),
+                ),
             )
             .await;
             let outcome = inner.expect("cancelled helper should finish before timeout");
             let err = outcome.expect_err("lock acquisition should honor inherited cancellation");
+            let message = err.to_string();
             assert!(
-                err.to_string().contains("session lock failed"),
+                message.contains("session lock failed")
+                    || message.contains("session action admission lock failed"),
                 "unexpected error: {err}"
             );
 
@@ -859,26 +1033,33 @@ mod tests {
             let (actions, mut event_rx, session, agent) = build_host_actions();
 
             actions
-                .send_message(ExtensionSendMessage {
-                    extension_id: Some("ext".to_string()),
-                    custom_type: "note".to_string(),
-                    content: "continue-now".to_string(),
-                    display: false,
-                    details: None,
-                    deliver_as: Some(ExtensionDeliverAs::Steer),
-                    trigger_turn: true,
-                })
+                .send_message(
+                    ExtensionSendMessage {
+                        extension_id: Some("ext".to_string()),
+                        custom_type: "note".to_string(),
+                        content: "continue-now".to_string(),
+                        display: false,
+                        details: None,
+                        deliver_as: Some(ExtensionDeliverAs::Steer),
+                        trigger_turn: true,
+                    },
+                    Some(actions.session_action_admission.capture_origin()),
+                )
                 .await
                 .expect("send_message");
 
             let queued = event_rx.try_recv().expect("continue should be queued");
-            assert!(matches!(
-                queued,
-                PiMsg::EnqueuePendingInput(PendingInput::Continue)
-            ));
+            let queued_session_id = match queued {
+                PiMsg::EnqueuePendingInput {
+                    session_id,
+                    input: PendingInput::Continue,
+                } => session_id,
+                other => panic!("unexpected queued event: {other:?}"),
+            };
 
             let cx = Cx::for_request();
             let session_guard = session.lock(&cx).await.expect("lock session");
+            assert_eq!(queued_session_id, session_guard.header.id);
             assert!(
                 session_guard
                     .to_messages_for_current_path()
@@ -914,15 +1095,18 @@ mod tests {
             let (actions, mut event_rx, _session, _agent) = build_host_actions();
 
             actions
-                .send_message(ExtensionSendMessage {
-                    extension_id: Some("ext".to_string()),
-                    custom_type: "note".to_string(),
-                    content: "defer".to_string(),
-                    display: false,
-                    details: None,
-                    deliver_as: Some(ExtensionDeliverAs::NextTurn),
-                    trigger_turn: true,
-                })
+                .send_message(
+                    ExtensionSendMessage {
+                        extension_id: Some("ext".to_string()),
+                        custom_type: "note".to_string(),
+                        content: "defer".to_string(),
+                        display: false,
+                        details: None,
+                        deliver_as: Some(ExtensionDeliverAs::NextTurn),
+                        trigger_turn: true,
+                    },
+                    Some(actions.session_action_admission.capture_origin()),
+                )
                 .await
                 .expect("send_message");
 
@@ -947,15 +1131,18 @@ mod tests {
                 .try_send(PiMsg::System("busy".to_string()))
                 .expect("fill bounded event channel");
 
-            let send_message = actions.send_message(ExtensionSendMessage {
-                extension_id: Some("ext".to_string()),
-                custom_type: "note".to_string(),
-                content: "visible".to_string(),
-                display: true,
-                details: None,
-                deliver_as: Some(ExtensionDeliverAs::Steer),
-                trigger_turn: false,
-            });
+            let send_message = actions.send_message(
+                ExtensionSendMessage {
+                    extension_id: Some("ext".to_string()),
+                    custom_type: "note".to_string(),
+                    content: "visible".to_string(),
+                    display: true,
+                    details: None,
+                    deliver_as: Some(ExtensionDeliverAs::Steer),
+                    trigger_turn: false,
+                },
+                Some(actions.session_action_admission.capture_origin()),
+            );
             let recv_cx = Cx::for_request();
             let recv_messages = async {
                 let first = event_rx.recv(&recv_cx).await.expect("busy message");
@@ -967,7 +1154,13 @@ mod tests {
 
             result.expect("send_message");
             assert!(matches!(first, PiMsg::System(text) if text == "busy"));
-            assert!(matches!(second, PiMsg::SystemNote(text) if text == "visible"));
+            assert!(matches!(
+                second,
+                PiMsg::SessionSystemNote {
+                    owner_session_id,
+                    message,
+                } if !owner_session_id.is_empty() && message == "visible"
+            ));
         });
     }
 
@@ -984,15 +1177,18 @@ mod tests {
                 .try_send(PiMsg::System("busy".to_string()))
                 .expect("fill bounded event channel");
 
-            let send_message = actions.send_message(ExtensionSendMessage {
-                extension_id: Some("ext".to_string()),
-                custom_type: "note".to_string(),
-                content: "continue-now".to_string(),
-                display: true,
-                details: None,
-                deliver_as: Some(ExtensionDeliverAs::Steer),
-                trigger_turn: true,
-            });
+            let send_message = actions.send_message(
+                ExtensionSendMessage {
+                    extension_id: Some("ext".to_string()),
+                    custom_type: "note".to_string(),
+                    content: "continue-now".to_string(),
+                    display: true,
+                    details: None,
+                    deliver_as: Some(ExtensionDeliverAs::Steer),
+                    trigger_turn: true,
+                },
+                Some(actions.session_action_admission.capture_origin()),
+            );
             let recv_cx = Cx::for_request();
             let recv_messages = async {
                 let first = event_rx.recv(&recv_cx).await.expect("busy message");
@@ -1005,10 +1201,19 @@ mod tests {
 
             result.expect("send_message");
             assert!(matches!(first, PiMsg::System(text) if text == "busy"));
-            assert!(matches!(second, PiMsg::SystemNote(text) if text == "continue-now"));
+            assert!(matches!(
+                second,
+                PiMsg::SessionSystemNote {
+                    owner_session_id,
+                    message,
+                } if !owner_session_id.is_empty() && message == "continue-now"
+            ));
             assert!(matches!(
                 third,
-                PiMsg::EnqueuePendingInput(PendingInput::Continue)
+                PiMsg::EnqueuePendingInput {
+                    session_id,
+                    input: PendingInput::Continue,
+                } if !session_id.is_empty()
             ));
         });
     }
@@ -1026,11 +1231,14 @@ mod tests {
                 .try_send(PiMsg::System("busy".to_string()))
                 .expect("fill bounded event channel");
 
-            let send_message = actions.send_user_message(ExtensionSendUserMessage {
-                extension_id: Some("ext".to_string()),
-                text: "hello from extension".to_string(),
-                deliver_as: None,
-            });
+            let send_message = actions.send_user_message(
+                ExtensionSendUserMessage {
+                    extension_id: Some("ext".to_string()),
+                    text: "hello from extension".to_string(),
+                    deliver_as: None,
+                },
+                Some(actions.session_action_admission.capture_origin()),
+            );
             let recv_cx = Cx::for_request();
             let recv_messages = async {
                 let first = event_rx.recv(&recv_cx).await.expect("busy message");
@@ -1044,8 +1252,10 @@ mod tests {
             assert!(matches!(first, PiMsg::System(text) if text == "busy"));
             assert!(matches!(
                 second,
-                PiMsg::EnqueuePendingInput(PendingInput::Text(text))
-                    if text == "hello from extension"
+                PiMsg::EnqueuePendingInput {
+                    session_id,
+                    input: PendingInput::GeneratedText(text),
+                } if !session_id.is_empty() && text == "hello from extension"
             ));
         });
     }
@@ -1067,14 +1277,21 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                session_action_admission: SessionActionAdmissionGate::default(),
             };
 
             ext_session
-                .set_thinking_level("high".to_string())
+                .set_thinking_level(
+                    "high".to_string(),
+                    Some(ext_session.session_action_admission.capture_origin()),
+                )
                 .await
                 .expect("first thinking update");
             ext_session
-                .set_thinking_level("high".to_string())
+                .set_thinking_level(
+                    "high".to_string(),
+                    Some(ext_session.session_action_admission.capture_origin()),
+                )
                 .await
                 .expect("second thinking update");
 
@@ -1118,10 +1335,14 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                session_action_admission: SessionActionAdmissionGate::default(),
             };
 
             ext_session
-                .set_thinking_level("high".to_string())
+                .set_thinking_level(
+                    "high".to_string(),
+                    Some(ext_session.session_action_admission.capture_origin()),
+                )
                 .await
                 .expect("thinking update should preserve requested level");
 
@@ -1154,14 +1375,23 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                session_action_admission: SessionActionAdmissionGate::default(),
             };
 
             ext_session
-                .set_model("anthropic".to_string(), "claude-sonnet-4-5".to_string())
+                .set_model(
+                    "anthropic".to_string(),
+                    "claude-sonnet-4-5".to_string(),
+                    Some(ext_session.session_action_admission.capture_origin()),
+                )
                 .await
                 .expect("first model update");
             ext_session
-                .set_model("anthropic".to_string(), "claude-sonnet-4-5".to_string())
+                .set_model(
+                    "anthropic".to_string(),
+                    "claude-sonnet-4-5".to_string(),
+                    Some(ext_session.session_action_admission.capture_origin()),
+                )
                 .await
                 .expect("second model update");
 
@@ -1201,10 +1431,15 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                session_action_admission: SessionActionAdmissionGate::default(),
             };
 
             ext_session
-                .set_model("gemini".to_string(), "gemini-2.5-pro".to_string())
+                .set_model(
+                    "gemini".to_string(),
+                    "gemini-2.5-pro".to_string(),
+                    Some(ext_session.session_action_admission.capture_origin()),
+                )
                 .await
                 .expect("alias target should dedupe");
 
@@ -1268,6 +1503,7 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                session_action_admission: SessionActionAdmissionGate::default(),
             };
 
             let state = ext_session.get_state().await;
@@ -1320,6 +1556,7 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                session_action_admission: SessionActionAdmissionGate::default(),
             };
 
             let state = ext_session.get_state().await;
@@ -1374,14 +1611,22 @@ mod tests {
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 config: Config::default(),
                 save_enabled: false,
+                session_action_admission: SessionActionAdmissionGate::default(),
             };
 
             ext_session
-                .set_model("openai".to_string(), "gpt-4o".to_string())
+                .set_model(
+                    "openai".to_string(),
+                    "gpt-4o".to_string(),
+                    Some(ext_session.session_action_admission.capture_origin()),
+                )
                 .await
                 .expect("same-branch model should dedupe");
             ext_session
-                .set_thinking_level("low".to_string())
+                .set_thinking_level(
+                    "low".to_string(),
+                    Some(ext_session.session_action_admission.capture_origin()),
+                )
                 .await
                 .expect("same-branch thinking should dedupe");
 
@@ -1423,11 +1668,381 @@ mod tests {
                     ..Config::default()
                 },
                 save_enabled: false,
+                session_action_admission: SessionActionAdmissionGate::default(),
             };
 
             let state = ext_session.get_state().await;
             assert_eq!(state["steeringMode"], "all");
             assert_eq!(state["followUpMode"], "one-at-a-time");
+        });
+    }
+
+    /// Regression guard for pi_agent_rust#138 (asupersync 0.3.9).
+    ///
+    /// `asupersync::sync::MutexGuard` became `!Send` in 0.3.9, so any future
+    /// that holds one across an `.await` cannot be spawned. Every mutating
+    /// `ExtensionSession` method holds the session lock across
+    /// `Session::save().await`, which means the guard has to be an
+    /// `OwnedMutexGuard`. Driving those methods through
+    /// `RuntimeHandle::spawn` (`F: Future + Send + 'static`) on a
+    /// multi-threaded runtime pins that property: reverting to a borrowed
+    /// guard makes this test fail to compile, and running it end to end proves
+    /// the save path still persists through the owned guard.
+    #[test]
+    fn ext_session_mutations_stay_send_across_save_await() {
+        let runtime = RuntimeBuilder::multi_thread()
+            .blocking_threads(1, 4)
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let dir = tempfile::Builder::new()
+                .prefix("pi-ext-session-")
+                .tempdir_in("/tmp")
+                .expect("tempdir");
+            let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                dir.path().to_path_buf(),
+            ))));
+            let ext_session = InteractiveExtensionSession {
+                session: Arc::clone(&session),
+                model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                is_streaming: Arc::new(AtomicBool::new(false)),
+                is_compacting: Arc::new(AtomicBool::new(false)),
+                config: Config::default(),
+                // Saving is what forces the guard across an await point.
+                save_enabled: true,
+                session_action_admission: SessionActionAdmissionGate::default(),
+            };
+
+            let origin = ext_session.session_action_admission.capture_origin();
+            handle
+                .spawn(async move {
+                    ext_session
+                        .set_name("spawned-session".to_string(), Some(origin.clone()))
+                        .await
+                        .expect("set_name");
+                    ext_session
+                        .append_message(
+                            SessionMessage::User {
+                                content: crate::model::UserContent::Text("hello".to_string()),
+                                timestamp: Some(0),
+                            },
+                            Some(origin.clone()),
+                        )
+                        .await
+                        .expect("append_message");
+                    ext_session
+                        .append_custom_entry(
+                            "regression".to_string(),
+                            Some(json!({"n": 1})),
+                            Some(origin),
+                        )
+                        .await
+                        .expect("append_custom_entry");
+                })
+                .await;
+
+            let cx = Cx::for_request();
+            let guard = session.lock(&cx).await.expect("lock session");
+            assert_eq!(guard.get_name().as_deref(), Some("spawned-session"));
+            assert!(
+                guard.path.is_some(),
+                "save() through the owned guard should have materialized a session file"
+            );
+            let custom_entries = guard
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry, crate::session::SessionEntry::Custom(_)))
+                .count();
+            assert_eq!(custom_entries, 1);
+        });
+    }
+
+    fn note_message(content: &str) -> ExtensionSendMessage {
+        ExtensionSendMessage {
+            extension_id: Some("ext".to_string()),
+            custom_type: "note".to_string(),
+            content: content.to_string(),
+            display: false,
+            details: None,
+            deliver_as: Some(ExtensionDeliverAs::Steer),
+            trigger_turn: false,
+        }
+    }
+
+    #[test]
+    fn host_actions_reject_missing_and_stale_origins_without_queueing() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let (actions, mut event_rx, session, _agent) = build_host_actions();
+            let missing = actions
+                .send_message(note_message("missing"), None)
+                .await
+                .expect_err("missing origin");
+            assert!(
+                missing
+                    .to_string()
+                    .contains("missing trusted task provenance"),
+                "unexpected missing-origin error: {missing}"
+            );
+
+            let stale = actions.session_action_admission.capture_origin();
+            actions.session_action_admission.advance_generation();
+            let stale_err = actions
+                .send_message(note_message("stale"), Some(stale))
+                .await
+                .expect_err("stale origin");
+            assert!(
+                stale_err.to_string().contains("active Session changed"),
+                "unexpected stale-origin error: {stale_err}"
+            );
+
+            let foreign = SessionActionAdmissionGate::default();
+            let foreign_err = actions
+                .send_user_message(
+                    ExtensionSendUserMessage {
+                        extension_id: Some("ext".to_string()),
+                        text: "stale-user".to_string(),
+                        deliver_as: Some(ExtensionDeliverAs::Steer),
+                    },
+                    Some(foreign.capture_origin()),
+                )
+                .await
+                .expect_err("foreign origin");
+            assert!(
+                foreign_err.to_string().contains("active Session changed"),
+                "unexpected foreign-origin error: {foreign_err}"
+            );
+
+            assert!(
+                event_rx.try_recv().is_err(),
+                "rejected actions must not enqueue UI input"
+            );
+
+            let cx = Cx::for_request();
+            let guard = session.lock(&cx).await.expect("lock session");
+            assert!(
+                guard.to_messages_for_current_path().is_empty(),
+                "rejected host actions must not append to the Session"
+            );
+        });
+    }
+
+    #[test]
+    fn session_mutators_reject_stale_origin_and_allow_current_origin() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let ext_session = InteractiveExtensionSession {
+                session: Arc::clone(&session),
+                model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                is_streaming: Arc::new(AtomicBool::new(false)),
+                is_compacting: Arc::new(AtomicBool::new(false)),
+                config: Config::default(),
+                save_enabled: false,
+                session_action_admission: SessionActionAdmissionGate::default(),
+            };
+            let stale = ext_session.session_action_admission.capture_origin();
+            ext_session.session_action_admission.advance_generation();
+
+            let err = ext_session
+                .set_name("from-old-session".to_string(), Some(stale.clone()))
+                .await
+                .expect_err("stale set_name");
+            assert!(err.to_string().contains("active Session changed"), "{err}");
+            let err = ext_session
+                .append_custom_entry("stale-note".to_string(), None, Some(stale))
+                .await
+                .expect_err("stale append");
+            assert!(err.to_string().contains("active Session changed"), "{err}");
+
+            ext_session
+                .set_name(
+                    "from-new-session".to_string(),
+                    Some(ext_session.session_action_admission.capture_origin()),
+                )
+                .await
+                .expect("current origin");
+
+            let cx = Cx::for_request();
+            let guard = session.lock(&cx).await.expect("lock session");
+            assert_eq!(guard.get_name().as_deref(), Some("from-new-session"));
+            assert!(guard.entries.iter().all(|entry| {
+                !matches!(
+                    entry,
+                    crate::session::SessionEntry::Custom(custom)
+                        if custom.custom_type == "stale-note"
+                )
+            }));
+        });
+    }
+
+    #[test]
+    fn try_install_session_advances_generation_for_new_resume_and_fork() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let (actions, _, session, agent) = build_host_actions();
+            let gate = actions.session_action_admission.clone();
+            let mut previous = gate.generation();
+            for _ in 0..3 {
+                let stale = gate.capture_origin();
+                crate::interactive::PiApp::try_install_session(
+                    &session,
+                    &agent,
+                    &gate,
+                    Session::in_memory(),
+                    Vec::new(),
+                    None,
+                )
+                .await
+                .expect("install replacement session");
+                assert_eq!(gate.generation(), previous + 1);
+                previous = gate.generation();
+                let err = actions
+                    .send_message(note_message("crossed-transition"), Some(stale))
+                    .await
+                    .expect_err("pre-transition origin");
+                assert!(err.to_string().contains("active Session changed"), "{err}");
+            }
+
+            actions
+                .send_message(note_message("post-transition"), Some(gate.capture_origin()))
+                .await
+                .expect("current generation host action");
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn real_js_timer_and_promise_mutations_are_rejected_across_session_replacement() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("delayed-interactive-session.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.registerCommand("append-late", {
+                    description: "append a custom Session entry",
+                    handler: async () => {
+                      await new Promise((resolve, reject) => {
+                        setTimeout(() => {
+                          Promise.resolve()
+                            .then(() => pi.session("appendEntry", {
+                              customType: "stale-js-note",
+                              data: { owner: "source" }
+                            }))
+                            .then(resolve, reject);
+                        }, 0);
+                      });
+                      return "appended";
+                    }
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let admission = SessionActionAdmissionGate::default();
+            let ext_session = InteractiveExtensionSession {
+                session: Arc::clone(&session),
+                model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                is_streaming: Arc::new(AtomicBool::new(false)),
+                is_compacting: Arc::new(AtomicBool::new(false)),
+                config: Config::default(),
+                save_enabled: false,
+                session_action_admission: admission.clone(),
+            };
+
+            let manager = ExtensionManager::new();
+            let tools = Arc::new(ToolRegistry::new(&[], temp_dir.path(), None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: temp_dir.path().display().to_string(),
+                    ..Default::default()
+                },
+                tools,
+                manager.clone(),
+            )
+            .await
+            .expect("start js runtime");
+            manager.set_js_runtime(js_runtime);
+            manager.set_session_action_origin_source(admission.origin_source());
+            manager.set_session(Arc::new(ext_session));
+            manager
+                .load_js_extensions(vec![
+                    JsExtensionLoadSpec::from_entry_path(&entry_path).expect("spec"),
+                ])
+                .await
+                .expect("load js extension");
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let transition_permit = admission
+                .acquire(cx.cx())
+                .await
+                .expect("transition admission");
+            let delayed_manager = manager.clone();
+            let hostcall = runtime_handle.spawn(async move {
+                delayed_manager
+                    .execute_command("append-late", "", 15_000)
+                    .await
+            });
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
+
+            let replacement_session_id = {
+                let mut guard = session.lock(cx.cx()).await.expect("session lock");
+                *guard = Session::in_memory();
+                guard.header.id.clone()
+            };
+            admission.advance_generation();
+            drop(transition_permit);
+
+            let err = hostcall
+                .await
+                .expect_err("stale real-JS timer/Promise Session mutation must be rejected");
+            assert!(
+                err.to_string().contains("active Session changed"),
+                "unexpected real-JS timer/Promise mutation error: {err}"
+            );
+
+            let guard = session
+                .lock(cx.cx())
+                .await
+                .expect("replacement session lock");
+            assert_eq!(guard.header.id, replacement_session_id);
+            assert!(guard.entries_for_current_path().iter().all(|entry| {
+                !matches!(
+                    entry,
+                    crate::session::SessionEntry::Custom(custom)
+                        if custom.custom_type == "stale-js-note"
+                )
+            }));
+            drop(guard);
+
+            let current_result = manager
+                .execute_command("append-late", "", 5_000)
+                .await
+                .expect("current-generation real-JS mutation");
+            assert_eq!(
+                current_result,
+                serde_json::Value::String("appended".to_string())
+            );
         });
     }
 }

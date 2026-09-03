@@ -111,40 +111,63 @@ We do not care about backwards compatibility—we're in early development with n
 
 ---
 
-## Drop-In Claim Messaging Guardrail
+## Product Direction: OMP-Inspired, Not a Legacy Pi Drop-In
 
-When editing docs, release notes, or user-facing copy:
+Pi Rust is **not** pursuing strict drop-in compatibility with legacy TypeScript
+Pi. Legacy Pi changes too quickly, and reproducing its internal implementation
+details would pull this project away from the product we want to build.
 
-- Do not describe Pi Rust as a strict drop-in replacement unless `docs/contracts/dropin-certification-contract.json` hard gates are satisfied.
-- Treat `docs/evidence/dropin-certification-verdict.json` as the release claim gate: strict replacement language requires `overall_verdict = CERTIFIED`.
-- Treat `docs/parity-certification.json` as informational progress evidence only; it does not override release-gate policy.
+- Treat legacy Pi as historical context and a source of selectively useful
+  behavior, never as a compatibility authority or release gate.
+- Use OMP as the closer product reference for feature selection, workflows,
+  look and feel, and UI/UX, while still making Rust-native design decisions.
+- Do not create or prioritize work merely to satisfy historical drop-in,
+  parity, differential, or certification artifacts.
+- Files under `docs/contracts/` and `docs/evidence/` that describe strict
+  drop-in certification are retained historical records. They do not authorize
+  claims, block releases, define completeness, or override current product
+  decisions.
+- User-facing copy must not call Pi Rust a drop-in replacement. Describe the
+  actual supported behavior and independently valuable product surface.
+
+## Build, Quality, and Release Authority: DSR Only
+
+**NEVER use GitHub Actions for this repository, for any reason.** Do not enable,
+dispatch, rerun, cancel, or cite a GitHub Actions workflow as evidence. Workflow
+files may remain in the tree as historical reference, but they are permanently
+non-authoritative and must stay disabled.
+
+- Doodlestein Self-Releaser (`dsr`) is the exclusive quality, cross-platform
+  build, packaging, signing, and release authority.
+- Use `dsr quality --tool pi_agent_rust`, `dsr build pi_agent_rust`, and
+  `dsr release pi_agent_rust <version>` (or the corresponding fail-closed DSR
+  operation) instead of any Actions workflow or ad hoc release upload.
+- RCH is an implementation detail that DSR may use to offload compilation.
+  Agents must not invoke Cargo or RCH directly as an alternate quality path.
+- A tag, local binary, RCH result, or source build is not a release. A release
+  exists only after DSR publishes the expected artifacts and DSR verification
+  succeeds against the public release.
 
 ---
 
-## Compiler Checks (CRITICAL)
+## Compiler and Test Checks (CRITICAL)
 
-**After any substantive code changes, you MUST verify no errors were introduced:**
-
-```bash
-# Check for compiler errors and warnings
-cargo check --all-targets
-
-# Check for clippy lints (pedantic + nursery are enabled)
-cargo clippy --all-targets -- -D warnings
-
-# Verify formatting
-cargo fmt --check
-```
-
-For heavyweight local runs (especially `--all-targets`) in multi-agent environments, set both build artifacts and test temp files to a high-capacity tmpfs to avoid `No space left on device` failures:
+**After any substantive code changes, use the one authoritative quality entry
+point:**
 
 ```bash
-export CARGO_TARGET_DIR="/data/tmp/pi_agent_rust_cargo/${USER:-agent}/target"
-export TMPDIR="/data/tmp/pi_agent_rust_cargo/${USER:-agent}/tmp"
-mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
+dsr quality --tool pi_agent_rust
 ```
 
-Use an agent-specific suffix (for example `/data/tmp/pi_agent_rust_cargo/topazfalcon`) to avoid collisions across concurrent agents.
+The registered DSR recipe owns formatting, compiler checks, Clippy, unit,
+conformance, integration, and required feature lanes. Do not run the underlying
+Cargo commands directly, and do not use a direct RCH invocation as a substitute.
+DSR owns target/temp placement and any RCH delegation needed to avoid local
+contention.
+
+If the repository's load-admission rule blocks DSR, record the exact hold and
+leave the relevant Bead open. Static review is useful but does not become a
+compile, test, or quality claim.
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
 
@@ -152,22 +175,9 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ## Testing
 
-### Unit Tests
-
-The test suite covers all core functionality:
-
-```bash
-# Run all tests
-cargo test
-
-# Run with output
-cargo test -- --nocapture
-
-# Run specific test module
-cargo test sse::tests
-cargo test tools::tests
-cargo test conformance
-```
+The DSR quality recipe runs the project's required test lanes. Individual
+test names below describe coverage domains; they are not permission to bypass
+DSR with direct Cargo commands.
 
 ### Test Categories
 
@@ -191,7 +201,7 @@ cargo test conformance
 ```
 CLI (clap) → main/app/config/resources → Agent Session
                          ↓
-Provider Layer (10 native provider implementation modules + extension providers)
+Provider Layer (11 native provider implementation modules + extension providers)
                          ↓
 Tool Registry (built-ins + extension tools) ↔ Extension Runtime (QuickJS + capability policy)
                          ↓
@@ -214,10 +224,12 @@ Session persistence + index (JSONL, default-enabled SQLite backend support)
 | `src/providers/cohere.rs` | Cohere API implementation |
 | `src/providers/azure.rs` | Azure OpenAI API implementation |
 | `src/providers/mod.rs` | Provider factory and extension stream-simple bridge |
-| `src/tools.rs` | 8 built-in tools |
-| `src/interactive.rs` | Interactive TUI application state and event loop |
+| `src/tools.rs` | Tool trait, registry, and the core file/shell/search tools; other built-ins live in their own modules (35 total, tiered in `src/xdev.rs`; `subagent` is opt-in) |
+| `src/interactive_ftui.rs` | Default FrankenTUI interactive stack (feature `ftui`, on by default) |
+| `src/interactive.rs` | Classic charmed_rust TUI application state and event loop (`--classic`) |
 | `src/rpc.rs` | RPC/stdin server mode |
-| `src/extensions.rs` | Extension protocol, policy, and host integration |
+| `src/extensions.rs` | Stable extension facade, public contracts, manager state, and shared entry points |
+| `src/extensions/` | Focused manager, protocol, policy, connector, runtime, and behavior-domain test modules |
 | `src/extensions_js.rs` | QuickJS runtime bridge and hostcalls |
 | `src/resources.rs` | Skills/prompt/theme/extension resource loading |
 | `src/models.rs` | Built-in and `models.json` registry resolution |
@@ -241,15 +253,13 @@ Session persistence + index (JSONL, default-enabled SQLite backend support)
 - Extension-provided providers via stream-simple bridge
 - Tool definitions with JSON Schema
 
-**Built-in Tools:**
-- `read` - Read files with line numbers, image support
-- `write` - Create/overwrite files
-- `edit` - String replacement editing
-- `bash` - Shell command execution with timeout
-- `grep` - Content search with context
-- `find` - File discovery with glob patterns
-- `ls` - Directory listing
-- `hashline_edit` - Precise edits using `LINE#HASH` tags from `read`/`grep` with `hashline=true`
+**Built-in Tools** (35 total; the tier table is `ESSENTIAL_DEFAULTS` / `OPT_IN_ONLY` in `src/xdev.rs`, the default `--tools` list is in `src/cli.rs`, and README "35 Built-in Tools" is the user-facing inventory — keep all three in sync):
+- Essential, always in the schema: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `hashline_edit`, `ask`, `todo`, `web_search`, `submit_plan`, `current_time`, `xdev`
+- Discoverable behind `xdev`: `ast_grep`, `ast_edit`, `lsp`, `debug`, `manage_skill`, plus the memory bank (`retain`, `recall`, `reflect`, `memory_edit`, `learn`) when `memory.backend` is `local`
+- Default-enabled: `jobs`, `hub`
+- `--tools` opt-in: `eval`, `github`, `security_scan`
+- Settings-gated: `browser`, `computer`, `inspect_image`, `generate_image`, `tts`
+- `subagent` - Native isolated Rust Pi child-agent delegation (opt-in only via `--tools ...subagent`)
 
 **Session Management:**
 - JSONL format (version 3)
@@ -277,7 +287,7 @@ This port uses two key libraries from sibling projects:
 **Current Status:**
 - asupersync powers runtime + HTTP/TLS + cancellation + optional SQLite integration
 - rich_rust/charmed_rust stack powers the interactive terminal UI
-- Provider layer has 10 native provider implementation modules in `src/providers/`: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini, Cohere, Azure OpenAI, Bedrock, Vertex AI, GitHub Copilot, and GitLab Duo
+- Provider layer has 11 native provider implementation modules in `src/providers/`: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini, Cohere, Azure OpenAI, Bedrock, Vertex AI, GitHub Copilot, GitLab Duo, and Cursor
 - Extension runtime, capability policy, and conformance harness are integrated
 
 ### Performance Targets
@@ -285,7 +295,7 @@ This port uses two key libraries from sibling projects:
 | Metric | Target | Notes |
 |--------|--------|-------|
 | Startup time | <100ms | No heavy initialization |
-| Binary size (release) | <22 MiB | CI size budget with LTO + strip enabled |
+| Binary size (release) | <48 MiB | DSR release-size budget with LTO + strip enabled (raised from 26 MiB for the v0.3.0 capability wave: BPE tables, LSP/DAP, MCP, eval kernels) |
 | TUI framerate | 60fps | Differential rendering |
 | Memory (idle) | <50MB | No leaks on long sessions |
 
@@ -319,13 +329,11 @@ The port uses fixture-based conformance tests to validate behavior matches expec
 ### Running Conformance Tests
 
 ```bash
-# All conformance tests
-cargo test conformance
-
-# Specific tool
-cargo test conformance::test_read
-cargo test conformance::test_bash
+dsr quality --tool pi_agent_rust
 ```
+
+Conformance is part of that fail-closed recipe. Do not substitute a hand-picked
+subset for the authoritative result.
 
 ---
 
@@ -382,6 +390,28 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
 - `"FILE_RESERVATION_CONFLICT"`: Adjust patterns, wait for expiry, or use non-exclusive reservation
 - **Auth errors:** If JWT+JWKS enabled, include bearer token with matching `kid`
 
+### Pre-Commit Guard (installed 2026-09-02, bd-0x31m)
+
+This checkout runs the agent-mail pre-commit guard: `.git/hooks/pre-commit` is
+the chain-runner and `.git/hooks/hooks.d/pre-commit/50-agent-mail.py` checks
+every commit against the active **exclusive** file reservations. It exists
+because an unattended sweeper committed another agent's unverified in-flight
+work five times in one day (last: `5d3eb35a`).
+
+- **Identify yourself:** the guard reads `AGENT_NAME` (falling back to the
+  registered pane identity). Commit and push as
+  `AGENT_NAME=<your registered agent name> git commit …`; an unidentified
+  commit is refused while any exclusive reservation is active.
+- **Never commit into someone else's reservation.** If the guard names a
+  holder, coordinate in the bead thread or wait for the lease to expire; do
+  not bypass it to land your slice.
+- **Release when you land:** `release_file_reservations` as soon as your
+  change is committed, so the guard stops blocking other agents.
+- **Human bypass only:** `AGENT_MAIL_GUARD_MODE=warn` (allow with a warning)
+  and `AGENT_MAIL_BYPASS=1` (skip) are for the operator, not for agents.
+- The hook files live under `.git/` and are not versioned; reinstall with the
+  agent-mail `install_precommit_guard` tool if a fresh clone lacks them.
+
 ---
 
 ## Beads (br) — Dependency-Aware Issue Tracking
@@ -395,6 +425,7 @@ Beads provides a lightweight, dependency-aware issue database and CLI (`br` - be
 - **Single source of truth:** Beads for task status/priority/dependencies; Agent Mail for conversation and audit
 - **Shared identifiers:** Use Beads issue ID (e.g., `br-123`) as Mail `thread_id` and prefix subjects with `[br-123]`
 - **Reservations:** When starting a task, call `file_reservation_paths()` with the issue ID in `reason`
+- **Outcome beads close on the outcome, not on the tooling:** a bead whose title names a run, a measurement, a published artifact, or a gate result closes only with that artifact's path and source SHA in the close reason. A shipped script, a dry run, a "blocked on RCH/DSR" note, or a static review closes nothing; leave the bead open with the exact hold recorded (this rule exists because three evidence beads were closed that way on 2026-08-28 and reopened on 2026-09-01)
 
 ### Typical Agent Flow
 
@@ -588,67 +619,60 @@ unrelated legacy findings.
 
 ---
 
-## Beads Ledger Reconciliation — Invariant
+## Historical Drop-In Ledger — Retired
 
-**CRITICAL INVARIANT:** The beads ledger reconciliation script MUST pass before any commit. This prevents "completion illusion" where all beads appear closed but critical gaps remain untracked.
+`docs/evidence/dropin-parity-gap-ledger.json` and
+`scripts/reconcile_beads_ledger.sh` belong to the retired strict drop-in
+program. They are historical diagnostics, not commit, quality, completeness,
+or release gates.
 
 ```bash
+# Optional historical consistency inspection only
 ./scripts/reconcile_beads_ledger.sh
 ```
 
-**Exit 0 = safe to commit.** **Exit 1 = orphan gaps found.**
-
-### What It Checks
-
-The script cross-references:
-- **Active beads** (from `br list --json`, statuses `open` and `in_progress`)
-- **Open critical/high gaps** (from `docs/evidence/dropin-parity-gap-ledger.json`)
-- **Gap-tracking external refs** (`external_ref=<gap-id>`)
-
-If any critical or high-severity gap lacks a corresponding active owner bead or active bead with `external_ref=<gap-id>`, the script fails and lists the orphan gap. If any active bead references a `gap-*` external ref that is not an active critical/high ledger gap, the script also fails so stale tracker work cannot outlive the ledger truth.
-
-### Fix Workflow
-
-1. **Run the script:** `./scripts/reconcile_beads_ledger.sh`
-2. **If it passes:** Proceed with commit
-3. **If it fails:** Create beads for each orphan gap:
-   ```bash
-   br create --title="Address gap-<id>" --type=task --priority=1
-   ```
-4. **Re-run until it passes:** The script must exit 0 before commit
-
-### CI Integration
-
-This check runs automatically in CI as the "Beads ledger reconciliation check" step. It will fail the build if orphan ledger gaps or stale active gap-tracking beads are detected.
-
-**Why This Matters:** Without this invariant, teams can falsely believe all work is complete when critical gaps remain untracked, leading to incomplete drop-in certification or missed functionality gaps.
+Do not create, reopen, or keep product Beads active merely to make this retired
+ledger green. Track current product defects and OMP-inspired improvements
+directly in Beads with concrete user-visible acceptance criteria.
 
 ---
 
-## RCH — Remote Compilation Helper
+## Module Reachability — Invariant
 
-RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation commands to a fleet of 8 remote Contabo VPS workers instead of building locally. This prevents compilation storms from overwhelming csd when many agents run simultaneously.
+**CRITICAL INVARIANT:** Every `pub mod` in `src/lib.rs` must have at least one non-test call site, or an allowlist entry stating why not.
 
-**RCH is installed at `~/.local/bin/rch` and is hooked into Claude Code's PreToolUse automatically.** Most of the time you don't need to do anything if you are Claude Code — builds are intercepted and offloaded transparently.
-
-To manually offload a build:
 ```bash
-rch exec -- cargo build --release
-rch exec -- cargo test
-rch exec -- cargo clippy
+python3 scripts/check_module_reachability.py          # exit 0 = safe to commit
+python3 scripts/check_module_reachability.py --json   # machine-readable report
 ```
 
-Quick commands:
-```bash
-rch doctor                    # Health check
-rch workers probe --all       # Test connectivity to all 8 workers
-rch status                    # Overview of current state
-rch queue                     # See active/waiting builds
-```
+### Why This Exists (bd-4rzpj)
 
-If rch or its workers are unavailable, it fails open — builds run locally as normal.
+This is the second half of the completion-illusion defense. Ledger reconciliation above catches *untracked* gaps; it cannot catch a bead **closed against code nobody calls**, because that code compiles and its tests pass.
 
-**Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
+That failure happened at epic scale on 2026-08-24 (bd-33df9): five modules landed with green unit tests, their beads were closed, the parent epics were closed — and nothing in the product ever called them. `reconcile_beads_ledger.sh` exited 0 the entire time. **A module only its own tests reference is not a shipped feature.**
+
+### What Counts as Reachable
+
+- `src/`, `examples/`, and `benches/` are real consumers. In this repo `cargo run --example` is a genuine operational path (the perf and conformance tooling runs that way).
+- `tests/` deliberately does **not** count. "A test pokes it" is exactly the state this gate exists to distinguish from "a user can reach it".
+- References inside a `#[cfg(test)] mod ... { }` block don't count either — the gate brace-tracks those blocks rather than guessing by proximity.
+
+### If It Fails
+
+1. **Land the call site** that makes the module reachable. This is almost always the right answer.
+2. **Or add it to `ALLOWLIST`** in the script *with a real reason*. Test-harness modules (`conformance_shapes`, `flake_classifier`, `swarm_flight_recorder`) are legitimate entries. The reason string is the point: it converts "nobody noticed" into "someone decided".
+
+**Never** silence this gate by deleting a module — Rule 1 forbids file deletion without express written permission, and a failing gate is evidence of missing integration work, not of a surplus file.
+
+---
+
+## RCH — DSR-Managed Compilation Transport
+
+RCH can offload compilation to remote workers, but agents do not invoke it
+directly in this repository. DSR decides when and how RCH is used and remains
+the only quality/build authority. An RCH result outside DSR is diagnostic only
+and cannot satisfy a Bead, integration, or release gate.
 
 ---
 
@@ -815,6 +839,11 @@ git push                # Push to remote
 - NEVER stop before pushing - that leaves work stranded locally
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
+- Stage only the files YOU changed (`git add <files>`, never `git add -A` or
+  `git add .`). Other sessions' uncommitted work must stay uncommitted until
+  they commit it; sweeping it into your commit under your message hides what
+  was tested and by whom (on 2026-09-01 this committed an ineffective fix
+  mid-edit and two implementations of the same tool within an hour)
 
 
 ---
@@ -861,7 +890,7 @@ Next steps (pick one)
 
 1. Decide how to handle the unrelated modified files above so we can resume cleanly.
 2. Triage beads_rust-orko (clippy/cargo warnings) and beads_rust-ydqr (rustfmt failures).
-3. If you want a full suite run later, fix conformance/clippy blockers and re‑run cargo test --all.
+3. If you want a full suite run later, fix the reported blockers and re-run `dsr quality --tool pi_agent_rust`.
 ```
 
 NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into thinking YOU made the changes and simply don't recall it for some reason.
@@ -871,3 +900,5 @@ NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are cha
 ## Note on Built-in TODO Functionality
 
 Also, if I ask you to explicitly use your built-in TODO functionality, don't complain about this and say you need to use beads. You can use built-in TODOs if I tell you specifically to do so. Always comply with such orders.
+
+For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"

@@ -13,6 +13,121 @@
     "suite_evidence",
     "aggregate_artifacts"
   ],
+  "perf_schema_registry": {
+    "description": "Registry of all performance evidence schemas referenced by the DSR perf recipe. Each entry pins a schema identifier to its required fields, providing machine-checkable contracts for the preflight harness.",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "budget_summary": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.budget_summary.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 5, "maxItems": 5,
+            "items": { "type": "string", "enum": ["schema", "generated_at", "git_commit", "correlation_id", "claim_readiness"] }
+          }
+        }
+      },
+      "budget_preflight": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.budget_preflight.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 4, "maxItems": 4,
+            "items": { "type": "string", "enum": ["schema", "missing_inputs", "expected_artifact_paths", "rch_commands"] }
+          }
+        }
+      },
+      "evidence_cache": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.evidence_cache.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 5, "maxItems": 5,
+            "items": { "type": "string", "enum": ["schema", "ttl_hours", "entries", "git_commit", "build_profile"] }
+          }
+        }
+      },
+      "phase1_matrix_validation": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.phase1_matrix_validation.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 6, "maxItems": 6,
+            "items": { "type": "string", "enum": ["schema", "generated_at", "correlation_id", "scale_points", "weighted_attribution", "confidence_intervals_95"] }
+          }
+        }
+      },
+      "host_topology_fingerprint": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.host_topology_fingerprint.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 7, "maxItems": 7,
+            "items": { "type": "string", "enum": ["schema", "generated_at", "cgroup_v2_cpu_quota", "cpuset_size", "numa_node_count", "memory_limit_bytes", "budget_profile"] }
+          }
+        }
+      },
+      "pijs_workload_measurement": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.pijs_workload.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 9, "maxItems": 9,
+            "items": { "type": "string", "enum": ["embedded_timestamp", "source_commit", "source_dirty", "run_id", "correlation_id", "iteration", "tool_name", "latency_us", "throughput_calls_per_sec"] }
+          }
+        }
+      },
+      "binary_size_canonical": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.binary_size.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 8, "maxItems": 8,
+            "items": { "type": "string", "enum": ["schema", "generated_at", "binary_path", "binary_sha256", "size_bytes", "cargo_profile", "compiled_profile_family", "strip"] }
+          }
+        }
+      },
+      "ext_cold_load_complex_estimate": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.criterion_estimate.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 5, "maxItems": 5,
+            "items": { "type": "string", "enum": ["schema", "fixture", "budget_name", "p95_us", "status"] }
+          }
+        }
+      },
+      "event_dispatch_scenario": {
+        "type": "object",
+        "required": ["schema", "required_fields"],
+        "additionalProperties": false,
+        "properties": {
+          "schema": { "type": "string", "const": "pi.perf.scenario_runner.v1" },
+          "required_fields": {
+            "type": "array", "uniqueItems": true, "minItems": 6, "maxItems": 6,
+            "items": { "type": "string", "enum": ["schema", "scenario", "event_count", "latency_p99_us", "budget_p99_us", "status"] }
+          }
+        }
+      }
+    }
+  },
   "additionalProperties": false,
   "properties": {
     "schema": {
@@ -301,6 +416,7 @@
         "realistic_replay_inputs",
         "required_metadata_fields",
         "evidence_labels",
+        "budget_input_negative_controls",
         "partition_weighting",
         "partition_interpretation",
         "user_perceived_sli_catalog",
@@ -427,6 +543,436 @@
             }
           },
           "description": "Evidence class and confidence label vocabulary for benchmark claims."
+        },
+        "budget_input_negative_controls": {
+          "type": "object",
+          "required": [
+            "scope",
+            "control_schema_version",
+            "unproven_input_status",
+            "release_binary",
+            "idle_rss",
+            "criterion_cold_load"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "scope": {
+              "type": "string",
+              "const": "release_budget_inputs"
+            },
+            "control_schema_version": {
+              "type": "string",
+              "const": "v1"
+            },
+            "unproven_input_status": {
+              "type": "string",
+              "const": "NO_DATA"
+            },
+            "release_binary": {
+              "type": "object",
+              "required": ["schema", "required_fields"],
+              "additionalProperties": false,
+              "properties": {
+                "schema": {
+                  "type": "string",
+                  "const": "pi.perf.binary_size_measurement.v1"
+                },
+                "required_fields": {
+                  "type": "array",
+                  "uniqueItems": true,
+                  "minItems": 8,
+                  "maxItems": 8,
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "binary_path",
+                      "binary_sha256",
+                      "size_bytes",
+                      "cargo_profile",
+                      "compiled_profile_family",
+                      "compiled_opt_level",
+                      "strip",
+                      "profile_source"
+                    ]
+                  }
+                }
+              }
+            },
+            "idle_rss": {
+              "type": "object",
+              "required": ["schema", "required_fields"],
+              "additionalProperties": false,
+              "properties": {
+                "schema": {
+                  "type": "string",
+                  "const": "pi.perf.idle_rss_measurement.v1"
+                },
+                "required_fields": {
+                  "type": "array",
+                  "uniqueItems": true,
+                  "minItems": 17,
+                  "maxItems": 17,
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "generated_at",
+                      "pid",
+                      "process_name",
+                      "allocator",
+                      "binary_path",
+                      "binary_sha256",
+                      "rss_bytes",
+                      "idle_state",
+                      "cargo_profile",
+                      "build_command",
+                      "sample_count",
+                      "samples",
+                      "rss_spread_bytes",
+                      "settle_ms",
+                      "bench_env_source",
+                      "bench_env",
+                      "bench_env_sha256"
+                    ]
+                  }
+                }
+              }
+            },
+            "criterion_cold_load": {
+              "type": "object",
+              "required": ["schema", "required_fields", "max_noise_score"],
+              "additionalProperties": false,
+              "properties": {
+                "schema": {
+                  "type": "string",
+                  "const": "pi.perf.cold_load_measurement.v1"
+                },
+                "required_fields": {
+                  "type": "array",
+                  "uniqueItems": true,
+                  "minItems": 7,
+                  "maxItems": 7,
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "bench_env_source",
+                      "bench_env_sha256",
+                      "governor",
+                      "aslr",
+                      "thp",
+                      "noise_score",
+                      "artifact_sha256"
+                    ]
+                  }
+                },
+                "max_noise_score": {
+                  "type": "integer",
+                  "const": 0
+                }
+              }
+            }
+          },
+          "description": "Release-budget negative controls. Numeric inputs without the required hash-bound proof are NO_DATA, never measurements."
+        },
+        "regression_gate_admission": {
+          "type": "object",
+          "required": [
+            "scope",
+            "required_record_fields",
+            "load_scenario_required_fields",
+            "allowed_measurement_methods",
+            "allowed_measurement_boundaries",
+            "eligible_measurement_boundaries",
+            "allowed_disk_cache_policies",
+            "allowed_host_page_cache_policies",
+            "required_eligible_provenance_fields",
+            "eligible_evidence_class",
+            "eligible_confidence",
+            "eligible_measurement_method",
+            "required_eligible_host_page_cache_policy",
+            "positive_sample_count_fields",
+            "require_positive_sample_count",
+            "uncontrolled_host_page_cache_eligible"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "scope": {
+              "type": "string",
+              "const": "generic_benchmark_record"
+            },
+            "required_record_fields": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 7,
+              "maxItems": 7,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "evidence_class",
+                  "confidence",
+                  "eligible_for_regression_gate",
+                  "measurement_method",
+                  "measurement_boundary",
+                  "measurement_contract_version",
+                  "disk_cache_policy"
+                ]
+              }
+            },
+            "load_scenario_required_fields": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "type": "string",
+                "enum": ["disk_cache_policy", "host_page_cache_policy"]
+              }
+            },
+            "allowed_measurement_methods": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "wall_clock_observation",
+                  "synthetic_seed_projection"
+                ]
+              }
+            },
+            "allowed_measurement_boundaries": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 5,
+              "maxItems": 5,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "in_process_preview",
+                  "production_extension_manager",
+                  "production_extension_runtime",
+                  "synthetic_seed_generation",
+                  "synthetic_seed_projection"
+                ]
+              }
+            },
+            "eligible_measurement_boundaries": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "production_extension_manager",
+                  "production_extension_runtime"
+                ]
+              }
+            },
+            "allowed_disk_cache_policies": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 4,
+              "maxItems": 4,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "disabled",
+                  "not_applicable",
+                  "not_applicable_synthetic",
+                  "unique_per_scenario_shared_across_warmup_and_runs"
+                ]
+              }
+            },
+            "allowed_host_page_cache_policies": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 3,
+              "maxItems": 3,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "not_applicable_measured_region",
+                  "not_applicable_synthetic",
+                  "uncontrolled"
+                ]
+              }
+            },
+            "required_eligible_provenance_fields": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 16,
+              "maxItems": 16,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "source_commit",
+                  "source_dirty",
+                  "build_profile",
+                  "executable_build_profile",
+                  "executable_profile_verified",
+                  "build_fingerprint_verified",
+                  "build_profile_verified",
+                  "build_fingerprint_contract",
+                  "compiled_profile_family",
+                  "compiled_opt_level",
+                  "compiled_debug",
+                  "compiled_features",
+                  "binary_path",
+                  "binary_sha256",
+                  "debug_assertions",
+                  "config_hash"
+                ]
+              }
+            },
+            "eligible_evidence_class": {
+              "type": "string",
+              "const": "measured"
+            },
+            "eligible_confidence": {
+              "type": "string",
+              "const": "high"
+            },
+            "eligible_measurement_method": {
+              "type": "string",
+              "const": "wall_clock_observation"
+            },
+            "required_eligible_host_page_cache_policy": {
+              "type": "string",
+              "const": "not_applicable_measured_region"
+            },
+            "positive_sample_count_fields": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 3,
+              "maxItems": 3,
+              "items": {
+                "type": "string",
+                "enum": ["runs", "iterations", "total_calls"]
+              }
+            },
+            "require_positive_sample_count": {
+              "type": "boolean",
+              "const": true
+            },
+            "uncontrolled_host_page_cache_eligible": {
+              "type": "boolean",
+              "const": false
+            }
+          },
+          "description": "Generic additive metadata admission contract for benchmark records that declare regression-gate eligibility. This policy does not by itself authorize any workload-specific release gate. Legacy v1 records without the eligibility marker retain their original validation semantics."
+        },
+        "pijs_regression_gate_admission": {
+          "type": "object",
+          "required": [
+            "scope",
+            "inherits",
+            "required_record_fields",
+            "required_schema",
+            "required_tool",
+            "required_scenario",
+            "required_runtime_engine",
+            "required_build_profile",
+            "required_build_profile_verified",
+            "required_iterations",
+            "required_tool_calls_per_iteration",
+            "required_measurement_boundary",
+            "required_measurement_contract_version"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "scope": {
+              "type": "string",
+              "const": "pi.perf.workload.v1/pijs_workload"
+            },
+            "inherits": {
+              "type": "string",
+              "const": "regression_gate_admission"
+            },
+            "required_record_fields": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 25,
+              "maxItems": 25,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "timestamp",
+                  "run_id",
+                  "correlation_id",
+                  "source_commit",
+                  "source_dirty",
+                  "binary_path",
+                  "executable_build_profile",
+                  "executable_profile_verified",
+                  "binary_sha256",
+                  "build_profile_verified",
+                  "build_fingerprint_contract",
+                  "build_fingerprint_verified",
+                  "debug_assertions",
+                  "compiled_profile_family",
+                  "compiled_opt_level",
+                  "compiled_debug",
+                  "compiled_features",
+                  "config_hash",
+                  "allocator_requested",
+                  "allocator_request_source",
+                  "allocator_effective",
+                  "allocator_fallback_reason",
+                  "elapsed_us",
+                  "elapsed_us_f64",
+                  "per_call_us_f64"
+                ]
+              }
+            },
+            "required_schema": {
+              "type": "string",
+              "const": "pi.perf.workload.v1"
+            },
+            "required_tool": {
+              "type": "string",
+              "const": "pijs_workload"
+            },
+            "required_scenario": {
+              "type": "string",
+              "const": "tool_call_roundtrip"
+            },
+            "required_runtime_engine": {
+              "type": "string",
+              "const": "quickjs"
+            },
+            "required_build_profile": {
+              "type": "string",
+              "const": "perf"
+            },
+            "required_build_profile_verified": {
+              "type": "boolean",
+              "const": true
+            },
+            "required_iterations": {
+              "type": "integer",
+              "const": 2000
+            },
+            "required_tool_calls_per_iteration": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "type": "integer",
+                "enum": [1, 10]
+              }
+            },
+            "required_measurement_boundary": {
+              "type": "string",
+              "const": "production_extension_manager"
+            },
+            "required_measurement_contract_version": {
+              "type": "string",
+              "const": "production_extension_manager.v1"
+            }
+          },
+          "description": "PiJS-specific release regression admission layered on the generic metadata policy: exact 2000-iteration path-verified perf-profile QuickJS measurements for the 1-call mean-latency and 10-call throughput lanes."
         },
         "partition_weighting": {
           "type": "object",

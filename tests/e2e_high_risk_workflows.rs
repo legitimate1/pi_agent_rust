@@ -81,6 +81,7 @@ fn make_assistant(
             ..Usage::default()
         },
         stop_reason,
+        stop_details: None,
         error_message: None,
         timestamp: 0,
     }
@@ -94,6 +95,7 @@ fn stream_done(msg: AssistantMessage) -> Pin<Box<dyn Stream<Item = Result<Stream
         model: msg.model.clone(),
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
+        stop_details: None,
         error_message: None,
         timestamp: 0,
     };
@@ -152,7 +154,11 @@ const fn event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::AutoCompactionEnd { .. } => "auto_compaction_end",
         AgentEvent::AutoRetryStart { .. } => "auto_retry_start",
         AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
+        AgentEvent::FailoverStart { .. } => "failover_start",
+        AgentEvent::FailoverEnd { .. } => "failover_end",
         AgentEvent::ExtensionError { .. } => "extension_error",
+        AgentEvent::AdvisorNote { .. } => "advisor_note",
+        AgentEvent::ProviderError { .. } => "provider_error",
     }
 }
 
@@ -253,10 +259,10 @@ fn run_cli(
         buf
     });
 
-    if let Some(input) = stdin {
-        if let Some(mut child_stdin) = child.stdin.take() {
-            child_stdin.write_all(input).expect("write stdin");
-        }
+    if let Some(input) = stdin
+        && let Some(mut child_stdin) = child.stdin.take()
+    {
+        child_stdin.write_all(input).expect("write stdin");
     }
 
     let timeout = Duration::from_secs(CLI_TIMEOUT_SECS);

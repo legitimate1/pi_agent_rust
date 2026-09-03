@@ -1,6 +1,6 @@
 # QA Certification Dossier
 
-> Generated: 2026-03-12T02:21:56.103Z
+> Generated: 2026-08-04T23:06:43.632Z
 > Bead: bd-1f42.8.10
 > Verdict: **PASS_WITH_RESIDUALS**
 
@@ -8,13 +8,13 @@
 
 **Do we have full unit/integration coverage without mocks/fakes?**
 
-Yes, with quantified residuals. 252 test files classified (93 unit, 125 VCR, 34 E2E). Non-mock compliance gate passes (19 checks). Test double inventory: 267 entries across 21 modules. 7 allowlisted exceptions documented with owner and replacement plan. 3 tracked for active migration (Recording*/MockHostActions via bd-m9rk), 4 permanent with rationale.
+The policy gates pass with quantified residuals. 302 test files classified (124 unit, 139 VCR, 39 E2E). Non-mock compliance gate passes (23 checks). Test double inventory: 267 entries across 21 modules. 7 allowlisted exceptions documented with owner and replacement plan. 3 tracked for active migration (Recording*/MockHostActions via bd-m9rk), 4 permanent with rationale.
 
 Evidence:
 - `docs/non-mock-rubric.json`
 - `docs/test_double_inventory.json`
 - `docs/testing-policy.md (Allowlisted Exceptions)`
-- `tests/non_mock_compliance_gate.rs (19 tests pass)`
+- `tests/non_mock_compliance_gate.rs (23 tests)`
 
 Residuals:
 - 3 recording doubles tracked for migration (bd-m9rk)
@@ -25,29 +25,29 @@ Residuals:
 
 **Do we have complete E2E integration scripts with detailed logging?**
 
-Yes. 11/12 E2E workflows covered (92%), 1 waived (live-only, requires credentials). 34 E2E test files classified. Structured logging: failure_digest.v1, failure_timeline.v1, evidence_contract.json, replay_bundle.v1. CI gate lanes: preflight fast-fail + full certification. Waiver lifecycle enforced. Replay bundles with environment context.
+The covered workflows have structured E2E evidence. 19/21 workflows covered (90%), 2 waived (live-only, requires credentials). 39 E2E test files classified. Structured logging: failure_digest.v1, failure_timeline.v1, evidence_contract.json, replay_bundle.v1. CI gate lanes: preflight fast-fail + full certification. Waiver lifecycle enforced. Replay bundles with environment context.
 
 Evidence:
 - `docs/e2e_scenario_matrix.json`
 - `scripts/e2e/run_all.sh`
-- `tests/ci_full_suite_gate.rs (12 tests pass)`
+- `tests/ci_full_suite_gate.rs (106 tests)`
 - `tests/e2e_replay_bundles.rs (10 tests pass)`
 - `docs/qa-runbook.md`
 - `docs/ci-operator-runbook.md`
 
 Residuals:
-- 1 waived workflow (live provider parity, requires credentials)
-- 2 CI gate failure (cross_platform), 0 skipped (missing conformance artifacts)
-- Evidence bundle only generated during full E2E runs
+- 2 waived workflows (live provider parity, require credentials)
+- 3 CI gate failures and 0 skipped gates in the current full-suite verdict
+- Evidence bundle current verdict: insufficient
 
 ## Suite Classification
 
 | Suite | Files |
 |-------|-------|
-| Unit | 93 |
-| VCR | 125 |
-| E2E | 34 |
-| **Total** | **252** |
+| Unit | 124 |
+| VCR | 139 |
+| E2E | 39 |
+| **Total** | **302** |
 
 ## Allowlisted Exceptions
 
@@ -65,9 +65,8 @@ Residuals:
 
 | ID | Severity | Follow-up | Description |
 |-----|----------|-----------|-------------|
-| cross_platform_gate | medium | bd-1f42.6.7 | Cross-platform matrix gate fails (platform_report.json incomplete) |
-| ext_conformance_artifacts | low | bd-1f42.4.4 | Extension conformance gate artifacts not present in local runs (requires ext-conformance feature) |
-| evidence_bundle_artifact | low | bd-1f42.6.8 | Evidence bundle index.json only generated during full E2E runs |
+| ext_conformance_artifacts | low | bd-1f42.4.4 | Extension conformance is incomplete: 60/226 tested, 166 not exercised |
+| evidence_bundle_artifact | low | bd-1f42.6.8 | Evidence bundle is not complete (current verdict: insufficient) |
 | recording_doubles_cleanup | low | bd-m9rk | RecordingSession/RecordingHostActions/MockHostActions tracked for migration to real sessions |
 | live_provider_parity | low | bd-1f42.8.5.3 | Live provider parity workflows waived (require live credentials) |
 
@@ -105,8 +104,8 @@ Residuals:
 
 ## Extension Remediation Backlog
 
-- Total non-pass extensions: 36
-- Actionable: 31
-- Non-actionable: 5
+- Total non-pass extensions: 0
+- Actionable: 0
+- Non-actionable: 0
 - Artifact: `tests/full_suite_gate/extension_remediation_backlog.json`
 - Markdown: `tests/full_suite_gate/extension_remediation_backlog.md`

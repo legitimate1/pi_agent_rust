@@ -281,11 +281,11 @@ impl Provider for VertexProvider {
             .header("Authorization", format!("Bearer {auth_value}"));
 
         // Apply provider-specific custom headers from compat config.
-        if let Some(compat) = &self.compat {
-            if let Some(custom_headers) = &compat.custom_headers {
-                for (key, value) in custom_headers {
-                    request = request.header(key, value);
-                }
+        if let Some(compat) = &self.compat
+            && let Some(custom_headers) = &compat.custom_headers
+        {
+            for (key, value) in custom_headers {
+                request = request.header(key, value);
             }
         }
 
@@ -294,7 +294,20 @@ impl Provider for VertexProvider {
             request = request.header(key, value);
         }
 
-        let request = request.json(&request_body)?;
+        let rewritten_body = super::offer_before_provider_request(
+            options,
+            self.name(),
+            self.api(),
+            self.model_id(),
+            &url,
+            &request_body,
+            |value| super::validate_streamed_json_rewrite(value, &[], &["contents"], &[]),
+        )
+        .await;
+        let request = match &rewritten_body {
+            Some(body) => request.json(body)?,
+            None => request.json(&request_body)?,
+        };
 
         let response = Box::pin(request.send()).await?;
         let status = response.status();
@@ -416,6 +429,7 @@ where
                 model,
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             },
@@ -438,10 +452,10 @@ where
         }
 
         // Process candidates.
-        if let Some(candidates) = response.candidates {
-            if let Some(candidate) = candidates.into_iter().next() {
-                self.process_candidate(candidate)?;
-            }
+        if let Some(candidates) = response.candidates
+            && let Some(candidate) = candidates.into_iter().next()
+        {
+            self.process_candidate(candidate)?;
         }
 
         Ok(())
@@ -515,8 +529,11 @@ where
 
                         self.ensure_started();
 
-                        self.pending_events
-                            .push_back(StreamEvent::ToolCallStart { content_index });
+                        self.pending_events.push_back(StreamEvent::ToolCallStart {
+                            content_index,
+                            id: tool_call.id.clone(),
+                            name: tool_call.name.clone(),
+                        });
                         self.pending_events.push_back(StreamEvent::ToolCallDelta {
                             content_index,
                             delta: args_str,

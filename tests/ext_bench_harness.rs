@@ -8,7 +8,7 @@
 //! ## Modes
 //!
 //! - `PI_BENCH_MODE=pr`      — diverse subset (10 extensions, 10 iterations) for PR CI
-//! - `PI_BENCH_MODE=nightly`  — full corpus (all safe extensions, 50 iterations)
+//! - `PI_BENCH_MODE=nightly`  — full corpus (all safe extensions, 100 iterations)
 //! - `PI_BENCH_MODE=custom`   — use `PI_BENCH_MAX` and `PI_BENCH_ITERATIONS`
 //!
 //! ## PR Subset Selection Policy (bd-2mb1)
@@ -51,9 +51,11 @@ use pi::extensions::{
     ExtensionEventName, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
 };
 use pi::extensions_js::PiJsRuntimeConfig;
+use pi::perf_build;
 use pi::tools::ToolRegistry;
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -154,26 +156,34 @@ fn collect_env_fingerprint() -> EnvFingerprint {
     );
     let mem_total_mb = sys.total_memory() / (1024 * 1024);
 
-    let build_profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    }
-    .to_string();
+    let build_profile = perf_build::detect_build_profile();
 
-    let git_commit = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
+    let git_commit = std::env::var("VERGEN_GIT_SHA")
         .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::process::Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .output()
+                .ok()
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
 
-    let features = vec!["ext-conformance".to_string()];
+    let features = perf_build::compiled_feature_set()
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
 
     // Build config hash from env fields
-    let hash_input =
-        format!("{os}|{arch}|{cpu_model}|{cpu_cores}|{mem_total_mb}|{build_profile}|{git_commit}");
-    let config_hash = format!("{:x}", simple_hash(hash_input.as_bytes()));
+    let hash_input = format!(
+        "{os}|{arch}|{cpu_model}|{cpu_cores}|{mem_total_mb}|{build_profile}|{git_commit}|{}",
+        features.join(",")
+    );
+    let config_hash = format!("{:x}", Sha256::digest(hash_input.as_bytes()));
 
     EnvFingerprint {
         os,
@@ -204,16 +214,6 @@ fn read_cpu_model() -> String {
     "unknown".to_string()
 }
 
-/// Simple FNV-1a hash for config fingerprinting (not cryptographic).
-fn simple_hash(data: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &byte in data {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    hash
-}
-
 // ─── Manifest Loading ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -230,7 +230,7 @@ struct ManifestEntry {
     registers_flags: bool,
     #[allow(dead_code)]
     registers_providers: bool,
-    subscribes_events: usize,
+    subscribes_events: Vec<String>,
     #[allow(dead_code)]
     uses_session: bool,
 }
@@ -238,6 +238,12 @@ struct ManifestEntry {
 impl ManifestEntry {
     const fn is_safe(&self) -> bool {
         !self.is_multi_file && !self.uses_exec
+    }
+
+    fn subscribes_to(&self, event: &str) -> bool {
+        self.subscribes_events
+            .iter()
+            .any(|candidate| candidate == event)
     }
 }
 
@@ -288,10 +294,12 @@ impl Manifest {
         // Official: tool-registering
         pick(&|e: &&ManifestEntry| e.source_tier == "official-pi-mono" && e.registers_tools);
         // Official: event-subscribing
-        pick(&|e: &&ManifestEntry| e.source_tier == "official-pi-mono" && e.subscribes_events > 0);
+        pick(&|e: &&ManifestEntry| {
+            e.source_tier == "official-pi-mono" && e.subscribes_to("agent_start")
+        });
         // Community: commands + events
         pick(&|e: &&ManifestEntry| {
-            e.source_tier == "community" && e.registers_commands && e.subscribes_events > 0
+            e.source_tier == "community" && e.registers_commands && e.subscribes_to("agent_start")
         });
         // Community: tools + commands + flags (complex registration)
         pick(&|e: &&ManifestEntry| {
@@ -300,7 +308,9 @@ impl Manifest {
         // npm: commands
         pick(&|e: &&ManifestEntry| e.source_tier == "npm-registry" && e.registers_commands);
         // npm: events
-        pick(&|e: &&ManifestEntry| e.source_tier == "npm-registry" && e.subscribes_events > 0);
+        pick(&|e: &&ManifestEntry| {
+            e.source_tier == "npm-registry" && e.subscribes_to("agent_start")
+        });
 
         // Fill remaining from safe pool
         for e in &safe {
@@ -334,6 +344,10 @@ fn output_dir() -> PathBuf {
             }
         },
     );
+    if let Some(subdir) = std::env::var_os("BENCH_OUTPUT_TARGET_SUBDIR") {
+        return perf_build::prepare_target_output_dir(&target_dir, Path::new(&subdir))
+            .unwrap_or_else(|message| panic!("{message}"));
+    }
     target_dir.join("perf")
 }
 
@@ -362,7 +376,13 @@ fn load_manifest() -> &'static Manifest {
                     registers_commands: caps["registers_commands"].as_bool().unwrap_or(false),
                     registers_flags: caps["registers_flags"].as_bool().unwrap_or(false),
                     registers_providers: caps["registers_providers"].as_bool().unwrap_or(false),
-                    subscribes_events: caps["subscribes_events"].as_array().map_or(0, Vec::len),
+                    subscribes_events: caps["subscribes_events"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect(),
                     uses_session: caps["uses_session"].as_bool().unwrap_or(false),
                 }
             })
@@ -700,12 +720,74 @@ fn bench_warm_load(entry: &ManifestEntry, n: usize, env: &EnvFingerprint) -> Sce
 }
 
 /// Benchmark event dispatch: fire events at loaded extensions and measure latency.
+fn measure_successful_dispatch<E>(
+    samples_us: &mut Vec<u64>,
+    dispatch: impl FnOnce() -> std::result::Result<(), E>,
+) -> std::result::Result<(), String>
+where
+    E: std::fmt::Display,
+{
+    let start = Instant::now();
+    dispatch().map_err(|error| error.to_string())?;
+    let elapsed_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+    samples_us.push(elapsed_us);
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn bench_event_dispatch(
     entries: &[&ManifestEntry],
     count: usize,
     env: &EnvFingerprint,
 ) -> ScenarioResult {
+    let agent_start_subscriber_count = entries
+        .iter()
+        .filter(|entry| entry.subscribes_to("agent_start"))
+        .count();
+    if entries.is_empty() || count == 0 || agent_start_subscriber_count == 0 {
+        return ScenarioResult {
+            schema: "pi.ext.rust_bench.v1".to_string(),
+            runtime: "pi_agent_rust".to_string(),
+            scenario: "event_dispatch".to_string(),
+            extension: format!("{}_extensions", entries.len()),
+            group: "aggregate".to_string(),
+            tier: 0,
+            success: false,
+            error: Some(
+                "Event dispatch requires at least one extension, one sample, and one agent_start subscriber"
+                    .to_string(),
+            ),
+            stats: Stats::from_micros(&[]),
+            env: env.clone(),
+        };
+    }
+
+    let mut specs = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let entry_file = artifacts_dir().join(&entry.entry_path);
+        match JsExtensionLoadSpec::from_entry_path(&entry_file) {
+            Ok(spec) => specs.push(spec),
+            Err(error) => {
+                return ScenarioResult {
+                    schema: "pi.ext.rust_bench.v1".to_string(),
+                    runtime: "pi_agent_rust".to_string(),
+                    scenario: "event_dispatch".to_string(),
+                    extension: format!("{}_extensions", entries.len()),
+                    group: "aggregate".to_string(),
+                    tier: 0,
+                    success: false,
+                    error: Some(format!(
+                        "Load spec error for {} ({}): {error}",
+                        entry.id,
+                        entry_file.display()
+                    )),
+                    stats: Stats::from_micros(&[]),
+                    env: env.clone(),
+                };
+            }
+        }
+    }
+
     let cwd = std::env::temp_dir().join("pi-bench-event-dispatch");
     let _ = std::fs::create_dir_all(&cwd);
     let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
@@ -739,15 +821,6 @@ fn bench_event_dispatch(
     };
     manager.set_js_runtime(runtime);
 
-    // Load all extensions
-    let mut specs = Vec::new();
-    for entry in entries {
-        let entry_file = artifacts_dir().join(&entry.entry_path);
-        if let Ok(spec) = JsExtensionLoadSpec::from_entry_path(&entry_file) {
-            specs.push(spec);
-        }
-    }
-
     let loaded_count = specs.len();
     let load_result = common::run_async({
         let manager = manager.clone();
@@ -780,20 +853,28 @@ fn bench_event_dispatch(
     });
 
     let mut samples_us = Vec::with_capacity(count);
-    for _ in 0..count {
-        let start = Instant::now();
-        let _ = common::run_async({
-            let manager = manager.clone();
-            let payload = Some(payload.clone());
-            async move {
-                manager
-                    .dispatch_event(ExtensionEventName::AgentStart, payload)
-                    .await
-            }
+    let mut dispatch_error = None;
+    for sample_index in 0..count {
+        let result = measure_successful_dispatch(&mut samples_us, || {
+            common::run_async({
+                let manager = manager.clone();
+                let payload = Some(payload.clone());
+                async move {
+                    manager
+                        .dispatch_event(ExtensionEventName::AgentStart, payload)
+                        .await
+                }
+            })
         });
-        let elapsed_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
-        samples_us.push(elapsed_us);
+        if let Err(error) = result {
+            dispatch_error = Some(format!(
+                "Event dispatch sample {sample_index} failed: {error}"
+            ));
+            break;
+        }
     }
+
+    let success = dispatch_error.is_none() && samples_us.len() == count;
 
     common::run_async({
         async move {
@@ -808,11 +889,24 @@ fn bench_event_dispatch(
         extension: format!("{loaded_count}_extensions"),
         group: "aggregate".to_string(),
         tier: 0,
-        success: true,
-        error: None,
+        success,
+        error: dispatch_error,
         stats: Stats::from_micros(&samples_us),
         env: env.clone(),
     }
+}
+
+#[test]
+fn failed_event_dispatch_is_not_recorded_as_a_latency_sample() {
+    let mut samples = Vec::new();
+    let error =
+        measure_successful_dispatch(&mut samples, || Err::<(), _>("synthetic dispatch failure"))
+            .expect_err("dispatch failure must be propagated");
+    assert!(error.contains("synthetic dispatch failure"));
+    assert!(
+        samples.is_empty(),
+        "a failed dispatch must not produce a successful latency sample"
+    );
 }
 
 // ─── Report Generation ──────────────────────────────────────────────────────
@@ -1240,9 +1334,37 @@ fn ext_bench_harness() {
     std::fs::create_dir_all(&out_dir).expect("create extension benchmark output dir");
 
     let jsonl_path = out_dir.join("ext_bench_harness.jsonl");
+    let correlation_id = std::env::var("CI_CORRELATION_ID")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let source_commit = std::env::var("VERGEN_GIT_SHA")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let source_dirty = std::env::var("VERGEN_GIT_DIRTY").as_deref() != Ok("false");
+    let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let jsonl: String = all_results
         .iter()
-        .filter_map(|r| serde_json::to_string(r).ok())
+        .filter_map(|result| {
+            let mut value = serde_json::to_value(result).ok()?;
+            let record = value.as_object_mut()?;
+            record.insert("timestamp".to_string(), Value::String(generated_at.clone()));
+            record.insert(
+                "run_id".to_string(),
+                correlation_id.clone().map_or(Value::Null, Value::String),
+            );
+            record.insert(
+                "correlation_id".to_string(),
+                correlation_id.clone().map_or(Value::Null, Value::String),
+            );
+            record.insert(
+                "source_commit".to_string(),
+                source_commit.clone().map_or(Value::Null, Value::String),
+            );
+            record.insert("source_dirty".to_string(), Value::Bool(source_dirty));
+            serde_json::to_string(&value).ok()
+        })
         .collect::<Vec<_>>()
         .join("\n");
     std::fs::write(&jsonl_path, format!("{jsonl}\n")).expect("write JSONL");
@@ -1345,6 +1467,15 @@ fn ext_bench_harness() {
         total_failed
     );
     eprintln!("  Budgets: {budgets_passed} pass, {budgets_failed} fail, {budgets_no_data} no_data");
+
+    assert_eq!(
+        total_failed, 0,
+        "Extension benchmark scenarios failed; report contains non-evidence rows"
+    );
+    assert_eq!(
+        budgets_no_data, 0,
+        "Extension benchmark budget checks produced NO_DATA"
+    );
 
     for check in &budget_checks {
         let actual_str = check

@@ -3,7 +3,7 @@
 Auth failure modes and exact remediation paths for each gap and longtail
 provider, linked to test evidence and the error hint system in `src/error.rs`.
 
-Generated: 2026-02-13
+Reconciled against the live registry and auth runtime: 2026-08-06
 
 ## Quick Reference
 
@@ -26,7 +26,9 @@ Generated: 2026-02-13
 
 This crosswalk maps every user-visible provider name (including upstream aliases from opencode and models.dev) to the Pi canonical ID, accepted aliases, auth env vars, and default endpoint. Use this when a user reports "missing provider" or confusion about which name to use.
 
-**Total**: 91 canonical providers, 43 aliases, 100% upstream coverage.
+**Total**: 102 registered canonical provider IDs and 61 aliases. Registration
+coverage is not a claim that every ID has an executable native route; use
+`pi --list-providers` and the implementation-mode evidence for runtime status.
 
 ### Native providers (dedicated adapter)
 
@@ -44,6 +46,7 @@ This crosswalk maps every user-visible provider name (including upstream aliases
 | `azure-openai` | `azure`, `azure_openai`, `azure-cognitive-services`, `azure-openai-responses` | `AZURE_OPENAI_API_KEY` | _(per-resource URL)_ | native-azure |
 | `github-copilot` | `copilot`, `github-copilot-enterprise` | `GITHUB_COPILOT_API_KEY`, `GITHUB_TOKEN` | _(token exchange)_ | native-copilot |
 | `gitlab` | `gitlab-duo` | `GITLAB_TOKEN`, `GITLAB_API_KEY` | _(configurable instance)_ | native-gitlab |
+| `cursor` | `cursor-agent` | `CURSOR_API_KEY`, `CURSOR_ACCESS_TOKEN` | `https://api2.cursor.sh/agent.v1.AgentService/Run` | cursor-agent |
 | `sap-ai-core` | `sap` | `AICORE_SERVICE_KEY`, `SAP_AI_CORE_CLIENT_ID`, `SAP_AI_CORE_CLIENT_SECRET`, `SAP_AI_CORE_TOKEN_URL`, `SAP_AI_CORE_SERVICE_URL` | _(per-instance)_ | native-sap |
 | `v0` | — | `V0_API_KEY` | _(per-instance)_ | native-v0 |
 
@@ -53,6 +56,7 @@ This crosswalk maps every user-visible provider name (including upstream aliases
 |---|---|---|---|
 | `groq` | — | `GROQ_API_KEY` | `https://api.groq.com/openai/v1` |
 | `cerebras` | — | `CEREBRAS_API_KEY` | `https://api.cerebras.ai/v1` |
+| `atlascloud` | `atlas-cloud`, `atlas` | `ATLASCLOUD_API_KEY`, `ATLAS_CLOUD_API_KEY` | `https://api.atlascloud.ai/v1` |
 | `openrouter` | `open-router` | `OPENROUTER_API_KEY` | `https://openrouter.ai/api/v1` |
 | `mistral` | `mistralai` | `MISTRAL_API_KEY` | `https://api.mistral.ai/v1` |
 | `deepseek` | `deep-seek` | `DEEPSEEK_API_KEY` | `https://api.deepseek.com` |
@@ -97,6 +101,14 @@ This crosswalk maps every user-visible provider name (including upstream aliases
 | `minimax-coding-plan` | — | `MINIMAX_API_KEY` | `https://api.minimax.io/anthropic/v1/messages` |
 | `minimax-cn-coding-plan` | — | `MINIMAX_CN_API_KEY` | `https://api.minimaxi.com/anthropic/v1/messages` |
 | `zenmux` | — | `ZENMUX_API_KEY` | `https://zenmux.ai/api/anthropic/v1/messages` |
+| `umans` | `umans-ai` | `UMANS_AI_CODING_PLAN_API_KEY` | `https://api.code.umans.ai/v1/messages` |
+
+`kimi-for-coding` has two intentional request-auth lanes. A `sk-*` direct API
+key, including one supplied through `KIMI_API_KEY`, is sent as `x-api-key`.
+Tokens obtained by `/login kimi-for-coding` or imported from the Kimi CLI are
+sent as `Authorization: Bearer` with the required Kimi device headers. Do not
+diagnose the absence of `x-api-key` as a failure when an OAuth/external token is
+active.
 
 ### OpenAI-compatible presets (longtail)
 
@@ -111,20 +123,24 @@ This crosswalk maps every user-visible provider name (including upstream aliases
 | `chutes` | — | `CHUTES_API_KEY` | `https://llm.chutes.ai/v1` |
 | `cloudflare-ai-gateway` | — | `CLOUDFLARE_API_TOKEN` | `https://gateway.ai.cloudflare.com/v1/...` |
 | `cloudflare-workers-ai` | — | `CLOUDFLARE_API_TOKEN` | `https://api.cloudflare.com/client/v4/accounts/.../ai/v1` |
+| `coreweave` | `coreweave-serverless` | `COREWEAVE_API_KEY`, `WANDB_API_KEY` | `https://api.inference.wandb.ai/v1` |
 | `cortecs` | — | `CORTECS_API_KEY` | `https://api.cortecs.ai/v1` |
 | `fastrouter` | — | `FASTROUTER_API_KEY` | `https://go.fastrouter.ai/api/v1` |
 | `firmware` | — | `FIRMWARE_API_KEY` | `https://app.firmware.ai/api/v1` |
 | `friendli` | — | `FRIENDLI_TOKEN` | `https://api.friendli.ai/serverless/v1` |
-| `github-models` | — | `GITHUB_TOKEN` | `https://models.github.ai/inference` |
+| `gmi` | `gmi-cloud`, `gmi-serving` | `GMI_API_KEY` | `https://api.gmi-serving.com/v1` |
 | `helicone` | — | `HELICONE_API_KEY` | `https://ai-gateway.helicone.ai/v1` |
 | `iflowcn` | — | `IFLOW_API_KEY` | `https://apis.iflow.cn/v1` |
 | `inception` | — | `INCEPTION_API_KEY` | `https://api.inceptionlabs.ai/v1` |
 | `inference` | — | `INFERENCE_API_KEY` | `https://inference.net/v1` |
 | `io-net` | — | `IOINTELLIGENCE_API_KEY` | `https://api.intelligence.io.solutions/api/v1` |
 | `jiekou` | — | `JIEKOU_API_KEY` | `https://api.jiekou.ai/openai` |
+| `kilo` | `kilo-gateway`, `kilo-ai` | `KILO_API_KEY` | `https://api.kilo.ai/api/gateway` |
 | `llama` | — | `LLAMA_API_KEY` | `https://api.llama.com/compat/v1` |
+| `llamacpp` | `llama-cpp`, `llama.cpp`, `llama-server` | _(none; local llama-server)_ | `http://127.0.0.1:8080/v1` |
 | `lmstudio` | `lm-studio` | `LMSTUDIO_API_KEY` | `http://127.0.0.1:1234/v1` |
 | `lucidquery` | — | `LUCIDQUERY_API_KEY` | `https://lucidquery.com/api/v1` |
+| `mistralrs` | `mistral-rs`, `mistral.rs` | _(none; local mistral.rs server)_ | `http://127.0.0.1:1234/v1` |
 | `moark` | — | `MOARK_API_KEY` | `https://moark.com/v1` |
 | `morph` | — | `MORPH_API_KEY` | `https://api.morphllm.com/v1` |
 | `nano-gpt` | `nanogpt` | `NANO_GPT_API_KEY` | `https://nano-gpt.com/api/v1` |
@@ -132,15 +148,19 @@ This crosswalk maps every user-visible provider name (including upstream aliases
 | `novita-ai` | `novita` | `NOVITA_API_KEY` | `https://api.novita.ai/openai` |
 | `ollama` | — | _(none)_ | `http://127.0.0.1:11434/v1` |
 | `ollama-cloud` | — | `OLLAMA_API_KEY` | `https://ollama.com/v1` |
-| `opencode` | — | `OPENCODE_API_KEY` | `https://opencode.ai/zen/v1` |
+| `opencode` | `opencode-zen` | `OPENCODE_API_KEY` | `https://opencode.ai/zen/v1` |
+| `opencode-go` | — | `OPENCODE_API_KEY` | `https://opencode.ai/zen/go/v1` |
 | `poe` | — | `POE_API_KEY` | `https://api.poe.com/v1` |
 | `privatemode-ai` | — | `PRIVATEMODE_API_KEY` | `http://localhost:8080/v1` |
+| `qianfan` | `baidu-qianfan` | `QIANFAN_API_KEY` | `https://qianfan.baidubce.com/v2` |
 | `requesty` | — | `REQUESTY_API_KEY` | `https://router.requesty.ai/v1` |
+| `sakana` | `sakana-ai` | `SAKANA_API_KEY`, `FUGU_API_KEY` | `https://api.sakana.ai/v1` (openai-responses) |
 | `submodel` | — | `SUBMODEL_INSTAGEN_ACCESS_KEY` | `https://llm.submodel.ai/v1` |
 | `synthetic` | — | `SYNTHETIC_API_KEY` | `https://api.synthetic.new/v1` |
 | `vercel` | `vercel-ai-gateway` | `AI_GATEWAY_API_KEY` | `https://ai-gateway.vercel.sh/v1` |
 | `vivgrid` | — | `VIVGRID_API_KEY` | `https://api.vivgrid.com/v1` |
 | `vultr` | — | `VULTR_API_KEY` | `https://api.vultrinference.com/v1` |
+| `wafer` | `wafer-serverless` | `WAFER_SERVERLESS_API_KEY` | `https://pass.wafer.ai/v1` |
 | `wandb` | — | `WANDB_API_KEY` | `https://api.inference.wandb.ai/v1` |
 | `xiaomi` | — | `XIAOMI_API_KEY` | `https://api.xiaomimimo.com/v1` |
 
@@ -179,6 +199,18 @@ If a user types any of these aliases (left), Pi resolves to the canonical ID (ri
 | `lm-studio` | `lmstudio` |
 | `kimi-coding`, `kimi-code` | `kimi-for-coding` |
 | `vercel-ai-gateway` | `vercel` |
+| `atlas`, `atlas-cloud` | `atlascloud` |
+| `cursor-agent` | `cursor` |
+| `llama-cpp`, `llama.cpp`, `llama-server` | `llamacpp` |
+| `mistral-rs`, `mistral.rs` | `mistralrs` |
+| `gmi-cloud`, `gmi-serving` | `gmi` |
+| `coreweave-serverless` | `coreweave` |
+| `sakana-ai` | `sakana` |
+| `wafer-serverless` | `wafer` |
+| `baidu-qianfan` | `qianfan` |
+| `umans-ai` | `umans` |
+| `kilo-gateway`, `kilo-ai` | `kilo` |
+| `opencode-zen` | `opencode` |
 
 ### Shared env-key families
 
@@ -192,9 +224,14 @@ Some distinct canonical IDs share environment variables (intentional for provide
 | `MINIMAX_API_KEY` | `minimax`, `minimax-coding-plan` |
 | `MINIMAX_CN_API_KEY` | `minimax-cn`, `minimax-cn-coding-plan` |
 | `CLOUDFLARE_API_TOKEN` | `cloudflare-ai-gateway`, `cloudflare-workers-ai` |
-| `GITHUB_TOKEN` | `github-copilot`, `github-models` |
+| `WANDB_API_KEY` | `wandb`, `coreweave` |
+| `OPENCODE_API_KEY` | `opencode`, `opencode-go` |
 
-**Validation**: `cargo test --test provider_metadata_comprehensive -- canonical_id_snapshot alias_mapping_snapshot`
+**Validation**: `cargo test --test provider_metadata_comprehensive provider_auth_reference_artifacts_match_runtime_metadata -- --exact`
+
+The former `github-models` preset was removed after GitHub retired the GitHub
+Models service on 2026-07-30. `github-copilot` is a separate native provider and
+remains supported.
 
 ## Failure Mode Matrix
 
@@ -436,8 +473,11 @@ The `AuthDiagnosticCode` enum (`src/error.rs:67-81`) provides stable machine cod
 
 ### Amazon Bedrock
 
-**Auth mechanism**: AWS SigV4 signing OR Bearer token
-**Env vars**: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_BEARER_TOKEN_BEDROCK`, `AWS_REGION`
+**Auth mechanism**: An explicit `--api-key`/per-request bearer override wins;
+otherwise use `AWS_BEARER_TOKEN_BEDROCK` or AWS SigV4 signing.
+**Env vars**: `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (optionally
+`AWS_SESSION_TOKEN`), `AWS_BEARER_TOKEN_BEDROCK`, `AWS_PROFILE` or
+`AWS_DEFAULT_PROFILE`, and `AWS_REGION` or `AWS_DEFAULT_REGION`
 
 | Failure mode | HTTP status | Response body shape | Diagnostic code | VCR cassette |
 |-------------|------------|--------------------|-----------------|----|
@@ -445,9 +485,15 @@ The `AuthDiagnosticCode` enum (`src/error.rs:67-81`) provides stable machine cod
 | Invalid credentials | 401 | `{"__type":"UnrecognizedClientException","message":"..."}` | `InvalidApiKey` | `verify_bedrock_error_auth_401.json` |
 | Wrong region | 403 | `{"__type":"AccessDeniedException","message":"..."}` | `MissingRegion` | — |
 
-**User-facing message**: `"Amazon Bedrock requires AWS credentials. Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_BEARER_TOKEN_BEDROCK, or store amazon-bedrock credentials in auth.json."`
-**Unique**: Multi-credential chain (SigV4 keys, bearer token, auth.json, AWS profile). SigV4 signing at request time.
-**Source**: `src/providers/bedrock.rs:138-182, 448-452, 802-866`
+**User-facing message**: `"Amazon Bedrock requires AWS credentials. Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_BEARER_TOKEN_BEDROCK, AWS_PROFILE (static or SSO), or store amazon-bedrock credentials in auth.json. For SSO profiles, run: aws sso login --profile <name>. An explicit direct bearer token may be passed via --api-key or StreamOptions.api_key."`
+**Unique**: A non-empty explicit direct bearer override takes precedence over
+all automatic AWS sources. Without one, the resolver checks the Bedrock bearer
+env token, complete env IAM keys, a static or SSO profile, then stored
+credentials. A region alone, profile name alone, access-key ID alone, or orphan
+session token is never treated as a bearer credential. SigV4 signing occurs at
+request time.
+**Source**: `src/providers/bedrock.rs` (`BedrockProvider::resolve_auth_context`,
+request signing) and `src/auth.rs` (`resolve_aws_credentials_async`)
 
 ### GitHub Copilot
 
@@ -515,9 +561,18 @@ Providers follow distinct error envelope formats:
 The auth system (`src/auth.rs`) resolves credentials in this order:
 
 1. **Explicit override** — `--api-key` flag or per-request key
-2. **Environment variables** — provider-specific vars from `provider_auth_env_keys()`
-3. **auth.json** — persisted credentials at `~/.pi/agent/auth.json`
-4. **Canonical fallback** — alias providers fall back to canonical (e.g., `openai-responses` → `openai`)
+2. **Stored OAuth or bearer token** — an unexpired OAuth access token or a
+   `BearerToken` entry in `~/.pi/agent/auth.json`
+3. **Environment variables** — provider-specific vars from
+   `provider_auth_env_keys()`, in their documented order
+4. **Stored API key** — an `ApiKey` entry in `~/.pi/agent/auth.json`
+5. **External coding-CLI credential** — supported credentials auto-detected
+   from another local coding CLI, only when using Pi's global auth storage
+
+Canonical IDs and aliases share credential lookup at each applicable tier; alias
+resolution is not a separate, lower-priority credential source. If all five auth
+sources are absent, model selection can still use an inline `models.json`
+`apiKey` fallback.
 
 **OAuth proactive refresh**: tokens refresh 10 minutes before expiry to avoid mid-request expiration.
 

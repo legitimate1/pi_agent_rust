@@ -2,9 +2,12 @@
 *.db
 *.db-shm
 *.db-wal
+*.db-fsqlite-ns-*
+*.vacuum-fsqlite-ns-*
 
 # Lock files
 *.lock
+.write.lock
 
 # Temporary
 last-touched
@@ -14,3 +17,11 @@ last-touched
 # Preserved pre-repair DB/WAL copies and timestamped recovery snapshots.
 *.bad_*
 recovery_*/
+
+# Merge artifacts (temporary files from 3-way merge)
+beads.base.jsonl
+beads.base.meta.json
+*.db-journal
+*.db-wal*
+*.vacuum-wal-cert*
+*.fsqlite-migration-state

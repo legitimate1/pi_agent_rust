@@ -81,6 +81,7 @@ fn make_assistant(
             ..Usage::default()
         },
         stop_reason,
+        stop_details: None,
         error_message: None,
         timestamp: 0,
     }
@@ -94,6 +95,7 @@ fn stream_done(msg: AssistantMessage) -> Pin<Box<dyn Stream<Item = Result<Stream
         model: msg.model.clone(),
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
+        stop_details: None,
         error_message: None,
         timestamp: 0,
     };
@@ -151,7 +153,11 @@ const fn event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::AutoCompactionEnd { .. } => "auto_compaction_end",
         AgentEvent::AutoRetryStart { .. } => "auto_retry_start",
         AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
+        AgentEvent::FailoverStart { .. } => "failover_start",
+        AgentEvent::FailoverEnd { .. } => "failover_end",
         AgentEvent::ExtensionError { .. } => "extension_error",
+        AgentEvent::AdvisorNote { .. } => "advisor_note",
+        AgentEvent::ProviderError { .. } => "provider_error",
     }
 }
 
@@ -177,12 +183,22 @@ fn write_jsonl_artifacts(harness: &TestHarness, test_name: &str) {
 #[derive(Debug)]
 struct SimpleProvider {
     response_text: String,
+    provider_name: String,
+    model_id: String,
 }
 
 impl SimpleProvider {
     fn new(text: &str) -> Self {
+        Self::with_identity(text, "simple-provider", "simple-model")
+    }
+
+    /// A simple provider that reports another provider/model identity, for
+    /// resuming a session whose header already binds that model.
+    fn with_identity(text: &str, provider_name: &str, model_id: &str) -> Self {
         Self {
             response_text: text.to_string(),
+            provider_name: provider_name.to_string(),
+            model_id: model_id.to_string(),
         }
     }
 }
@@ -191,13 +207,13 @@ impl SimpleProvider {
 #[allow(clippy::unnecessary_literal_bound)]
 impl Provider for SimpleProvider {
     fn name(&self) -> &str {
-        "simple-provider"
+        &self.provider_name
     }
     fn api(&self) -> &str {
         "simple-api"
     }
     fn model_id(&self) -> &str {
-        "simple-model"
+        &self.model_id
     }
     async fn stream(
         &self,
@@ -205,7 +221,7 @@ impl Provider for SimpleProvider {
         _options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let msg = make_assistant(
-            "simple-provider",
+            &self.provider_name,
             StopReason::Stop,
             vec![ContentBlock::Text(TextContent::new(&self.response_text))],
             10,
@@ -797,7 +813,11 @@ fn cycle_run_abort_persist_reload_resume() {
         let session = Arc::clone(&session);
         async move {
             let cx = asupersync::Cx::for_testing();
-            let mut guard = session.lock(&cx).await.expect("lock");
+            // `MutexGuard` is `!Send` (asupersync 0.3.9) and `run_async` requires
+            // a `Send` future, so the guard held across `save().await` must be owned.
+            let mut guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock");
             guard.save().await.expect("save after abort");
         }
     });
@@ -890,12 +910,19 @@ fn cycle_tool_abort_then_fresh_success() {
         format!("Tool abort: is_ok={}", abort_result.is_ok()),
     );
 
-    // Phase 2: Fresh run should succeed
+    // Phase 2: Fresh run should succeed. The session header now binds the
+    // phase-1 model, and a fresh run on that session must keep using it (an
+    // unregistered, different provider/model is refused at selection), so the
+    // simple provider reports the same identity.
     let fresh_msg = run_async({
         let cwd = cwd.clone();
         let session = Arc::clone(&session);
         async move {
-            let provider: Arc<dyn Provider> = Arc::new(SimpleProvider::new("fresh success"));
+            let provider: Arc<dyn Provider> = Arc::new(SimpleProvider::with_identity(
+                "fresh success",
+                "tool-finalize-provider",
+                "tool-finalize-model",
+            ));
             let mut agent_session = make_agent_session(&cwd, provider, session, 4);
             agent_session
                 .run_text("try again".to_string(), |_| {})

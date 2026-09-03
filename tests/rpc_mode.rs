@@ -189,6 +189,7 @@ fn rpc_get_state_and_prompt() {
             cli_api_key: None,
             auth,
             runtime_handle: handle.clone(),
+            ask_tool: None,
         };
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
@@ -464,6 +465,7 @@ fn rpc_session_stats_counts_tool_calls_and_results() {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::ToolUse,
+                stop_details: None,
                 error_message: None,
                 timestamp: now,
             },
@@ -496,6 +498,7 @@ fn rpc_session_stats_counts_tool_calls_and_results() {
             cli_api_key: None,
             auth,
             runtime_handle: handle.clone(),
+            ask_tool: None,
         };
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);

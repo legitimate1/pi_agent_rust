@@ -96,6 +96,7 @@ fn make_rpc_options(
         cli_api_key: None,
         auth,
         runtime_handle: handle.clone(),
+        ask_tool: None,
     }
 }
 
@@ -185,6 +186,7 @@ fn rpc_get_session_stats_returns_stats() {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 1_700_000_000_000,
             },
@@ -331,6 +333,7 @@ fn rpc_get_last_assistant_text_with_messages() {
                 model: "test-model".to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 1_700_000_000_000,
             },

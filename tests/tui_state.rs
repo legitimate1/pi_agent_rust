@@ -17,6 +17,7 @@ use pi::extensions::{
 use pi::extensions_js::PiJsRuntimeConfig;
 use pi::interactive::{ConversationMessage, MessageRole, PendingInput, PiApp, PiMsg};
 use pi::keybindings::KeyBindings;
+use pi::mcp::McpManager;
 use pi::model::{
     AssistantMessage, ContentBlock, Cost, ImageContent, StopReason, StreamEvent, TextContent,
     Usage, UserContent,
@@ -43,6 +44,13 @@ fn make_executable(path: &std::path::Path) {
     perms.set_mode(0o755);
     fs::set_permissions(path, perms).expect("set permissions");
 }
+
+/// Upper bound for events produced by an extension hook running on the
+/// `QuickJS` runtime thread (bd-7n3y7): the wait returns as soon as the event
+/// arrives, so a generous bound costs nothing on a quiet host, while the old
+/// one-second bound made the `/new` and `/resume` cancellation tests flaky
+/// under a loaded full-lane worker.
+const EXTENSION_HOOK_WAIT: Duration = Duration::from_secs(20);
 
 fn test_runtime_handle() -> asupersync::runtime::RuntimeHandle {
     static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
@@ -180,6 +188,7 @@ fn build_app_with_session_and_config(
         model_entry,
         model_scope,
         available_models,
+        None,
         pending_inputs,
         event_tx,
         test_runtime_handle(),
@@ -189,6 +198,7 @@ fn build_app_with_session_and_config(
         Some(KeyBindings::new()),
         messages,
         usage,
+        None,
     );
     app.set_terminal_size(80, 24);
     app
@@ -201,6 +211,29 @@ fn build_app_with_session_and_events_and_extension(
     config: Config,
     extension_source: &str,
 ) -> (PiApp, mpsc::Receiver<PiMsg>) {
+    let (app, event_rx, _manager) = build_app_with_extension_and_mcp(
+        harness,
+        pending_inputs,
+        session,
+        config,
+        extension_source,
+        None,
+    );
+    (app, event_rx)
+}
+
+/// Like `build_app_with_session_and_events_and_extension`, but the App also
+/// owns an MCP manager (the classic TUI's `mcp_manager` slot) and the loaded
+/// `ExtensionManager` is handed back so a test can register late servers the
+/// way the `registerMcpServer` hostcall does.
+fn build_app_with_extension_and_mcp(
+    harness: &TestHarness,
+    pending_inputs: Vec<PendingInput>,
+    session: Session,
+    config: Config,
+    extension_source: &str,
+    mcp_manager: Option<Arc<McpManager>>,
+) -> (PiApp, mpsc::Receiver<PiMsg>, ExtensionManager) {
     let config = common::hermetic_interactive_config(config);
     let cwd = harness.temp_dir().to_path_buf();
     let tools = ToolRegistry::new(&[], &cwd, Some(&config));
@@ -263,18 +296,20 @@ fn build_app_with_session_and_events_and_extension(
         model_entry,
         model_scope,
         available_models,
+        None,
         pending_inputs,
         event_tx,
         test_runtime_handle(),
         false,
         false,
-        Some(manager),
+        Some(manager.clone()),
         Some(KeyBindings::new()),
         messages,
         usage,
+        mcp_manager,
     );
     app.set_terminal_size(80, 24);
-    (app, event_rx)
+    (app, event_rx, manager)
 }
 
 fn build_app_with_models(
@@ -316,6 +351,7 @@ fn build_app_with_models(
         model_entry,
         model_scope,
         available_models,
+        None,
         Vec::new(),
         event_tx,
         test_runtime_handle(),
@@ -325,6 +361,7 @@ fn build_app_with_models(
         Some(keybindings),
         messages,
         usage,
+        None,
     );
     app.set_terminal_size(80, 24);
     app
@@ -390,6 +427,7 @@ fn build_app_with_session_and_events_and_config(
         model_entry,
         model_scope,
         available_models,
+        None,
         pending_inputs,
         event_tx,
         test_runtime_handle(),
@@ -399,6 +437,7 @@ fn build_app_with_session_and_events_and_config(
         Some(KeyBindings::new()),
         messages,
         usage,
+        None,
     );
     app.set_terminal_size(80, 24);
     (app, event_rx)
@@ -847,6 +886,34 @@ fn apply_pi(harness: &TestHarness, app: &mut PiApp, label: &str, msg: PiMsg) -> 
     apply_msg(harness, app, label, Message::new(msg))
 }
 
+fn apply_conversation_reset(
+    harness: &TestHarness,
+    app: &mut PiApp,
+    label: &str,
+    messages: Vec<ConversationMessage>,
+    usage: Usage,
+    status: Option<String>,
+) -> StepOutcome {
+    let session = app.session_handle();
+    let session_id = session
+        .try_lock()
+        .expect("lock session for conversation reset")
+        .header
+        .id
+        .clone();
+    apply_pi(
+        harness,
+        app,
+        label,
+        PiMsg::ConversationReset {
+            session_id,
+            messages,
+            usage,
+            status,
+        },
+    )
+}
+
 fn apply_key(harness: &TestHarness, app: &mut PiApp, label: &str, key: KeyMsg) -> StepOutcome {
     apply_msg(harness, app, label, Message::new(key))
 }
@@ -900,6 +967,19 @@ fn assert_after_not_contains(harness: &TestHarness, step: &StepOutcome, needle: 
             harness,
             step,
             &format!("Expected view NOT to contain: {needle}"),
+        );
+    }
+}
+
+fn assert_after_count(harness: &TestHarness, step: &StepOutcome, needle: &str, expected: usize) {
+    let found = step.after.matches(needle).count();
+    if found != expected {
+        fail_step(
+            harness,
+            step,
+            &format!(
+                "Expected view to contain {needle:?} exactly {expected} time(s), found {found}"
+            ),
         );
     }
 }
@@ -1359,15 +1439,13 @@ fn tui_state_pageup_changes_scroll_percent_when_scrollable() {
     let messages = (0..40)
         .map(|idx| user_msg(&format!("line {idx}")))
         .collect::<Vec<_>>();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset(many)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     let baseline_view = normalize_view(&BubbleteaModel::view(&app));
@@ -1390,15 +1468,13 @@ fn tui_state_pagedown_restores_scroll_percent_when_scrollable() {
     let messages = (0..40)
         .map(|idx| user_msg(&format!("line {idx}")))
         .collect::<Vec<_>>();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset(many)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     press_pgup(&harness, &mut app);
@@ -1501,15 +1577,13 @@ fn tui_state_text_delta_preserves_manual_scroll_position() {
     let messages = (0..50)
         .map(|idx| user_msg(&format!("history {idx:03}")))
         .collect::<Vec<_>>();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset(history)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     let pgup_step = press_pgup(&harness, &mut app);
@@ -1662,6 +1736,7 @@ fn tui_state_tool_end_appends_tool_output_message() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
     assert_after_contains(&harness, &step, "Tool read output:");
@@ -1706,6 +1781,7 @@ fn tui_state_tool_update_with_diff_details_appends_diff_block() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -1760,6 +1836,7 @@ fn tui_state_tool_update_with_large_diff_shows_truncation_indicator() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
     assert_after_contains(&harness, &step, "collapsed");
@@ -1830,6 +1907,7 @@ fn tui_state_tool_update_with_diff_without_replace_message_uses_generic_header()
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -1877,6 +1955,7 @@ fn tui_state_tool_update_with_details_and_no_content_renders_pretty_json() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -1920,6 +1999,7 @@ fn tui_state_tool_output_over_threshold_auto_collapses_with_preview() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -1965,6 +2045,7 @@ fn tui_state_tool_output_at_threshold_stays_expanded() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -2006,6 +2087,7 @@ fn tui_state_expand_tools_reexpands_auto_collapsed_blocks() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
     assert_after_contains(&harness, &step, "collapsed");
@@ -2069,6 +2151,7 @@ fn tui_state_expand_tools_toggles_tool_output_visibility() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
     assert_after_contains(&harness, &step, "Tool read output:");
@@ -2134,6 +2217,7 @@ fn tui_state_terminal_show_images_false_hides_images_in_tool_output() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -2192,6 +2276,7 @@ fn tui_state_terminal_show_images_true_shows_image_placeholders_in_tool_output()
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -2262,6 +2347,7 @@ fn tui_state_terminal_show_images_false_reports_multiple_hidden_images() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -2316,6 +2402,7 @@ fn tui_state_terminal_show_images_false_still_renders_tool_output_when_only_imag
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -2436,10 +2523,15 @@ fn tui_state_agent_done_error_without_response_adds_error_message() {
     assert_after_contains(&harness, &step, "boom");
 }
 
+/// #209 (ab888c82): a provider failure after partial text used to leave only
+/// the one-line status behind, so the transcript now keeps the partial answer
+/// AND exactly one error card. Before #209 this test asserted that no card
+/// appears once text had streamed; the newer contract wins, and "exactly one"
+/// is what still guards against a duplicated system message.
 #[test]
-fn tui_state_agent_done_error_with_response_does_not_duplicate_error_system_message() {
+fn tui_state_agent_done_error_with_response_keeps_partial_text_and_one_error_card() {
     let harness = TestHarness::new(
-        "tui_state_agent_done_error_with_response_does_not_duplicate_error_system_message",
+        "tui_state_agent_done_error_with_response_keeps_partial_text_and_one_error_card",
     );
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
@@ -2462,7 +2554,7 @@ fn tui_state_agent_done_error_with_response_does_not_duplicate_error_system_mess
         },
     );
     assert_after_contains(&harness, &step, "partial");
-    assert_after_not_contains(&harness, &step, "Error: boom");
+    assert_after_count(&harness, &step, "Error: boom", 1);
 }
 
 #[test]
@@ -2506,15 +2598,13 @@ fn tui_state_conversation_reset_replaces_messages_sets_usage_and_status() {
     log_initial_state(&harness, &app);
 
     let messages = vec![user_msg("u1"), assistant_msg("a1")];
-    let step = apply_pi(
+    let step = apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset",
-        PiMsg::ConversationReset {
-            messages,
-            usage: sample_usage(11, 22),
-            status: Some("reset ok".to_string()),
-        },
+        messages,
+        sample_usage(11, 22),
+        Some("reset ok".to_string()),
     );
     assert_after_contains(&harness, &step, "reset ok");
     assert_after_contains(&harness, &step, "Tokens: 11 in / 22 out");
@@ -2575,6 +2665,10 @@ fn tui_state_system_message_appends_without_processing() {
     let harness = TestHarness::new("tui_state_system_message_appends_without_processing");
     let message = "OAuth token for anthropic has expired. Run /login anthropic to re-authenticate.";
     let mut app = build_app(&harness, Vec::new());
+    // System messages hard-wrap to the terminal width (bd-06s4y); use a
+    // terminal wide enough for the whole sentence so the contains() below
+    // stays byte-exact.
+    app.set_terminal_size(200, 30);
     log_initial_state(&harness, &app);
 
     let step = apply_pi(
@@ -2604,7 +2698,12 @@ fn tui_login_no_args_shows_provider_table() {
     let test_name = "tui_login_no_args_shows_provider_table";
     let harness = TestHarness::new(test_name);
     let mut app = build_app(&harness, Vec::new());
-    app.set_terminal_size(80, 80);
+    // The provider-metadata catalog has grown past 100 entries, so the /login
+    // table is taller than any realistic terminal; the view anchors the table
+    // header at the top and clips the rest. This test asserts table CONTENT,
+    // not viewport paging, so use a terminal tall enough to show every row
+    // (paging behavior is covered by the scroll tests).
+    app.set_terminal_size(80, 400);
     log_initial_state(&harness, &app);
     log_auth_test_event(
         test_name,
@@ -2809,6 +2908,26 @@ fn tui_state_slash_theme_lists_and_switches() {
     type_text(&harness, &mut app, "/theme");
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "* light");
+}
+
+#[test]
+fn tui_state_slash_theme_auto_detects_and_persists_the_auto_spec() {
+    let harness = TestHarness::new("tui_state_slash_theme_auto_detects_and_persists_the_auto_spec");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/theme auto");
+    let step = press_enter(&harness, &mut app);
+    // Detection result depends on COLORFGBG in the environment; the status
+    // line always names the auto spec plus the detected built-in.
+    assert_after_contains(&harness, &step, "Switched to theme: auto (detected: ");
+
+    let settings_path = harness.temp_path(".pi/settings.json");
+    let settings = fs::read_to_string(settings_path).expect("read settings.json");
+    assert!(
+        settings.contains("\"theme\": \"auto\""),
+        "expected the auto spec (not the detected theme) persisted to settings.json: {settings}"
+    );
 }
 
 #[test]
@@ -3507,7 +3626,12 @@ fn tui_state_slash_share_creates_gist_and_reports_urls_and_cleans_temp_file() {
         .find(|msg| matches!(msg, PiMsg::System(_)) || matches!(msg, PiMsg::AgentError(_)))
         .expect("expected share result");
     let step = apply_pi(&harness, &mut app, "PiMsg share result", msg);
-    assert_after_contains(&harness, &step, "Created private gist");
+    assert_after_contains(&harness, &step, "Created secret gist");
+    assert_after_contains(
+        &harness,
+        &step,
+        "not private; anyone with the URL can view it",
+    );
     assert_after_contains(&harness, &step, "Share URL:");
     assert_after_contains(
         &harness,
@@ -3599,13 +3723,14 @@ fn tui_state_slash_share_is_cancellable_and_cleans_temp_file() {
 
 #[test]
 #[cfg(unix)]
-fn tui_state_slash_share_public_flag_creates_public_gist() {
-    let harness = TestHarness::new("tui_state_slash_share_public_flag_creates_public_gist");
+fn tui_state_slash_share_rejects_public_argument_before_invoking_gh() {
+    let harness =
+        TestHarness::new("tui_state_slash_share_rejects_public_argument_before_invoking_gh");
 
     let args_record = harness.temp_path("gh_args.txt");
     let gh_path = harness.temp_path("gh");
     let script = format!(
-        "#!/bin/sh\nset -e\n\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"status\" ]; then\n  exit 0\nfi\n\nif [ \"$1\" = \"gist\" ] && [ \"$2\" = \"create\" ]; then\n  printf '%s\\n' \"$@\" > \"{args_record}\"\n  echo \"https://gist.github.com/testuser/pub123public456\"\n  exit 0\nfi\n\necho \"unexpected gh args: $@\" >&2\nexit 2\n",
+        "#!/bin/sh\nset -e\nprintf '%s\\n' \"$@\" >> \"{args_record}\"\nexit 0\n",
         args_record = args_record.display(),
     );
     fs::write(&gh_path, script).expect("write fake gh");
@@ -3615,7 +3740,7 @@ fn tui_state_slash_share_public_flag_creates_public_gist() {
         gh_path: Some(gh_path.display().to_string()),
         ..Default::default()
     };
-    let (mut app, mut event_rx) = build_app_with_session_and_events_and_config(
+    let (mut app, _event_rx) = build_app_with_session_and_events_and_config(
         &harness,
         Vec::new(),
         Session::in_memory(),
@@ -3624,37 +3749,24 @@ fn tui_state_slash_share_public_flag_creates_public_gist() {
     log_initial_state(&harness, &app);
 
     log_test_event(
-        "tui_state_slash_share_public_flag_creates_public_gist",
-        "share_initiated",
-        &json!({"privacy": "public"}),
+        "tui_state_slash_share_rejects_public_argument_before_invoking_gh",
+        "public_share_rejected",
+        &json!({}),
     );
 
     type_text(&harness, &mut app, "/share public");
     let step = press_enter(&harness, &mut app);
-    assert_after_contains(&harness, &step, "Sharing session...");
-
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(3), |msgs| {
-        msgs.iter()
-            .any(|msg| matches!(msg, PiMsg::System(_)) || matches!(msg, PiMsg::AgentError(_)))
-    });
-    let msg = events
-        .into_iter()
-        .find(|msg| matches!(msg, PiMsg::System(_)) || matches!(msg, PiMsg::AgentError(_)))
-        .expect("expected share result");
-    let step = apply_pi(&harness, &mut app, "PiMsg share result", msg);
-    assert_after_contains(&harness, &step, "Created public gist");
-
-    // Verify the mock gh received --public=true
-    let recorded_args = fs::read_to_string(&args_record).expect("read recorded args");
+    assert_after_contains(&harness, &step, "public sharing is disabled");
     assert!(
-        recorded_args.contains("--public=true"),
-        "expected --public=true in gh args, got: {recorded_args}"
+        !args_record.exists(),
+        "rejected public share invoked gh: {}",
+        fs::read_to_string(&args_record).unwrap_or_default()
     );
 
     log_test_event(
-        "tui_state_slash_share_public_flag_creates_public_gist",
-        "share_completed",
-        &json!({"privacy": "public", "public_flag_passed": true}),
+        "tui_state_slash_share_rejects_public_argument_before_invoking_gh",
+        "gh_not_invoked",
+        &json!({"secret_by_construction": true}),
     );
 }
 
@@ -3885,7 +3997,7 @@ export default function init(pi) {
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Loading session...");
 
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(1), |msgs| {
+    let events = wait_for_pi_msgs(&mut event_rx, EXTENSION_HOOK_WAIT, |msgs| {
         msgs.iter().any(|msg| matches!(msg, PiMsg::System(_)))
     });
     let system = events
@@ -3929,7 +4041,7 @@ export default function init(pi) {
     press_enter(&harness, &mut app);
     press_enter(&harness, &mut app);
 
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(1), |msgs| {
+    let events = wait_for_pi_msgs(&mut event_rx, EXTENSION_HOOK_WAIT, |msgs| {
         msgs.iter()
             .any(|msg| matches!(msg, PiMsg::ConversationReset { .. }))
     });
@@ -3973,15 +4085,13 @@ fn tui_state_slash_copy_reports_clipboard_unavailable_or_success() {
     log_initial_state(&harness, &app);
 
     let messages = vec![assistant_msg("hello from assistant")];
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     type_text(&harness, &mut app, "/copy");
@@ -4039,15 +4149,13 @@ fn tui_state_slash_clear_clears_conversation_and_sets_status() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset",
-        PiMsg::ConversationReset {
-            messages: vec![user_msg("hello")],
-            usage: Usage::default(),
-            status: None,
-        },
+        vec![user_msg("hello")],
+        Usage::default(),
+        None,
     );
     type_text(&harness, &mut app, "/clear");
     let step = press_enter(&harness, &mut app);
@@ -4062,15 +4170,13 @@ fn tui_state_slash_new_resets_conversation_and_sets_status() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset",
-        PiMsg::ConversationReset {
-            messages: vec![user_msg("hello"), assistant_msg("world")],
-            usage: sample_usage(12, 34),
-            status: Some("old".to_string()),
-        },
+        vec![user_msg("hello"), assistant_msg("world")],
+        sample_usage(12, 34),
+        Some("old".to_string()),
     );
 
     type_text(&harness, &mut app, "/new");
@@ -4101,21 +4207,19 @@ export default function init(pi) {
     );
     log_initial_state(&harness, &app);
 
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset",
-        PiMsg::ConversationReset {
-            messages: vec![user_msg("hello"), assistant_msg("world")],
-            usage: sample_usage(12, 34),
-            status: None,
-        },
+        vec![user_msg("hello"), assistant_msg("world")],
+        sample_usage(12, 34),
+        None,
     );
 
     type_text(&harness, &mut app, "/new");
     press_enter(&harness, &mut app);
 
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(1), |msgs| {
+    let events = wait_for_pi_msgs(&mut event_rx, EXTENSION_HOOK_WAIT, |msgs| {
         msgs.iter().any(|msg| matches!(msg, PiMsg::System(_)))
     });
     let system = events
@@ -4148,21 +4252,19 @@ export default function init(pi) {
     );
     log_initial_state(&harness, &app);
 
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset",
-        PiMsg::ConversationReset {
-            messages: vec![user_msg("hello"), assistant_msg("world")],
-            usage: sample_usage(12, 34),
-            status: None,
-        },
+        vec![user_msg("hello"), assistant_msg("world")],
+        sample_usage(12, 34),
+        None,
     );
 
     type_text(&harness, &mut app, "/new");
     press_enter(&harness, &mut app);
 
-    let events = wait_for_pi_msgs(&mut event_rx, Duration::from_secs(1), |msgs| {
+    let events = wait_for_pi_msgs(&mut event_rx, EXTENSION_HOOK_WAIT, |msgs| {
         msgs.iter()
             .any(|msg| matches!(msg, PiMsg::ConversationReset { .. }))
     });
@@ -4174,6 +4276,102 @@ export default function init(pi) {
     assert_after_contains(&harness, &step, "Started new session");
     assert_after_not_contains(&harness, &step, "You: hello");
     assert_after_not_contains(&harness, &step, "world");
+}
+
+/// bd-8m21l / bd-z7267: the classic TUI's turn tasks call
+/// `pi::mcp::sync_extension_registrations` right after locking the agent, so a
+/// server an extension registers after startup (what the `registerMcpServer`
+/// hostcall does) reaches the App's MCP manager at the next turn: once, with
+/// extension provenance, pending trust (nothing mounts), and never twice.
+/// Removing the sync calls from `src/interactive/agent.rs` fails this test.
+#[test]
+fn tui_state_late_extension_mcp_registration_reaches_the_manager_at_the_next_turn() {
+    let harness = TestHarness::new(
+        "tui_state_late_extension_mcp_registration_reaches_the_manager_at_the_next_turn",
+    );
+    let session = Session::in_memory();
+    let cwd = harness.temp_dir().to_path_buf();
+    let global_dir = harness.temp_path("mcp-global");
+    fs::create_dir_all(&global_dir).expect("create MCP global dir");
+    let mcp_manager = Arc::new(
+        pi::mcp::bootstrap_with_project_trust(&cwd, &global_dir, &[], true)
+            .expect("bootstrap MCP manager"),
+    );
+    let extension_source = r"
+export default function init(pi) {}
+";
+    let (mut app, mut event_rx, extensions) = build_app_with_extension_and_mcp(
+        &harness,
+        Vec::new(),
+        session,
+        Config::default(),
+        extension_source,
+        Some(Arc::clone(&mcp_manager)),
+    );
+    log_initial_state(&harness, &app);
+    assert!(
+        mcp_manager
+            .list()
+            .iter()
+            .all(|row| row.name != "late-fixture"),
+        "nothing is registered at startup"
+    );
+
+    // What the `registerMcpServer` hostcall does once startup is over.
+    extensions.register_mcp_server(json!({
+        "name": "late-fixture",
+        "command": "pi-mcp-late-fixture-does-not-exist",
+        "extension_id": "ext"
+    }));
+    assert!(
+        mcp_manager
+            .list()
+            .iter()
+            .all(|row| row.name != "late-fixture"),
+        "the extension snapshot alone must not reach the MCP manager"
+    );
+
+    let run_turn = |app: &mut PiApp, event_rx: &mut mpsc::Receiver<PiMsg>, label: &str| {
+        type_text(&harness, app, "hello");
+        press_enter(&harness, app);
+        let events = wait_for_pi_msgs(event_rx, Duration::from_secs(10), |msgs| {
+            msgs.iter()
+                .any(|msg| matches!(msg, PiMsg::AgentDone { .. }))
+        });
+        let done = events
+            .into_iter()
+            .find(|msg| matches!(msg, PiMsg::AgentDone { .. }))
+            .unwrap_or_else(|| panic!("expected AgentDone after {label}"));
+        apply_pi(&harness, app, "PiMsg::AgentDone", done);
+    };
+
+    run_turn(&mut app, &mut event_rx, "the first turn");
+    let rows: Vec<_> = mcp_manager
+        .list()
+        .into_iter()
+        .filter(|row| row.name == "late-fixture")
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the first turn registers the late server once"
+    );
+    assert_eq!(rows[0].provenance, "extension");
+    assert_eq!(
+        rows[0].trust, "pending",
+        "a server first seen at runtime waits for acknowledgement exactly like at startup"
+    );
+
+    run_turn(&mut app, &mut event_rx, "the second turn");
+    assert_eq!(
+        mcp_manager
+            .list()
+            .iter()
+            .filter(|row| row.name == "late-fixture")
+            .count(),
+        1,
+        "a later turn must not register the same server again"
+    );
 }
 
 #[test]
@@ -4284,7 +4482,7 @@ fn tui_state_slash_fork_creates_session_and_prefills_editor() {
             .any(|msg| matches!(msg, PiMsg::ConversationReset { .. }));
         let has_editor = msgs
             .iter()
-            .any(|msg| matches!(msg, PiMsg::SetEditorText(_)));
+            .any(|msg| matches!(msg, PiMsg::SetEditorText { .. }));
         has_reset && has_editor
     });
 
@@ -4294,7 +4492,7 @@ fn tui_state_slash_fork_creates_session_and_prefills_editor() {
     for msg in events {
         match msg {
             PiMsg::ConversationReset { .. } => reset_msg = Some(msg),
-            PiMsg::SetEditorText(_) => editor_msg = Some(msg),
+            PiMsg::SetEditorText { .. } => editor_msg = Some(msg),
             PiMsg::AgentError(err) => {
                 fork_err = Some(err);
             }
@@ -4582,6 +4780,7 @@ fn tui_state_tool_progress_reset_on_new_tool_start() {
             name: "bash".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
     let step = apply_pi(
@@ -4684,20 +4883,33 @@ fn tui_state_tool_update_with_progress_shows_timeout_suffix() {
 // Capability prompt overlay tests
 // ============================================================================
 
+fn typed_capability_prompt(
+    id: &str,
+    extension_id: &str,
+    capability: &str,
+    message: &str,
+) -> ExtensionUiRequest {
+    ExtensionUiRequest::new_capability_prompt(
+        id,
+        extension_id,
+        capability,
+        json!({"message": message}),
+    )
+}
+
 #[test]
 fn tui_state_capability_prompt_shows_overlay() {
     let harness = TestHarness::new("tui_state_capability_prompt_shows_overlay");
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    let request = ExtensionUiRequest::new(
+    let request = ExtensionUiRequest::new_capability_prompt(
         "cap-1",
-        "confirm",
+        "my-ext",
+        "exec",
         json!({
             "title": "Allow extension capability: exec",
             "message": "Extension my-ext requests capability 'exec'. Allow?",
-            "extension_id": "my-ext",
-            "capability": "exec",
         }),
     );
     let step = apply_pi(
@@ -4721,15 +4933,7 @@ fn tui_state_capability_prompt_navigate_buttons() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    let request = ExtensionUiRequest::new(
-        "cap-2",
-        "confirm",
-        json!({
-            "extension_id": "test-ext",
-            "capability": "http",
-            "message": "test prompt",
-        }),
-    );
+    let request = typed_capability_prompt("cap-2", "test-ext", "http", "test prompt");
     apply_pi(
         &harness,
         &mut app,
@@ -4762,15 +4966,7 @@ fn tui_state_capability_prompt_escape_denies() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    let request = ExtensionUiRequest::new(
-        "cap-3",
-        "confirm",
-        json!({
-            "extension_id": "test-ext",
-            "capability": "exec",
-            "message": "test",
-        }),
-    );
+    let request = typed_capability_prompt("cap-3", "test-ext", "exec", "test");
     apply_pi(
         &harness,
         &mut app,
@@ -4796,15 +4992,7 @@ fn tui_state_capability_prompt_enter_confirms() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    let request = ExtensionUiRequest::new(
-        "cap-4",
-        "confirm",
-        json!({
-            "extension_id": "test-ext",
-            "capability": "exec",
-            "message": "test",
-        }),
-    );
+    let request = typed_capability_prompt("cap-4", "test-ext", "exec", "test");
     apply_pi(
         &harness,
         &mut app,
@@ -4857,15 +5045,7 @@ fn tui_state_capability_prompt_blocks_regular_input() {
     log_initial_state(&harness, &app);
 
     // Show capability prompt.
-    let request = ExtensionUiRequest::new(
-        "cap-block",
-        "confirm",
-        json!({
-            "extension_id": "test-ext",
-            "capability": "exec",
-            "message": "test",
-        }),
-    );
+    let request = typed_capability_prompt("cap-block", "test-ext", "exec", "test");
     apply_pi(
         &harness,
         &mut app,
@@ -4887,15 +5067,7 @@ fn tui_state_capability_prompt_tab_cycles_buttons() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    let request = ExtensionUiRequest::new(
-        "cap-tab",
-        "confirm",
-        json!({
-            "extension_id": "test-ext",
-            "capability": "http",
-            "message": "test",
-        }),
-    );
+    let request = typed_capability_prompt("cap-tab", "test-ext", "http", "test");
     apply_pi(
         &harness,
         &mut app,
@@ -4942,15 +5114,8 @@ fn tui_state_capability_prompt_shows_auto_deny_timer() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    let request = ExtensionUiRequest::new(
-        "cap-timer",
-        "confirm",
-        json!({
-            "extension_id": "timer-ext",
-            "capability": "fs",
-            "message": "File system access",
-        }),
-    );
+    let request = typed_capability_prompt("cap-timer", "timer-ext", "fs", "File system access")
+        .with_timeout_ms(30_000);
     let step = apply_pi(
         &harness,
         &mut app,
@@ -4968,14 +5133,11 @@ fn tui_state_capability_prompt_shows_description() {
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    let request = ExtensionUiRequest::new(
+    let request = typed_capability_prompt(
         "cap-desc",
-        "confirm",
-        json!({
-            "extension_id": "fancy-ext",
-            "capability": "env",
-            "message": "Access environment variables HOME, PATH",
-        }),
+        "fancy-ext",
+        "env",
+        "Access environment variables HOME, PATH",
     );
     let step = apply_pi(
         &harness,
@@ -5120,6 +5282,7 @@ fn create_two_branch_session() -> (Session, String, String, String) {
                 cost: Cost::default(),
             },
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 1,
         },
@@ -5148,6 +5311,7 @@ fn create_two_branch_session() -> (Session, String, String, String) {
                 cost: Cost::default(),
             },
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 3,
         },
@@ -5189,6 +5353,7 @@ fn create_many_branch_session(branch_count: usize) -> Session {
                     cost: Cost::default(),
                 },
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: i_i64 + 1,
             },
@@ -5507,6 +5672,7 @@ fn tui_grad_diff_pure_addition_renders_only_plus_lines() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -5553,6 +5719,7 @@ fn tui_grad_diff_pure_removal_renders_only_minus_lines() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -5599,6 +5766,7 @@ fn tui_grad_diff_multiline_replacement_preserves_context() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -5644,6 +5812,7 @@ fn tui_grad_diff_tool_error_omits_diff() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: true,
+            output: None,
         },
     );
 
@@ -5689,6 +5858,7 @@ fn tui_grad_diff_no_diff_key_shows_plain_output() {
             name: "bash".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -5814,6 +5984,7 @@ fn tui_grad_collapse_multiple_tools_mixed_sizes() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
     apply_pi(
@@ -5856,6 +6027,7 @@ fn tui_grad_collapse_multiple_tools_mixed_sizes() {
             name: "bash".to_string(),
             tool_id: "tool-2".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -5902,6 +6074,7 @@ fn tui_grad_collapse_global_toggle_affects_all_tool_blocks() {
                 name: "read".to_string(),
                 tool_id: format!("tool-{i}"),
                 is_error: false,
+                output: None,
             },
         );
     }
@@ -5963,6 +6136,7 @@ fn tui_grad_collapse_auto_collapsed_shows_preview_line_count() {
             name: "bash".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6015,6 +6189,7 @@ fn tui_grad_image_default_config_shows_images() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6076,6 +6251,7 @@ fn tui_grad_image_mixed_content_with_show_images_false_preserves_text() {
             name: "bash".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6088,6 +6264,7 @@ fn tui_grad_image_mixed_content_with_show_images_false_preserves_text() {
 // ─── TUI Graduation: Integration (cross-feature) ───────────────────────────
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn tui_grad_integration_multiple_tools_in_sequence() {
     let harness = TestHarness::new("tui_grad_integration_multiple_tools_in_sequence");
     let mut app = build_app(&harness, Vec::new());
@@ -6122,6 +6299,7 @@ fn tui_grad_integration_multiple_tools_in_sequence() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6158,6 +6336,7 @@ fn tui_grad_integration_multiple_tools_in_sequence() {
             name: "edit".to_string(),
             tool_id: "tool-2".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6190,6 +6369,7 @@ fn tui_grad_integration_multiple_tools_in_sequence() {
             name: "bash".to_string(),
             tool_id: "tool-3".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6245,6 +6425,7 @@ fn tui_grad_integration_branching_with_tool_diffs() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6289,6 +6470,7 @@ fn tui_grad_integration_tool_error_then_success_sequence() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: true,
+            output: None,
         },
     );
 
@@ -6325,6 +6507,7 @@ fn tui_grad_integration_tool_error_then_success_sequence() {
             name: "edit".to_string(),
             tool_id: "tool-2".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6377,6 +6560,7 @@ fn tui_grad_integration_diff_with_collapse_toggle() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6932,6 +7116,7 @@ fn tui_state_tool_error_output_collapse_toggle() {
             name: "bash".to_string(),
             tool_id: "tool-err-1".to_string(),
             is_error: true,
+            output: None,
         },
     );
     // Error tool output is shown.
@@ -6983,6 +7168,7 @@ fn tui_state_multiple_tool_blocks_collapse_together() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -7017,6 +7203,7 @@ fn tui_state_multiple_tool_blocks_collapse_together() {
             name: "grep".to_string(),
             tool_id: "tool-2".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -7079,6 +7266,7 @@ fn tui_state_thinking_and_tool_toggles_independent() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -7339,6 +7527,7 @@ fn tui_perf_memory_pressure_forces_degraded() {
             name: "read".to_string(),
             tool_id: "perf-tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -7490,15 +7679,13 @@ fn tui_perf_degraded_mode_skips_markdown_cache() {
             thinking: None,
         })
         .collect::<Vec<_>>();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset(cache+tools)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     // Warm the render cache first.
@@ -7570,15 +7757,13 @@ fn tui_perf_emergency_mode_raw_text_no_cache() {
             collapsed: false,
         })
         .collect::<Vec<_>>();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "PiMsg::ConversationReset(cache-critical)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     // Warm caches/prefix before entering critical mode.
@@ -8116,15 +8301,13 @@ fn tui_perf_cache_feeds_prefix() {
             collapsed: false,
         })
         .collect();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(50 msgs)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     // Warm the render cache + prefix by triggering a full rebuild.
@@ -8201,15 +8384,13 @@ fn tui_perf_streaming_to_cache_transition() {
             collapsed: false,
         })
         .collect();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(5 msgs)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     // Warm cache + prefix.
@@ -8337,15 +8518,13 @@ fn tui_perf_render_buffer_reuses_cached_content() {
             collapsed: false,
         })
         .collect();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(20 msgs)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     // First call: populates cache + prefix + sets capacity hint via view().
@@ -8424,15 +8603,13 @@ fn tui_perf_buffer_survives_cache_invalidation() {
             collapsed: false,
         })
         .collect();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(10 msgs)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     // Warm cache: full rebuild populates cache + prefix.
@@ -8599,12 +8776,136 @@ fn assert_view_bounded(surface: &str, view: &str, terminal_height: usize) {
     );
 }
 
-fn write_large_session_perf_json_artifact(value: &serde_json::Value) {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/artifacts/perf");
-    let _ = fs::create_dir_all(&dir);
-    let path = dir.join("large_session_tui_frame_budget.json");
-    let content = serde_json::to_string_pretty(value).expect("serialize perf artifact");
-    fs::write(&path, format!("{content}\n")).expect("write perf json artifact");
+const TUI_PERF_ARTIFACT_GENERATION_ENV: &str = "PI_GENERATE_TUI_PERF_ARTIFACTS";
+
+fn tui_perf_artifact_generation_enabled() -> bool {
+    let Some(value) = std::env::var_os(TUI_PERF_ARTIFACT_GENERATION_ENV) else {
+        return false;
+    };
+    assert_eq!(
+        value,
+        std::ffi::OsStr::new("1"),
+        "{TUI_PERF_ARTIFACT_GENERATION_ENV} must be unset or exactly '1', got {}",
+        value.display()
+    );
+    true
+}
+
+fn write_verified_perf_artifact(path: &std::path::Path, payload: &str) {
+    let parent = path.parent().expect("perf artifact must have a parent");
+    fs::create_dir_all(parent).unwrap_or_else(|error| {
+        panic!(
+            "failed to create perf artifact directory {}: {error}",
+            parent.display()
+        )
+    });
+    let parent_metadata = fs::symlink_metadata(parent).unwrap_or_else(|error| {
+        panic!(
+            "failed to stat perf artifact directory {}: {error}",
+            parent.display()
+        )
+    });
+    assert!(
+        parent_metadata.file_type().is_dir(),
+        "perf artifact parent must be a real directory, not a symlink: {}",
+        parent.display()
+    );
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => assert!(
+            metadata.file_type().is_file(),
+            "existing perf artifact must be a regular file, not a symlink: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "failed to inspect existing perf artifact {}: {error}",
+            path.display()
+        ),
+    }
+
+    fs::write(path, payload).unwrap_or_else(|error| {
+        panic!("failed to write perf artifact {}: {error}", path.display())
+    });
+    let metadata = fs::symlink_metadata(path).unwrap_or_else(|error| {
+        panic!(
+            "failed to stat written perf artifact {}: {error}",
+            path.display()
+        )
+    });
+    assert!(
+        metadata.file_type().is_file(),
+        "written perf artifact must be a regular file: {}",
+        path.display()
+    );
+    assert_eq!(
+        metadata.len(),
+        u64::try_from(payload.len()).expect("perf artifact length must fit u64"),
+        "written perf artifact length mismatch: {}",
+        path.display()
+    );
+    let retained = fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read back written perf artifact {}: {error}",
+            path.display()
+        )
+    });
+    assert_eq!(
+        retained,
+        payload,
+        "written perf artifact bytes differ from the validated payload: {}",
+        path.display()
+    );
+}
+
+fn serialize_and_validate_perf_json(value: &serde_json::Value) -> String {
+    let content = serde_json::to_string_pretty(value)
+        .unwrap_or_else(|error| panic!("failed to serialize TUI perf JSON: {error}"));
+    let payload = format!("{content}\n");
+    let parsed: serde_json::Value = serde_json::from_str(&payload)
+        .unwrap_or_else(|error| panic!("generated TUI perf JSON must parse: {error}"));
+    assert_eq!(
+        parsed, *value,
+        "generated TUI perf JSON must round-trip without semantic changes"
+    );
+    payload
+}
+
+fn serialize_and_validate_perf_jsonl(entries: &[serde_json::Value]) -> String {
+    assert!(!entries.is_empty(), "TUI perf JSONL must contain records");
+    let lines = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let line = serde_json::to_string(entry).unwrap_or_else(|error| {
+                panic!(
+                    "failed to serialize TUI perf JSONL record {}: {error}",
+                    index + 1
+                )
+            });
+            let parsed: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|error| {
+                panic!(
+                    "generated TUI perf JSONL record {} must parse: {error}",
+                    index + 1
+                )
+            });
+            assert_eq!(
+                parsed,
+                *entry,
+                "generated TUI perf JSONL record {} must round-trip without semantic changes",
+                index + 1
+            );
+            line
+        })
+        .collect::<Vec<_>>();
+    format!("{}\n", lines.join("\n"))
+}
+
+fn write_runtime_large_session_perf_json_artifact(value: &serde_json::Value) {
+    let payload = serialize_and_validate_perf_json(value);
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/artifacts/perf/large_session_tui_frame_budget.json");
+    write_verified_perf_artifact(&path, &payload);
 }
 
 #[test]
@@ -8644,15 +8945,13 @@ fn tui_perf_large_session_frame_budget_surfaces_emit_evidence() {
         collapsed: true,
     });
 
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(720 msgs + huge tool preview)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     let mut conversation_probe = SurfaceProbe::default();
@@ -8877,7 +9176,7 @@ fn tui_perf_large_session_frame_budget_surfaces_emit_evidence() {
         );
     }
 
-    write_large_session_perf_json_artifact(&evidence);
+    write_runtime_large_session_perf_json_artifact(&evidence);
     log_perf_test_event(
         "tui_perf_large_session_frame_budget_surfaces_emit_evidence",
         "large_session_tui_frame_budget",
@@ -8910,15 +9209,13 @@ fn tui_perf_e2e_long_conversation_responsiveness() {
             collapsed: false,
         })
         .collect();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(500 msgs)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     // Measure content build (where the cache effect is visible).
@@ -8974,7 +9271,7 @@ fn tui_perf_e2e_long_conversation_responsiveness() {
          got {content_p50_us}us"
     );
 
-    write_perf_artifact(
+    validate_or_write_perf_artifact(
         "long_conversation_responsiveness.jsonl",
         &[json!({
             "schema": "pi.test.perf_event.v1",
@@ -9061,15 +9358,13 @@ fn tui_frame_budget_snapshot_covers_large_session_surfaces() {
         })
         .collect();
 
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(600 mixed messages)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
     app.reset_frame_timing_for_test();
     let large_view = BubbleteaModel::view(&app);
@@ -9103,15 +9398,13 @@ fn tui_frame_budget_snapshot_covers_large_session_surfaces() {
             collapsed: true,
         })
         .collect();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(large tool previews)",
-        PiMsg::ConversationReset {
-            messages: tool_messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        tool_messages,
+        Usage::default(),
+        None,
     );
     let tool_view = BubbleteaModel::view(&app);
     assert_view_fits("tool_preview", &tool_view, 40);
@@ -9213,7 +9506,7 @@ fn tui_frame_budget_snapshot_covers_large_session_surfaces() {
         "frame-budget telemetry must not include raw conversation or tool payload text"
     );
 
-    write_perf_artifact("large_session_tui_frame_budget.jsonl", &snapshots);
+    validate_or_write_perf_artifact("large_session_tui_frame_budget.jsonl", &snapshots);
     log_perf_test_event(
         "tui_frame_budget_snapshot_covers_large_session_surfaces",
         "surface_snapshots",
@@ -9252,15 +9545,13 @@ fn tui_perf_e2e_streaming_with_history() {
             collapsed: false,
         })
         .collect();
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(200 msgs)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     let _ = BubbleteaModel::view(&app);
@@ -9305,6 +9596,10 @@ fn tui_perf_e2e_streaming_with_history() {
     } else {
         1.0
     };
+    // Round so the JSONL round-trip assertion in
+    // validate_or_write_perf_artifact never trips over f64 shortest-repr
+    // precision for unlucky quotients (timing-dependent flake).
+    let ratio = (ratio * 1_000_000.0).round() / 1_000_000.0;
     assert!(
         ratio < 5.0,
         "late tokens should not be much slower than early tokens: \
@@ -9313,7 +9608,7 @@ fn tui_perf_e2e_streaming_with_history() {
 
     let streaming_len: usize = (0..token_count).map(|i| format!("token-{i} ").len()).sum();
 
-    write_perf_artifact(
+    validate_or_write_perf_artifact(
         "streaming_with_history.jsonl",
         &[json!({
             "schema": "pi.test.perf_event.v1",
@@ -9393,6 +9688,7 @@ fn tui_perf_e2e_degradation_under_load() {
                 name: format!("read-{idx}"),
                 tool_id: format!("e2e-tool-{idx}"),
                 is_error: false,
+                output: None,
             },
         );
     }
@@ -9450,7 +9746,7 @@ fn tui_perf_e2e_degradation_under_load() {
         "view should render after pressure recovery"
     );
 
-    write_perf_artifact(
+    validate_or_write_perf_artifact(
         "degradation_under_load.jsonl",
         &[json!({
             "schema": "pi.test.perf_event.v1",
@@ -9532,15 +9828,13 @@ fn tui_perf_e2e_memory_pressure_response() {
             });
         }
     }
-    apply_pi(
+    apply_conversation_reset(
         &harness,
         &mut app,
         "ConversationReset(50 msgs)",
-        PiMsg::ConversationReset {
-            messages,
-            usage: Usage::default(),
-            status: None,
-        },
+        messages,
+        Usage::default(),
+        None,
     );
 
     let _ = BubbleteaModel::view(&app);
@@ -9611,7 +9905,7 @@ fn tui_perf_e2e_memory_pressure_response() {
         "memory pressure actions should not modify the session file"
     );
 
-    write_perf_artifact(
+    validate_or_write_perf_artifact(
         "memory_pressure_response.jsonl",
         &[json!({
             "schema": "pi.test.perf_event.v1",
@@ -9639,16 +9933,398 @@ fn tui_perf_e2e_memory_pressure_response() {
     );
 }
 
-/// Helper: write a JSONL artifact file to tests/artifacts/perf/.
+/// Validate a JSONL payload and retain it only when its output policy allows it.
 #[allow(dead_code)]
-fn write_perf_artifact(filename: &str, entries: &[serde_json::Value]) {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/artifacts/perf");
-    let _ = fs::create_dir_all(&dir);
-    let path = dir.join(filename);
-    let content = entries
-        .iter()
-        .map(|e| serde_json::to_string(e).expect("serialize artifact entry"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    fs::write(&path, format!("{content}\n")).expect("write perf artifact");
+fn validate_or_write_perf_artifact(filename: &str, entries: &[serde_json::Value]) {
+    let payload = serialize_and_validate_perf_jsonl(entries);
+    let generation_enabled = tui_perf_artifact_generation_enabled();
+    let should_write = match filename {
+        "large_session_tui_frame_budget.jsonl" => true,
+        "long_conversation_responsiveness.jsonl"
+        | "streaming_with_history.jsonl"
+        | "degradation_under_load.jsonl"
+        | "memory_pressure_response.jsonl" => generation_enabled,
+        _ => panic!("unexpected TUI perf artifact filename: {filename}"),
+    };
+    if !should_write {
+        return;
+    }
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/artifacts/perf")
+        .join(filename);
+    write_verified_perf_artifact(&path, &payload);
+}
+
+// ============================================================================
+// Tool-heavy stress + scroll-stability regression tests (HN-reported class of
+// bugs: "lots of tool calls freeze/scramble the UI", "auto-scroll is weird").
+// ============================================================================
+
+/// Drive one complete tool cycle through the `PiMsg` pipeline.
+fn run_tool_cycle(harness: &TestHarness, app: &mut PiApp, idx: usize, output_lines: usize) {
+    let tool_id = format!("stress-tool-{idx}");
+    apply_pi(
+        harness,
+        app,
+        "ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: tool_id.clone(),
+        },
+    );
+    apply_pi(
+        harness,
+        app,
+        "ToolInvocation(bash)",
+        PiMsg::ToolInvocation {
+            tool_id: tool_id.clone(),
+            summary: format!("echo stress-{idx}"),
+        },
+    );
+    apply_pi(
+        harness,
+        app,
+        "ToolUpdate(bash)",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: tool_id.clone(),
+            content: vec![ContentBlock::Text(TextContent::new(numbered_lines(
+                output_lines,
+            )))],
+            details: None,
+        },
+    );
+    apply_pi(
+        harness,
+        app,
+        "ToolEnd(bash)",
+        PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id,
+            is_error: false,
+            output: None,
+        },
+    );
+}
+
+#[test]
+fn tui_tool_end_preserves_scroll_position_when_scrolled_up() {
+    let harness = TestHarness::new("tui_tool_end_preserves_scroll_position_when_scrolled_up");
+    let mut app = build_app(&harness, Vec::new());
+    app.set_terminal_size(80, 20);
+    log_initial_state(&harness, &app);
+
+    // Build a scrollable transcript, then scroll away from the bottom.
+    fill_viewport_with_stream(&harness, &mut app, 80);
+    finalize_agent(&harness, &mut app);
+    press_pgup(&harness, &mut app);
+    press_pgup(&harness, &mut app);
+    let pct_before = parse_scroll_percent(&normalize_view(&BubbleteaModel::view(&app)))
+        .expect("scroll indicator before tool");
+    assert!(pct_before < 100, "should be scrolled up before tool runs");
+
+    // A tool completes while the user is reading earlier output.
+    apply_pi(&harness, &mut app, "AgentStart", PiMsg::AgentStart);
+    run_tool_cycle(&harness, &mut app, 0, 30);
+
+    let pct_after = parse_scroll_percent(&normalize_view(&BubbleteaModel::view(&app)))
+        .expect("scroll indicator after tool");
+    assert!(
+        pct_after < 100,
+        "ToolEnd must not yank a scrolled-up reader to the bottom (got {pct_after}%)"
+    );
+}
+
+#[test]
+fn tui_tool_end_follows_tail_when_at_bottom() {
+    let harness = TestHarness::new("tui_tool_end_follows_tail_when_at_bottom");
+    let mut app = build_app(&harness, Vec::new());
+    app.set_terminal_size(80, 20);
+    log_initial_state(&harness, &app);
+
+    fill_viewport_with_stream(&harness, &mut app, 80);
+    finalize_agent(&harness, &mut app);
+    let pct_before = parse_scroll_percent(&normalize_view(&BubbleteaModel::view(&app)))
+        .expect("scroll indicator at bottom");
+    assert_eq!(pct_before, 100, "should start at the bottom");
+
+    apply_pi(&harness, &mut app, "AgentStart", PiMsg::AgentStart);
+    run_tool_cycle(&harness, &mut app, 0, 30);
+
+    let pct_after = parse_scroll_percent(&normalize_view(&BubbleteaModel::view(&app)))
+        .expect("scroll indicator after tool");
+    assert_eq!(
+        pct_after, 100,
+        "a reader following the tail should stay at the bottom after ToolEnd"
+    );
+}
+
+#[test]
+fn tui_stress_many_tool_calls_stays_consistent() {
+    let harness = TestHarness::new("tui_stress_many_tool_calls_stays_consistent");
+    let mut app = build_app(&harness, Vec::new());
+    app.set_terminal_size(100, 30);
+    log_initial_state(&harness, &app);
+
+    apply_pi(&harness, &mut app, "AgentStart", PiMsg::AgentStart);
+
+    // Phase 1: 150 sequential tool cycles with non-trivial output while the
+    // user follows the tail. The view must keep rendering and stay pinned to
+    // the bottom.
+    for idx in 0..150 {
+        run_tool_cycle(&harness, &mut app, idx, 40);
+    }
+    let view = normalize_view(&BubbleteaModel::view(&app));
+    assert!(
+        view.contains("stress-149") || view.contains("collapsed"),
+        "latest tool output should be visible or collapsed at the tail"
+    );
+    let pct = parse_scroll_percent(&view).expect("scroll indicator after stress phase 1");
+    assert_eq!(pct, 100, "tail-following reader should remain at bottom");
+
+    // Phase 2: user scrolls up, then 50 more tool cycles land. The scroll
+    // position must be preserved the whole time.
+    press_pgup(&harness, &mut app);
+    press_pgup(&harness, &mut app);
+    press_pgup(&harness, &mut app);
+    let pct_scrolled = parse_scroll_percent(&normalize_view(&BubbleteaModel::view(&app)))
+        .expect("scroll indicator after scrolling up");
+    assert!(pct_scrolled < 100, "should be scrolled up");
+    for idx in 150..200 {
+        run_tool_cycle(&harness, &mut app, idx, 40);
+        let pct_now = parse_scroll_percent(&normalize_view(&BubbleteaModel::view(&app)))
+            .expect("scroll indicator during stress phase 2");
+        assert!(
+            pct_now < 100,
+            "tool cycle {idx} yanked a scrolled-up reader to the bottom"
+        );
+    }
+
+    // Phase 3: returning to the bottom must still work, and the app must
+    // finalize cleanly with all 200 tool messages in the transcript.
+    for _ in 0..400 {
+        press_pgdown(&harness, &mut app);
+    }
+    let pct_bottom = parse_scroll_percent(&normalize_view(&BubbleteaModel::view(&app)))
+        .expect("scroll indicator after returning to bottom");
+    assert_eq!(pct_bottom, 100, "PageDown must reach the bottom again");
+    let step = finalize_agent(&harness, &mut app);
+    let pct_final = parse_scroll_percent(&step.after).expect("scroll indicator after finalize");
+    assert_eq!(
+        pct_final, 100,
+        "finalizing at the bottom must keep the viewport at the bottom"
+    );
+}
+
+#[test]
+fn tui_tool_invocation_summary_visible_in_status_and_transcript() {
+    let harness = TestHarness::new("tui_tool_invocation_summary_visible_in_status_and_transcript");
+    let mut app = build_app(&harness, Vec::new());
+    app.set_terminal_size(100, 30);
+    log_initial_state(&harness, &app);
+
+    apply_pi(&harness, &mut app, "AgentStart", PiMsg::AgentStart);
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "tool-cmd-1".to_string(),
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "ToolInvocation(bash)",
+        PiMsg::ToolInvocation {
+            tool_id: "tool-cmd-1".to_string(),
+            summary: "cargo test --lib".to_string(),
+        },
+    );
+    // While running, the status row shows the command, not just "Running bash".
+    assert_after_contains(&harness, &step, "Running bash");
+    assert_after_contains(&harness, &step, "cargo test --lib");
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolUpdate(bash)",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "tool-cmd-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("test result: ok."))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "ToolEnd(bash)",
+        PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id: "tool-cmd-1".to_string(),
+            is_error: false,
+            output: None,
+        },
+    );
+    // The transcript block records what ran alongside its output.
+    assert_after_contains(&harness, &step, "Tool bash output:");
+    assert_after_contains(&harness, &step, "$ cargo test --lib");
+    assert_after_contains(&harness, &step, "test result: ok.");
+}
+
+#[test]
+fn tui_tool_invocation_summary_never_mislabels_interleaved_tools() {
+    // Parallel tool execution emits all ToolStart events first, then
+    // interleaved updates. A stale invocation summary from tool B must not be
+    // stamped onto tool A's output block (summaries are matched by tool_id).
+    let harness = TestHarness::new("tui_tool_invocation_summary_never_mislabels_interleaved_tools");
+    let mut app = build_app(&harness, Vec::new());
+    app.set_terminal_size(100, 30);
+    log_initial_state(&harness, &app);
+
+    apply_pi(&harness, &mut app, "AgentStart", PiMsg::AgentStart);
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolStart(a)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "par-a".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolInvocation(a)",
+        PiMsg::ToolInvocation {
+            tool_id: "par-a".to_string(),
+            summary: "echo A".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolStart(b)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "par-b".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolInvocation(b)",
+        PiMsg::ToolInvocation {
+            tool_id: "par-b".to_string(),
+            summary: "echo B".to_string(),
+        },
+    );
+
+    // Tool A's update arrives while the summary slot holds tool B's command.
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolUpdate(a)",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "par-a".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("output-from-A"))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "ToolEnd(a)",
+        PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id: "par-a".to_string(),
+            is_error: false,
+            output: None,
+        },
+    );
+    assert_after_contains(&harness, &step, "output-from-A");
+    assert_after_not_contains(&harness, &step, "$ echo B");
+
+    // Tool B's own block still gets its correct header.
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolUpdate(b)",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "par-b".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("output-from-B"))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "ToolEnd(b)",
+        PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id: "par-b".to_string(),
+            is_error: false,
+            output: None,
+        },
+    );
+    assert_after_contains(&harness, &step, "output-from-B");
+    assert_after_contains(&harness, &step, "$ echo B");
+}
+
+#[test]
+fn tui_tool_output_ansi_escapes_are_sanitized() {
+    // bd-p45xh: raw escape sequences in tool output (clear-screen, OSC window
+    // titles, colors, CR progress rewrites) must never reach the transcript.
+    let harness = TestHarness::new("tui_tool_output_ansi_escapes_are_sanitized");
+    let mut app = build_app(&harness, Vec::new());
+    app.set_terminal_size(100, 30);
+    log_initial_state(&harness, &app);
+
+    apply_pi(&harness, &mut app, "AgentStart", PiMsg::AgentStart);
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "ansi-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolUpdate(bash ansi)",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "ansi-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "\u{1b}[2J\u{1b}[H\u{1b}]0;evil title\u{7}\u{1b}[1;31mFAIL\u{1b}[0m turned \u{1b}[32mPASS\u{1b}[0m\r\nprogress 10%\rprogress 100%",
+            ))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "ToolEnd(bash)",
+        PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id: "ansi-1".to_string(),
+            is_error: false,
+            output: None,
+        },
+    );
+
+    // Cleaned text is present…
+    assert_after_contains(&harness, &step, "FAIL turned PASS");
+    assert_after_contains(&harness, &step, "progress 100%");
+    // …and the dangerous sequences are gone (the view's own styling uses SGR
+    // sequences, so assert on the specific non-SGR payloads).
+    assert_after_not_contains(&harness, &step, "\u{1b}[2J");
+    assert_after_not_contains(&harness, &step, "]0;evil title");
 }

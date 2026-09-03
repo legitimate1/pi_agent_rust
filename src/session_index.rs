@@ -3,17 +3,22 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::session::{Session, SessionEntry, SessionHeader};
+use crate::session_sqlite::{SqliteConnection, run_on_sqlite_thread};
+use fsqlite::SqliteValue as Value;
 use serde::Deserialize;
-use sqlmodel_core::Value;
-use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_JSONL_LINE_BYTES: usize = 100 * 1024 * 1024;
+// Directory locks become reclaimable after the proper-lockfile-compatible
+// 10-second stale horizon. Waiting longer than that is required for immediate
+// recovery when a process is killed while updating the session index.
+const SESSION_INDEX_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
+const SESSION_INDEX_GENERATION_FILENAME: &str = "session-index.generation";
 
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
@@ -60,20 +65,51 @@ impl SessionIndex {
             return Ok(());
         };
 
+        // This public row-repair API receives an already-persisted session, so
+        // it cannot publish a genuinely write-ahead witness. Invalidate global
+        // freshness and update only the known row; the managed Session save
+        // paths use `index_session_snapshot_at_generation` with a ticket taken
+        // before persistence and may advance a contiguous generation instead.
+        note_session_namespace_change(self.sessions_root())?;
         let meta = build_meta(path, &session.header, &session.entries)?;
-        self.upsert_meta(meta)
+        self.upsert_meta(meta, None)
     }
 
     /// Update index metadata for an already-persisted session snapshot.
     ///
     /// This avoids requiring a full `Session` clone when callers already have
-    /// header + aggregate entry stats.
+    /// header + aggregate entry stats. Because the snapshot is already on disk,
+    /// this conservative repair invalidates global freshness instead of
+    /// pretending to have witnessed the preceding write.
     pub fn index_session_snapshot(
         &self,
         path: &Path,
         header: &SessionHeader,
         message_count: u64,
         name: Option<String>,
+    ) -> Result<()> {
+        note_session_namespace_change(self.sessions_root())?;
+        let (last_modified_ms, size_bytes) = session_file_stats(path)?;
+        let meta = SessionMeta {
+            path: path.display().to_string(),
+            id: header.id.clone(),
+            cwd: header.cwd.clone(),
+            timestamp: header.timestamp.clone(),
+            message_count,
+            last_modified_ms,
+            size_bytes,
+            name,
+        };
+        self.upsert_meta(meta, None)
+    }
+
+    fn index_session_snapshot_at_generation(
+        &self,
+        path: &Path,
+        header: &SessionHeader,
+        message_count: u64,
+        name: Option<String>,
+        generation: u64,
     ) -> Result<()> {
         let (last_modified_ms, size_bytes) = session_file_stats(path)?;
         let meta = SessionMeta {
@@ -86,14 +122,14 @@ impl SessionIndex {
             size_bytes,
             name,
         };
-        self.upsert_meta(meta)
+        self.upsert_meta(meta, Some(generation))
     }
 
     pub(crate) fn upsert_session_meta(&self, meta: SessionMeta) -> Result<()> {
-        self.upsert_meta(meta)
+        self.upsert_meta(meta, None)
     }
 
-    fn upsert_meta(&self, meta: SessionMeta) -> Result<()> {
+    fn upsert_meta(&self, meta: SessionMeta, generation: Option<u64>) -> Result<()> {
         self.with_lock(|conn| {
             init_schema(conn)?;
 
@@ -101,8 +137,14 @@ impl SessionIndex {
                 .map_err(|e| Error::session(format!("BEGIN failed: {e}")))?;
 
             let result = (|| -> Result<()> {
+                // A row-local save cannot prove that every other session path
+                // was discovered successfully. Preserve the last complete-scan
+                // epoch (including its deliberate absence after a partial scan).
                 upsert_meta_row(conn, meta)?;
-                store_sync_epoch(conn)
+                if let Some(generation) = generation {
+                    accept_namespace_generation_if_complete(conn, generation)?;
+                }
+                Ok(())
             })();
 
             match result {
@@ -135,7 +177,7 @@ impl SessionIndex {
                     (
                         "SELECT path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name
                          FROM sessions WHERE cwd=?1 ORDER BY last_modified_ms DESC",
-                        vec![Value::Text(cwd.to_string())],
+                        vec![Value::from(cwd.to_string())],
                     )
                 },
             );
@@ -153,6 +195,7 @@ impl SessionIndex {
     }
 
     pub fn delete_session_path(&self, path: &Path) -> Result<()> {
+        note_session_namespace_change(self.sessions_root())?;
         let path = path.to_string_lossy().to_string();
         self.with_lock(|conn| {
             init_schema(conn)?;
@@ -161,15 +204,11 @@ impl SessionIndex {
                 .map_err(|e| Error::session(format!("BEGIN failed: {e}")))?;
 
             let result = (|| -> Result<()> {
-                conn.execute_sync("DELETE FROM sessions WHERE path=?1", &[Value::Text(path)])
+                conn.execute_sync("DELETE FROM sessions WHERE path=?1", &[Value::from(path)])
                     .map_err(|e| Error::session(format!("Delete failed: {e}")))?;
-
-                conn.execute_sync(
-                    "INSERT INTO meta (key,value) VALUES ('last_sync_epoch_ms', ?1)
-                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    &[Value::Text(current_epoch_ms())],
-                )
-                .map_err(|e| Error::session(format!("Meta update failed: {e}")))?;
+                // Like an upsert, deleting one known row says nothing about
+                // undiscovered paths. Only a complete scan may advance the
+                // global freshness epoch.
                 Ok(())
             })();
 
@@ -188,33 +227,89 @@ impl SessionIndex {
     }
 
     pub fn reindex_all(&self) -> Result<()> {
+        self.reindex_all_with_after_scan(|| {})
+    }
+
+    fn reindex_all_with_after_scan(&self, after_scan: impl FnOnce() + Send) -> Result<()> {
         let sessions_root = self.sessions_root();
         if !sessions_root.exists() {
             return Ok(());
         }
+        let sessions_root = sessions_root.to_path_buf();
 
-        let mut metas = Vec::new();
-        for entry in walk_sessions(sessions_root) {
-            let Ok(path) = entry else { continue };
-            if let Ok(meta) = build_meta_from_file(&path) {
-                metas.push(meta);
+        self.with_lock(move |conn| {
+            let scan_generation = load_session_namespace_generation(&sessions_root)?;
+            let mut metas = Vec::new();
+            let mut invalid_paths = Vec::new();
+            let mut traversal_complete = true;
+            let mut metadata_complete = true;
+            for entry in walk_sessions(&sessions_root) {
+                let path = match entry {
+                    Ok(path) => path,
+                    Err(err) => {
+                        traversal_complete = false;
+                        tracing::warn!(
+                            error = %err,
+                            "Failed to traverse sessions while rebuilding index"
+                        );
+                        continue;
+                    }
+                };
+                match build_meta_from_file(&path) {
+                    Ok(meta) => metas.push(meta),
+                    Err(err) => {
+                        metadata_complete = false;
+                        invalid_paths.push(path.clone());
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %err,
+                            "Failed to rebuild session metadata"
+                        );
+                    }
+                }
             }
-        }
 
-        self.with_lock(|conn| {
+            // Keep the advisory index lock across discovery and replacement.
+            // Otherwise an upsert that lands after the scan but before DELETE
+            // can be erased by this rebuild.
+            after_scan();
+            let generation_unchanged =
+                load_session_namespace_generation(&sessions_root)? == scan_generation;
             init_schema(conn)?;
 
             conn.execute_raw("BEGIN IMMEDIATE")
                 .map_err(|e| Error::session(format!("BEGIN failed: {e}")))?;
 
             let result = (|| -> Result<()> {
-                conn.execute_sync("DELETE FROM sessions", &[])
-                    .map_err(|e| Error::session(format!("Delete failed: {e}")))?;
+                if traversal_complete {
+                    // We reached the complete namespace, so replacement is
+                    // safe even if a known file failed metadata validation.
+                    // Invalid files are omitted instead of allowing their old
+                    // derived rows (or unrelated deleted rows) to survive.
+                    conn.execute_sync("DELETE FROM sessions", &[])
+                        .map_err(|e| Error::session(format!("Delete failed: {e}")))?;
+                } else {
+                    // An incomplete scan can leave some subtrees unknown, so
+                    // preserve their existing rows. A path that was reached
+                    // but failed metadata validation is known-invalid and its
+                    // old derived row must not survive.
+                    for path in invalid_paths {
+                        conn.execute_sync(
+                            "DELETE FROM sessions WHERE path=?1",
+                            &[Value::from(path.display().to_string())],
+                        )
+                        .map_err(|e| Error::session(format!("Delete failed: {e}")))?;
+                    }
+                }
 
                 for meta in metas {
                     upsert_meta_row(conn, meta)?;
                 }
-                store_sync_epoch(conn)?;
+                record_scan_completeness(
+                    conn,
+                    traversal_complete && metadata_complete && generation_unchanged,
+                    scan_generation,
+                )?;
 
                 Ok(())
             })();
@@ -241,19 +336,20 @@ impl SessionIndex {
         // Prefer the persisted sync epoch over the main SQLite file mtime.
         // In WAL mode, recent writes can live in the sidecar files while the
         // base database timestamp stays old enough to look stale.
-        if let Ok(Some(last_sync_epoch_ms)) = self.with_lock(load_last_sync_epoch_ms) {
-            return epoch_ms_is_stale(last_sync_epoch_ms, max_age);
-        }
-        let Ok(meta) = fs::metadata(&self.db_path) else {
+        let scan_state = self.with_lock(|conn| {
+            init_schema(conn)?;
+            Ok((
+                load_last_sync_epoch_ms(conn)?,
+                load_last_scan_generation(conn)?,
+            ))
+        });
+        let Ok((Some(last_sync_epoch_ms), Some(last_scan_generation))) = scan_state else {
             return true;
         };
-        let Ok(modified) = meta.modified() else {
+        let Ok(current_generation) = load_session_namespace_generation(self.sessions_root()) else {
             return true;
         };
-        let age = SystemTime::now()
-            .duration_since(modified)
-            .unwrap_or_default();
-        age > max_age
+        current_generation != last_scan_generation || epoch_ms_is_stale(last_sync_epoch_ms, max_age)
     }
 
     /// Reindex the session database if the index is stale.
@@ -271,151 +367,190 @@ impl SessionIndex {
     /// indexed snapshot. Changed or new files are streamed for metadata only,
     /// while rows for paths that no longer exist are pruned from the index.
     pub fn refresh_incremental(&self) -> Result<SessionIndexRefreshSummary> {
+        self.refresh_incremental_with_file_stats(session_file_stats)
+    }
+
+    fn refresh_incremental_with_file_stats(
+        &self,
+        file_stats: impl Fn(&Path) -> Result<(i64, u64)> + Send,
+    ) -> Result<SessionIndexRefreshSummary> {
+        self.refresh_incremental_with_file_stats_and_after_scan(file_stats, || {})
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn refresh_incremental_with_file_stats_and_after_scan(
+        &self,
+        file_stats: impl Fn(&Path) -> Result<(i64, u64)> + Send,
+        after_scan: impl FnOnce() + Send,
+    ) -> Result<SessionIndexRefreshSummary> {
         let sessions_root = self.sessions_root().to_path_buf();
         if !sessions_root.exists() {
             return Ok(SessionIndexRefreshSummary::default());
         }
 
-        let indexed_by_path: HashMap<PathBuf, SessionMeta> = self
-            .list_sessions(None)?
-            .into_iter()
-            .map(|meta| (PathBuf::from(&meta.path), meta))
-            .collect();
+        // Keep one advisory lock across the indexed snapshot, filesystem scan,
+        // and transaction. Otherwise a concurrent newer upsert can be erased
+        // or overwritten by conclusions derived from the older snapshot.
+        self.with_lock(move |conn| {
+            init_schema(conn)?;
+            let scan_generation = load_session_namespace_generation(&sessions_root)?;
+            let indexed_by_path = load_indexed_sessions_by_path(conn)?;
+            let last_complete_scan_epoch_ms = load_last_sync_epoch_ms(conn)?;
+            let mut summary = SessionIndexRefreshSummary::default();
+            let mut seen_paths = HashSet::new();
+            let mut refreshed = Vec::new();
+            let mut pruned_paths = HashSet::new();
 
-        let mut summary = SessionIndexRefreshSummary::default();
-        let mut seen_paths = HashSet::new();
-        let mut refreshed = Vec::new();
+            for path_result in walk_sessions(&sessions_root) {
+                let path = match path_result {
+                    Ok(path) => path,
+                    Err(err) => {
+                        summary.failed_files = summary.failed_files.saturating_add(1);
+                        tracing::warn!(
+                            error = %err,
+                            "Failed to traverse sessions while incrementally refreshing index"
+                        );
+                        continue;
+                    }
+                };
+                summary.scanned_files = summary.scanned_files.saturating_add(1);
+                seen_paths.insert(path.clone());
 
-        for path_result in walk_sessions(&sessions_root) {
-            let Ok(path) = path_result else {
-                summary.failed_files = summary.failed_files.saturating_add(1);
-                continue;
-            };
-            summary.scanned_files = summary.scanned_files.saturating_add(1);
-            seen_paths.insert(path.clone());
+                let stats = match file_stats(&path) {
+                    Ok(stats) => stats,
+                    Err(err) => {
+                        summary.failed_files = summary.failed_files.saturating_add(1);
+                        if indexed_by_path.contains_key(&path) {
+                            // The directory entry was observed, but its current
+                            // identity can no longer be validated. Keeping the old
+                            // derived row selectable would present stale metadata
+                            // as though it described the unreadable/racing file.
+                            pruned_paths.insert(path.clone());
+                        }
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %err,
+                            "Failed to stat session while incrementally refreshing index"
+                        );
+                        continue;
+                    }
+                };
 
-            let stats = match session_file_stats(&path) {
-                Ok(stats) => stats,
-                Err(err) => {
-                    summary.failed_files = summary.failed_files.saturating_add(1);
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "Failed to stat session while incrementally refreshing index"
-                    );
+                if let Some(indexed) = indexed_by_path.get(&path) {
+                    let (last_modified_ms, size_bytes) = stats;
+                    // A file whose timestamp shares the complete-scan
+                    // millisecond may have been rewritten later in that same
+                    // tick. Only strictly older matching identities are safe
+                    // to reuse without reparsing.
+                    let predates_complete_scan = last_complete_scan_epoch_ms
+                        .is_some_and(|epoch_ms| last_modified_ms < epoch_ms);
+                    if predates_complete_scan
+                        && indexed.last_modified_ms == last_modified_ms
+                        && indexed.size_bytes == size_bytes
+                    {
+                        summary.reused_files = summary.reused_files.saturating_add(1);
+                        continue;
+                    }
+                }
+
+                match build_meta_from_file(&path) {
+                    Ok(meta) => {
+                        summary.refreshed_files = summary.refreshed_files.saturating_add(1);
+                        refreshed.push(meta);
+                    }
+                    Err(err) => {
+                        summary.failed_files = summary.failed_files.saturating_add(1);
+                        if indexed_by_path.contains_key(&path) {
+                            pruned_paths.insert(path.clone());
+                        }
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %err,
+                            "Failed to refresh session metadata while incrementally refreshing index"
+                        );
+                    }
+                }
+            }
+
+            for path in indexed_by_path.into_keys() {
+                if seen_paths.contains(&path) {
                     continue;
                 }
-            };
-
-            if let Some(indexed) = indexed_by_path.get(&path) {
-                let (last_modified_ms, size_bytes) = stats;
-                if indexed.last_modified_ms.eq(&last_modified_ms)
-                    && indexed.size_bytes.eq(&size_bytes)
-                {
-                    summary.reused_files = summary.reused_files.saturating_add(1);
-                    continue;
+                match session_path_is_missing(&path) {
+                    Ok(true) => {
+                        pruned_paths.insert(path);
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        summary.failed_files = summary.failed_files.saturating_add(1);
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %err,
+                            "Failed to determine whether indexed session path exists during incremental refresh"
+                        );
+                    }
                 }
             }
-
-            match build_meta_from_file(&path) {
-                Ok(meta) => {
-                    summary.refreshed_files = summary.refreshed_files.saturating_add(1);
-                    refreshed.push(meta);
-                }
-                Err(err) => {
-                    summary.failed_files = summary.failed_files.saturating_add(1);
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "Failed to refresh session metadata while incrementally refreshing index"
-                    );
-                }
-            }
-        }
-
-        let mut pruned_paths = Vec::new();
-        for path in indexed_by_path.into_keys() {
-            if seen_paths.contains(&path) {
-                continue;
-            }
-            if session_path_is_missing(&path) {
-                pruned_paths.push(path);
-            }
-        }
-        summary.pruned_rows = pruned_paths.len();
-
-        self.apply_refresh_changes(refreshed, pruned_paths)?;
-        Ok(summary)
+            summary.pruned_rows = pruned_paths.len();
+            after_scan();
+            let generation_unchanged =
+                load_session_namespace_generation(&sessions_root)? == scan_generation;
+            apply_refresh_changes_on_conn(
+                conn,
+                refreshed,
+                pruned_paths.into_iter().collect(),
+                summary.failed_files == 0 && generation_unchanged,
+                scan_generation,
+            )?;
+            Ok(summary)
+        })
     }
 
-    fn with_lock<T>(&self, f: impl FnOnce(&SqliteConnection) -> Result<T>) -> Result<T> {
+    fn with_lock<T: Send>(
+        &self,
+        f: impl FnOnce(&SqliteConnection) -> Result<T> + Send,
+    ) -> Result<T> {
         if let Some(parent) = self.db_path.parent() {
             fs::create_dir_all(parent)?;
         }
         // `self.lock_path` is `<sessions>/session-index.lock` — the same path
         // upstream TS pi locks with `proper-lockfile`. Use the directory-based
         // protocol (see `crate::file_lock`) so the two interoperate.
-        let _lock = crate::file_lock::DirLock::acquire(&self.lock_path, Duration::from_secs(5))
+        let _lock = crate::file_lock::DirLock::acquire(&self.lock_path, SESSION_INDEX_LOCK_TIMEOUT)
             .map_err(|e| Error::session(format!("session index lock: {e}")))?;
 
-        let config = SqliteConfig::file(self.db_path.to_string_lossy())
-            .flags(OpenFlags::create_read_write())
-            .busy_timeout(5000);
+        run_on_sqlite_thread(|| {
+            // Opens with strict multi-process refusal and a 5s busy timeout.
+            let conn = SqliteConnection::open_read_write(&self.db_path)
+                .map_err(|e| Error::session(format!("SQLite open: {e}")))?;
 
-        let conn = SqliteConnection::open(&config)
-            .map_err(|e| Error::session(format!("SQLite open: {e}")))?;
+            // Set pragmas for performance
+            conn.execute_raw("PRAGMA journal_mode = WAL")
+                .map_err(|e| Error::session(format!("PRAGMA journal_mode: {e}")))?;
+            conn.execute_raw("PRAGMA synchronous = NORMAL")
+                .map_err(|e| Error::session(format!("PRAGMA synchronous: {e}")))?;
+            conn.execute_raw("PRAGMA wal_autocheckpoint = 1000")
+                .map_err(|e| Error::session(format!("PRAGMA wal_autocheckpoint: {e}")))?;
+            conn.execute_raw("PRAGMA foreign_keys = ON")
+                .map_err(|e| Error::session(format!("PRAGMA foreign_keys: {e}")))?;
 
-        // Set pragmas for performance
-        conn.execute_raw("PRAGMA journal_mode = WAL")
-            .map_err(|e| Error::session(format!("PRAGMA journal_mode: {e}")))?;
-        conn.execute_raw("PRAGMA synchronous = NORMAL")
-            .map_err(|e| Error::session(format!("PRAGMA synchronous: {e}")))?;
-        conn.execute_raw("PRAGMA wal_autocheckpoint = 1000")
-            .map_err(|e| Error::session(format!("PRAGMA wal_autocheckpoint: {e}")))?;
-        conn.execute_raw("PRAGMA foreign_keys = ON")
-            .map_err(|e| Error::session(format!("PRAGMA foreign_keys: {e}")))?;
-
-        f(&conn)
+            let result = f(&conn)?;
+            conn.close()
+                .map_err(|e| Error::session(format!("SQLite close: {e}")))?;
+            Ok(result)
+        })
     }
 
     fn apply_refresh_changes(
         &self,
         refreshed: Vec<SessionMeta>,
         pruned_paths: Vec<PathBuf>,
+        scan_complete: bool,
     ) -> Result<()> {
+        let generation = load_session_namespace_generation(self.sessions_root())?;
         self.with_lock(|conn| {
             init_schema(conn)?;
-
-            conn.execute_raw("BEGIN IMMEDIATE")
-                .map_err(|e| Error::session(format!("BEGIN failed: {e}")))?;
-
-            let result = (|| -> Result<()> {
-                for path in pruned_paths {
-                    conn.execute_sync(
-                        "DELETE FROM sessions WHERE path=?1",
-                        &[Value::Text(path.display().to_string())],
-                    )
-                    .map_err(|e| Error::session(format!("Delete failed: {e}")))?;
-                }
-
-                for meta in refreshed {
-                    upsert_meta_row(conn, meta)?;
-                }
-
-                store_sync_epoch(conn)
-            })();
-
-            match result {
-                Ok(()) => {
-                    conn.execute_raw("COMMIT")
-                        .map_err(|e| Error::session(format!("COMMIT failed: {e}")))?;
-                    Ok(())
-                }
-                Err(e) => {
-                    let _ = conn.execute_raw("ROLLBACK");
-                    Err(e)
-                }
-            }
+            apply_refresh_changes_on_conn(conn, refreshed, pruned_paths, scan_complete, generation)
         })
     }
 
@@ -430,6 +565,43 @@ impl Default for SessionIndex {
     }
 }
 
+fn apply_refresh_changes_on_conn(
+    conn: &SqliteConnection,
+    refreshed: Vec<SessionMeta>,
+    pruned_paths: Vec<PathBuf>,
+    scan_complete: bool,
+    scan_generation: u64,
+) -> Result<()> {
+    conn.execute_raw("BEGIN IMMEDIATE")
+        .map_err(|e| Error::session(format!("BEGIN failed: {e}")))?;
+
+    let result = (|| -> Result<()> {
+        for path in pruned_paths {
+            conn.execute_sync(
+                "DELETE FROM sessions WHERE path=?1",
+                &[Value::from(path.display().to_string())],
+            )
+            .map_err(|e| Error::session(format!("Delete failed: {e}")))?;
+        }
+
+        for meta in refreshed {
+            upsert_meta_row(conn, meta)?;
+        }
+
+        record_scan_completeness(conn, scan_complete, scan_generation)
+    })();
+
+    match result {
+        Ok(()) => conn
+            .execute_raw("COMMIT")
+            .map_err(|e| Error::session(format!("COMMIT failed: {e}"))),
+        Err(err) => {
+            let _ = conn.execute_raw("ROLLBACK");
+            Err(err)
+        }
+    }
+}
+
 /// Queue (currently immediate) index update for a persisted session snapshot.
 ///
 /// Callers use this helper from save paths where index freshness is
@@ -440,17 +612,29 @@ pub(crate) fn enqueue_session_index_snapshot_update(
     header: &SessionHeader,
     message_count: u64,
     name: Option<String>,
+    generation: Option<u64>,
 ) {
     let sessions_root = sessions_root.to_path_buf();
     let path = path.to_path_buf();
     let header = header.clone();
 
-    if let Err(err) = SessionIndex::for_sessions_root(&sessions_root).index_session_snapshot(
-        &path,
-        &header,
-        message_count,
-        name,
-    ) {
+    let index = SessionIndex::for_sessions_root(&sessions_root);
+    let result = if let Some(generation) = generation {
+        index.index_session_snapshot_at_generation(&path, &header, message_count, name, generation)
+    } else {
+        let meta = session_file_stats(&path).map(|(last_modified_ms, size_bytes)| SessionMeta {
+            path: path.display().to_string(),
+            id: header.id.clone(),
+            cwd: header.cwd.clone(),
+            timestamp: header.timestamp.clone(),
+            message_count,
+            last_modified_ms,
+            size_bytes,
+            name,
+        });
+        meta.and_then(|meta| index.upsert_meta(meta, None))
+    };
+    if let Err(err) = result {
         tracing::warn!(
             sessions_root = %sessions_root.display(),
             path = %path.display(),
@@ -458,6 +642,10 @@ pub(crate) fn enqueue_session_index_snapshot_update(
             "Failed to update session index snapshot"
         );
     }
+}
+
+pub(crate) fn begin_session_index_namespace_change(sessions_root: &Path) -> Result<u64> {
+    note_session_namespace_change(sessions_root)
 }
 
 fn init_schema(conn: &SqliteConnection) -> Result<()> {
@@ -501,14 +689,14 @@ fn upsert_meta_row(conn: &SqliteConnection, meta: SessionMeta) -> Result<()> {
            size_bytes=excluded.size_bytes,
            name=excluded.name",
         &[
-            Value::Text(meta.path),
-            Value::Text(meta.id),
-            Value::Text(meta.cwd),
-            Value::Text(meta.timestamp),
-            Value::BigInt(message_count),
-            Value::BigInt(meta.last_modified_ms),
-            Value::BigInt(size_bytes),
-            meta.name.map_or(Value::Null, Value::Text),
+            Value::from(meta.path),
+            Value::from(meta.id),
+            Value::from(meta.cwd),
+            Value::from(meta.timestamp),
+            Value::from(message_count),
+            Value::from(meta.last_modified_ms),
+            Value::from(size_bytes),
+            meta.name.map_or(Value::Null, Value::from),
         ],
     )
     .map_err(|e| Error::session(format!("Insert failed: {e}")))?;
@@ -519,10 +707,76 @@ fn store_sync_epoch(conn: &SqliteConnection) -> Result<()> {
     conn.execute_sync(
         "INSERT INTO meta (key,value) VALUES ('last_sync_epoch_ms', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        &[Value::Text(current_epoch_ms())],
+        &[Value::from(current_epoch_ms())],
     )
     .map_err(|e| Error::session(format!("Meta update failed: {e}")))?;
     Ok(())
+}
+
+fn store_scan_generation(conn: &SqliteConnection, generation: u64) -> Result<()> {
+    conn.execute_sync(
+        "INSERT INTO meta (key,value) VALUES ('last_scan_generation', ?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        &[Value::from(generation.to_string())],
+    )
+    .map_err(|e| Error::session(format!("Generation update failed: {e}")))?;
+    Ok(())
+}
+
+fn accept_namespace_generation_if_complete(conn: &SqliteConnection, generation: u64) -> Result<()> {
+    if load_last_sync_epoch_ms(conn)?.is_some() {
+        let Some(current) = load_last_scan_generation(conn)? else {
+            return record_scan_completeness(conn, false, generation);
+        };
+        if current.checked_add(1) == Some(generation) {
+            store_scan_generation(conn, generation)?;
+        } else {
+            record_scan_completeness(conn, false, generation)?;
+        }
+    }
+    Ok(())
+}
+
+fn record_scan_completeness(
+    conn: &SqliteConnection,
+    scan_complete: bool,
+    scan_generation: u64,
+) -> Result<()> {
+    if scan_complete {
+        store_sync_epoch(conn)?;
+        return store_scan_generation(conn, scan_generation);
+    }
+
+    conn.execute_sync("DELETE FROM meta WHERE key='last_sync_epoch_ms'", &[])
+        .map_err(|e| Error::session(format!("Meta invalidation failed: {e}")))?;
+    conn.execute_sync("DELETE FROM meta WHERE key='last_scan_generation'", &[])
+        .map_err(|e| Error::session(format!("Generation invalidation failed: {e}")))?;
+    Ok(())
+}
+
+fn session_namespace_generation_path(sessions_root: &Path) -> PathBuf {
+    sessions_root.join(SESSION_INDEX_GENERATION_FILENAME)
+}
+
+fn load_session_namespace_generation(sessions_root: &Path) -> Result<u64> {
+    match fs::metadata(session_namespace_generation_path(sessions_root)) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn note_session_namespace_change(sessions_root: &Path) -> Result<u64> {
+    fs::create_dir_all(sessions_root)?;
+    let path = session_namespace_generation_path(sessions_root);
+    let mut generation = OpenOptions::new().create(true).append(true).open(&path)?;
+    fs4::FileExt::lock(&generation)?;
+    generation.write_all(b"\n")?;
+    generation.sync_data()?;
+    generation
+        .metadata()
+        .map(|metadata| metadata.len())
+        .map_err(Into::into)
 }
 
 fn sqlite_i64_from_u64(field: &str, value: u64) -> Result<i64> {
@@ -538,36 +792,64 @@ fn sqlite_u64_from_i64(field: &str, value: i64) -> Result<u64> {
     })
 }
 
-fn row_to_meta(row: &sqlmodel_core::Row) -> Result<SessionMeta> {
-    let message_count = row
-        .get_named::<i64>("message_count")
-        .map_err(|e| Error::session(format!("get message_count: {e}")))?;
-    let size_bytes = row
-        .get_named::<i64>("size_bytes")
-        .map_err(|e| Error::session(format!("get size_bytes: {e}")))?;
+fn row_text(row: &fsqlite::Row, index: usize, column: &str) -> Result<String> {
+    match row.get(index) {
+        Some(Value::Text(text)) => Ok(text.as_str().to_string()),
+        other => Err(Error::session(format!(
+            "get {column}: expected TEXT, got {other:?}"
+        ))),
+    }
+}
+
+fn row_i64(row: &fsqlite::Row, index: usize, column: &str) -> Result<i64> {
+    match row.get(index) {
+        Some(Value::Integer(value)) => Ok(*value),
+        other => Err(Error::session(format!(
+            "get {column}: expected INTEGER, got {other:?}"
+        ))),
+    }
+}
+
+// Column order matches the `SELECT path,id,cwd,timestamp,message_count,
+// last_modified_ms,size_bytes,name` projection used by every sessions query.
+fn row_to_meta(row: &fsqlite::Row) -> Result<SessionMeta> {
+    let message_count = row_i64(row, 4, "message_count")?;
+    let size_bytes = row_i64(row, 6, "size_bytes")?;
 
     Ok(SessionMeta {
-        path: row
-            .get_named("path")
-            .map_err(|e| Error::session(format!("get path: {e}")))?,
-        id: row
-            .get_named("id")
-            .map_err(|e| Error::session(format!("get id: {e}")))?,
-        cwd: row
-            .get_named("cwd")
-            .map_err(|e| Error::session(format!("get cwd: {e}")))?,
-        timestamp: row
-            .get_named("timestamp")
-            .map_err(|e| Error::session(format!("get timestamp: {e}")))?,
+        path: row_text(row, 0, "path")?,
+        id: row_text(row, 1, "id")?,
+        cwd: row_text(row, 2, "cwd")?,
+        timestamp: row_text(row, 3, "timestamp")?,
         message_count: sqlite_u64_from_i64("message_count", message_count)?,
-        last_modified_ms: row
-            .get_named("last_modified_ms")
-            .map_err(|e| Error::session(format!("get last_modified_ms: {e}")))?,
+        last_modified_ms: row_i64(row, 5, "last_modified_ms")?,
         size_bytes: sqlite_u64_from_i64("size_bytes", size_bytes)?,
-        name: row
-            .get_named::<Option<String>>("name")
-            .map_err(|e| Error::session(format!("get name: {e}")))?,
+        name: match row.get(7) {
+            Some(Value::Text(text)) => Some(text.as_str().to_string()),
+            Some(Value::Null) | None => None,
+            other => {
+                return Err(Error::session(format!(
+                    "get name: expected TEXT or NULL, got {other:?}"
+                )));
+            }
+        },
     })
+}
+
+fn load_indexed_sessions_by_path(conn: &SqliteConnection) -> Result<HashMap<PathBuf, SessionMeta>> {
+    let rows = conn
+        .query_sync(
+            "SELECT path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name
+             FROM sessions",
+            &[],
+        )
+        .map_err(|e| Error::session(format!("Query failed: {e}")))?;
+    let mut indexed = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let meta = row_to_meta(&row)?;
+        indexed.insert(PathBuf::from(&meta.path), meta);
+    }
+    Ok(indexed)
 }
 
 fn build_meta(
@@ -673,14 +955,9 @@ fn build_meta_from_jsonl(path: &Path) -> Result<SessionMeta> {
 
     let mut message_count = 0u64;
     let mut name = None;
-    loop {
-        let Some(line_buf) = read_capped_utf8_line(&mut reader).map_err(|err| {
-            Error::session(format!("Read session entry line {}: {err}", path.display()))
-        })?
-        else {
-            break;
-        };
-
+    while let Some(line_buf) = read_capped_utf8_line(&mut reader).map_err(|err| {
+        Error::session(format!("Read session entry line {}: {err}", path.display()))
+    })? {
         if let Ok(entry) = serde_json::from_str::<PartialEntry>(&line_buf) {
             match entry.r#type.as_str() {
                 "message" => message_count += 1,
@@ -756,8 +1033,8 @@ where
 }
 
 #[cfg(feature = "sqlite-sessions")]
-fn sqlite_auxiliary_paths(path: &Path) -> [PathBuf; 2] {
-    ["-wal", "-shm"].map(|suffix| {
+fn sqlite_auxiliary_paths(path: &Path) -> [PathBuf; 7] {
+    crate::session_sqlite::SQLITE_SIDECAR_SUFFIXES.map(|suffix| {
         let mut candidate = path.as_os_str().to_os_string();
         candidate.push(suffix);
         PathBuf::from(candidate)
@@ -805,10 +1082,10 @@ pub(crate) fn session_file_stats(path: &Path) -> Result<(i64, u64)> {
 }
 
 pub(crate) fn is_session_file_path(path: &Path) -> bool {
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        if name.starts_with("session-index.") {
-            return false;
-        }
+    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+        && name.starts_with("session-index.")
+    {
+        return false;
     }
     match path.extension().and_then(|ext| ext.to_str()) {
         Some("jsonl") => true,
@@ -829,18 +1106,8 @@ fn is_v2_sidecar_dir(path: &Path) -> bool {
         })
 }
 
-fn session_path_is_missing(path: &Path) -> bool {
-    match path.try_exists() {
-        Ok(exists) => !exists,
-        Err(err) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "Failed to determine whether indexed session path exists during incremental refresh"
-            );
-            false
-        }
-    }
+fn session_path_is_missing(path: &Path) -> std::io::Result<bool> {
+    path.try_exists().map(|exists| !exists)
 }
 
 pub(crate) fn walk_sessions(root: &Path) -> Vec<std::io::Result<PathBuf>> {
@@ -848,28 +1115,62 @@ pub(crate) fn walk_sessions(root: &Path) -> Vec<std::io::Result<PathBuf>> {
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Ok(file_type) = entry.file_type() else {
-                    continue;
-                };
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                out.push(Err(std::io::Error::new(
+                    err.kind(),
+                    format!("Read sessions directory {}: {err}", dir.display()),
+                )));
+                continue;
+            }
+        };
 
-                if file_type.is_dir() {
-                    if is_v2_sidecar_dir(&path) {
-                        continue;
-                    }
-                    stack.push(path);
-                } else if file_type.is_symlink() {
-                    // Allow symlinks to files, but skip symlinked directories to avoid cycles
-                    if let Ok(meta) = fs::metadata(&path) {
-                        if meta.is_file() && is_session_file_path(&path) {
-                            out.push(Ok(path));
-                        }
-                    }
-                } else if is_session_file_path(&path) {
-                    out.push(Ok(path));
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    out.push(Err(std::io::Error::new(
+                        err.kind(),
+                        format!("Read sessions directory entry {}: {err}", dir.display()),
+                    )));
+                    continue;
                 }
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) => {
+                    out.push(Err(std::io::Error::new(
+                        err.kind(),
+                        format!("Read session file type {}: {err}", path.display()),
+                    )));
+                    continue;
+                }
+            };
+
+            if file_type.is_dir() {
+                if is_v2_sidecar_dir(&path) {
+                    continue;
+                }
+                stack.push(path);
+            } else if file_type.is_symlink() {
+                // Allow symlinks to files, but skip symlinked directories to avoid cycles.
+                if !is_session_file_path(&path) {
+                    continue;
+                }
+                match fs::metadata(&path) {
+                    Ok(meta) if meta.is_file() => {
+                        out.push(Ok(path));
+                    }
+                    Ok(_) => {}
+                    Err(err) => out.push(Err(std::io::Error::new(
+                        err.kind(),
+                        format!("Read session symlink target {}: {err}", path.display()),
+                    ))),
+                }
+            } else if is_session_file_path(&path) {
+                out.push(Ok(path));
             }
         }
     }
@@ -907,10 +1208,25 @@ fn load_last_sync_epoch_ms(conn: &SqliteConnection) -> Result<Option<i64>> {
     let Some(row) = rows.into_iter().next() else {
         return Ok(None);
     };
-    let value = row
-        .get_named::<String>("value")
-        .map_err(|err| Error::session(format!("get meta value: {err}")))?;
+    let value = row_text(&row, 0, "value")?;
     Ok(value.parse::<i64>().ok())
+}
+
+fn load_last_scan_generation(conn: &SqliteConnection) -> Result<Option<u64>> {
+    let rows = conn
+        .query_sync(
+            "SELECT value FROM meta WHERE key='last_scan_generation' LIMIT 1",
+            &[],
+        )
+        .map_err(|err| Error::session(format!("Query generation failed: {err}")))?;
+    let Some(row) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    let value = row_text(&row, 0, "last_scan_generation")?;
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|err| Error::session(format!("Invalid last_scan_generation: {err}")))
 }
 
 #[cfg(test)]
@@ -986,8 +1302,7 @@ mod tests {
                     .into_iter()
                     .next()
                     .ok_or_else(|| Error::session("Missing meta row".to_string()))?;
-                row.get_named::<String>("value")
-                    .map_err(|err| Error::session(format!("get meta value: {err}")))
+                row_text(&row, 0, "value")
             })
             .expect("read meta.last_sync_epoch_ms")
     }
@@ -1071,8 +1386,9 @@ mod tests {
     }
 
     #[test]
-    fn index_session_inserts_row_and_updates_meta() {
-        let harness = TestHarness::new("index_session_inserts_row_and_updates_meta");
+    fn index_session_inserts_row_without_claiming_global_scan_freshness() {
+        let harness =
+            TestHarness::new("index_session_inserts_row_without_claiming_global_scan_freshness");
         let root = harness.temp_path("sessions");
         fs::create_dir_all(&root).expect("create root dir");
         let index = SessionIndex::for_sessions_root(&root);
@@ -1095,15 +1411,9 @@ mod tests {
         assert_eq!(sessions[0].message_count, 1);
         assert_eq!(sessions[0].path, session_path.display().to_string());
 
-        let meta_value = read_meta_last_sync_epoch_ms(&index);
-        harness
-            .log()
-            .info_ctx("verify", "meta.last_sync_epoch_ms present", |ctx| {
-                ctx.push(("value".into(), meta_value.clone()));
-            });
         assert!(
-            meta_value.parse::<i64>().is_ok(),
-            "Expected meta value to be an integer epoch ms"
+            index.should_reindex(Duration::from_secs(3600)),
+            "indexing one row must not claim a complete namespace scan"
         );
     }
 
@@ -1130,7 +1440,6 @@ mod tests {
             .list_sessions(Some("cwd-update"))
             .expect("list sessions")[0]
             .clone();
-        let first_sync = read_meta_last_sync_epoch_ms(&index);
 
         std::thread::sleep(Duration::from_millis(10));
         fs::write(&session_path, "second-longer").expect("rewrite session file");
@@ -1145,7 +1454,6 @@ mod tests {
             .list_sessions(Some("cwd-update"))
             .expect("list sessions")[0]
             .clone();
-        let second_sync = read_meta_last_sync_epoch_ms(&index);
 
         harness.log().info_ctx("verify", "row updated", |ctx| {
             ctx.push((
@@ -1158,14 +1466,12 @@ mod tests {
             ));
             ctx.push(("first_size".into(), first_meta.size_bytes.to_string()));
             ctx.push(("second_size".into(), second_meta.size_bytes.to_string()));
-            ctx.push(("first_sync".into(), first_sync.clone()));
-            ctx.push(("second_sync".into(), second_sync.clone()));
         });
 
         assert_eq!(second_meta.message_count, 2);
         assert!(second_meta.size_bytes >= first_meta.size_bytes);
         assert!(second_meta.last_modified_ms >= first_meta.last_modified_ms);
-        assert!(second_sync.parse::<i64>().unwrap_or(0) >= first_sync.parse::<i64>().unwrap_or(0));
+        assert!(index.should_reindex(Duration::from_secs(3600)));
     }
 
     #[test]
@@ -1280,6 +1586,104 @@ mod tests {
     }
 
     #[test]
+    fn reindex_all_holds_index_lock_across_scan_and_replacement() {
+        let harness = TestHarness::new("reindex_all_holds_index_lock_across_scan_and_replacement");
+        let root = harness.temp_path("sessions");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create dirs");
+
+        let first_path = project_dir.join("first.jsonl");
+        let first_header = make_header("id-first", "cwd-reindex-lock");
+        write_session_jsonl(
+            &first_path,
+            &first_header,
+            &[make_user_entry(None, "m1", "first")],
+        );
+
+        let index = SessionIndex::for_sessions_root(&root);
+        let reindex = index.clone();
+        let lock_path = reindex.lock_path.clone();
+        let (scan_ready_tx, scan_ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_scan_tx, release_scan_rx) = std::sync::mpsc::sync_channel(0);
+        let reindex_handle = std::thread::spawn(move || {
+            reindex.reindex_all_with_after_scan(move || {
+                assert!(
+                    lock_path.is_dir(),
+                    "the index lock directory must exist throughout replacement"
+                );
+                scan_ready_tx.send(()).expect("signal completed scan");
+                release_scan_rx.recv().expect("release completed scan");
+            })
+        });
+        scan_ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reindex should reach completed-scan hook");
+
+        let second_path = project_dir.join("second.jsonl");
+        let second_header = make_header("id-second", "cwd-reindex-lock");
+        write_session_jsonl(
+            &second_path,
+            &second_header,
+            &[make_user_entry(None, "m2", "second")],
+        );
+
+        let updater = index.clone();
+        let (update_done_tx, update_done_rx) = std::sync::mpsc::channel();
+        let generation_before =
+            load_session_namespace_generation(&root).expect("read generation before update");
+        let update_handle = std::thread::spawn(move || {
+            let result = updater.index_session_snapshot(&second_path, &second_header, 1, None);
+            update_done_tx.send(()).expect("signal update completion");
+            result
+        });
+        let generation_deadline = Instant::now() + Duration::from_secs(5);
+        while load_session_namespace_generation(&root).expect("read concurrent generation")
+            <= generation_before
+            && Instant::now() < generation_deadline
+        {
+            std::thread::yield_now();
+        }
+        assert!(
+            load_session_namespace_generation(&root).expect("read changed generation")
+                > generation_before,
+            "concurrent update must publish its namespace generation"
+        );
+        assert!(
+            matches!(
+                update_done_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "concurrent upsert must not complete while the scan lock is held"
+        );
+
+        release_scan_tx.send(()).expect("release reindex");
+        reindex_handle
+            .join()
+            .expect("join reindex thread")
+            .expect("reindex should succeed");
+        update_handle
+            .join()
+            .expect("join update thread")
+            .expect("concurrent update should succeed");
+
+        let ids: HashSet<_> = index
+            .list_sessions(Some("cwd-reindex-lock"))
+            .expect("list sessions after concurrent rebuild")
+            .into_iter()
+            .map(|meta| meta.id)
+            .collect();
+        assert_eq!(
+            ids,
+            HashSet::from(["id-first".to_string(), "id-second".to_string()]),
+            "the rebuild must not erase an upsert that began after its scan"
+        );
+        assert!(
+            index.should_reindex(Duration::from_secs(3600)),
+            "a namespace change during discovery must prevent a fresh-scan claim"
+        );
+    }
+
+    #[test]
     fn reindex_all_skips_invalid_jsonl_files() {
         let harness = TestHarness::new("reindex_all_skips_invalid_jsonl_files");
         let root = harness.temp_path("sessions");
@@ -1299,6 +1703,105 @@ mod tests {
         let sessions = index.list_sessions(None).expect("list sessions");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "id-good");
+        assert!(
+            index.should_reindex(Duration::from_secs(3600)),
+            "a partial rebuild must remain stale so the invalid file is retried"
+        );
+    }
+
+    #[test]
+    fn reindex_all_complete_traversal_drops_stale_rows_despite_invalid_file() {
+        let harness = TestHarness::new(
+            "reindex_all_complete_traversal_drops_stale_rows_despite_invalid_file",
+        );
+        let root = harness.temp_path("sessions");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create dirs");
+        let index = SessionIndex::for_sessions_root(&root);
+
+        let stale_path = project_dir.join("stale.jsonl");
+        index
+            .apply_refresh_changes(
+                vec![SessionMeta {
+                    path: stale_path.display().to_string(),
+                    id: "id-stale".to_string(),
+                    cwd: "cwd-stale".to_string(),
+                    timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+                    message_count: 1,
+                    last_modified_ms: 1,
+                    size_bytes: 1,
+                    name: None,
+                }],
+                Vec::new(),
+                true,
+            )
+            .expect("seed stale derived row");
+
+        let good_path = project_dir.join("good.jsonl");
+        write_session_jsonl(
+            &good_path,
+            &make_header("id-good", "cwd-good"),
+            &[make_user_entry(None, "m1", "valid")],
+        );
+        fs::write(project_dir.join("bad.jsonl"), "not-json\n").expect("write invalid session");
+
+        index.reindex_all().expect("partial metadata rebuild");
+        let listed = index.list_sessions(None).expect("list rebuilt sessions");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "id-good");
+        assert!(index.should_reindex(Duration::from_secs(3600)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reindex_all_incomplete_traversal_preserves_unknown_rows() {
+        use std::os::unix::fs::symlink;
+
+        let harness = TestHarness::new("reindex_all_incomplete_traversal_preserves_unknown_rows");
+        let root = harness.temp_path("sessions");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create dirs");
+        let index = SessionIndex::for_sessions_root(&root);
+        let stale_path = project_dir.join("unknown.jsonl");
+        index
+            .apply_refresh_changes(
+                vec![SessionMeta {
+                    path: stale_path.display().to_string(),
+                    id: "id-unknown".to_string(),
+                    cwd: "cwd-unknown".to_string(),
+                    timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+                    message_count: 1,
+                    last_modified_ms: 1,
+                    size_bytes: 1,
+                    name: None,
+                }],
+                Vec::new(),
+                true,
+            )
+            .expect("seed unknown row");
+        write_session_jsonl(
+            &project_dir.join("good.jsonl"),
+            &make_header("id-good", "cwd-good"),
+            &[make_user_entry(None, "m1", "valid")],
+        );
+        symlink(
+            project_dir.join("missing-target.jsonl"),
+            project_dir.join("broken.jsonl"),
+        )
+        .expect("create broken session symlink");
+
+        index.reindex_all().expect("incomplete traversal rebuild");
+        let ids: HashSet<_> = index
+            .list_sessions(None)
+            .expect("list preserved rows")
+            .into_iter()
+            .map(|meta| meta.id)
+            .collect();
+        assert_eq!(
+            ids,
+            HashSet::from(["id-unknown".to_string(), "id-good".to_string()])
+        );
+        assert!(index.should_reindex(Duration::from_secs(3600)));
     }
 
     #[test]
@@ -1469,7 +1972,7 @@ mod tests {
     fn file_stats_sqlite_includes_wal_and_shm_sizes() {
         let harness = TestHarness::new("file_stats_sqlite_includes_wal_and_shm_sizes");
         let path = harness.temp_path("test_session.sqlite");
-        let [wal_path, shm_path] = sqlite_auxiliary_paths(&path);
+        let [wal_path, shm_path, ..] = sqlite_auxiliary_paths(&path);
 
         fs::write(&path, b"db").expect("write sqlite db");
         fs::write(&wal_path, b"walpayload").expect("write sqlite wal");
@@ -1489,7 +1992,7 @@ mod tests {
         fs::create_dir_all(&project_dir).expect("create project dir");
 
         let path = project_dir.join("test.sqlite");
-        let [wal_path, _shm_path] = sqlite_auxiliary_paths(&path);
+        let [wal_path, ..] = sqlite_auxiliary_paths(&path);
         fs::write(&path, b"db").expect("write sqlite db");
 
         let base_millis = fs::metadata(&path)
@@ -1549,6 +2052,7 @@ mod tests {
             &header,
             3,
             Some("Queued Session".to_string()),
+            None,
         );
 
         let index = SessionIndex::for_sessions_root(&root);
@@ -1582,13 +2086,13 @@ mod tests {
                     "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     &[
-                        Value::Text("/tmp/negative-message-count.jsonl".to_string()),
-                        Value::Text("id-neg".to_string()),
-                        Value::Text("cwd-neg".to_string()),
-                        Value::Text("2026-01-01T00:00:00Z".to_string()),
-                        Value::BigInt(-1),
-                        Value::BigInt(1),
-                        Value::BigInt(1),
+                        Value::from("/tmp/negative-message-count.jsonl".to_string()),
+                        Value::from("id-neg".to_string()),
+                        Value::from("cwd-neg".to_string()),
+                        Value::from("2026-01-01T00:00:00Z".to_string()),
+                        Value::from(-1),
+                        Value::from(1),
+                        Value::from(1),
                         Value::Null,
                     ],
                 )
@@ -1620,13 +2124,13 @@ mod tests {
                     "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     &[
-                        Value::Text("/tmp/negative-size-bytes.jsonl".to_string()),
-                        Value::Text("id-neg".to_string()),
-                        Value::Text("cwd-neg".to_string()),
-                        Value::Text("2026-01-01T00:00:00Z".to_string()),
-                        Value::BigInt(1),
-                        Value::BigInt(1),
-                        Value::BigInt(-1),
+                        Value::from("/tmp/negative-size-bytes.jsonl".to_string()),
+                        Value::from("id-neg".to_string()),
+                        Value::from("cwd-neg".to_string()),
+                        Value::from("2026-01-01T00:00:00Z".to_string()),
+                        Value::from(1),
+                        Value::from(1),
+                        Value::from(-1),
                         Value::Null,
                     ],
                 )
@@ -1719,7 +2223,8 @@ mod tests {
     #[test]
     fn walk_sessions_nonexistent_dir() {
         let paths = walk_sessions(Path::new("/nonexistent/path"));
-        assert!(paths.is_empty());
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].is_err());
     }
 
     // ── current_epoch_ms ────────────────────────────────────────────
@@ -1801,19 +2306,47 @@ mod tests {
         fs::create_dir_all(&root).expect("create root dir");
         let index = SessionIndex::for_sessions_root(&root);
 
-        // Create the db by indexing a session
         let session_path = harness.temp_path("sessions/project/fresh.jsonl");
         fs::create_dir_all(session_path.parent().expect("parent")).expect("create dirs");
-        fs::write(&session_path, "data").expect("write");
-
-        let mut session = Session::in_memory();
-        session.header = make_header("id-fresh", "cwd-fresh");
-        session.path = Some(session_path);
-        session.entries.push(make_user_entry(None, "m1", "hi"));
-        index.index_session(&session).expect("index session");
+        write_session_jsonl(
+            &session_path,
+            &make_header("id-fresh", "cwd-fresh"),
+            &[make_user_entry(None, "m1", "hi")],
+        );
+        index.refresh_incremental().expect("complete refresh");
 
         // DB just created — should not need reindex for large max_age
         assert!(!index.should_reindex(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn should_reindex_fails_stale_when_generation_proof_is_corrupt() {
+        let harness =
+            TestHarness::new("should_reindex_fails_stale_when_generation_proof_is_corrupt");
+        let root = harness.temp_path("sessions");
+        let session_path = root.join("project/fresh.jsonl");
+        fs::create_dir_all(session_path.parent().expect("parent")).expect("create dirs");
+        write_session_jsonl(
+            &session_path,
+            &make_header("id-fresh", "cwd-fresh"),
+            &[make_user_entry(None, "m1", "hi")],
+        );
+        let index = SessionIndex::for_sessions_root(&root);
+        index.refresh_incremental().expect("complete refresh");
+        index
+            .with_lock(|conn| {
+                conn.execute_sync(
+                    "UPDATE meta SET value='not-a-generation' WHERE key='last_scan_generation'",
+                    &[],
+                )
+                .map_err(|err| Error::session(format!("Corrupt generation failed: {err}")))
+            })
+            .expect("corrupt generation proof");
+
+        assert!(
+            index.should_reindex(Duration::from_secs(3600)),
+            "an unreadable completeness witness must fail stale"
+        );
     }
 
     #[cfg(unix)]
@@ -1826,13 +2359,12 @@ mod tests {
 
         let session_path = harness.temp_path("sessions/project/fresh-meta.jsonl");
         fs::create_dir_all(session_path.parent().expect("parent")).expect("create dirs");
-        fs::write(&session_path, "data").expect("write");
-
-        let mut session = Session::in_memory();
-        session.header = make_header("id-fresh-meta", "cwd-fresh-meta");
-        session.path = Some(session_path);
-        session.entries.push(make_user_entry(None, "m1", "hi"));
-        index.index_session(&session).expect("index session");
+        write_session_jsonl(
+            &session_path,
+            &make_header("id-fresh-meta", "cwd-fresh-meta"),
+            &[make_user_entry(None, "m1", "hi")],
+        );
+        index.refresh_incremental().expect("complete refresh");
 
         let status = Command::new("touch")
             .args([
@@ -1916,6 +2448,19 @@ mod tests {
         assert_eq!(first.refreshed_files, 1);
         assert_eq!(first.reused_files, 0);
 
+        let indexed_mtime =
+            index.list_sessions(None).expect("list indexed session")[0].last_modified_ms;
+        index
+            .with_lock(move |conn| {
+                conn.execute_sync(
+                    "INSERT INTO meta (key,value) VALUES ('last_sync_epoch_ms', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    &[Value::from(indexed_mtime.saturating_add(1))],
+                )
+                .map_err(|err| Error::session(format!("Set scan epoch failed: {err}")))
+            })
+            .expect("place complete scan after fixture mtime");
+
         let unchanged = index.refresh_incremental().expect("unchanged refresh");
         assert_eq!(unchanged.scanned_files, 1);
         assert_eq!(unchanged.reused_files, 1);
@@ -1937,6 +2482,306 @@ mod tests {
             .expect("list refreshed session");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name.as_deref(), Some("renamed"));
+    }
+
+    #[test]
+    fn refresh_incremental_invalid_changed_header_evicts_stale_row_and_stays_stale() {
+        let harness = TestHarness::new(
+            "refresh_incremental_invalid_changed_header_evicts_stale_row_and_stays_stale",
+        );
+        let root = harness.temp_path("sessions");
+        fs::create_dir_all(root.join("project")).expect("create dirs");
+        let index = SessionIndex::for_sessions_root(&root);
+
+        let session_path = root.join("project").join("changed.jsonl");
+        let header = make_header("id-before-corruption", "cwd-before-corruption");
+        write_session_jsonl(
+            &session_path,
+            &header,
+            &[make_user_entry(None, "m1", "valid")],
+        );
+        let seeded = index.refresh_incremental().expect("seed index");
+        assert_eq!(seeded.failed_files, 0);
+        assert_eq!(index.list_sessions(None).expect("list seeded").len(), 1);
+
+        fs::write(&session_path, "not a valid session header\n")
+            .expect("replace session with invalid header");
+        let refreshed = index
+            .refresh_incremental()
+            .expect("partial refresh should preserve usable index state");
+
+        assert_eq!(refreshed.failed_files, 1);
+        assert_eq!(refreshed.pruned_rows, 1);
+        assert!(
+            index
+                .list_sessions(None)
+                .expect("list after failure")
+                .is_empty(),
+            "derived metadata from the old header must not survive corruption"
+        );
+        assert!(
+            index.should_reindex(Duration::from_secs(3600)),
+            "a partial refresh must invalidate the global freshness epoch"
+        );
+
+        let later_path = root.join("project").join("later.jsonl");
+        let later_header = make_header("id-later", "cwd-later");
+        write_session_jsonl(
+            &later_path,
+            &later_header,
+            &[make_user_entry(None, "m2", "later")],
+        );
+        index
+            .index_session_snapshot(&later_path, &later_header, 1, None)
+            .expect("upsert one later session");
+        assert!(
+            index.should_reindex(Duration::from_secs(3600)),
+            "a row-local upsert must not conceal an unresolved partial scan"
+        );
+        index
+            .delete_session_path(&later_path)
+            .expect("delete later indexed row");
+        assert!(
+            index.should_reindex(Duration::from_secs(3600)),
+            "a row-local delete must not conceal an unresolved partial scan"
+        );
+    }
+
+    #[test]
+    fn direct_snapshot_repair_invalidates_complete_scan_freshness() {
+        let harness =
+            TestHarness::new("direct_snapshot_repair_invalidates_complete_scan_freshness");
+        let root = harness.temp_path("sessions");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create dirs");
+        let index = SessionIndex::for_sessions_root(&root);
+
+        let path = project_dir.join("session.jsonl");
+        let header = make_header("id-direct-repair", "cwd-direct-repair");
+        write_session_jsonl(&path, &header, &[make_user_entry(None, "m1", "initial")]);
+        index.refresh_incremental().expect("complete initial scan");
+        assert!(!index.should_reindex(Duration::from_secs(3600)));
+
+        index
+            .index_session_snapshot(&path, &header, 1, None)
+            .expect("repair one persisted snapshot");
+        assert!(
+            index.should_reindex(Duration::from_secs(3600)),
+            "an after-the-write row repair must not claim a write-ahead generation"
+        );
+    }
+
+    #[test]
+    fn later_success_cannot_acknowledge_past_a_failed_generation() {
+        let harness = TestHarness::new("later_success_cannot_acknowledge_past_a_failed_generation");
+        let root = harness.temp_path("sessions");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create dirs");
+        let index = SessionIndex::for_sessions_root(&root);
+        write_session_jsonl(
+            &project_dir.join("base.jsonl"),
+            &make_header("id-base", "cwd-base"),
+            &[make_user_entry(None, "m1", "base")],
+        );
+        index.refresh_incremental().expect("complete base scan");
+        assert!(!index.should_reindex(Duration::from_secs(3600)));
+
+        let _failed_generation =
+            begin_session_index_namespace_change(&root).expect("issue failed generation");
+        let later_generation =
+            begin_session_index_namespace_change(&root).expect("issue later generation");
+        let later_path = project_dir.join("later.jsonl");
+        let later_header = make_header("id-later", "cwd-later");
+        write_session_jsonl(
+            &later_path,
+            &later_header,
+            &[make_user_entry(None, "m2", "later")],
+        );
+        index
+            .index_session_snapshot_at_generation(
+                &later_path,
+                &later_header,
+                1,
+                None,
+                later_generation,
+            )
+            .expect("apply later generation");
+
+        assert!(
+            index.should_reindex(Duration::from_secs(3600)),
+            "a later success must not conceal an earlier failed mutation ticket"
+        );
+    }
+
+    #[test]
+    fn refresh_incremental_reparses_equal_stats_at_complete_scan_millisecond() {
+        let harness = TestHarness::new(
+            "refresh_incremental_reparses_equal_stats_at_complete_scan_millisecond",
+        );
+        let root = harness.temp_path("sessions");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create dirs");
+        let index = SessionIndex::for_sessions_root(&root);
+        let path = project_dir.join("same-tick.jsonl");
+        write_session_jsonl(
+            &path,
+            &make_header("id-before", "cwd-before"),
+            &[make_user_entry(None, "m1", "valid")],
+        );
+        index.refresh_incremental().expect("seed index");
+        let seeded = index
+            .list_sessions(None)
+            .expect("list seeded index")
+            .into_iter()
+            .next()
+            .expect("seeded row");
+
+        index
+            .with_lock(|conn| {
+                conn.execute_sync(
+                    "INSERT INTO meta (key,value) VALUES ('last_sync_epoch_ms', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    &[Value::from(seeded.last_modified_ms)],
+                )
+                .map_err(|err| Error::session(format!("Set scan epoch failed: {err}")))
+            })
+            .expect("align scan epoch with file millisecond");
+
+        let invalid_len = usize::try_from(seeded.size_bytes).expect("fixture size fits usize");
+        fs::write(&path, "x".repeat(invalid_len)).expect("same-size invalid rewrite");
+        let old_mtime = seeded.last_modified_ms;
+        let old_size = seeded.size_bytes;
+        let summary = index
+            .refresh_incremental_with_file_stats(move |_| Ok((old_mtime, old_size)))
+            .expect("same-stat refresh");
+
+        assert_eq!(summary.reused_files, 0);
+        assert_eq!(summary.failed_files, 1);
+        assert_eq!(summary.pruned_rows, 1);
+        assert!(
+            index
+                .list_sessions(None)
+                .expect("list after rewrite")
+                .is_empty()
+        );
+        assert!(index.should_reindex(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn refresh_incremental_holds_index_lock_across_scan_and_apply() {
+        let harness =
+            TestHarness::new("refresh_incremental_holds_index_lock_across_scan_and_apply");
+        let root = harness.temp_path("sessions");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create dirs");
+        let index = SessionIndex::for_sessions_root(&root);
+        write_session_jsonl(
+            &project_dir.join("one.jsonl"),
+            &make_header("id-one", "cwd-one"),
+            &[make_user_entry(None, "m1", "one")],
+        );
+        let scan_lock_path = index.lock_path.clone();
+        let apply_lock_path = index.lock_path.clone();
+
+        index
+            .refresh_incremental_with_file_stats_and_after_scan(
+                move |path| {
+                    assert!(
+                        scan_lock_path.is_dir(),
+                        "the index lock directory must exist during traversal"
+                    );
+                    session_file_stats(path)
+                },
+                move || {
+                    assert!(
+                        apply_lock_path.is_dir(),
+                        "the index lock directory must exist between scan and apply"
+                    );
+                },
+            )
+            .expect("locked incremental refresh");
+    }
+
+    #[test]
+    fn refresh_incremental_stat_failure_evicts_stale_row_and_stays_stale() {
+        let harness =
+            TestHarness::new("refresh_incremental_stat_failure_evicts_stale_row_and_stays_stale");
+        let root = harness.temp_path("sessions");
+        fs::create_dir_all(root.join("project")).expect("create dirs");
+        let index = SessionIndex::for_sessions_root(&root);
+
+        let session_path = root.join("project").join("unreadable.jsonl");
+        let header = make_header("id-before-stat-failure", "cwd-before-stat-failure");
+        write_session_jsonl(
+            &session_path,
+            &header,
+            &[make_user_entry(None, "m1", "valid")],
+        );
+        let seeded = index.refresh_incremental().expect("seed index");
+        assert_eq!(seeded.failed_files, 0);
+        assert_eq!(index.list_sessions(None).expect("list seeded").len(), 1);
+
+        let rejected_path = session_path;
+        let refreshed = index
+            .refresh_incremental_with_file_stats(|path| {
+                if path == rejected_path {
+                    Err(Error::session("injected session stat failure"))
+                } else {
+                    session_file_stats(path)
+                }
+            })
+            .expect("partial refresh should preserve usable index state");
+
+        assert_eq!(refreshed.failed_files, 1);
+        assert_eq!(refreshed.pruned_rows, 1);
+        assert!(
+            index
+                .list_sessions(None)
+                .expect("list after failure")
+                .is_empty(),
+            "metadata that can no longer be tied to the current file must not remain selectable"
+        );
+        assert!(
+            index.should_reindex(Duration::from_secs(3600)),
+            "a stat failure must invalidate the global freshness epoch"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_incremental_surfaces_traversal_errors_and_stays_stale() {
+        use std::os::unix::fs::symlink;
+
+        let harness =
+            TestHarness::new("refresh_incremental_surfaces_traversal_errors_and_stays_stale");
+        let root = harness.temp_path("sessions");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create dirs");
+        let index = SessionIndex::for_sessions_root(&root);
+
+        let session_path = project_dir.join("valid.jsonl");
+        let header = make_header("id-valid", "cwd-valid");
+        write_session_jsonl(
+            &session_path,
+            &header,
+            &[make_user_entry(None, "m1", "valid")],
+        );
+        symlink(
+            project_dir.join("missing-target.jsonl"),
+            project_dir.join("broken.jsonl"),
+        )
+        .expect("create broken session symlink");
+
+        let summary = index
+            .refresh_incremental()
+            .expect("refresh with traversal error");
+        assert_eq!(summary.scanned_files, 1);
+        assert_eq!(summary.refreshed_files, 1);
+        assert_eq!(summary.failed_files, 1);
+        assert!(
+            index.should_reindex(Duration::from_secs(3600)),
+            "a traversal error must keep the index stale for retry"
+        );
     }
 
     #[test]
@@ -1971,6 +2816,7 @@ mod tests {
                     name: None,
                 }],
                 Vec::new(),
+                true,
             )
             .expect("seed missing row");
 
@@ -2025,6 +2871,7 @@ mod tests {
                     name: None,
                 }],
                 Vec::new(),
+                true,
             )
             .expect("seed missing row without creating file");
     }
@@ -2510,14 +3357,14 @@ mod tests {
                             "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name)
                              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                             &[
-                                Value::Text(path),
-                                Value::Text(row.id.clone()),
-                                Value::Text(row.cwd.clone()),
-                                Value::Text(row.timestamp.clone()),
-                                Value::BigInt(row.message_count),
-                                Value::BigInt(row.last_modified_ms),
-                                Value::BigInt(row.size_bytes),
-                                row.name.clone().map_or(Value::Null, Value::Text),
+                                Value::from(path),
+                                Value::from(row.id.clone()),
+                                Value::from(row.cwd.clone()),
+                                Value::from(row.timestamp.clone()),
+                                Value::from(row.message_count),
+                                Value::from(row.last_modified_ms),
+                                Value::from(row.size_bytes),
+                                row.name.clone().map_or(Value::Null, Value::from),
                             ],
                         )
                         .map_err(|err| Error::session(format!("insert session row {idx}: {err}")))?;

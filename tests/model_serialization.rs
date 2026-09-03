@@ -56,6 +56,7 @@ fn make_assistant_message(content: Vec<ContentBlock>) -> AssistantMessage {
         model: "claude-3-5-sonnet-20241022".to_string(),
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
+        stop_details: None,
         error_message: None,
         timestamp: 1_700_000_000,
     }
@@ -172,6 +173,7 @@ fn test_assistant_message_round_trip() {
             },
         },
         stop_reason: StopReason::Stop,
+        stop_details: None,
         error_message: None,
         timestamp: 1_700_000_000,
     });
@@ -207,6 +209,7 @@ fn test_assistant_message_with_error() {
         model: "claude-3-5-sonnet-20241022".to_string(),
         usage: Usage::default(),
         stop_reason: StopReason::Error,
+        stop_details: None,
         error_message: Some("Rate limit exceeded".to_string()),
         timestamp: 1_700_000_000,
     });
@@ -608,6 +611,7 @@ fn test_thinking_level_serialization() {
         (ThinkingLevel::Medium, "\"medium\""),
         (ThinkingLevel::High, "\"high\""),
         (ThinkingLevel::XHigh, "\"xhigh\""),
+        (ThinkingLevel::Max, "\"max\""),
     ];
 
     for (level, expected) in test_cases {
@@ -639,6 +643,8 @@ fn test_thinking_level_from_str() {
         ("high", ThinkingLevel::High),
         ("xhigh", ThinkingLevel::XHigh),
         ("XHIGH", ThinkingLevel::XHigh),
+        ("max", ThinkingLevel::Max),
+        ("MAX", ThinkingLevel::Max),
     ];
 
     for (input, expected) in test_cases {
@@ -672,6 +678,7 @@ fn test_thinking_level_display() {
         (ThinkingLevel::Medium, "medium"),
         (ThinkingLevel::High, "high"),
         (ThinkingLevel::XHigh, "xhigh"),
+        (ThinkingLevel::Max, "max"),
     ];
 
     for (level, expected) in test_cases {
@@ -695,6 +702,7 @@ fn test_thinking_level_default_budget() {
         (ThinkingLevel::Medium, 8192),
         (ThinkingLevel::High, 16384),
         (ThinkingLevel::XHigh, 32768),
+        (ThinkingLevel::Max, 65536),
     ];
 
     for (level, expected) in test_cases {
@@ -976,6 +984,7 @@ fn test_empty_content_blocks() {
         model: "claude-3-5-sonnet-20241022".to_string(),
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
+        stop_details: None,
         error_message: None,
         timestamp: 1_700_000_000,
     });
@@ -1134,6 +1143,7 @@ fn test_mixed_content_sequence() {
         model: "claude-3-5-sonnet-20241022".to_string(),
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
+        stop_details: None,
         error_message: None,
         timestamp: 1_700_000_000,
     });

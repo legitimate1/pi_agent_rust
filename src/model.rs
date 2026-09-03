@@ -9,6 +9,36 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum number of visible ASCII characters retained from an image MIME type.
+pub(crate) const MAX_IMAGE_MIME_TYPE_LEN: usize = 80;
+
+/// Normalize untrusted image MIME metadata before it enters model/session state.
+///
+/// MIME labels are metadata rather than terminal text. Retain only the bounded
+/// ASCII token prefix used by media types so control sequences, bidi controls,
+/// parameters, and trailing prose cannot reach downstream renderers/providers.
+pub(crate) fn sanitize_image_mime_type(mime_type: &str) -> String {
+    let sanitized: String = mime_type
+        .trim()
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '+' | '-'))
+        .take(MAX_IMAGE_MIME_TYPE_LEN)
+        .collect();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn deserialize_image_mime_type<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mime_type = String::deserialize(deserializer)?;
+    Ok(sanitize_image_mime_type(&mime_type))
+}
+
 // ============================================================================
 // Message Types
 // ============================================================================
@@ -63,6 +93,14 @@ pub struct AssistantMessage {
     pub model: String,
     pub usage: Usage,
     pub stop_reason: StopReason,
+    /// Provider-supplied structured details for a terminal stop reason.
+    ///
+    /// Anthropic currently emits these for `refusal` stops. Keeping the
+    /// provider response structured (rather than flattening it into
+    /// `error_message`) lets callers make an informed policy decision and
+    /// preserves the complete response in persisted sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_details: Option<StopDetails>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
     pub timestamp: i64,
@@ -125,6 +163,28 @@ pub enum StopReason {
     Error,
     /// The request was aborted locally.
     Aborted,
+    /// The provider paused a long-running turn and expects the assistant
+    /// response to be resubmitted unchanged to continue it.
+    PauseTurn,
+    /// The provider completed the request but declined it for policy reasons.
+    Refusal,
+}
+
+/// Provider-supplied structured details for a terminal stop reason.
+///
+/// The category is deliberately represented as a string. Providers may add
+/// categories without changing the response envelope, and preserving the
+/// received value is safer than turning an otherwise valid refusal into a
+/// deserialization failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopDetails {
+    /// Discriminator supplied by the provider (currently `"refusal"`).
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Provider policy category, if one is available.
+    pub category: Option<String>,
+    /// Human-readable provider explanation, if one is available.
+    pub explanation: Option<String>,
 }
 
 // ============================================================================
@@ -184,6 +244,7 @@ pub struct ThinkingContent {
 #[serde(rename_all = "camelCase")]
 pub struct ImageContent {
     pub data: String, // Base64 encoded
+    #[serde(deserialize_with = "deserialize_image_mime_type")]
     pub mime_type: String,
 }
 
@@ -272,8 +333,16 @@ pub enum StreamEvent {
         content: String,
     },
 
+    /// A tool-call content block opened. `id`/`name` carry whatever the
+    /// provider already knows at this point (most providers send both on the
+    /// opening chunk); empty strings mean "not known yet" and the terminal
+    /// [`StreamEvent::ToolCallEnd`] still carries the authoritative values.
+    /// Populating them here lets snapshot clients (RPC/ACP) correlate the
+    /// growing partial with the later tool-execution events (#129).
     ToolCallStart {
         content_index: usize,
+        id: String,
+        name: String,
     },
     ToolCallDelta {
         content_index: usize,
@@ -392,6 +461,7 @@ pub enum ThinkingLevel {
     Medium,
     High,
     XHigh,
+    Max,
 }
 
 impl std::str::FromStr for ThinkingLevel {
@@ -405,6 +475,7 @@ impl std::str::FromStr for ThinkingLevel {
             "medium" | "med" | "2" => Ok(Self::Medium),
             "high" | "3" => Ok(Self::High),
             "xhigh" | "4" => Ok(Self::XHigh),
+            "max" | "5" => Ok(Self::Max),
             _ => Err(format!("Invalid thinking level: {s}")),
         }
     }
@@ -420,6 +491,7 @@ impl ThinkingLevel {
             Self::Medium => 8192,
             Self::High => 16384,
             Self::XHigh => 32768, // High reasonable limit
+            Self::Max => 65536,   // Top tier above xhigh
         }
     }
 }
@@ -433,6 +505,7 @@ impl std::fmt::Display for ThinkingLevel {
             Self::Medium => "medium",
             Self::High => "high",
             Self::XHigh => "xhigh",
+            Self::Max => "max",
         };
         write!(f, "{s}")
     }
@@ -472,6 +545,7 @@ mod tests {
             model: "claude-sonnet-4".to_string(),
             usage: sample_usage(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 1_700_000_000,
         }
@@ -843,6 +917,8 @@ mod tests {
             StopReason::Stop,
             StopReason::Length,
             StopReason::ToolUse,
+            StopReason::PauseTurn,
+            StopReason::Refusal,
             StopReason::Error,
             StopReason::Aborted,
         ];
@@ -863,6 +939,27 @@ mod tests {
             serde_json::to_string(&StopReason::Stop).unwrap(),
             "\"stop\""
         );
+        assert_eq!(
+            serde_json::to_string(&StopReason::PauseTurn).unwrap(),
+            "\"pauseTurn\""
+        );
+    }
+
+    #[test]
+    fn refusal_stop_details_roundtrip_and_are_optional() {
+        let mut message = sample_assistant_message();
+        message.stop_reason = StopReason::Refusal;
+        message.stop_details = Some(StopDetails {
+            kind: "refusal".to_string(),
+            category: Some("cyber".to_string()),
+            explanation: Some("The request could enable cyber harm.".to_string()),
+        });
+
+        let json = serde_json::to_string(&message).expect("serialize");
+        assert!(json.contains("stopDetails"));
+        let parsed: AssistantMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.stop_reason, StopReason::Refusal);
+        assert_eq!(parsed.stop_details, message.stop_details);
     }
 
     // ── ContentBlock ───────────────────────────────────────────────────
@@ -931,6 +1028,7 @@ mod tests {
                 }),
                 ContentBlock::Text(TextContent::new("After.")),
             ],
+            stop_details: None,
             ..AssistantMessage::default()
         };
         let json = serde_json::to_value(&original).expect("serialize");
@@ -975,6 +1073,29 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn content_block_image_deserialization_sanitizes_mime_type() {
+        let hostile = serde_json::json!({
+            "type": "image",
+            "data": "aGVsbG8=",
+            "mimeType": "  image/png\u{001b}[2J\u{202e}evil",
+        });
+        let parsed: ContentBlock =
+            serde_json::from_value(hostile).expect("deserialize hostile image MIME metadata");
+        assert!(matches!(
+            parsed,
+            ContentBlock::Image(ImageContent { mime_type, .. }) if mime_type == "image/png"
+        ));
+
+        let overlong = format!("image/{}", "a".repeat(MAX_IMAGE_MIME_TYPE_LEN));
+        let parsed: ImageContent = serde_json::from_value(serde_json::json!({
+            "data": "aGVsbG8=",
+            "mimeType": overlong,
+        }))
+        .expect("deserialize overlong image MIME metadata");
+        assert_eq!(parsed.mime_type.len(), MAX_IMAGE_MIME_TYPE_LEN);
     }
 
     #[test]
@@ -1079,6 +1200,8 @@ mod tests {
             ("3", ThinkingLevel::High),
             ("xhigh", ThinkingLevel::XHigh),
             ("4", ThinkingLevel::XHigh),
+            ("max", ThinkingLevel::Max),
+            ("5", ThinkingLevel::Max),
         ];
         for (input, expected) in &cases {
             let parsed: ThinkingLevel = input.parse().expect(input);
@@ -1452,6 +1575,8 @@ mod tests {
             Just(StopReason::Stop),
             Just(StopReason::Length),
             Just(StopReason::ToolUse),
+            Just(StopReason::PauseTurn),
+            Just(StopReason::Refusal),
             Just(StopReason::Error),
             Just(StopReason::Aborted),
         ]
@@ -1531,7 +1656,10 @@ mod tests {
                 interesting_text_strategy(),
             ],
         )
-            .prop_map(|(data, mime_type)| ImageContent { data, mime_type })
+            .prop_map(|(data, mime_type)| ImageContent {
+                data,
+                mime_type: sanitize_image_mime_type(&mime_type),
+            })
     }
 
     fn tool_call_strategy() -> impl Strategy<Value = ToolCall> {
@@ -1603,6 +1731,7 @@ mod tests {
                         model,
                         usage,
                         stop_reason,
+                        stop_details: None,
                         error_message,
                         timestamp,
                     }

@@ -45,6 +45,31 @@ pub trait Provider: Send + Sync {
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> crate::error::Result<Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>>;
+
+    /// Run the provider's *native* server-side compaction over a fully-built
+    /// request body and return the raw response JSON (gh #167).
+    ///
+    /// Only APIs with a real server-side compact endpoint implement this
+    /// (currently `openai-responses`, which POSTs the body to the sibling
+    /// `…/responses/compact` route). Credentials are resolved host-side from
+    /// `options` exactly like [`Provider::stream`]; callers must sanitize
+    /// `request_body` before handing it in (see the extension compaction
+    /// bridge in `agent.rs`). The default implementation reports the API as
+    /// unsupported so callers fail open to summary compaction.
+    async fn compact_native(
+        &self,
+        _request_body: &serde_json::Value,
+        _options: &StreamOptions,
+    ) -> crate::error::Result<serde_json::Value> {
+        Err(crate::error::Error::provider(
+            self.name().to_string(),
+            format!(
+                "provider {} does not implement native compaction (api: {})",
+                self.name(),
+                self.api()
+            ),
+        ))
+    }
 }
 
 // ============================================================================
@@ -114,6 +139,67 @@ pub struct ToolDef {
 }
 
 // ============================================================================
+// Before-Provider-Request Hook
+// ============================================================================
+
+/// Event handed to a [`BeforeProviderRequestHook`] just before a provider
+/// sends its fully-built HTTP request body (gh #167 / bd-1q31s).
+///
+/// `payload` is the provider-specific request body exactly as it would be
+/// serialized onto the wire. Auth headers are deliberately **not** part of
+/// this event: credentials stay reachable only through their dedicated,
+/// capability-gated surfaces.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BeforeProviderRequestEvent {
+    pub provider: String,
+    pub api: String,
+    pub model: String,
+    #[serde(rename = "baseUrl")]
+    pub base_url: String,
+    pub payload: serde_json::Value,
+}
+
+type BeforeProviderRequestFn = dyn Fn(
+        BeforeProviderRequestEvent,
+    ) -> Pin<Box<dyn std::future::Future<Output = Option<serde_json::Value>> + Send>>
+    + Send
+    + Sync;
+
+/// Host-provided interceptor that may rewrite a provider request body.
+///
+/// It runs before the body is sent. Returning `None` keeps the original body;
+/// returning `Some(value)` proposes a replacement, which the provider must
+/// validate before use (fail-open to the original on rejection).
+#[derive(Clone)]
+pub struct BeforeProviderRequestHook(std::sync::Arc<BeforeProviderRequestFn>);
+
+impl BeforeProviderRequestHook {
+    pub fn new<F>(hook: F) -> Self
+    where
+        F: Fn(
+                BeforeProviderRequestEvent,
+            )
+                -> Pin<Box<dyn std::future::Future<Output = Option<serde_json::Value>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self(std::sync::Arc::new(hook))
+    }
+
+    /// Offer the request body for rewriting. `None` means "keep the original".
+    pub async fn rewrite(&self, event: BeforeProviderRequestEvent) -> Option<serde_json::Value> {
+        (self.0)(event).await
+    }
+}
+
+impl std::fmt::Debug for BeforeProviderRequestHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BeforeProviderRequestHook")
+    }
+}
+
+// ============================================================================
 // Stream Options
 // ============================================================================
 
@@ -128,9 +214,19 @@ pub struct StreamOptions {
     pub api_key: Option<String>,
     pub cache_retention: CacheRetention,
     pub session_id: Option<String>,
+    /// Cache-affinity key serialized as `prompt_cache_key` on OpenAI-shaped
+    /// requests (chat completions, Azure, Responses). OpenAI-compatible
+    /// backends route a request to a prompt-cache shard by prefix hash
+    /// combined with this key; without it some stacks give streamed requests
+    /// no cache affinity at all. Session-scoped by default (see
+    /// `app::resolve_prompt_cache_key`); `None` omits the field so the wire
+    /// format is unchanged for backends that reject unknown params.
+    pub prompt_cache_key: Option<String>,
     pub headers: HashMap<String, String>,
     pub thinking_level: Option<ThinkingLevel>,
     pub thinking_budgets: Option<ThinkingBudgets>,
+    /// Optional `before_provider_request` interceptor (gh #167 / bd-1q31s).
+    pub before_provider_request: Option<BeforeProviderRequestHook>,
 }
 
 /// Cache retention policy.
@@ -152,6 +248,7 @@ pub struct ThinkingBudgets {
     pub medium: u32,
     pub high: u32,
     pub xhigh: u32,
+    pub max: u32,
 }
 
 impl Default for ThinkingBudgets {
@@ -162,6 +259,7 @@ impl Default for ThinkingBudgets {
             medium: 8192,
             high: 16384,
             xhigh: 32768, // Default to double high, or model max? Let's pick a reasonable default.
+            max: 65536,
         }
     }
 }

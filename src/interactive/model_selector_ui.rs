@@ -449,6 +449,7 @@ mod tests {
             current,
             Vec::new(),
             available,
+            None,
             Vec::new(),
             event_tx,
             runtime_handle(),
@@ -458,6 +459,7 @@ mod tests {
             Some(KeyBindings::new()),
             Vec::new(),
             Usage::default(),
+            None,
         )
     }
 

@@ -7,7 +7,7 @@
 #
 # Highlights:
 # - Installs latest (or requested) GitHub release binary for your platform
-# - Verifies artifact checksum via SHA256SUMS
+# - Verifies each release artifact via its exact `.sha256` sidecar
 # - Detects existing TypeScript pi and can migrate to Rust canonical `pi`
 # - Creates `legacy-pi` alias for the preserved TypeScript CLI when migrated
 # - Writes installer state for idempotent re-runs and clean uninstall
@@ -36,14 +36,16 @@ FORCE_INSTALL=0
 OFFLINE="${PI_INSTALLER_OFFLINE:-0}"
 OFFLINE_TARBALL="${PI_INSTALLER_OFFLINE_TARBALL:-}"
 AGENT_SKILLS_ENABLED="${AGENT_SKILLS_ENABLED:-1}"
+RETAIN_TEMP="${PI_INSTALLER_RETAIN_TEMP:-0}"
 
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 SOURCE_DIR="${SOURCE_DIR:-}"
 SIGSTORE_BUNDLE_URL="${SIGSTORE_BUNDLE_URL:-}"
-COSIGN_IDENTITY_RE="${COSIGN_IDENTITY_RE:-^https://github.com/${OWNER}/${REPO}/.github/workflows/release.yml@refs/tags/.*$}"
-COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
+COSIGN_IDENTITY_RE="${COSIGN_IDENTITY_RE:-}"
+COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-}"
+COSIGN_BIN="${PI_INSTALLER_COSIGN_BIN:-cosign}"
 COMPLETIONS_MODE="${COMPLETIONS_MODE:-auto}"
 
 PROXY_ARGS=()
@@ -93,7 +95,7 @@ STATE_FILE="$STATE_DIR/install-state.env"
 STATE_VERSION="1"
 
 TMP=""
-LOCK_DIR="/tmp/pi-agent-rust-install.lock.d"
+LOCK_DIR="${PI_INSTALLER_LOCK_DIR:-/tmp/pi-agent-rust-install.lock.d}"
 LOCKED=0
 MIGRATION_MOVED=0
 INSTALL_COMMITTED=0
@@ -245,12 +247,181 @@ run_command_with_timeout_capture() {
   return "$cmd_rc"
 }
 
+# Execute "$@" exactly once under a hard wall-clock deadline that does not
+# depend on any external timeout wrapper. stdout is discarded; stderr is
+# captured verbatim into <err_file> so dynamic-loader diagnostics survive.
+# This is the only sanctioned way to run an untrusted downloaded artifact in
+# the compatibility probe: no code path may rerun it without a deadline
+# (bd-wmga9).
+PI_INSTALLER_PROBE_TIMEOUT="${PI_INSTALLER_PROBE_TIMEOUT:-20}"
+run_bounded_stderr_capture() {
+  local seconds="$1"
+  local err_file="$2"
+  shift 2
+
+  : > "$err_file"
+
+  local out_file=""
+  out_file="$(mktemp 2>/dev/null || true)"
+  if [ -z "$out_file" ]; then
+    return 125
+  fi
+
+  local timed_out_file=""
+  timed_out_file="$(mktemp 2>/dev/null || true)"
+  if [ -z "$timed_out_file" ]; then
+    rm -f "$out_file" 2>/dev/null || true
+    return 125
+  fi
+  : > "$timed_out_file"
+
+  "$@" > "$out_file" 2> "$err_file" &
+  local cmd_pid=$!
+
+  (
+    sleep "$seconds" 2>/dev/null || true
+    if kill -0 "$cmd_pid" 2>/dev/null; then
+      printf '1\n' > "$timed_out_file"
+      kill "$cmd_pid" >/dev/null 2>&1 || true
+      sleep 1
+      kill -9 "$cmd_pid" >/dev/null 2>&1 || true
+    fi
+  ) &
+  local watchdog_pid=$!
+
+  local cmd_rc=0
+  if wait "$cmd_pid" 2>/dev/null; then
+    cmd_rc=0
+  else
+    cmd_rc=$?
+  fi
+
+  kill "$watchdog_pid" >/dev/null 2>&1 || true
+  wait "$watchdog_pid" 2>/dev/null || true
+
+  rm -f "$out_file" 2>/dev/null || true
+
+  if [ -s "$timed_out_file" ]; then
+    rm -f "$timed_out_file" 2>/dev/null || true
+    return 124
+  fi
+  rm -f "$timed_out_file" 2>/dev/null || true
+  return "$cmd_rc"
+}
+
 capture_version_line() {
   local bin_path="$1"
   local out=""
   out="$(run_command_with_timeout_capture 2 "$bin_path" --version || true)"
   out="$(printf '%s\n' "$out" | head -1)"
   printf '%s\n' "$out"
+}
+
+# Linux release binaries are dynamically linked against the glibc of the
+# machine that built them. On a host whose libc is older, the dynamic loader
+# refuses to start the program before main() runs, e.g.:
+#   pi: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found (required by pi)
+# Probe a downloaded artifact once, before it is installed, so an unloadable
+# binary never lands on PATH. Every execution of the artifact is hard-bounded
+# (external timeout wrapper when usable, internal watchdog otherwise); a
+# wrapper reporting 127 is treated as AMBIGUOUS — GNU timeout normally
+# propagates the child's status, and a real ELF whose interpreter is missing
+# can legitimately exit 127 — so the fallback attempt stays under the same
+# internal deadline and nothing is ever rerun unbounded (bd-wmga9).
+#
+# Outcome contract:
+#   returns 2  probe itself timed out (inconclusive; never overwrite)
+#   returns 0  loader/interpreter definitively rejected the artifact;
+#              sets LIBC_PROBE_KIND to exactly one of:
+#                glibc        — `GLIBC_x.y.z' not found; LIBC_PROBE_REQUIRED
+#                               carries the highest numeric version observed
+#                stdlibcxx    — `GLIBCXX_x.y.z' not found; REQUIRED carries
+#                               the highest full GLIBCXX_ token observed
+#                cxxabi       — `CXXABI_x.y.z' not found; REQUIRED likewise
+#                interpreter  — missing ELF interpreter / shared object with
+#                               no version diagnostic; REQUIRED stays empty
+#   returns 1  otherwise: binary ran fine, unrelated startup failure,
+#              non-Linux host, or missing artifact.
+LIBC_PROBE_REQUIRED=""
+LIBC_PROBE_KIND=""
+release_binary_needs_newer_libc() {
+  local bin_path="$1"
+  LIBC_PROBE_REQUIRED=""
+  LIBC_PROBE_KIND=""
+  [ "$OS" = "linux" ] || return 1
+  [ -f "$bin_path" ] || return 1
+  chmod +x "$bin_path" 2>/dev/null || true
+
+  local probe_err="$TMP/libc-probe.err"
+  local probe_rc=0
+  local probe_timeout="${PI_INSTALLER_PROBE_TIMEOUT:-20}"
+  local timeout_cmd=""
+  timeout_cmd="$(version_timeout_cmd)"
+
+  if [ -n "$timeout_cmd" ]; then
+    "$timeout_cmd" "$probe_timeout" "$bin_path" --version >/dev/null 2>"$probe_err" || probe_rc=$?
+    if [ "$probe_rc" -eq 124 ]; then
+      LIBC_PROBE_KIND="timeout"
+      return 2
+    fi
+    if [ "$probe_rc" -eq 127 ]; then
+      # Ambiguous exit: could be an unusable wrapper OR the artifact's own
+      # fast failure. One more attempt, still hard-bounded.
+      probe_rc=0
+      run_bounded_stderr_capture "$probe_timeout" "$probe_err" "$bin_path" --version || probe_rc=$?
+    fi
+  else
+    run_bounded_stderr_capture "$probe_timeout" "$probe_err" "$bin_path" --version || probe_rc=$?
+  fi
+
+  if [ "$probe_rc" -eq 0 ]; then
+    return 1
+  fi
+  if [ "$probe_rc" -eq 124 ]; then
+    LIBC_PROBE_KIND="timeout"
+    return 2
+  fi
+
+  # Loader diagnostics, most-specific family first. A glibc version is only
+  # ever claimed when one was actually printed by the loader.
+  if grep -Eq "version \`GLIBC_[0-9][0-9.]*' not found" "$probe_err" 2>/dev/null; then
+    LIBC_PROBE_KIND="glibc"
+    LIBC_PROBE_REQUIRED="$({ grep -Eo "GLIBC_[0-9][0-9.]*" "$probe_err" 2>/dev/null || true; } | sed 's/^GLIBC_//' | sort -t. -k1,1n -k2,2n | tail -1)"
+    return 0
+  fi
+  if grep -Eq "version \`GLIBCXX_[0-9][0-9.]*' not found" "$probe_err" 2>/dev/null; then
+    LIBC_PROBE_KIND="stdlibcxx"
+    LIBC_PROBE_REQUIRED="$({ grep -Eo "GLIBCXX_[0-9][0-9.]*" "$probe_err" 2>/dev/null || true; } | sort -t. -k1,1n -k2,2n | tail -1)"
+    return 0
+  fi
+  if grep -Eq "version \`CXXABI_[0-9][0-9.]*' not found" "$probe_err" 2>/dev/null; then
+    LIBC_PROBE_KIND="cxxabi"
+    LIBC_PROBE_REQUIRED="$({ grep -Eo "CXXABI_[0-9][0-9.]*" "$probe_err" 2>/dev/null || true; } | sort -t. -k1,1n -k2,2n | tail -1)"
+    return 0
+  fi
+  # Missing ELF interpreter shapes: exec refuses before any version
+  # diagnostic exists ("required file not found", "cannot execute binary
+  # file", or a named ld-linux path that does not exist).
+  if grep -Eq "required file not found|cannot execute binary file|No such file or directory.*(ld-linux|ld-musl|interpreter)" "$probe_err" 2>/dev/null; then
+    LIBC_PROBE_KIND="interpreter"
+    return 0
+  fi
+
+  # Any other failure keeps the historical behavior: install anyway.
+  return 1
+}
+
+# Best-effort description of the host C library for diagnostics.
+host_libc_description() {
+  local desc=""
+  desc="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+  if [ -z "$desc" ] && command -v ldd >/dev/null 2>&1; then
+    desc="$(ldd --version 2>/dev/null | head -1 || true)"
+  fi
+  if [ -z "$desc" ]; then
+    desc="unknown (no getconf/ldd available)"
+  fi
+  printf '%s\n' "$desc"
 }
 
 is_managed_alias() {
@@ -375,7 +546,7 @@ fetch_url_to_file() {
       max_time="${PI_INSTALLER_ARTIFACT_MAX_TIME:-240}"
       retries="${PI_INSTALLER_ARTIFACT_RETRIES:-2}"
       ;;
-    "release checksum manifest"|"checksum file"|"derived checksum file"|"sigstore bundle")
+    "release checksum manifest"|"checksum file"|"derived checksum file"|"artifact checksum sidecar"|"sigstore bundle")
       connect_timeout="${PI_INSTALLER_META_CONNECT_TIMEOUT:-5}"
       max_time="${PI_INSTALLER_META_MAX_TIME:-20}"
       retries="${PI_INSTALLER_META_RETRIES:-2}"
@@ -389,7 +560,7 @@ fetch_url_to_file() {
       err "Local ${context} not found: $local_path"
       return 1
     fi
-    cp "$local_path" "$output_path"
+    cp "$local_path" "$output_path" || return 1
     return 0
   fi
 
@@ -400,6 +571,58 @@ fetch_url_to_file() {
     --retry-delay "$retry_delay" \
     --retry-connrefused \
     "$url" -o "$output_path"
+}
+
+# Fetch optional release metadata while distinguishing a real HTTP absence from
+# transport/auth/server failure. Return 10 only for a local miss or final
+# HTTP 404/410; every other failure is authoritative and must not trigger a
+# checksum-policy downgrade.
+fetch_optional_url_to_file() {
+  local url="$1"
+  local output_path="$2"
+  local context="$3"
+  local connect_timeout="${PI_INSTALLER_META_CONNECT_TIMEOUT:-5}"
+  local max_time="${PI_INSTALLER_META_MAX_TIME:-20}"
+  local retries="${PI_INSTALLER_META_RETRIES:-2}"
+  local retry_delay="${PI_INSTALLER_RETRY_DELAY:-1}"
+
+  if [ "$context" = "release artifact" ]; then
+    connect_timeout="${PI_INSTALLER_ARTIFACT_CONNECT_TIMEOUT:-10}"
+    max_time="${PI_INSTALLER_ARTIFACT_MAX_TIME:-240}"
+    retries="${PI_INSTALLER_ARTIFACT_RETRIES:-2}"
+  fi
+
+  if ! ensure_network_allowed "$url" "$context"; then
+    return 1
+  fi
+
+  if is_local_resource_ref "$url"; then
+    local local_path
+    local_path="$(resource_to_local_path "$url")"
+    if [ ! -e "$local_path" ]; then
+      return 10
+    fi
+    cp "$local_path" "$output_path" || return 1
+    return 0
+  fi
+
+  local http_status="" curl_rc=0
+  http_status="$(curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    --retry "$retries" \
+    --retry-delay "$retry_delay" \
+    --retry-connrefused \
+    --write-out '%{http_code}' \
+    -o "$output_path" \
+    "$url")" || curl_rc=$?
+  if [ "$curl_rc" -eq 0 ]; then
+    return 0
+  fi
+  case "$http_status" in
+    404|410) return 10 ;;
+    *) return 1 ;;
+  esac
 }
 
 fetch_url_to_stdout() {
@@ -1017,11 +1240,11 @@ detect_platform() {
 
   case "${OS}-${ARCH}" in
     linux-x86_64)
-      TARGET="x86_64-unknown-linux-musl"
+      TARGET="x86_64-unknown-linux-gnu"
       ASSET_PLATFORM="linux-amd64"
       ;;
     linux-aarch64)
-      TARGET="aarch64-unknown-linux-musl"
+      TARGET="aarch64-unknown-linux-gnu"
       ASSET_PLATFORM="linux-arm64"
       ;;
     darwin-x86_64)
@@ -1136,7 +1359,12 @@ check_network_preflight() {
   elif [ -n "$ARTIFACT_URL" ]; then
     probe_url="$ARTIFACT_URL"
   else
-    probe_url="$SHA_URL"
+    # Probe the release page, not the aggregate SHA256SUMS manifest. DSR
+    # publishes a per-asset `.sha256` sidecar and may ship no manifest at
+    # all, so a manifest probe would warn on every canonical release and,
+    # worse, made the installer touch SHA256SUMS even when the sidecar was
+    # authoritative (tests/installer_regression.sh sidecar cases).
+    probe_url="https://github.com/${OWNER}/${REPO}/releases/tag/${VERSION}"
   fi
 
   if [ -z "$probe_url" ]; then
@@ -1157,6 +1385,30 @@ preflight_checks() {
 }
 
 validate_options() {
+  case "$RETAIN_TEMP" in
+    0|1)
+      ;;
+    *)
+      err "PI_INSTALLER_RETAIN_TEMP must be 0 or 1"
+      exit 1
+      ;;
+  esac
+
+  case "$LOCK_DIR" in
+    /*)
+      ;;
+    *)
+      err "PI_INSTALLER_LOCK_DIR must be an absolute path"
+      exit 1
+      ;;
+  esac
+  case "$LOCK_DIR" in
+    /|*/|*//*|*/./*|*/.|*/../*|*/..|*$'\t'*|*$'\n'*|*$'\r'*)
+      err "PI_INSTALLER_LOCK_DIR is unsafe"
+      exit 1
+      ;;
+  esac
+
   case "$AGENT_SKILLS_ENABLED" in
     0|1)
       ;;
@@ -1281,17 +1533,29 @@ acquire_lock() {
     return 0
   fi
 
-  if [ -f "$LOCK_DIR/pid" ]; then
-    local old_pid
+  if [ -d "$LOCK_DIR" ] && [ ! -L "$LOCK_DIR" ] \
+    && [ -f "$LOCK_DIR/pid" ] && [ ! -L "$LOCK_DIR/pid" ]; then
+    local old_pid stale_lock_dir
     old_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
-    if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
-      rmdir "$LOCK_DIR" 2>/dev/null || true
-      if mkdir "$LOCK_DIR" 2>/dev/null; then
-        LOCKED=1
-        echo $$ > "$LOCK_DIR/pid"
-        return 0
-      fi
-    fi
+    case "$old_pid" in
+      ''|*[!0-9]*|0)
+        ;;
+      *)
+        if ! kill -0 "$old_pid" 2>/dev/null \
+          && command -v ps >/dev/null 2>&1 \
+          && ! ps -p "$old_pid" >/dev/null 2>&1; then
+          stale_lock_dir="${LOCK_DIR}.stale.$(date -u +%Y%m%dT%H%M%SZ).$$.${RANDOM}"
+          if [ ! -e "$stale_lock_dir" ] && [ ! -L "$stale_lock_dir" ] \
+            && mv "$LOCK_DIR" "$stale_lock_dir" 2>/dev/null \
+            && mkdir "$LOCK_DIR" 2>/dev/null; then
+            LOCKED=1
+            echo $$ > "$LOCK_DIR/pid"
+            warn "Preserved stale installer lock: $stale_lock_dir"
+            return 0
+          fi
+        fi
+        ;;
+    esac
   fi
 
   err "Another installer appears to be running: $LOCK_DIR"
@@ -1308,12 +1572,21 @@ cleanup() {
     fi
   fi
 
-  if [ -n "$TMP" ] && [ -d "$TMP" ]; then
-    remove_path_recursively "$TMP" 2>/dev/null || true
-  fi
-  if [ "$LOCKED" -eq 1 ]; then
-    rm -f "$LOCK_DIR/pid" 2>/dev/null || true
-    rmdir "$LOCK_DIR" 2>/dev/null || true
+  if [ "$RETAIN_TEMP" -eq 1 ]; then
+    if [ -n "$TMP" ] && [ -d "$TMP" ]; then
+      warn "Retaining installer temporary directory: $TMP"
+    fi
+    if [ "$LOCKED" -eq 1 ] && [ -d "$LOCK_DIR" ]; then
+      warn "Retaining installer lock directory: $LOCK_DIR"
+    fi
+  else
+    if [ -n "$TMP" ] && [ -d "$TMP" ]; then
+      remove_path_recursively "$TMP" 2>/dev/null || true
+    fi
+    if [ "$LOCKED" -eq 1 ]; then
+      rm -f "$LOCK_DIR/pid" 2>/dev/null || true
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
   fi
 
   trap - EXIT
@@ -1510,10 +1783,33 @@ verify_download_checksum() {
     fi
     checksum_source_kind="artifact-derived"
   else
-    if ! fetch_url_to_file "$SHA_URL" "$checksum_file" "release checksum manifest"; then
-      warn "No SHA256SUMS found in release; skipping checksum verification"
-      CHECKSUM_STATUS="skipped (no SHA256SUMS in release)"
-      return 0
+    local artifact_base="${artifact_url%%\?*}"
+    artifact_base="${artifact_base%%#*}"
+    local derived_checksum_url="${artifact_base}.sha256"
+    local sidecar_rc=0
+    if fetch_optional_url_to_file "$derived_checksum_url" "$checksum_file" "artifact checksum sidecar"; then
+      checksum_source_kind="artifact-derived"
+    else
+      sidecar_rc=$?
+      if [ "$sidecar_rc" -ne 10 ]; then
+        err "Failed to fetch canonical checksum sidecar: $derived_checksum_url"
+        CHECKSUM_STATUS="failed (checksum sidecar transport error)"
+        return 4
+      fi
+      local manifest_rc=0
+      if fetch_optional_url_to_file "$SHA_URL" "$checksum_file" "release checksum manifest"; then
+        checksum_source_kind="release-manifest"
+      else
+        manifest_rc=$?
+        if [ "$manifest_rc" -eq 10 ]; then
+          err "Release provides neither ${asset_name}.sha256 nor SHA256SUMS"
+          CHECKSUM_STATUS="failed (checksum unavailable)"
+        else
+          err "Failed to fetch aggregate release checksum manifest: $SHA_URL"
+          CHECKSUM_STATUS="failed (checksum manifest transport error)"
+        fi
+        return 4
+      fi
     fi
   fi
 
@@ -1532,19 +1828,34 @@ verify_download_checksum() {
 
     if [ -z "$expected" ]; then
       if [ "$checksum_source_kind" != "release-manifest" ]; then
-        local checksum_count
+        local checksum_count checksum_entry_name
         checksum_count=$(awk '$1 ~ /^[0-9a-fA-F]{64}$/ { c += 1 } END { print c + 0 }' "$checksum_file")
         if [ "$checksum_count" -eq 1 ]; then
-          expected=$(awk '$1 ~ /^[0-9a-fA-F]{64}$/ { print $1; exit }' "$checksum_file")
+          checksum_entry_name=$(awk '$1 ~ /^[0-9a-fA-F]{64}$/ {
+            file=$2
+            sub(/^\*/, "", file)
+            sub(/^\.\//, "", file)
+            print file
+            exit
+          }' "$checksum_file")
+          if [ -z "$checksum_entry_name" ]; then
+            expected=$(awk '$1 ~ /^[0-9a-fA-F]{64}$/ { print $1; exit }' "$checksum_file")
+          fi
         fi
       fi
     fi
 
     if [ -z "$expected" ]; then
       CHECKSUM_STATUS="failed (missing checksum entry)"
+      if [ "$checksum_source_kind" = "artifact-derived" ]; then
+        err "Checksum sidecar for $asset_name does not contain one usable SHA-256 digest"
+        return 6
+      fi
       return 2
     fi
   fi
+
+  expected=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
 
   local actual
   actual=$(compute_sha256 "$artifact_file")
@@ -1557,13 +1868,11 @@ verify_download_checksum() {
   fi
 
   local source_desc="SHA256SUMS"
-  if [ -n "$CHECKSUM" ]; then
-    source_desc="--checksum"
-  elif [ -n "$CHECKSUM_URL" ]; then
-    source_desc="--checksum-url"
-  elif [ -n "$ARTIFACT_URL" ]; then
-    source_desc="artifact .sha256"
-  fi
+  case "$checksum_source_kind" in
+    inline) source_desc="--checksum" ;;
+    custom-url) source_desc="--checksum-url" ;;
+    artifact-derived) source_desc="artifact .sha256" ;;
+  esac
 
   CHECKSUM_STATUS="verified (${source_desc})"
   ok "Checksum verified for ${asset_name}"
@@ -1581,7 +1890,12 @@ verify_sigstore_bundle() {
     return 0
   fi
 
-  if ! command -v cosign >/dev/null 2>&1; then
+  if ! command -v "$COSIGN_BIN" >/dev/null 2>&1; then
+    if [ -n "$SIGSTORE_BUNDLE_URL" ]; then
+      SIGSTORE_STATUS="failed (cosign not found)"
+      err "A Sigstore bundle was explicitly requested, but cosign is not installed"
+      return 1
+    fi
     SIGSTORE_STATUS="skipped (cosign not found)"
     warn "cosign not found; skipping signature verification"
     return 0
@@ -1602,12 +1916,24 @@ verify_sigstore_bundle() {
   local bundle_file
   bundle_file="$TMP/$(basename "${bundle_url%%\?*}")"
   if ! fetch_url_to_file "$bundle_url" "$bundle_file" "sigstore bundle"; then
+    if [ -n "$SIGSTORE_BUNDLE_URL" ]; then
+      SIGSTORE_STATUS="failed (explicit bundle unavailable)"
+      err "Failed to fetch explicitly requested Sigstore bundle: $bundle_url"
+      return 1
+    fi
     SIGSTORE_STATUS="skipped (bundle unavailable)"
     warn "Sigstore bundle not found; skipping signature verification"
     return 0
   fi
 
-  if ! cosign verify-blob \
+  if [ -z "$COSIGN_IDENTITY_RE" ] || [ -z "$COSIGN_OIDC_ISSUER" ]; then
+    SIGSTORE_STATUS="failed (identity policy unavailable)"
+    err "Sigstore bundle found, but no trusted cosign identity policy is configured"
+    err "Set both COSIGN_IDENTITY_RE and COSIGN_OIDC_ISSUER for this bundle's signer"
+    return 1
+  fi
+
+  if ! "$COSIGN_BIN" verify-blob \
     --bundle "$bundle_file" \
     --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
     --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
@@ -1704,22 +2030,26 @@ download_release_binary() {
   if [ -n "$ARTIFACT_URL" ]; then
     candidates+=("$ASSET_NAME|$ARTIFACT_URL")
   else
-    # Try candidates in priority order. dsr bare-binary names first (most common
-    # for local releases), then archive formats, then Rust target-triple names.
+    # Try the canonical DSR release-contract archive first. Historical names
+    # remain as read-only install fallbacks for already-published artifacts.
     local base_v="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}"
-    # dsr-style naming: pi_<os>_<arch> with underscores (e.g. pi_darwin_arm64)
-    if [ -n "$ASSET_PLATFORM" ]; then
-      local dsr_name="pi_${ASSET_PLATFORM//-/_}${EXE_EXT}"
-      candidates+=("${dsr_name}|${base_v}/${dsr_name}")
-    fi
-    # Bare binary name (dsr uploads Linux as just "pi")
-    candidates+=("pi${EXE_EXT}|${base_v}/pi${EXE_EXT}")
-    # Archive formats (GH Actions output)
     if [ -n "$ASSET_PLATFORM" ]; then
       if [ -n "$EXE_EXT" ]; then
         candidates+=("pi-${ASSET_PLATFORM}.zip|${base_v}/pi-${ASSET_PLATFORM}.zip")
       else
         candidates+=("pi-${ASSET_PLATFORM}.tar.xz|${base_v}/pi-${ASSET_PLATFORM}.tar.xz")
+      fi
+    fi
+    # Historical underscore-separated bare-binary naming.
+    if [ -n "$ASSET_PLATFORM" ]; then
+      local dsr_name="pi_${ASSET_PLATFORM//-/_}${EXE_EXT}"
+      candidates+=("${dsr_name}|${base_v}/${dsr_name}")
+    fi
+    # Historical bare binary name.
+    candidates+=("pi${EXE_EXT}|${base_v}/pi${EXE_EXT}")
+    # Historical archive alternatives.
+    if [ -n "$ASSET_PLATFORM" ]; then
+      if [ -z "$EXE_EXT" ]; then
         candidates+=("pi-${ASSET_PLATFORM}.tar.gz|${base_v}/pi-${ASSET_PLATFORM}.tar.gz")
       fi
     fi
@@ -1735,11 +2065,19 @@ download_release_binary() {
     local artifact_file="$TMP/$candidate"
     # Suppress stderr for candidate probing — 404s are expected as we try
     # multiple naming conventions. Only show errors for explicit --artifact-url.
-    if ! fetch_url_to_file "$candidate_url" "$artifact_file" "release artifact" 2>/dev/null; then
-      if [ -n "$ARTIFACT_URL" ]; then
-        err "Failed to download artifact: $candidate_url"
+    local artifact_fetch_rc=0
+    if fetch_optional_url_to_file "$candidate_url" "$artifact_file" "release artifact" 2>/dev/null; then
+      :
+    else
+      artifact_fetch_rc=$?
+      if [ "$artifact_fetch_rc" -eq 10 ]; then
+        if [ -n "$ARTIFACT_URL" ]; then
+          err "Requested artifact was not found: $candidate_url"
+        fi
+        continue
       fi
-      continue
+      err "Failed to fetch release artifact because of a transport or server error: $candidate_url"
+      return 8
     fi
 
     ASSET_NAME="$candidate"
@@ -1764,12 +2102,14 @@ download_release_binary() {
       return 5
     fi
 
-    local extracted=""
-    extracted="$(extract_release_artifact "$candidate" "$artifact_file" || true)"
-    if [ -n "$extracted" ] && [ -e "$extracted" ]; then
-      printf '%s\n' "$extracted"
-      return 0
+    local extracted="" extract_rc=0
+    extracted="$(extract_release_artifact "$candidate" "$artifact_file")" || extract_rc=$?
+    if [ "$extract_rc" -ne 0 ] || [ -z "$extracted" ] || [ ! -e "$extracted" ]; then
+      err "Checksum-verified release artifact could not be extracted: $candidate"
+      return 7
     fi
+    printf '%s\n' "$extracted"
+    return 0
   done
 
   err "No downloadable release artifact found for version ${VERSION} and target ${TARGET}"
@@ -3449,10 +3789,61 @@ main() {
     local download_rc=0
     if run_with_spinner "Downloading release binary" download_release_binary > "$TMP/source_bin_path"; then
       source_bin=$(cat "$TMP/source_bin_path")
+      local libc_probe_rc=0
+      release_binary_needs_newer_libc "$source_bin" || libc_probe_rc=$?
+      if [ "$libc_probe_rc" -eq 2 ]; then
+        # Inconclusive probe (hard deadline elapsed): treat the artifact as
+        # untrustworthy and never touch an existing executable with it.
+        err "Compatibility probe for the release binary timed out after ${PI_INSTALLER_PROBE_TIMEOUT:-20}s; leaving the current installation untouched"
+        exit 1
+      elif [ "$libc_probe_rc" -eq 0 ]; then
+        case "$LIBC_PROBE_KIND" in
+          glibc)
+            warn "The release binary needs glibc ${LIBC_PROBE_REQUIRED:-(newer)} but this system has: $(host_libc_description)"
+            ;;
+          stdlibcxx)
+            warn "The release binary requires libstdc++ symbol version ${LIBC_PROBE_REQUIRED}, which this system's libstdc++ cannot provide: $(host_libc_description)"
+            ;;
+          cxxabi)
+            warn "The release binary requires libstdc++ runtime symbol ${LIBC_PROBE_REQUIRED} (CXXABI), which this system cannot provide: $(host_libc_description)"
+            ;;
+          interpreter)
+            err "The downloaded release binary has a missing ELF interpreter and cannot start on this system"
+            ;;
+          *)
+            warn "The release binary cannot start on this system ($(LIBC_PROBE_KIND)) but this system has: $(host_libc_description)"
+            ;;
+        esac
+        warn "Installing it would leave a 'pi' that cannot start, so it was not installed"
+        if [ -n "$ARTIFACT_URL" ] && [ "$VERSION" = "custom-artifact" ]; then
+          err "Custom artifact cannot run here; pass --version vX.Y.Z with --artifact-url to allow a source build, or use --from-source"
+          exit 1
+        fi
+        if [ "$OFFLINE" -eq 1 ]; then
+          err "Offline mode cannot fall back to a source build; re-run with --from-source --source-dir <checkout>, or install on a system with a newer glibc"
+          exit 1
+        fi
+        warn "Falling back to building pi from source with the local Rust toolchain"
+        FROM_SOURCE=1
+        INSTALL_SOURCE="source (release binary needs newer glibc)"
+        CHECKSUM_STATUS="not applicable (source fallback)"
+        SIGSTORE_STATUS="not applicable (source fallback)"
+        check_dependencies
+        run_with_spinner "Building pi from source" build_from_source > "$TMP/source_bin_path"
+        source_bin=$(cat "$TMP/source_bin_path")
+      fi
     else
       download_rc=$?
-      if [ "$download_rc" -eq 2 ] || [ "$download_rc" -eq 3 ] || [ "$download_rc" -eq 4 ]; then
+      if [ "$download_rc" -eq 2 ] || [ "$download_rc" -eq 3 ] || [ "$download_rc" -eq 4 ] || [ "$download_rc" -eq 6 ]; then
         err "Release checksum verification failed; aborting install"
+        exit 1
+      fi
+      if [ "$download_rc" -eq 7 ]; then
+        err "Release packaging validation failed; aborting install"
+        exit 1
+      fi
+      if [ "$download_rc" -eq 8 ]; then
+        err "Release artifact transport failed; aborting install"
         exit 1
       fi
       if [ "$download_rc" -eq 5 ]; then

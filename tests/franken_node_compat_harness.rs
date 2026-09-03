@@ -1,9 +1,11 @@
 //! `FrankenNode` Semantic Compatibility Harness (bd-3ar8v.7.3)
 //!
 //! Executes JS fixture scripts against Node.js and Bun to capture baseline
-//! compatibility data, then produces a machine-readable compatibility matrix.
+//! compatibility data, then verifies a machine-readable compatibility matrix.
 //! If `FRANKEN_NODE_RUNTIME` points at a runtime executable, the same fixtures
 //! are also executed against that runtime and reported as a separate leg.
+//! Set `PI_GENERATE_FRANKEN_NODE_COMPATIBILITY_MATRIX=1` to regenerate the
+//! committed matrix explicitly.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -396,16 +398,16 @@ fn check_divergences(
         .collect();
     let mut divergences = Vec::new();
     for check in &candidate.checks {
-        if let Some(&reference_pass) = reference_checks.get(check.name.as_str()) {
-            if reference_pass != check.pass {
-                let mut divergence = String::with_capacity(check.name.len() + label.len() + 32);
-                let _ = write!(
-                    &mut divergence,
-                    "{}: node={}, {}={}",
-                    check.name, reference_pass, label, check.pass
-                );
-                divergences.push(divergence);
-            }
+        if let Some(&reference_pass) = reference_checks.get(check.name.as_str())
+            && reference_pass != check.pass
+        {
+            let mut divergence = String::with_capacity(check.name.len() + label.len() + 32);
+            let _ = write!(
+                &mut divergence,
+                "{}: node={}, {}={}",
+                check.name, reference_pass, label, check.pass
+            );
+            divergences.push(divergence);
         }
     }
     divergences
@@ -1034,10 +1036,10 @@ fn compat_harness_captures_node_bun_divergences() {
         .collect();
     let mut divergences = Vec::new();
     for check in &bun_result.checks {
-        if let Some(&node_pass) = node_checks.get(check.name.as_str()) {
-            if node_pass != check.pass {
-                divergences.push(check.name.clone());
-            }
+        if let Some(&node_pass) = node_checks.get(check.name.as_str())
+            && node_pass != check.pass
+        {
+            divergences.push(check.name.clone());
         }
     }
 
@@ -1095,17 +1097,104 @@ fn print_compatibility_matrix_summary(matrix: &CompatibilityMatrix, artifact_pat
     println!("  Artifact: {}", artifact_path.display());
 }
 
+fn verify_or_generate_compatibility_matrix(
+    matrix: &CompatibilityMatrix,
+    reports: &Path,
+    artifact_path: &Path,
+) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(matrix)
+        .map_err(|error| format!("serialize computed compatibility matrix: {error}"))?;
+    let generate = matches!(
+        std::env::var("PI_GENERATE_FRANKEN_NODE_COMPATIBILITY_MATRIX").as_deref(),
+        Ok("1")
+    );
+    if generate {
+        std::fs::create_dir_all(reports)
+            .map_err(|error| format!("create reports directory {}: {error}", reports.display()))?;
+        std::fs::write(artifact_path, format!("{json}\n")).map_err(|error| {
+            format!(
+                "write compatibility matrix artifact {}: {error}",
+                artifact_path.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    let committed_json = std::fs::read_to_string(artifact_path).map_err(|error| {
+        format!(
+            "read committed compatibility matrix artifact {}: {error}",
+            artifact_path.display()
+        )
+    })?;
+    let mut committed: serde_json::Value =
+        serde_json::from_str(&committed_json).map_err(|error| {
+            format!(
+                "committed compatibility matrix artifact {} contains malformed JSON: {error}",
+                artifact_path.display()
+            )
+        })?;
+    serde_json::from_str::<CompatibilityMatrix>(&committed_json).map_err(|error| {
+        format!(
+            "committed compatibility matrix artifact {} does not match the expected schema: {error}",
+            artifact_path.display()
+        )
+    })?;
+    let mut computed = serde_json::to_value(matrix)
+        .map_err(|error| format!("encode computed compatibility matrix value: {error}"))?;
+    committed
+        .as_object_mut()
+        .ok_or_else(|| {
+            format!(
+                "committed compatibility matrix artifact {} must be a JSON object",
+                artifact_path.display()
+            )
+        })?
+        .remove("generated_at")
+        .ok_or_else(|| {
+            format!(
+                "committed compatibility matrix artifact {} is missing generated_at",
+                artifact_path.display()
+            )
+        })?;
+    computed
+        .as_object_mut()
+        .ok_or_else(|| "computed compatibility matrix must be a JSON object".to_string())?
+        .remove("generated_at")
+        .ok_or_else(|| "computed compatibility matrix is missing generated_at".to_string())?;
+    // The runtime versions describe the machine that produced the matrix, not
+    // the compatibility verdicts. Comparing them made the check fail on every
+    // host whose Node/Bun differ from the generating host (the DSR workers do)
+    // while hiding nothing: verdicts and pass rates are still compared exactly.
+    for matrix_value in [&mut committed, &mut computed] {
+        let object = matrix_value
+            .as_object_mut()
+            .ok_or_else(|| "compatibility matrix must be a JSON object".to_string())?;
+        for env_field in ["node_version", "bun_version"] {
+            object.remove(env_field).ok_or_else(|| {
+                format!("compatibility matrix is missing environment field {env_field}")
+            })?;
+        }
+    }
+    assert_eq!(
+        committed, computed,
+        "committed FrankenNode compatibility matrix is stale; regenerate explicitly with \
+         PI_GENERATE_FRANKEN_NODE_COMPATIBILITY_MATRIX=1 cargo test \
+         --test franken_node_compat_harness generate_compatibility_matrix -- --exact"
+    );
+    Ok(())
+}
+
 #[test]
-fn generate_compatibility_matrix() {
+fn generate_compatibility_matrix() -> Result<(), String> {
     if find_node().is_none() || find_bun().is_none() {
         eprintln!("SKIP: generate_compatibility_matrix requires both Node.js and Bun");
-        return;
+        return Ok(());
     }
     let matrix = match run_compatibility_matrix() {
         Ok(matrix) => matrix,
         Err(err) => {
             eprintln!("SKIP: generate_compatibility_matrix runtime discovery failed: {err}");
-            return;
+            return Ok(());
         }
     };
 
@@ -1171,14 +1260,14 @@ fn generate_compatibility_matrix() {
         }
     }
 
-    // Write artifact
+    // Ordinary test runs verify the committed artifact without mutating the
+    // source tree. Regeneration is an explicit maintainer operation.
     let reports = reports_dir();
-    std::fs::create_dir_all(&reports).expect("create reports dir");
     let artifact_path = reports.join("compatibility_matrix.json");
-    let json = serde_json::to_string_pretty(&matrix).expect("serialize matrix");
-    std::fs::write(&artifact_path, &json).expect("write matrix artifact");
+    verify_or_generate_compatibility_matrix(&matrix, &reports, &artifact_path)?;
 
     print_compatibility_matrix_summary(&matrix, &artifact_path);
+    Ok(())
 }
 
 #[test]

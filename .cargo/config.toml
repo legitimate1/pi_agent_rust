@@ -5,8 +5,27 @@
 # so we add the prefix to the native-library and pkg-config search paths.
 # These settings are inert on Linux/macOS/Windows.
 
+# Release binaries are held to a <48 MiB budget (raised for the v0.3.0
+# capability wave).
+#
+# The parallel rustc front-end (-Z threads) and the LLVM machine outliner
+# are both scoped away from Windows: on *-msvc targets each breaks SEH
+# directive emission (".seh_ directive must appear within an active
+# frame" — the outliner does not support SEH frames, and the parallel
+# front-end miscompiles their emission), so Windows builds use the
+# default single-threaded front-end without outlining.
+[target.'cfg(all(not(target_os = "windows"), not(target_os = "freebsd")))']
+rustflags = ["-Z", "threads=4", "-Cllvm-args=-enable-machine-outliner=always"]
+
 [target.'cfg(target_os = "freebsd")']
 rustflags = ["-L", "/usr/local/lib"]
 
 [env]
 PKG_CONFIG_PATH = { value = "/usr/local/libdata/pkgconfig", force = false }
+
+# Windows MSVC linking must not depend on PATH resolution of link.exe:
+# build hosts with Git-for-Windows expose GNU coreutils `link` first, which
+# rustc then invokes as the linker and fails ("extra operand ... .rcgu.o").
+# rust-lld ships with the pinned toolchain and drives MSVC links natively.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"

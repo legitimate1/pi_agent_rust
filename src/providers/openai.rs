@@ -8,6 +8,12 @@
 
 use std::borrow::Cow;
 
+use crate::auth::{
+    AUTH_RESOLUTION_LOCK_TIMEOUT, AuthStorage, AuthStorageLoadFailure,
+    resolve_ambient_sap_auth_token_with_client, resolve_sap_auth_candidate_with_client,
+    resolve_sap_auth_token_with_client,
+};
+use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
@@ -23,6 +29,7 @@ use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::pin::Pin;
 
 // ============================================================================
@@ -31,6 +38,7 @@ use std::pin::Pin;
 
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
+const MAX_API_ERROR_BODY_BYTES: usize = 64 * 1024;
 const OPENROUTER_DEFAULT_HTTP_REFERER: &str = "https://github.com/Dicklesworthstone/pi_agent_rust";
 const OPENROUTER_DEFAULT_X_TITLE: &str = "Pi Agent Rust";
 
@@ -75,6 +83,24 @@ fn authorization_override(
         })
 }
 
+fn redacted_api_error_body(body: &str, secrets: &[&str]) -> String {
+    crate::auth::redact_known_secrets_bounded(body, secrets, MAX_API_ERROR_BODY_BYTES)
+}
+
+fn push_api_error_secret(secrets: &mut Vec<String>, value: &str, authorization: bool) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    secrets.push(value.to_string());
+    if authorization && let Some(separator) = value.find(char::is_whitespace) {
+        let credential = value[separator..].trim();
+        if !credential.is_empty() {
+            secrets.push(credential.to_string());
+        }
+    }
+}
+
 fn first_non_empty_env(keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         std::env::var(key)
@@ -105,6 +131,8 @@ pub struct OpenAIProvider {
     base_url: String,
     provider: String,
     compat: Option<CompatConfig>,
+    auth_path_override: Option<PathBuf>,
+    auth_header: bool,
     /// Whether the model is a reasoning model. Gates the DeepSeek thinking
     /// dialect so non-reasoning DeepSeek models (e.g. `deepseek-chat`) never
     /// emit `thinking`/`reasoning_effort` (gh #114). Defaults to `false`; the
@@ -121,6 +149,8 @@ impl OpenAIProvider {
             base_url: OPENAI_API_URL.to_string(),
             provider: "openai".to_string(),
             compat: None,
+            auth_path_override: None,
+            auth_header: true,
             reasoning: false,
         }
     }
@@ -160,6 +190,19 @@ impl OpenAIProvider {
         self
     }
 
+    #[cfg(test)]
+    #[must_use]
+    fn with_auth_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.auth_path_override = Some(path.into());
+        self
+    }
+
+    fn auth_path(&self) -> PathBuf {
+        self.auth_path_override
+            .clone()
+            .unwrap_or_else(Config::auth_path)
+    }
+
     /// Attach provider-specific compatibility overrides.
     ///
     /// Overrides are applied during request building (field names, headers,
@@ -170,17 +213,45 @@ impl OpenAIProvider {
         self
     }
 
+    /// Control whether this route generates a Bearer Authorization header.
+    /// Custom Authorization headers remain authoritative regardless of this flag.
+    #[must_use]
+    pub const fn with_auth_header(mut self, enabled: bool) -> Self {
+        self.auth_header = enabled;
+        self
+    }
+
     /// Detect a provider-specific reasoning dialect for this transport.
     ///
-    /// DeepSeek is identified the same way `ModelEntry::is_deepseek_reasoning_model`
-    /// does it — by the canonical provider id (so the `deep-seek` alias also
-    /// matches) or a `deepseek.com` base URL — AND only for reasoning models, so a
-    /// non-reasoning DeepSeek model (e.g. `deepseek-chat`) emits no
+    /// An explicit catalog `compat.thinkingFormat` declaration wins (gh #166):
+    /// `"deepseek"` opts any custom OpenAI-compatible provider into the
+    /// DeepSeek dialect regardless of provider id or base URL, while any other
+    /// declared format (the legacy catalog also carries `"openai"`, `"zai"`,
+    /// `"qwen"`) explicitly opts out of it — this transport only models the
+    /// DeepSeek dialect today, so those serialize with no
+    /// `thinking`/`reasoning_effort`, exactly like providers with no dialect.
+    ///
+    /// When no `thinkingFormat` is declared, DeepSeek is identified the same
+    /// way `ModelEntry::is_deepseek_reasoning_model` does it — by the
+    /// canonical provider id (so the `deep-seek` alias also matches) or a
+    /// `deepseek.com` base URL. Either path applies only to reasoning models,
+    /// so a non-reasoning DeepSeek model (e.g. `deepseek-chat`) emits no
     /// `thinking`/`reasoning_effort` (byte-for-byte as before #113, gh #114).
     /// Every other OpenAI-compatible provider is left untouched.
     fn reasoning_style(&self) -> Option<ReasoningStyle> {
         if !self.reasoning {
             return None;
+        }
+        if let Some(format) = self
+            .compat
+            .as_ref()
+            .and_then(|c| c.thinking_format.as_deref())
+            .map(str::trim)
+            .filter(|format| !format.is_empty())
+        {
+            return format
+                .eq_ignore_ascii_case("deepseek")
+                .then_some(ReasoningStyle::DeepSeek);
         }
         let provider_is_deepseek = canonical_provider_id(&self.provider)
             .is_some_and(|canonical| canonical == "deepseek")
@@ -191,6 +262,10 @@ impl OpenAIProvider {
         } else {
             None
         }
+    }
+
+    fn is_sap_ai_core(&self) -> bool {
+        canonical_provider_id(&self.provider).is_some_and(|canonical| canonical == "sap-ai-core")
     }
 
     /// Build the request body for the OpenAI API.
@@ -243,17 +318,36 @@ impl OpenAIProvider {
         // Forward the reasoning level for providers with a request-side reasoning
         // dialect. Only DeepSeek today; all other transports get `(None, None)`,
         // so their serialized body is unchanged. DeepSeek collapses `low`/`medium`
-        // into `high` and `xhigh` into `max` itself, so we only emit the values it
-        // documents and let `off` request the explicit non-thinking path.
+        // into `high` itself, so we only emit the values it documents and let
+        // `off` request the explicit non-thinking path. Both `xhigh` and `max`
+        // map to DeepSeek's top `"max"` tier (xhigh kept its historical mapping
+        // when the first-class `max` level was added; gh #139). A catalog
+        // `thinkingLevelMap` overrides the emitted `reasoning_effort` value for
+        // enabled levels (gh #117/#165), matching the anthropic-messages and
+        // openai-responses transports; `off` never emits an effort.
         let (thinking, reasoning_effort) = match self.reasoning_style() {
-            Some(ReasoningStyle::DeepSeek) => match options.thinking_level.unwrap_or_default() {
-                ThinkingLevel::Off => (Some(OpenAIThinking { kind: "disabled" }), None),
-                ThinkingLevel::High => (Some(OpenAIThinking { kind: "enabled" }), Some("high")),
-                ThinkingLevel::XHigh => (Some(OpenAIThinking { kind: "enabled" }), Some("max")),
-                ThinkingLevel::Minimal | ThinkingLevel::Low | ThinkingLevel::Medium => {
-                    (Some(OpenAIThinking { kind: "enabled" }), None)
+            Some(ReasoningStyle::DeepSeek) => {
+                let level = options.thinking_level.unwrap_or_default();
+                if level == ThinkingLevel::Off {
+                    (Some(OpenAIThinking { kind: "disabled" }), None)
+                } else {
+                    let mapped = self
+                        .compat
+                        .as_ref()
+                        .and_then(|c| c.thinking_level_map.as_ref())
+                        .and_then(|map| map.get(level.to_string().as_str()))
+                        .map(String::as_str);
+                    let effort = mapped.or(match level {
+                        ThinkingLevel::High => Some("high"),
+                        ThinkingLevel::XHigh | ThinkingLevel::Max => Some("max"),
+                        ThinkingLevel::Off
+                        | ThinkingLevel::Minimal
+                        | ThinkingLevel::Low
+                        | ThinkingLevel::Medium => None,
+                    });
+                    (Some(OpenAIThinking { kind: "enabled" }), effort)
                 }
-            },
+            }
             None => (None, None),
         };
 
@@ -268,6 +362,7 @@ impl OpenAIProvider {
             stream_options,
             thinking,
             reasoning_effort,
+            prompt_cache_key: options.prompt_cache_key.clone(),
         }
     }
 
@@ -361,13 +456,62 @@ impl Provider for OpenAIProvider {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let authorization_override = authorization_override(options, self.compat.as_ref());
 
-        let auth_value = if authorization_override.is_some() {
+        let auth_value = if authorization_override.is_some() || !self.auth_header {
             None
         } else {
-            let resolved = options
+            // SAP supports either a direct bearer or a service-key JSON candidate. Classify every
+            // candidate before constructing the Authorization header so legacy ApiKey entries can
+            // never leak a service key verbatim. The explicit lane remains highest precedence and
+            // bypasses auth-file loading when it contains a direct bearer.
+            let resolved = if self.is_sap_ai_core() {
+                if let Some(candidate) = options
+                    .api_key
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                {
+                    resolve_sap_auth_candidate_with_client(&self.client, candidate).await?
+                } else {
+                    match AuthStorage::load_with_lock_timeout_classified(
+                        self.auth_path(),
+                        AUTH_RESOLUTION_LOCK_TIMEOUT,
+                    ) {
+                        Ok(auth) => {
+                            resolve_sap_auth_token_with_client(&self.client, &auth, None).await?
+                        }
+                        Err(failure @ AuthStorageLoadFailure::LockTimeout(_)) => {
+                            return Err(failure.into_error());
+                        }
+                        Err(AuthStorageLoadFailure::Other(load_error)) => {
+                            let ambient =
+                                resolve_ambient_sap_auth_token_with_client(&self.client).await?;
+                            if ambient.is_some() {
+                                tracing::warn!(
+                                    error = %load_error,
+                                    "stored SAP credentials are unavailable; using complete ambient credentials"
+                                );
+                                ambient
+                            } else {
+                                return Err(Error::auth(format!(
+                                    "Failed to load SAP AI Core credentials: {load_error}"
+                                )));
+                            }
+                        }
+                    }
+                }
+            } else if let Some(key) = options
                 .api_key
-                .clone()
-                .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+                .as_deref()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+            {
+                Some(key.to_string())
+            } else {
+                std::env::var("OPENAI_API_KEY")
+                    .ok()
+                    .map(|key| key.trim().to_string())
+                    .filter(|key| !key.is_empty())
+            };
             match resolved {
                 Some(key) => Some(key),
                 // Local / self-hosted providers (ollama, llamacpp, mistralrs, …)
@@ -375,6 +519,11 @@ impl Provider for OpenAIProvider {
                 // API key. For these we proceed without an Authorization header
                 // instead of failing, matching how ollama already works. (#104)
                 None if crate::provider_metadata::provider_is_keyless_local(self.name()) => None,
+                None if self.is_sap_ai_core() => {
+                    return Err(Error::auth(
+                        "SAP AI Core requires AICORE_SERVICE_KEY, the SAP_AI_CORE_* split credential variables, a stored service key, or an explicit bearer token.",
+                    ));
+                }
                 None => {
                     return Err(Error::provider(
                         self.name(),
@@ -393,7 +542,7 @@ impl Provider for OpenAIProvider {
             .post(&self.base_url)
             .header("Accept", "text/event-stream");
 
-        if let Some(auth_value) = auth_value {
+        if let Some(auth_value) = auth_value.as_deref() {
             request = request.header("Authorization", format!("Bearer {auth_value}"));
         }
 
@@ -418,14 +567,14 @@ impl Provider for OpenAIProvider {
         }
 
         // Apply provider-specific custom headers from compat config.
-        if let Some(compat) = &self.compat {
-            if let Some(custom_headers) = &compat.custom_headers {
-                request = super::apply_headers_ignoring_blank_auth_overrides(
-                    request,
-                    custom_headers,
-                    &["authorization"],
-                );
-            }
+        if let Some(compat) = &self.compat
+            && let Some(custom_headers) = &compat.custom_headers
+        {
+            request = super::apply_headers_ignoring_blank_auth_overrides(
+                request,
+                custom_headers,
+                &["authorization"],
+            );
         }
 
         // Per-request headers from StreamOptions (highest priority).
@@ -435,15 +584,75 @@ impl Provider for OpenAIProvider {
             &["authorization"],
         );
 
-        let request = request.json(&request_body)?;
+        let rewritten_body = super::offer_before_provider_request(
+            options,
+            self.name(),
+            self.api(),
+            self.model_id(),
+            &self.base_url,
+            &request_body,
+            |value| {
+                super::validate_streamed_json_rewrite(
+                    value,
+                    &["model"],
+                    &["messages"],
+                    &[("stream", serde_json::Value::Bool(true))],
+                )
+            },
+        )
+        .await;
+        let request = match &rewritten_body {
+            Some(body) => request.json(body)?,
+            None => request.json(&request_body)?,
+        };
 
         let response = Box::pin(request.send()).await?;
         let status = response.status();
         if !(200..300).contains(&status) {
             let body = response
-                .text()
+                .text_limited(MAX_API_ERROR_BODY_BYTES)
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
+            let mut secrets = Vec::new();
+            for value in [auth_value.as_deref(), authorization_override.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                push_api_error_secret(&mut secrets, value, true);
+            }
+            if let Some(headers) = self
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.custom_headers.as_ref())
+            {
+                for (name, value) in headers {
+                    push_api_error_secret(
+                        &mut secrets,
+                        value,
+                        name.eq_ignore_ascii_case("authorization"),
+                    );
+                }
+            }
+            for (name, value) in &options.headers {
+                push_api_error_secret(
+                    &mut secrets,
+                    value,
+                    name.eq_ignore_ascii_case("authorization"),
+                );
+            }
+            if let Ok(url) = url::Url::parse(&self.base_url) {
+                secrets.extend(
+                    url.query_pairs()
+                        .map(|(_, value)| value.into_owned())
+                        .filter(|value| !value.is_empty()),
+                );
+                push_api_error_secret(&mut secrets, url.username(), false);
+                if let Some(password) = url.password() {
+                    push_api_error_secret(&mut secrets, password, false);
+                }
+            }
+            let secret_refs = secrets.iter().map(String::as_str).collect::<Vec<_>>();
+            let body = redacted_api_error_body(&body, &secret_refs);
             return Err(Error::provider(
                 &self.provider,
                 format!("OpenAI API error (HTTP {status}): {body}"),
@@ -538,15 +747,17 @@ impl Provider for OpenAIProvider {
                             let err = Error::sse(&e);
                             return Some((Err(err), state));
                         }
-                        // Stream ended without [DONE] sentinel (e.g.
-                        // premature server disconnect).  Emit a Done event
-                        // so the agent loop receives the accumulated partial
-                        // instead of silently losing it.
+                        // A clean transport EOF is not a successful OpenAI
+                        // completion unless the [DONE] sentinel was observed.
+                        // The agent loop retains partial content on this error.
                         None => {
                             state.done = true;
-                            let reason = state.partial.stop_reason;
-                            let message = std::mem::take(&mut state.partial);
-                            return Some((Ok(StreamEvent::Done { reason, message }), state));
+                            return Some((
+                                Err(Error::api(
+                                    "OpenAI stream ended before [DONE] sentinel (unexpected EOF)",
+                                )),
+                                state,
+                            ));
                         }
                     }
                 }
@@ -719,7 +930,7 @@ fn trailing_json_string_start(out: &str) -> Option<usize> {
                 backslashes += 1;
                 j -= 1;
             }
-            if backslashes % 2 == 0 {
+            if backslashes.is_multiple_of(2) {
                 return Some(i);
             }
         }
@@ -749,6 +960,7 @@ where
                 model,
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             },
@@ -968,8 +1180,20 @@ where
                         thought_signature: None,
                     }));
 
-                    self.pending_events
-                        .push_back(StreamEvent::ToolCallStart { content_index });
+                    // #129: the opening chunk carries the tool-call id and
+                    // (usually) the function name — surface them on the start
+                    // event so agent-side partials are correlatable from the
+                    // first delta. The accumulation below remains the source
+                    // of truth for the provider-side partial.
+                    self.pending_events.push_back(StreamEvent::ToolCallStart {
+                        content_index,
+                        id: tc_delta.id.clone().unwrap_or_default(),
+                        name: tc_delta
+                            .function
+                            .as_ref()
+                            .and_then(|f| f.name.clone())
+                            .unwrap_or_default(),
+                    });
 
                     self.tool_calls.len() - 1
                 };
@@ -1014,12 +1238,11 @@ where
                         // JSON; on an un-completable fragment it returns None and
                         // we keep the last good value (never wrong data). The
                         // terminal event still sets the fully-parsed arguments.
-                        if let Some(partial_args) = complete_partial_json(&tc.arguments) {
-                            if let Some(ContentBlock::ToolCall(block)) =
+                        if let Some(partial_args) = complete_partial_json(&tc.arguments)
+                            && let Some(ContentBlock::ToolCall(block)) =
                                 self.partial.content.get_mut(content_index)
-                            {
-                                block.arguments = partial_args;
-                            }
+                        {
+                            block.arguments = partial_args;
                         }
 
                         // The delta is still emitted for streaming consumers.
@@ -1110,9 +1333,16 @@ pub struct OpenAIRequest<'a> {
     thinking: Option<OpenAIThinking>,
     /// DeepSeek-only reasoning effort (`"high"` | `"max"`). DeepSeek maps
     /// `low`/`medium` to `high` and `xhigh` to `max` itself, so we only emit the
-    /// two values it documents.
+    /// two values it documents — unless a catalog `thinkingLevelMap` remaps the
+    /// level, in which case the mapped value (borrowed from the provider's
+    /// compat config) is sent verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'static str>,
+    reasoning_effort: Option<&'a str>,
+    /// Cache-affinity key (OpenAI `prompt_cache_key`, gh #188). Omitted when
+    /// unset so backends that reject unknown params never see it. See
+    /// `StreamOptions::prompt_cache_key`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1453,6 +1683,7 @@ fn convert_tool_to_openai(tool: &ToolDef) -> OpenAITool<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthCredential;
     use asupersync::runtime::RuntimeBuilder;
     use futures::{StreamExt, stream};
     use serde::{Deserialize, Serialize};
@@ -1581,6 +1812,35 @@ mod tests {
     }
 
     #[test]
+    fn test_build_request_prompt_cache_key_serialize_and_omit() {
+        let provider = OpenAIProvider::new("gpt-4o");
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+
+        // Set → serialized verbatim (gh #188).
+        let options = StreamOptions {
+            prompt_cache_key: Some("sess-123".to_string()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert_eq!(value["prompt_cache_key"], "sess-123");
+
+        // Unset → field absent, wire format byte-identical to before.
+        let value =
+            serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                .expect("serialize request");
+        assert!(value.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
     fn test_build_request_includes_system_tools_and_stream_options() {
         let provider = OpenAIProvider::new("gpt-4o");
         let context = Context {
@@ -1692,6 +1952,197 @@ mod tests {
         let high_url = body(&ds_by_url, crate::model::ThinkingLevel::High);
         assert_eq!(high_url["thinking"]["type"], "enabled");
         assert_eq!(high_url["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn test_build_request_compat_thinking_format_deepseek_custom_provider() {
+        // gh #166: a custom openai-completions provider (non-deepseek id, non
+        // deepseek.com URL) that declares `compat.thinkingFormat: "deepseek"`
+        // must get the full DeepSeek mapping — identical to native detection.
+        let body = |provider: &OpenAIProvider, level: crate::model::ThinkingLevel| {
+            let context = Context {
+                system_prompt: None,
+                messages: vec![Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("Solve it".to_string()),
+                    timestamp: 0,
+                })]
+                .into(),
+                tools: Vec::<ToolDef>::new().into(),
+            };
+            let options = StreamOptions {
+                thinking_level: Some(level),
+                ..Default::default()
+            };
+            serde_json::to_value(provider.build_request(&context, &options))
+                .expect("serialize request")
+        };
+
+        let custom = OpenAIProvider::new("deepseek-v4-flash")
+            .with_provider_name("opencode-go")
+            .with_base_url("https://opencode.ai/zen/go/v1".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                thinking_format: Some("deepseek".to_string()),
+                ..Default::default()
+            }));
+
+        let off = body(&custom, crate::model::ThinkingLevel::Off);
+        assert_eq!(off["thinking"]["type"], "disabled");
+        assert!(
+            off.get("reasoning_effort").is_none(),
+            "off must not send reasoning_effort"
+        );
+
+        let high = body(&custom, crate::model::ThinkingLevel::High);
+        assert_eq!(high["thinking"]["type"], "enabled");
+        assert_eq!(high["reasoning_effort"], "high");
+
+        let xhigh = body(&custom, crate::model::ThinkingLevel::XHigh);
+        assert_eq!(xhigh["thinking"]["type"], "enabled");
+        assert_eq!(xhigh["reasoning_effort"], "max");
+
+        let max = body(&custom, crate::model::ThinkingLevel::Max);
+        assert_eq!(max["thinking"]["type"], "enabled");
+        assert_eq!(max["reasoning_effort"], "max");
+
+        // The reasoning gate still applies: a non-reasoning model with the
+        // same declaration emits neither field.
+        let non_reasoning = OpenAIProvider::new("deepseek-v4-flash")
+            .with_provider_name("opencode-go")
+            .with_base_url("https://opencode.ai/zen/go/v1".to_string())
+            .with_reasoning(false)
+            .with_compat(Some(CompatConfig {
+                thinking_format: Some("deepseek".to_string()),
+                ..Default::default()
+            }));
+        let quiet = body(&non_reasoning, crate::model::ThinkingLevel::High);
+        assert!(quiet.get("thinking").is_none());
+        assert!(quiet.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_build_request_thinking_level_map_overrides_deepseek_effort() {
+        // gh #165/#166 interaction: a catalog `thinkingLevelMap` is
+        // authoritative over the DeepSeek dialect's built-in effort
+        // vocabulary, matching the anthropic-messages and openai-responses
+        // transports. Unmapped levels keep the documented defaults, and `off`
+        // never emits an effort even if mapped.
+        let provider = OpenAIProvider::new("deepseek-v4-pro")
+            .with_provider_name("deepseek")
+            .with_base_url("https://api.deepseek.com/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                thinking_level_map: Some(HashMap::from([
+                    ("xhigh".to_string(), "high".to_string()),
+                    ("medium".to_string(), "medium".to_string()),
+                    ("off".to_string(), "none".to_string()),
+                ])),
+                ..Default::default()
+            }));
+        let body = |level: crate::model::ThinkingLevel| {
+            let context = Context {
+                system_prompt: None,
+                messages: vec![Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("Solve it".to_string()),
+                    timestamp: 0,
+                })]
+                .into(),
+                tools: Vec::<ToolDef>::new().into(),
+            };
+            let options = StreamOptions {
+                thinking_level: Some(level),
+                ..Default::default()
+            };
+            serde_json::to_value(provider.build_request(&context, &options))
+                .expect("serialize request")
+        };
+
+        let xhigh = body(crate::model::ThinkingLevel::XHigh);
+        assert_eq!(xhigh["thinking"]["type"], "enabled");
+        assert_eq!(xhigh["reasoning_effort"], "high", "map overrides max");
+
+        let medium = body(crate::model::ThinkingLevel::Medium);
+        assert_eq!(
+            medium["reasoning_effort"], "medium",
+            "map can emit an effort for a level with no default"
+        );
+
+        let max = body(crate::model::ThinkingLevel::Max);
+        assert_eq!(
+            max["reasoning_effort"], "max",
+            "unmapped level keeps default"
+        );
+
+        let high = body(crate::model::ThinkingLevel::High);
+        assert_eq!(high["reasoning_effort"], "high");
+
+        let off = body(crate::model::ThinkingLevel::Off);
+        assert_eq!(off["thinking"]["type"], "disabled");
+        assert!(
+            off.get("reasoning_effort").is_none(),
+            "off never emits an effort, mapped or not"
+        );
+    }
+
+    #[test]
+    fn test_build_request_compat_thinking_format_explicit_declaration_wins() {
+        // gh #166: an explicit non-deepseek `thinkingFormat` opts a provider
+        // out of the DeepSeek dialect even when the id/URL heuristic would
+        // have enabled it — the explicit catalog declaration is authoritative.
+        let provider = OpenAIProvider::new("deepseek-v4-pro")
+            .with_provider_name("deepseek")
+            .with_base_url("https://api.deepseek.com/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                thinking_format: Some("openai".to_string()),
+                ..Default::default()
+            }));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::<ToolDef>::new().into(),
+        };
+        let options = StreamOptions {
+            thinking_level: Some(crate::model::ThinkingLevel::High),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert!(value.get("thinking").is_none());
+        assert!(value.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_build_request_compat_without_thinking_format_keeps_custom_provider_unchanged() {
+        // gh #166: a custom provider whose compat config carries no
+        // `thinkingFormat` serializes exactly as before — the heuristic still
+        // finds no DeepSeek identity, so no reasoning controls are emitted.
+        let provider = OpenAIProvider::new("some-model")
+            .with_provider_name("opencode-go")
+            .with_base_url("https://opencode.ai/zen/go/v1".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig::default()));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::<ToolDef>::new().into(),
+        };
+        let options = StreamOptions {
+            thinking_level: Some(crate::model::ThinkingLevel::High),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert!(value.get("thinking").is_none());
+        assert!(value.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -2055,6 +2506,226 @@ mod tests {
         assert_eq!(body["stream_options"]["include_usage"], true);
     }
 
+    #[test]
+    fn auth_header_false_sends_custom_openai_request_without_authorization() {
+        let options = StreamOptions::default();
+        let captured = run_stream_and_capture_headers_with(
+            OpenAIProvider::new("custom-model")
+                .with_provider_name("custom-openai")
+                .with_auth_header(false),
+            &options,
+        )
+        .expect("captured keyless custom request");
+
+        assert!(
+            !captured.headers.contains_key("authorization"),
+            "authHeader:false must not synthesize Authorization"
+        );
+    }
+
+    #[test]
+    fn stream_error_redacts_transmitted_bearer_credential() {
+        let secret = "provider-\"secret\\with&reserved=characters";
+        let header_secret = "custom-\"header\\credential";
+        let query_secret = "query-secret-value";
+        let response_json = serde_json::json!({
+            "authorizationEcho": secret,
+            "customHeaderEcho": header_secret,
+            "queryEcho": query_secret,
+        })
+        .to_string();
+        let response_body = format!("upstream error: {response_json}");
+        let (base_url, request_rx) = spawn_test_server(401, "application/json", &response_body);
+        let provider = OpenAIProvider::new("gpt-4o")
+            .with_base_url(format!("{base_url}?api_key={query_secret}"));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let mut options = StreamOptions {
+            api_key: Some(secret.to_string()),
+            ..Default::default()
+        };
+        options
+            .headers
+            .insert("x-api-key".to_string(), header_secret.to_string());
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let error = runtime.block_on(async {
+            match provider.stream(&context, &options).await {
+                Ok(_) => panic!("HTTP error must not produce a stream"),
+                Err(error) => error,
+            }
+        });
+        let message = error.to_string();
+        assert!(message.contains("HTTP 401"), "{message}");
+        assert!(message.contains("[REDACTED]"), "{message}");
+        assert!(!message.contains(secret), "credential leaked: {message}");
+        assert!(
+            !message.contains("provider-"),
+            "escaped credential leaked: {message}"
+        );
+        assert!(
+            !message.contains("custom-"),
+            "header credential leaked: {message}"
+        );
+        assert!(
+            !message.contains(query_secret),
+            "query credential leaked: {message}"
+        );
+        request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured error request");
+
+        let expanding = redacted_api_error_body(&"x".repeat(MAX_API_ERROR_BODY_BYTES), &["x"]);
+        assert!(
+            expanding.len() <= MAX_API_ERROR_BODY_BYTES,
+            "redaction expansion exceeded the final API error bound"
+        );
+    }
+
+    #[test]
+    fn sap_stream_exchanges_service_key_before_sending_bearer_header() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = temp_dir.path().join("auth.json");
+        let (token_url, token_request_rx) = spawn_test_server(
+            200,
+            "application/json",
+            r#"{"access_token":"sap-access-token"}"#,
+        );
+        let mut auth = AuthStorage::load(auth_path.clone()).expect("load auth");
+        let service_key_json = json!({
+            "clientid": "sap-client",
+            // ubs:ignore test fixture credential, not live secret.
+            "clientsecret": "sap-secret",
+            "url": token_url,
+            "serviceurls": {
+                "AI_API_URL": "https://api.ai.sap.example.com"
+            }
+        })
+        .to_string();
+        auth.set(
+            "sap-ai-core",
+            // Legacy auth files stored the complete service-key JSON in the generic ApiKey lane.
+            // It must be exchanged, never forwarded as the bearer value.
+            AuthCredential::ApiKey {
+                key: service_key_json.clone(),
+            },
+        );
+        auth.save().expect("save auth");
+
+        let (inference_url, inference_request_rx) =
+            spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = OpenAIProvider::new("deployment-a")
+            .with_provider_name("sap-ai-core")
+            .with_base_url(inference_url)
+            .with_auth_path(auth_path);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions::default();
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let token_request = token_request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured token request");
+        assert!(token_request.body.contains("grant_type=client_credentials"));
+        assert!(token_request.body.contains("client_id=sap-client"));
+
+        let inference_request = inference_request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured inference request");
+        let authorization = inference_request
+            .headers
+            .get("authorization")
+            .expect("SAP inference authorization header");
+        assert_eq!(
+            authorization, "Bearer sap-access-token",
+            "legacy service-key JSON must be exchanged before inference"
+        );
+        assert!(!authorization.contains(&service_key_json));
+        assert!(!authorization.contains("sap-secret"));
+        assert!(!inference_request.body.contains(&service_key_json));
+        assert!(!inference_request.body.contains("sap-secret"));
+    }
+
+    #[test]
+    fn sap_stream_uses_stored_direct_bearer_without_requiring_service_key() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = temp_dir.path().join("auth.json");
+        let mut auth = AuthStorage::load(auth_path.clone()).expect("load auth");
+        auth.set(
+            "sap-ai-core",
+            AuthCredential::BearerToken {
+                token: "stored-sap-bearer".to_string(),
+            },
+        );
+        auth.save().expect("save auth");
+
+        let (inference_url, inference_request_rx) =
+            spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = OpenAIProvider::new("deployment-a")
+            .with_provider_name("sap-ai-core")
+            .with_base_url(inference_url)
+            .with_auth_path(auth_path);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider
+                .stream(&context, &StreamOptions::default())
+                .await
+                .expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let inference_request = inference_request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured inference request");
+        assert_eq!(
+            inference_request
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer stored-sap-bearer")
+        );
+    }
+
     /// Drive `provider.stream()` once against `base_url` with no API key and
     /// return the `Result`. Keeps the request path deterministic and fast by
     /// pointing at an unroutable address so we observe the *auth decision*
@@ -2281,6 +2952,68 @@ mod tests {
         .join("\n")
     }
 
+    #[test]
+    fn stream_rejects_transport_eof_before_done_sentinel() {
+        let body = [
+            r#"data: {"choices":[{"delta":{"content":"partial"}}]}"#,
+            "",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            "",
+        ]
+        .join("\n");
+
+        let out = collect_stream_items_from_body(&body);
+        assert!(
+            out.iter()
+                .any(|item| matches!(item, Ok(StreamEvent::TextDelta { delta, .. }) if delta == "partial")),
+            "partial content should be emitted before the terminal error"
+        );
+        assert!(
+            !out.iter()
+                .any(|item| matches!(item, Ok(StreamEvent::Done { .. }))),
+            "premature EOF must never be reported as Done"
+        );
+        let error = out
+            .last()
+            .expect("terminal stream item")
+            .as_ref()
+            .expect_err("premature EOF must be a stream error")
+            .to_string();
+        assert!(error.contains("[DONE]"), "{error}");
+        assert!(error.contains("unexpected EOF"), "{error}");
+        assert!(crate::error::is_retryable_error(&error, None, None));
+    }
+
+    fn collect_stream_items_from_body(body: &str) -> Vec<Result<StreamEvent>> {
+        let (base_url, _rx) = spawn_test_server(200, "text/event-stream", body);
+        let provider = OpenAIProvider::new("gpt-test").with_base_url(base_url);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions {
+            api_key: Some("sk-test-key".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            let mut items = Vec::new();
+            while let Some(item) = stream.next().await {
+                items.push(item);
+            }
+            items
+        })
+    }
+
     fn spawn_test_server(
         status_code: u16,
         content_type: &str,
@@ -2501,6 +3234,8 @@ mod tests {
             StopReason::Stop => "stop",
             StopReason::Length => "length",
             StopReason::ToolUse => "tool_use",
+            StopReason::PauseTurn => "pause_turn",
+            StopReason::Refusal => "refusal",
             StopReason::Error => "error",
             StopReason::Aborted => "aborted",
         }

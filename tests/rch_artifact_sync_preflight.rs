@@ -49,14 +49,25 @@ fn run_postcondition_baseline(
     generated_path: &str,
     before_manifest: &Path,
 ) -> Result<Output, Box<dyn Error>> {
-    Ok(Command::new("python3")
+    run_postcondition_baseline_many(repo, &[generated_path], before_manifest)
+}
+
+fn run_postcondition_baseline_many(
+    repo: &Path,
+    generated_paths: &[&str],
+    before_manifest: &Path,
+) -> Result<Output, Box<dyn Error>> {
+    let mut command = Command::new("python3");
+    command
         .arg(script_path())
         .arg("--repo-root")
         .arg(repo)
         .arg("--mode")
-        .arg("postcondition")
-        .arg("--generated-artifact")
-        .arg(generated_path)
+        .arg("postcondition");
+    for generated_path in generated_paths {
+        command.arg("--generated-artifact").arg(generated_path);
+    }
+    Ok(command
         .arg("--write-before-manifest")
         .arg(before_manifest)
         .arg("--json")
@@ -68,6 +79,67 @@ fn run_postcondition(
     generated_path: &str,
     before_manifest: &Path,
 ) -> Result<Output, Box<dyn Error>> {
+    run_postcondition_many(repo, &[generated_path], before_manifest)
+}
+
+fn run_postcondition_many(
+    repo: &Path,
+    generated_paths: &[&str],
+    before_manifest: &Path,
+) -> Result<Output, Box<dyn Error>> {
+    let mut command = Command::new("python3");
+    command
+        .arg(script_path())
+        .arg("--repo-root")
+        .arg(repo)
+        .arg("--mode")
+        .arg("postcondition");
+    for generated_path in generated_paths {
+        command.arg("--generated-artifact").arg(generated_path);
+    }
+    Ok(command
+        .arg("--before-manifest")
+        .arg(before_manifest)
+        .arg("--json")
+        .output()?)
+}
+
+fn run_postcondition_baseline_with_identity(
+    repo: &Path,
+    generated_path: &str,
+    before_manifest: &Path,
+    source_commit: &str,
+    correlation_id: &str,
+    command_digest: &str,
+) -> Result<Output, Box<dyn Error>> {
+    Ok(Command::new("python3")
+        .arg(script_path())
+        .arg("--repo-root")
+        .arg(repo)
+        .arg("--mode")
+        .arg("postcondition")
+        .arg("--generated-artifact")
+        .arg(generated_path)
+        .arg("--write-before-manifest")
+        .arg(before_manifest)
+        .arg("--source-commit")
+        .arg(source_commit)
+        .arg("--correlation-id")
+        .arg(correlation_id)
+        .arg("--command-digest")
+        .arg(command_digest)
+        .arg("--json")
+        .output()?)
+}
+
+fn run_postcondition_with_identity(
+    repo: &Path,
+    generated_path: &str,
+    before_manifest: &Path,
+    source_commit: &str,
+    correlation_id: &str,
+    command_digest: &str,
+) -> Result<Output, Box<dyn Error>> {
     Ok(Command::new("python3")
         .arg(script_path())
         .arg("--repo-root")
@@ -78,6 +150,12 @@ fn run_postcondition(
         .arg(generated_path)
         .arg("--before-manifest")
         .arg(before_manifest)
+        .arg("--source-commit")
+        .arg(source_commit)
+        .arg("--correlation-id")
+        .arg(correlation_id)
+        .arg("--command-digest")
+        .arg(command_digest)
         .arg("--json")
         .output()?)
 }
@@ -197,8 +275,8 @@ fn unanchored_artifacts_ignore_blocks_nested_required_artifacts() -> Result<(), 
             (
                 Ok(REQUIRED_ARTIFACT),
                 Ok(".rchignore"),
-                Ok(2),
-                Ok("artifacts/**"),
+                Ok(1),
+                Ok("artifacts/"),
                 Ok("required_path_excluded"),
             )
         )
@@ -210,6 +288,421 @@ fn unanchored_artifacts_ignore_blocks_nested_required_artifacts() -> Result<(), 
         )));
     }
 
+    Ok(())
+}
+
+#[test]
+fn project_rch_config_exclude_blocks_required_artifact() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    write_required_artifact(repo)?;
+    fs::write(repo.join(".rchignore"), "# no project-local ignore rules\n")?;
+    fs::create_dir_all(repo.join(".rch"))?;
+    fs::write(
+        repo.join(".rch/config.toml"),
+        "[transfer]\nexclude_patterns = [\"tests/ext_conformance/artifacts/\"]\n",
+    )?;
+
+    let output = run_preflight(repo, REQUIRED_ARTIFACT)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "project transfer excludes are part of RCH's effective source filter\n{}",
+            output_debug(&output)
+        )));
+    }
+
+    let report = parse_json(&output)?;
+    let excluded_by_config = array_field(&report, "violations")?.iter().any(|violation| {
+        matches!(
+            (
+                string_field(violation, "source"),
+                string_field(violation, "pattern"),
+                string_field(violation, "reason"),
+            ),
+            (
+                Ok(".rch/config.toml"),
+                Ok("tests/ext_conformance/artifacts/"),
+                Ok("required_path_excluded"),
+            )
+        )
+    });
+    if !excluded_by_config {
+        return Err(test_error(format!(
+            "config exclusion failure must identify .rch/config.toml\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn project_rch_config_uses_installed_rch_exclude_normalization() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    let required_path = ".git/refs/heads/main";
+    let artifact = repo.join(required_path);
+    fs::create_dir_all(
+        artifact
+            .parent()
+            .ok_or_else(|| test_error("normalized config artifact should have a parent"))?,
+    )?;
+    fs::write(&artifact, "0123456789abcdef\n")?;
+    fs::write(repo.join(".rchignore"), "# no project-local ignore rules\n")?;
+    fs::create_dir_all(repo.join(".rch"))?;
+    fs::write(
+        repo.join(".rch/config.toml"),
+        "[transfer]\nexclude_patterns = [\".git/objects/\"]\n",
+    )?;
+
+    let output = run_preflight(repo, required_path)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "RCH rewrites .git/objects/ to .git/, so sibling Git paths must be excluded\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let normalized = array_field(&report, "violations")?.iter().any(|violation| {
+        matches!(
+            (
+                string_field(violation, "source"),
+                string_field(violation, "pattern"),
+                string_field(violation, "reason"),
+            ),
+            (
+                Ok(".rch/config.toml"),
+                Ok(".git/"),
+                Ok("required_path_excluded"),
+            )
+        )
+    });
+    if !normalized {
+        return Err(test_error(format!(
+            "config diagnostics must report RCH's normalized .git/ exclusion\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn project_rch_config_preserves_literal_pattern_whitespace() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    let required_path = "target-worker/perf/current.json";
+    let artifact = repo.join(required_path);
+    fs::create_dir_all(
+        artifact
+            .parent()
+            .ok_or_else(|| test_error("whitespace-pattern artifact should have a parent"))?,
+    )?;
+    fs::write(&artifact, "{\"current\":true}\n")?;
+    fs::write(repo.join(".rchignore"), "# no project-local ignore rules\n")?;
+    fs::create_dir_all(repo.join(".rch"))?;
+    fs::write(
+        repo.join(".rch/config.toml"),
+        "[transfer]\nexclude_patterns = [\" target-*/\"]\n",
+    )?;
+
+    let output = run_preflight(repo, required_path)?;
+    if !output.status.success() {
+        return Err(test_error(format!(
+            "RCH passes config pattern whitespace literally to rsync\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    require_string_field(&report, "status", "pass")?;
+    Ok(())
+}
+
+#[test]
+fn mandatory_rch_runtime_exclude_blocks_required_artifact() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    let required_path = ".rch-tmp/current-evidence.json";
+    let artifact = repo.join(required_path);
+    fs::create_dir_all(
+        artifact
+            .parent()
+            .ok_or_else(|| test_error("mandatory-exclude artifact should have a parent"))?,
+    )?;
+    fs::write(&artifact, "{\"current\":true}\n")?;
+    fs::write(repo.join(".rchignore"), "# no project-local ignore rules\n")?;
+
+    let output = run_preflight(repo, required_path)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "RCH's mandatory runtime exclusions must be part of preflight\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let mandatory = array_field(&report, "violations")?.iter().any(|violation| {
+        matches!(
+            (
+                string_field(violation, "source"),
+                string_field(violation, "pattern"),
+                string_field(violation, "reason"),
+            ),
+            (
+                Ok("RCH mandatory exclusions"),
+                Ok(".rch-tmp/"),
+                Ok("required_path_excluded"),
+            )
+        )
+    });
+    if !mandatory {
+        return Err(test_error(format!(
+            "mandatory exclusion failure must identify RCH's .rch-tmp/ rule\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn globbed_directory_exclude_matches_descendant_artifact() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    let required_path = "target-worker/perf/current.json";
+    let artifact = repo.join(required_path);
+    fs::create_dir_all(
+        artifact
+            .parent()
+            .ok_or_else(|| test_error("globbed-directory artifact should have a parent"))?,
+    )?;
+    fs::write(&artifact, "{\"current\":true}\n")?;
+    fs::write(repo.join(".rchignore"), "# no project-local ignore rules\n")?;
+    fs::create_dir_all(repo.join(".rch"))?;
+    fs::write(
+        repo.join(".rch/config.toml"),
+        "[transfer]\nexclude_patterns = [\"target-*/\"]\n",
+    )?;
+
+    let output = run_preflight(repo, required_path)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "wildcards in directory excludes must match the directory component\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let matched = array_field(&report, "violations")?.iter().any(|violation| {
+        matches!(
+            (
+                string_field(violation, "source"),
+                string_field(violation, "pattern"),
+                string_field(violation, "reason"),
+            ),
+            (
+                Ok(".rch/config.toml"),
+                Ok("target-*/"),
+                Ok("required_path_excluded"),
+            )
+        )
+    });
+    if !matched {
+        return Err(test_error(format!(
+            "globbed directory exclusion must identify the matching config rule\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn single_star_does_not_cross_path_separators() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    let required_path = "tests/one/two/artifact.json";
+    let artifact = repo.join(required_path);
+    fs::create_dir_all(
+        artifact
+            .parent()
+            .ok_or_else(|| test_error("slash-sensitive artifact should have a parent"))?,
+    )?;
+    fs::write(&artifact, "{\"current\":true}\n")?;
+    fs::write(repo.join(".rchignore"), "tests/*/artifact.json\n")?;
+
+    let output = run_preflight(repo, required_path)?;
+    if !output.status.success() {
+        return Err(test_error(format!(
+            "an rsync single-star component must not match across a slash\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    require_string_field(&report, "status", "pass")?;
+    Ok(())
+}
+
+#[test]
+fn unmodeled_rsync_escape_fails_closed() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    let required_path = "literal*artifact.json";
+    fs::write(repo.join(required_path), "{\"current\":true}\n")?;
+    fs::write(repo.join(".rchignore"), "literal\\*artifact.json\n")?;
+
+    let output = run_preflight(repo, required_path)?;
+    if output.status.success() {
+        return Err(test_error(
+            "a pattern outside the bounded matcher must fail closed, not claim inclusion",
+        ));
+    }
+    let report = parse_json(&output)?;
+    let unsupported = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason").is_ok_and(|reason| reason == "ignore_file_error")
+            && string_field(violation, "message")
+                .is_ok_and(|message| message.contains("context-dependent backslash escaping"))
+    });
+    if !unsupported {
+        return Err(test_error(format!(
+            "unsupported rsync escape must produce a structured fail-closed diagnostic\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn slashless_exclude_matches_an_intermediate_directory_component() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    let required_path = "nested/cache-dir/current.json";
+    let artifact = repo.join(required_path);
+    fs::create_dir_all(
+        artifact
+            .parent()
+            .ok_or_else(|| test_error("slashless-rule artifact should have a parent"))?,
+    )?;
+    fs::write(&artifact, "{\"current\":true}\n")?;
+    fs::write(repo.join(".rchignore"), "cache-*\n")?;
+
+    let output = run_preflight(repo, required_path)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "a slashless rsync rule must match an intermediate directory basename\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let excluded = array_field(&report, "violations")?.iter().any(|violation| {
+        matches!(
+            (
+                string_field(violation, "pattern"),
+                string_field(violation, "reason"),
+            ),
+            (Ok("cache-*"), Ok("required_path_excluded"))
+        )
+    });
+    if !excluded {
+        return Err(test_error(format!(
+            "slashless intermediate-directory match must report its rule\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn config_rule_wins_before_matching_rchignore_rule() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    write_required_artifact(repo)?;
+    fs::create_dir_all(repo.join(".rch"))?;
+    fs::write(
+        repo.join(".rch/config.toml"),
+        "[transfer]\nexclude_patterns = [\"tests/**\"]\n",
+    )?;
+    fs::write(repo.join(".rchignore"), "artifacts/**\n")?;
+
+    let output = run_preflight(repo, REQUIRED_ARTIFACT)?;
+    if output.status.success() {
+        return Err(test_error("matching config and ignore excludes must fail"));
+    }
+    let report = parse_json(&output)?;
+    let first = array_field(&report, "required_paths")?
+        .first()
+        .ok_or_else(|| test_error("expected required path result"))?;
+    let first_rule = array_field(first, "matched_rules")?
+        .first()
+        .ok_or_else(|| test_error("expected first matching rule"))?;
+    require_string_field(first_rule, "source", ".rch/config.toml")?;
+    require_string_field(first_rule, "pattern", "tests/**")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn required_artifact_symlink_fails_preflight() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    let target = repo.join("outside-artifact.json");
+    fs::write(&target, "{\"schema\":\"fixture\"}\n")?;
+    let artifact = repo.join(REQUIRED_ARTIFACT);
+    fs::create_dir_all(
+        artifact
+            .parent()
+            .ok_or_else(|| test_error("required artifact path should have a parent"))?,
+    )?;
+    symlink(&target, &artifact)?;
+    fs::write(repo.join(".rchignore"), "# no excludes\n")?;
+
+    let output = run_preflight(repo, REQUIRED_ARTIFACT)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "a symlink must not satisfy required source-artifact presence\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let non_regular = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason").is_ok_and(|reason| reason == "required_path_not_regular")
+    });
+    if !non_regular {
+        return Err(test_error(format!(
+            "symlink rejection must report required_path_not_regular\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn required_artifact_with_symlinked_ancestor_fails_preflight() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path().join("repo");
+    let external = temp.path().join("external");
+    fs::create_dir_all(repo.join("tests"))?;
+    fs::create_dir_all(&external)?;
+    fs::write(external.join("artifact.json"), "{\"external\":true}\n")?;
+    symlink(&external, repo.join("tests/linked"))?;
+    fs::write(repo.join(".rchignore"), "# no excludes\n")?;
+
+    let output = run_preflight(&repo, "tests/linked/artifact.json")?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "a symlinked ancestor must not satisfy required source-artifact presence\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let non_regular = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason").is_ok_and(|reason| reason == "required_path_not_regular")
+    });
+    if !non_regular {
+        return Err(test_error(format!(
+            "ancestor symlink rejection must report required_path_not_regular\n{}",
+            output_debug(&output)
+        )));
+    }
     Ok(())
 }
 
@@ -242,6 +735,39 @@ fn anchored_root_artifacts_ignore_keeps_nested_required_artifacts() -> Result<()
         )));
     }
 
+    Ok(())
+}
+
+#[test]
+fn leading_bang_is_literal_and_does_not_reinclude_required_artifact() -> Result<(), Box<dyn Error>>
+{
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    write_required_artifact(repo)?;
+    fs::write(
+        repo.join(".rchignore"),
+        "tests/**\n!tests/ext_conformance/artifacts/**\n",
+    )?;
+
+    let output = run_preflight(repo, REQUIRED_ARTIFACT)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "RCH treats a leading bang literally, so it must not reinclude an excluded path\n{}",
+            output_debug(&output)
+        )));
+    }
+
+    let report = parse_json(&output)?;
+    let violations = array_field(&report, "violations")?;
+    let excluded = violations.iter().any(|violation| {
+        string_field(violation, "reason").is_ok_and(|reason| reason == "required_path_excluded")
+    });
+    if !excluded {
+        return Err(test_error(format!(
+            "literal bang rule must not mask the original exclusion\n{}",
+            output_debug(&output)
+        )));
+    }
     Ok(())
 }
 
@@ -375,5 +901,643 @@ fn postcondition_passes_when_local_generated_artifact_changes() -> Result<(), Bo
     let summary = object_field(&report, "summary")?;
     require_u64_field(summary, "updated_count", 1)?;
     require_u64_field(summary, "violation_count", 0)?;
+    Ok(())
+}
+
+#[test]
+fn postcondition_requires_exact_baseline_artifact_set() -> Result<(), Box<dyn Error>> {
+    const SECOND_GENERATED_ARTIFACT: &str =
+        "tests/full_suite_gate/secondary_full_suite_verdict.json";
+
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    write_generated_artifact(repo, "{\"generated_at\":\"old\"}\n")?;
+    let second = repo.join(SECOND_GENERATED_ARTIFACT);
+    fs::create_dir_all(
+        second
+            .parent()
+            .ok_or_else(|| test_error("secondary generated artifact should have a parent"))?,
+    )?;
+    fs::write(&second, "{\"generated_at\":\"old\"}\n")?;
+
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let baseline_output = run_postcondition_baseline_many(
+        repo,
+        &[GENERATED_ARTIFACT, SECOND_GENERATED_ARTIFACT],
+        &before_manifest,
+    )?;
+    if !baseline_output.status.success() {
+        return Err(test_error(format!(
+            "two-artifact baseline capture should pass\n{}",
+            output_debug(&baseline_output)
+        )));
+    }
+
+    write_generated_artifact(repo, "{\"generated_at\":\"new\"}\n")?;
+    let output = run_postcondition(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "a subset postcondition request must not silently omit a baseline artifact\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let mismatch = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "before_manifest_artifact_set_mismatch")
+    });
+    if !mismatch {
+        return Err(test_error(format!(
+            "subset rejection must report before_manifest_artifact_set_mismatch\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn postcondition_rejects_invocation_identity_mismatch() -> Result<(), Box<dyn Error>> {
+    const SOURCE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    const OTHER_SOURCE_COMMIT: &str = "fedcba9876543210fedcba9876543210fedcba98";
+    const CORRELATION_ID: &str = "rch-artifact-sync-test";
+    const COMMAND_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    write_generated_artifact(repo, "{\"generated_at\":\"old\"}\n")?;
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let baseline_output = run_postcondition_baseline_with_identity(
+        repo,
+        GENERATED_ARTIFACT,
+        &before_manifest,
+        SOURCE_COMMIT,
+        CORRELATION_ID,
+        COMMAND_DIGEST,
+    )?;
+    if !baseline_output.status.success() {
+        return Err(test_error(format!(
+            "identity-bound baseline should pass\n{}",
+            output_debug(&baseline_output)
+        )));
+    }
+    write_generated_artifact(repo, "{\"generated_at\":\"new\"}\n")?;
+
+    let output = run_postcondition_with_identity(
+        repo,
+        GENERATED_ARTIFACT,
+        &before_manifest,
+        OTHER_SOURCE_COMMIT,
+        CORRELATION_ID,
+        COMMAND_DIGEST,
+    )?;
+    if output.status.success() {
+        return Err(test_error(
+            "changed bytes from a different invocation identity must fail",
+        ));
+    }
+    let report = parse_json(&output)?;
+    let mismatch = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "before_manifest_identity_mismatch")
+    });
+    if !mismatch {
+        return Err(test_error(format!(
+            "identity mismatch must produce a structured diagnostic\n{}",
+            output_debug(&output)
+        )));
+    }
+
+    let matching_output = run_postcondition_with_identity(
+        repo,
+        GENERATED_ARTIFACT,
+        &before_manifest,
+        SOURCE_COMMIT,
+        CORRELATION_ID,
+        COMMAND_DIGEST,
+    )?;
+    if !matching_output.status.success() {
+        return Err(test_error(format!(
+            "changed bytes with the exact baseline invocation identity should pass\n{}",
+            output_debug(&matching_output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn postcondition_rejects_explicit_empty_invocation_identity() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    write_generated_artifact(repo, "{\"generated_at\":\"old\"}\n")?;
+    let before_manifest = repo.join("before-rch-artifacts.json");
+
+    let output = run_postcondition_baseline_with_identity(
+        repo,
+        GENERATED_ARTIFACT,
+        &before_manifest,
+        "",
+        "",
+        "",
+    )?;
+    if output.status.success() {
+        return Err(test_error(
+            "explicit empty identity fields must not collapse into unbound mode",
+        ));
+    }
+    let report = parse_json(&output)?;
+    let invalid_arguments = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "invalid_postcondition_arguments")
+    });
+    if !invalid_arguments {
+        return Err(test_error(format!(
+            "empty invocation identity must produce a structured argument diagnostic\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn postcondition_rejects_empty_baseline_artifact_set() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let empty_baseline = serde_json::json!({
+        "schema": "pi.rch.artifact_sync_preflight.v1",
+        "mode": "postcondition-baseline",
+        "status": "pass",
+        "repo_root": repo.display().to_string(),
+        "invocation_identity": {},
+        "generated_artifacts": [],
+        "violations": [],
+        "summary": {
+            "generated_artifact_count": 0,
+            "violation_count": 0,
+        },
+    });
+    fs::write(
+        &before_manifest,
+        serde_json::to_vec_pretty(&empty_baseline)?,
+    )?;
+
+    let output = run_postcondition_many(repo, &[], &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(
+            "an empty baseline must not pass a zero-artifact postcondition",
+        ));
+    }
+    let report = parse_json(&output)?;
+    let invalid_set = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "before_manifest_artifact_set_invalid")
+    });
+    if !invalid_set {
+        return Err(test_error(format!(
+            "empty artifact set must produce a structured artifact-set diagnostic\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn postcondition_rejects_duplicate_baseline_artifact_identity() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    write_generated_artifact(repo, "{\"generated_at\":\"old\"}\n")?;
+
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let baseline_output = run_postcondition_baseline(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if !baseline_output.status.success() {
+        return Err(test_error(format!(
+            "duplicate negative baseline capture should pass\n{}",
+            output_debug(&baseline_output)
+        )));
+    }
+    let mut baseline: Value = serde_json::from_slice(&fs::read(&before_manifest)?)?;
+    let duplicate = baseline["generated_artifacts"][0].clone();
+    baseline["generated_artifacts"]
+        .as_array_mut()
+        .ok_or_else(|| test_error("baseline generated_artifacts must be an array"))?
+        .push(duplicate);
+    fs::write(&before_manifest, serde_json::to_vec_pretty(&baseline)?)?;
+    write_generated_artifact(repo, "{\"generated_at\":\"new\"}\n")?;
+
+    let output = run_postcondition(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "duplicate baseline artifact identities must fail closed\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let duplicate_rejected = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "before_manifest_duplicate_artifact")
+    });
+    if !duplicate_rejected {
+        return Err(test_error(format!(
+            "duplicate baseline must report before_manifest_duplicate_artifact\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn postcondition_rejects_malformed_baseline_snapshot() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    write_generated_artifact(repo, "{\"generated_at\":\"old\"}\n")?;
+
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let baseline_output = run_postcondition_baseline(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if !baseline_output.status.success() {
+        return Err(test_error(format!(
+            "malformed-snapshot negative baseline capture should pass\n{}",
+            output_debug(&baseline_output)
+        )));
+    }
+    let mut baseline: Value = serde_json::from_slice(&fs::read(&before_manifest)?)?;
+    baseline["generated_artifacts"][0]["snapshot"]["exists"] = Value::Null;
+    fs::write(&before_manifest, serde_json::to_vec_pretty(&baseline)?)?;
+    write_generated_artifact(repo, "{\"generated_at\":\"new\"}\n")?;
+
+    let output = run_postcondition(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "a malformed baseline snapshot must fail closed\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let malformed_rejected = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "before_manifest_snapshot_invalid")
+    });
+    if !malformed_rejected {
+        return Err(test_error(format!(
+            "malformed snapshot must report before_manifest_snapshot_invalid\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn postcondition_rejects_metadata_only_changes_with_identical_bytes() -> Result<(), Box<dyn Error>>
+{
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    write_generated_artifact(repo, "{\"generated_at\":\"old\"}\n")?;
+
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let baseline_output = run_postcondition_baseline(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if !baseline_output.status.success() {
+        return Err(test_error(format!(
+            "metadata negative baseline capture should pass\n{}",
+            output_debug(&baseline_output)
+        )));
+    }
+
+    let mut baseline: Value = serde_json::from_slice(&fs::read(&before_manifest)?)?;
+    baseline["generated_artifacts"][0]["snapshot"]["mtime_ns"] = Value::from(0);
+    fs::write(&before_manifest, serde_json::to_vec_pretty(&baseline)?)?;
+
+    let output = run_postcondition(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "metadata-only change with identical bytes must remain stale\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let stale = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "generated_artifact_not_updated")
+    });
+    if !stale {
+        return Err(test_error(format!(
+            "metadata-only change must report generated_artifact_not_updated\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn postcondition_rejects_before_manifest_from_another_repo() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path().join("repo");
+    let foreign_repo = temp.path().join("foreign-repo");
+    fs::create_dir_all(&repo)?;
+    fs::create_dir_all(&foreign_repo)?;
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    write_generated_artifact(&repo, "{\"generated_at\":\"old\"}\n")?;
+
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let baseline_output = run_postcondition_baseline(&repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if !baseline_output.status.success() {
+        return Err(test_error(format!(
+            "foreign-root negative baseline capture should pass\n{}",
+            output_debug(&baseline_output)
+        )));
+    }
+
+    let mut baseline: Value = serde_json::from_slice(&fs::read(&before_manifest)?)?;
+    baseline["repo_root"] = Value::from(foreign_repo.display().to_string());
+    fs::write(&before_manifest, serde_json::to_vec_pretty(&baseline)?)?;
+    write_generated_artifact(&repo, "{\"generated_at\":\"new\"}\n")?;
+
+    let output = run_postcondition(&repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "before manifest from another repo must fail closed\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let wrong_root = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "before_manifest_repo_root_mismatch")
+    });
+    if !wrong_root {
+        return Err(test_error(format!(
+            "foreign before manifest must report repo-root mismatch\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn postcondition_reports_malformed_before_manifest_as_json() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    write_generated_artifact(repo, "{\"generated_at\":\"new\"}\n")?;
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    fs::write(&before_manifest, "{not-json\n")?;
+
+    let output = run_postcondition(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(
+            "a malformed before manifest must fail the postcondition",
+        ));
+    }
+    let report = parse_json(&output)?;
+    require_string_field(&report, "status", "fail")?;
+    let read_error = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason").is_ok_and(|reason| reason == "before_manifest_read_error")
+    });
+    if !read_error {
+        return Err(test_error(format!(
+            "malformed baseline must produce a structured read diagnostic\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn postcondition_baseline_reports_manifest_write_error_as_json() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    write_generated_artifact(repo, "{\"generated_at\":\"old\"}\n")?;
+    let before_manifest = repo.join("manifest-is-a-directory");
+    fs::create_dir_all(&before_manifest)?;
+
+    let output = run_postcondition_baseline(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(
+            "a before-manifest write failure must fail closed",
+        ));
+    }
+    let report = parse_json(&output)?;
+    let write_error = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "before_manifest_write_error")
+    });
+    if !write_error {
+        return Err(test_error(format!(
+            "manifest write failure must produce structured JSON\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn postcondition_baseline_rejects_relative_parent_traversal() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo)?;
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    let before_manifest = repo.join("before-rch-artifacts.json");
+
+    let output = run_postcondition_baseline(&repo, "../external.json", &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(
+            "relative parent traversal must not identify an external generated artifact",
+        ));
+    }
+    let report = parse_json(&output)?;
+    let rejected = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason").is_ok_and(|reason| reason == "before_snapshot_error")
+    });
+    if !rejected {
+        return Err(test_error(format!(
+            "relative traversal rejection must be machine-readable\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn postcondition_preserves_absolute_artifact_paths_outside_repo() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path().join("repo");
+    let artifact = temp.path().join("external-target/extension_bench.jsonl");
+    fs::create_dir_all(&repo)?;
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+
+    let generated_path = artifact
+        .to_str()
+        .ok_or_else(|| test_error("absolute generated artifact path must be UTF-8"))?;
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let baseline_output = run_postcondition_baseline(&repo, generated_path, &before_manifest)?;
+    if !baseline_output.status.success() {
+        return Err(test_error(format!(
+            "absolute-path baseline capture should pass\n{}",
+            output_debug(&baseline_output)
+        )));
+    }
+
+    fs::create_dir_all(
+        artifact
+            .parent()
+            .ok_or_else(|| test_error("absolute artifact should have a parent"))?,
+    )?;
+    fs::write(&artifact, "{\"current_run\":true}\n")?;
+
+    let output = run_postcondition(&repo, generated_path, &before_manifest)?;
+    if !output.status.success() {
+        return Err(test_error(format!(
+            "new absolute artifact outside repo should pass the postcondition\n{}",
+            output_debug(&output)
+        )));
+    }
+
+    let report = parse_json(&output)?;
+    let first_postcondition = array_field(&report, "postconditions")?
+        .first()
+        .ok_or_else(|| test_error("expected one absolute-path postcondition"))?;
+    require_string_field(first_postcondition, "path", generated_path)?;
+    if !bool_field(first_postcondition, "updated")? {
+        return Err(test_error("new absolute artifact should be marked updated"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn postcondition_rejects_generated_artifact_with_symlinked_ancestor() -> Result<(), Box<dyn Error>>
+{
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path().join("repo");
+    let external = temp.path().join("external");
+    let generated_path = "generated/linked/current.json";
+    fs::create_dir_all(&repo)?;
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let baseline_output = run_postcondition_baseline(&repo, generated_path, &before_manifest)?;
+    if !baseline_output.status.success() {
+        return Err(test_error(format!(
+            "missing generated artifact baseline should pass\n{}",
+            output_debug(&baseline_output)
+        )));
+    }
+
+    fs::create_dir_all(&external)?;
+    fs::write(external.join("current.json"), "{\"current_run\":true}\n")?;
+    fs::create_dir_all(repo.join("generated"))?;
+    symlink(&external, repo.join("generated/linked"))?;
+
+    let output = run_postcondition(&repo, generated_path, &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(
+            "a symlinked ancestor must not satisfy generated-artifact writeback",
+        ));
+    }
+    let report = parse_json(&output)?;
+    let rejected = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "generated_artifact_not_regular_file")
+    });
+    if !rejected {
+        return Err(test_error(format!(
+            "generated ancestor symlink must report a regular-file violation\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn postcondition_rejects_symlinked_generated_artifact() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let baseline_output = run_postcondition_baseline(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if !baseline_output.status.success() {
+        return Err(test_error(format!(
+            "symlink negative baseline capture should pass\n{}",
+            output_debug(&baseline_output)
+        )));
+    }
+
+    let target = repo.join("actual-artifact.json");
+    fs::write(&target, "{\"current_run\":true}\n")?;
+    let link = repo.join(GENERATED_ARTIFACT);
+    fs::create_dir_all(
+        link.parent()
+            .ok_or_else(|| test_error("generated artifact should have a parent"))?,
+    )?;
+    symlink(&target, &link)?;
+
+    let output = run_postcondition(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "symlinked generated artifact must fail the postcondition\n{}",
+            output_debug(&output)
+        )));
+    }
+
+    let report = parse_json(&output)?;
+    let has_symlink_diagnostic = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "generated_artifact_not_regular_file")
+    });
+    if !has_symlink_diagnostic {
+        return Err(test_error(format!(
+            "symlink rejection must report a regular-file violation\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn postcondition_baseline_rejects_preexisting_symlink() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    let target = repo.join("actual-artifact.json");
+    fs::write(&target, "{\"stale\":true}\n")?;
+    let link = repo.join(GENERATED_ARTIFACT);
+    fs::create_dir_all(
+        link.parent()
+            .ok_or_else(|| test_error("generated artifact should have a parent"))?,
+    )?;
+    symlink(&target, &link)?;
+
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let output = run_postcondition_baseline(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "baseline capture must reject a preexisting symlinked output\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let rejected = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "before_snapshot_not_regular_file")
+    });
+    if !rejected {
+        return Err(test_error(format!(
+            "preexisting symlink must fail with before_snapshot_not_regular_file\n{}",
+            output_debug(&output)
+        )));
+    }
     Ok(())
 }

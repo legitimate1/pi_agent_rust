@@ -401,10 +401,10 @@ impl Drop for TestHarness {
             }
             eprintln!("=== END LOGS ===\n");
 
-            if let Ok(path) = env::var("TEST_LOG_PATH") {
-                if let Err(err) = self.logger.as_ref().write_dump_to_path(&path) {
-                    eprintln!("Failed to write test log to {path}: {err}");
-                }
+            if let Ok(path) = env::var("TEST_LOG_PATH")
+                && let Err(err) = self.logger.as_ref().write_dump_to_path(&path)
+            {
+                eprintln!("Failed to write test log to {path}: {err}");
             }
         }
     }
@@ -719,6 +719,38 @@ impl Drop for MockHttpServer {
     }
 }
 
+/// Resolve a response for one request: queue pop, then static route, then
+/// (when the request carries a query string) the same lookups against the
+/// bare path. Exact matches always win; no registered route contains a
+/// query, so the fallback only widens.
+fn resolve_route(
+    method: &str,
+    path: &str,
+    routes: &Arc<Mutex<std::collections::HashMap<RouteKey, MockHttpResponse>>>,
+    route_queues: &Arc<
+        Mutex<std::collections::HashMap<RouteKey, std::collections::VecDeque<MockHttpResponse>>>,
+    >,
+) -> MockHttpResponse {
+    let lookup = |method: &str, path: &str| {
+        let key = RouteKey {
+            method: method.to_string(),
+            path: path.to_string(),
+        };
+        route_queues
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .and_then(std::collections::VecDeque::pop_front)
+            .or_else(|| routes.lock().unwrap().get(&key).cloned())
+    };
+    lookup(method, path)
+        .or_else(|| {
+            path.split_once('?')
+                .and_then(|(bare, _)| lookup(method, bare))
+        })
+        .unwrap_or_else(|| MockHttpResponse::text(404, "not found"))
+}
+
 fn handle_connection(
     stream: &mut TcpStream,
     peer: SocketAddr,
@@ -824,14 +856,7 @@ fn handle_connection(
         }
     });
 
-    let route_key = RouteKey { method, path };
-    let response = route_queues
-        .lock()
-        .unwrap()
-        .get_mut(&route_key)
-        .and_then(std::collections::VecDeque::pop_front)
-        .or_else(|| routes.lock().unwrap().get(&route_key).cloned())
-        .unwrap_or_else(|| MockHttpResponse::text(404, "not found"));
+    let response = resolve_route(&method, &path, routes, route_queues);
 
     write_response(stream, &response)?;
     Ok(())
@@ -1115,20 +1140,20 @@ impl LiveE2eRegistry {
         if let Some(model_id) = requested_model {
             let model_id = model_id.trim();
             if !model_id.is_empty() {
-                if let Some(entry) = self.registry.find(target.provider, model_id) {
-                    if self.resolve_api_key_with_source(&entry).is_some() {
-                        return Some(entry);
-                    }
+                if let Some(entry) = self.registry.find(target.provider, model_id)
+                    && self.resolve_api_key_with_source(&entry).is_some()
+                {
+                    return Some(entry);
                 }
                 return None;
             }
         }
 
         for model_id in target.preferred_models {
-            if let Some(entry) = self.registry.find(target.provider, model_id) {
-                if self.resolve_api_key_with_source(&entry).is_some() {
-                    return Some(entry);
-                }
+            if let Some(entry) = self.registry.find(target.provider, model_id)
+                && self.resolve_api_key_with_source(&entry).is_some()
+            {
+                return Some(entry);
             }
         }
 

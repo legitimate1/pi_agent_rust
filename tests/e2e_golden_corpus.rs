@@ -200,6 +200,27 @@ impl GoldenTestHarness {
     }
 
     fn setup_vcr(&self, scenario: &str, cassette: &Value, env: &mut BTreeMap<String, String>) {
+        // Normalize legacy-shaped Anthropic request bodies in checked-in
+        // fixtures to the current prompt-cache wire shape (system block
+        // array + cache_control markers); bodies already in the new shape
+        // are untouched. Keeps the fixture corpus from silently drifting
+        // when the provider wire format evolves.
+        let mut cassette = cassette.clone();
+        if let Some(interactions) = cassette
+            .get_mut("interactions")
+            .and_then(Value::as_array_mut)
+        {
+            for interaction in interactions {
+                if let Some(body) = interaction
+                    .get_mut("request")
+                    .and_then(|request| request.get_mut("body"))
+                    && body.get("messages").is_some()
+                {
+                    common::apply_prompt_cache_wire_shape(body);
+                }
+            }
+        }
+        let cassette = &cassette;
         let cassette_dir = self.harness.temp_path("vcr-cassettes");
         fs::create_dir_all(&cassette_dir).expect("create cassette dir");
 
@@ -273,12 +294,12 @@ impl GoldenTestHarness {
             buf
         });
 
-        if let Some(input) = stdin {
-            if let Some(mut child_stdin) = child.stdin.take() {
-                child_stdin
-                    .write_all(input.as_bytes())
-                    .expect("write stdin");
-            }
+        if let Some(input) = stdin
+            && let Some(mut child_stdin) = child.stdin.take()
+        {
+            child_stdin
+                .write_all(input.as_bytes())
+                .expect("write stdin");
         }
 
         let timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS);

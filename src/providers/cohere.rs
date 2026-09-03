@@ -159,14 +159,14 @@ impl Provider for CohereProvider {
         }
 
         // Apply provider-specific custom headers from compat config.
-        if let Some(compat) = &self.compat {
-            if let Some(custom_headers) = &compat.custom_headers {
-                request = super::apply_headers_ignoring_blank_auth_overrides(
-                    request,
-                    custom_headers,
-                    &["authorization"],
-                );
-            }
+        if let Some(compat) = &self.compat
+            && let Some(custom_headers) = &compat.custom_headers
+        {
+            request = super::apply_headers_ignoring_blank_auth_overrides(
+                request,
+                custom_headers,
+                &["authorization"],
+            );
         }
 
         // Per-request headers from StreamOptions (highest priority).
@@ -176,7 +176,27 @@ impl Provider for CohereProvider {
             &["authorization"],
         );
 
-        let request = request.json(&request_body)?;
+        let rewritten_body = super::offer_before_provider_request(
+            options,
+            self.name(),
+            self.api(),
+            self.model_id(),
+            &self.base_url,
+            &request_body,
+            |value| {
+                super::validate_streamed_json_rewrite(
+                    value,
+                    &["model"],
+                    &["messages"],
+                    &[("stream", serde_json::Value::Bool(true))],
+                )
+            },
+        )
+        .await;
+        let request = match &rewritten_body {
+            Some(body) => request.json(body)?,
+            None => request.json(&request_body)?,
+        };
 
         let response = Box::pin(request.send()).await?;
         let status = response.status();
@@ -330,6 +350,7 @@ where
                 model,
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             },
@@ -482,15 +503,18 @@ where
                     thought_signature: None,
                 }));
 
+                self.pending_events.push_back(StreamEvent::ToolCallStart {
+                    content_index,
+                    id: tc.id.clone(),
+                    name: tc.function.name.clone(),
+                });
+
                 self.active_tool_call = Some(ToolCallAccum {
                     content_index,
                     id: tc.id,
                     name: tc.function.name,
                     arguments: tc.function.arguments.clone(),
                 });
-
-                self.pending_events
-                    .push_back(StreamEvent::ToolCallStart { content_index });
                 if !tc.function.arguments.is_empty() {
                     self.pending_events.push_back(StreamEvent::ToolCallDelta {
                         content_index,
@@ -1009,6 +1033,8 @@ mod tests {
             StopReason::Stop => "stop",
             StopReason::Length => "length",
             StopReason::ToolUse => "tool_use",
+            StopReason::PauseTurn => "pause_turn",
+            StopReason::Refusal => "refusal",
             StopReason::Error => "error",
             StopReason::Aborted => "aborted",
         }
@@ -1641,6 +1667,7 @@ mod tests {
                     model: "command-r".to_string(),
                     usage: Usage::default(),
                     stop_reason: StopReason::ToolUse,
+                    stop_details: None,
                     error_message: None,
                     timestamp: 1,
                 }),
@@ -1705,6 +1732,7 @@ mod tests {
                 model: "command-r".to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::ToolUse,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             })],

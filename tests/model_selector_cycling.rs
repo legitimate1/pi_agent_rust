@@ -148,6 +148,7 @@ fn build_app_with_models_and_config(
         current,
         scope,
         available,
+        None,
         Vec::new(),
         event_tx,
         test_runtime_handle(),
@@ -157,6 +158,7 @@ fn build_app_with_models_and_config(
         Some(KeyBindings::new()),
         Vec::new(),
         Usage::default(),
+        None,
     );
     app.set_terminal_size(80, 24);
     app
@@ -188,6 +190,7 @@ fn strip_suffix_removes_known_levels() {
     assert_eq!(strip_thinking_level_suffix("model:low"), "model");
     assert_eq!(strip_thinking_level_suffix("model:medium"), "model");
     assert_eq!(strip_thinking_level_suffix("model:xhigh"), "model");
+    assert_eq!(strip_thinking_level_suffix("model:max"), "model");
 }
 
 #[test]

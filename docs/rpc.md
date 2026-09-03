@@ -80,10 +80,23 @@ Communication is via **JSON Lines** over stdin/stdout. Each line must be a valid
 
 ### Extension UI
 - **extension_ui_response**: Reply to a pending extension UI request.
-  - Params: `requestId` (preferred) or legacy alias `id`, plus one of:
+  - Params: echo the `requestGeneration` integer from the matching
+    `extension_ui_request`, provide `requestId` (preferred) or legacy alias
+    `id`, and include one of:
     - `confirmed` (boolean) for `confirm`
     - `value` (string/boolean depending on method) for `select`/`input`/`editor`
     - `cancelled` (`true`) to cancel
+
+### Ask tool (requires `--tools ...,ask`)
+- **ask_response**: Answer a pending `ask_request` event.
+  - Params: `requestId` (or alias `id`), plus one of:
+    - `answers`: array of `{questionId, selected: [labels], other?}` —
+      `selected` holds chosen option labels (several when the question was
+      `multi`); `other` carries a free-text answer instead.
+    - `dismissed` (`true`) to cancel the whole request (the model sees a
+      "user dismissed the question" tool error).
+  - Reply: `{ "resolved": bool }` — `false` when the request already timed
+    out (the tool waits `timeoutMs` from the event, then errors).
 
 ## Events
 
@@ -93,7 +106,15 @@ Communication is via **JSON Lines** over stdin/stdout. Each line must be a valid
 - `tool_execution_start`: Tool execution started.
 - `tool_execution_update`: Streaming tool output.
 - `tool_execution_end`: Tool execution finished.
-- `extension_ui_request`: Extension requested host UI interaction (confirm/select/input/editor/notify/etc.).
+- `extension_ui_request`: Extension requested host UI interaction
+  (confirm/select/input/editor/notify/etc.). Response-bearing events carry a
+  `requestGeneration` correlation token; clients must echo it in
+  `extension_ui_response` so a late response cannot resolve a newer request
+  that reused the same public ID.
+- `ask_request`: The ask tool needs the user to answer question cards.
+  Carries `id`, `questions` (each `{id?, question, header?, options:
+  [{label, description?}], recommended?, multi}`), and `timeoutMs`.
+  Answer with the `ask_response` command.
 - `agent_end`: Turn complete.
 - `auto_retry_start` / `auto_retry_end`: Transient error retries.
 - `auto_compaction_start` / `auto_compaction_end`: Auto-compaction status.

@@ -18,7 +18,6 @@ mod common;
 use clap::Parser as _;
 use common::run_async;
 use common::tmux::TuiSession;
-use fs4::fs_std::FileExt as _;
 use pi::app::build_system_prompt;
 use pi::cli;
 use pi::model::ContentBlock;
@@ -39,6 +38,7 @@ use std::time::{Duration, Instant};
 /// Standard CLI args for interactive mode with minimal features.
 fn base_interactive_args() -> Vec<&'static str> {
     vec![
+        "--classic",
         "--provider",
         "openai",
         "--model",
@@ -57,12 +57,16 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const VCR_TEST_NAME: &str = "e2e_tui_tool_read";
 const VCR_BASIC_CHAT_TEST_NAME: &str = "e2e_tui_basic_chat";
+const VCR_RICH_MARKDOWN_TEST_NAME: &str = "e2e_tui_rich_markdown";
 const VCR_MULTI_TOOL_CHAIN_TEST_NAME: &str = "e2e_tui_multi_tool_chain";
 const VCR_SCROLL_FINALIZE_TEST_NAME: &str = "e2e_tui_scroll_finalize";
 const VCR_MODEL: &str = "claude-sonnet-4-20250514";
+const VCR_MODEL_MAX_TOKENS: u32 = 64_000;
 const VCR_PROMPT: &str = "Read sample.txt";
 const VCR_BASIC_CHAT_PROMPT: &str = "Say hello";
 const VCR_BASIC_CHAT_RESPONSE: &str = "Hello! How can I help you today?";
+const VCR_RICH_MARKDOWN_PROMPT: &str = "Show the requested rich markdown";
+const VCR_RICH_MARKDOWN_RESPONSE: &str = r"Palette #33AAFF and math \alpha + \infty";
 const VCR_SCROLL_FINALIZE_PROMPT: &str = "Emit a long scrolling response";
 const VCR_SCROLL_FINALIZE_LAST_LINE: &str = "FINAL-LINE-SCROLL-FINALIZE";
 const SAMPLE_FILE_NAME: &str = "sample.txt";
@@ -96,7 +100,7 @@ impl TmuxE2eLock {
             .truncate(false)
             .open(&path)
             .expect("open tmux e2e lock file");
-        file.lock_exclusive().expect("lock tmux e2e lock file");
+        fs4::FileExt::lock(&file).expect("lock tmux e2e lock file");
         Self {
             _thread_guard: thread_guard,
             file,
@@ -107,7 +111,7 @@ impl TmuxE2eLock {
 impl Drop for TmuxE2eLock {
     fn drop(&mut self) {
         // Call the fs4 trait explicitly so we don't depend on std's newer `File::unlock()`.
-        let _ = fs4::fs_std::FileExt::unlock(&self.file);
+        let _ = fs4::FileExt::unlock(&self.file);
     }
 }
 
@@ -177,6 +181,7 @@ fn setup_config_ui_fixture(session: &TuiSession, package_name: &str) -> PathBuf 
 
 fn vcr_interactive_args() -> Vec<&'static str> {
     vec![
+        "--classic",
         "--provider",
         "anthropic",
         "--model",
@@ -196,6 +201,7 @@ fn vcr_interactive_args() -> Vec<&'static str> {
 
 fn vcr_interactive_args_no_tools() -> Vec<&'static str> {
     vec![
+        "--classic",
         "--provider",
         "anthropic",
         "--model",
@@ -232,12 +238,51 @@ fn build_vcr_system_prompt_for_args(
         &package_dir,
         true,
         true,
+        None,
+        &pi::config::Config::default(),
     )
     .expect("build vcr system prompt")
 }
 
 fn build_vcr_system_prompt(workdir: &Path, env_root: &Path) -> String {
     build_vcr_system_prompt_for_args(vcr_interactive_args, workdir, env_root)
+}
+
+/// The exact Anthropic tool schemas the interactive binary sends for
+/// `vcr_interactive_args()`: every registered tool that is not
+/// discoverable-tier (the agent keeps discoverable tools out of the live
+/// schema until promoted via `xdev`). Deriving this from the real
+/// `ToolRegistry` keeps cassettes from drifting when implicitly-registered
+/// tools (e.g. `xdev`, `submit_plan`) change.
+fn vcr_anthropic_tool_schemas(cwd: &Path) -> Vec<Value> {
+    let mut args: Vec<&str> = vec!["pi"];
+    args.extend(vcr_interactive_args());
+    let cli = cli::Cli::try_parse_from(args).expect("parse vcr cli args");
+    let enabled = cli.enabled_tools();
+    let config = pi::config::Config::default();
+    let registry = pi::tools::ToolRegistry::new(&enabled, cwd, Some(&config));
+    let mut schemas: Vec<Value> = registry
+        .tools()
+        .iter()
+        .filter(|tool| !registry.is_discoverable(tool.name()))
+        .map(|tool| {
+            json!({
+                "name": tool.name(),
+                "description": tool.description(),
+                "input_schema": tool.parameters(),
+            })
+        })
+        .collect();
+    // `submit_plan` is appended by main.rs via `agent.extend_tools` after
+    // registry construction ("always registered — self-errors outside plan
+    // mode"), so it is part of the live schema too.
+    let submit_plan = pi::plan::SubmitPlanTool::new(pi::plan::PlanState::new(), false);
+    schemas.push(json!({
+        "name": submit_plan.name(),
+        "description": submit_plan.description(),
+        "input_schema": submit_plan.parameters(),
+    }));
+    schemas
 }
 
 fn parse_scroll_percent(pane: &str) -> Option<u32> {
@@ -284,17 +329,35 @@ fn vcr_scroll_finalize_response() -> String {
 
 /// Write a VCR cassette for a basic chat interaction (no tools, simple text response).
 fn write_vcr_basic_chat_cassette(dir: &Path, system_prompt: &str) -> PathBuf {
-    let cassette_path = dir.join(format!("{VCR_BASIC_CHAT_TEST_NAME}.json"));
+    write_vcr_text_chat_cassette(
+        dir,
+        system_prompt,
+        VCR_BASIC_CHAT_TEST_NAME,
+        VCR_BASIC_CHAT_PROMPT,
+        VCR_BASIC_CHAT_RESPONSE,
+    )
+}
 
-    let request = json!({
+/// Write a VCR cassette for a single no-tools text turn.
+fn write_vcr_text_chat_cassette(
+    dir: &Path,
+    system_prompt: &str,
+    test_name: &str,
+    prompt: &str,
+    response_text: &str,
+) -> PathBuf {
+    let cassette_path = dir.join(format!("{test_name}.json"));
+
+    let mut request = json!({
         "model": VCR_MODEL,
         "messages": [
-            { "role": "user", "content": [ { "type": "text", "text": VCR_BASIC_CHAT_PROMPT } ] }
+            { "role": "user", "content": [ { "type": "text", "text": prompt } ] }
         ],
         "system": system_prompt,
-        "max_tokens": 8192,
+        "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
+    common::apply_prompt_cache_wire_shape(&mut request);
 
     let sse_chunk = |event: &str, data: serde_json::Value| -> String {
         let payload = serde_json::to_string(&data).expect("serialize sse payload");
@@ -325,7 +388,7 @@ fn write_vcr_basic_chat_cassette(dir: &Path, system_prompt: &str) -> PathBuf {
                 json!({
                     "type": "content_block_delta",
                     "index": 0,
-                    "delta": { "type": "text_delta", "text": VCR_BASIC_CHAT_RESPONSE }
+                    "delta": { "type": "text_delta", "text": response_text }
                 }),
             ),
             sse_chunk(
@@ -347,7 +410,7 @@ fn write_vcr_basic_chat_cassette(dir: &Path, system_prompt: &str) -> PathBuf {
 
     let cassette = Cassette {
         version: "1.0".to_string(),
-        test_name: VCR_BASIC_CHAT_TEST_NAME.to_string(),
+        test_name: test_name.to_string(),
         recorded_at: "1970-01-01T00:00:00Z".to_string(),
         interactions: vec![Interaction {
             request: RecordedRequest {
@@ -376,15 +439,16 @@ fn write_vcr_scroll_finalize_cassette(dir: &Path, system_prompt: &str) -> PathBu
     let cassette_path = dir.join(format!("{VCR_SCROLL_FINALIZE_TEST_NAME}.json"));
     let response_text = vcr_scroll_finalize_response();
 
-    let request = json!({
+    let mut request = json!({
         "model": VCR_MODEL,
         "messages": [
             { "role": "user", "content": [ { "type": "text", "text": VCR_SCROLL_FINALIZE_PROMPT } ] }
         ],
         "system": system_prompt,
-        "max_tokens": 8192,
+        "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
+    common::apply_prompt_cache_wire_shape(&mut request);
 
     let sse_chunk = |event: &str, data: serde_json::Value| -> String {
         let payload = serde_json::to_string(&data).expect("serialize sse payload");
@@ -528,25 +592,19 @@ fn write_vcr_cassette_for_read(
     read_path: &str,
 ) -> PathBuf {
     let cassette_path = dir.join(format!("{VCR_TEST_NAME}.json"));
-    let tool_schema = {
-        let tool = ReadTool::new(dir);
-        json!({
-            "name": tool.name(),
-            "description": tool.description(),
-            "input_schema": tool.parameters(),
-        })
-    };
-    let request_one = json!({
+    let tool_schemas = vcr_anthropic_tool_schemas(dir);
+    let mut request_one = json!({
         "model": VCR_MODEL,
         "messages": [
             { "role": "user", "content": [ { "type": "text", "text": prompt } ] }
         ],
         "system": system_prompt,
-        "max_tokens": 8192,
+        "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
-        "tools": [tool_schema],
+        "tools": &tool_schemas,
     });
-    let request_two = json!({
+    common::apply_prompt_cache_wire_shape(&mut request_one);
+    let mut request_two = json!({
         "model": VCR_MODEL,
         "messages": [
             { "role": "user", "content": [ { "type": "text", "text": prompt } ] },
@@ -575,10 +633,11 @@ fn write_vcr_cassette_for_read(
             }
         ],
         "system": system_prompt,
-        "max_tokens": 8192,
+        "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
-        "tools": [tool_schema],
+        "tools": tool_schemas,
     });
+    common::apply_prompt_cache_wire_shape(&mut request_two);
 
     let sse_chunk = |event: &str, data: serde_json::Value| -> String {
         let payload = serde_json::to_string(&data).expect("serialize sse payload");
@@ -1031,6 +1090,53 @@ fn e2e_tui_startup_and_exit() {
     );
 }
 
+/// E2E chrome: the shipped TUI footer renders the status-line module.
+#[test]
+fn e2e_tui_startup_renders_powerline_status() {
+    let Some((_lock, mut session)) =
+        new_locked_tui_session("e2e_tui_startup_renders_powerline_status")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    session.launch(&base_interactive_args());
+    let pane = session.wait_and_capture("powerline", "ctx: 0%", STARTUP_TIMEOUT);
+    assert!(
+        pane.contains("ACT") && pane.contains("ctx: 0%"),
+        "Expected compact powerline mode/context segments; got:\n{pane}"
+    );
+
+    session.exit_gracefully();
+    session.write_artifacts();
+}
+
+/// E2E chrome: the shipped TUI emits the delight OSC terminal title.
+#[test]
+fn e2e_tui_startup_sets_delight_terminal_title() {
+    let Some((_lock, mut session)) =
+        new_locked_tui_session("e2e_tui_startup_sets_delight_terminal_title")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    session.launch(&base_interactive_args());
+    session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
+    let title = session.tmux.pane_title();
+    assert!(
+        title == "Pi · openai/gpt-4o-mini · ready"
+            || title == "Pi _ openai/gpt-4o-mini _ ready"
+            || (title.starts_with("Pi ")
+                && title.contains("openai/gpt-4o-mini")
+                && title.ends_with("ready")),
+        "Expected delight terminal title; got: {title:?}"
+    );
+
+    session.exit_gracefully();
+    session.write_artifacts();
+}
+
 #[test]
 fn e2e_tui_config_subcommand_save_persists_resource_filters() {
     let Some((_lock, mut session)) =
@@ -1287,6 +1393,7 @@ fn e2e_tui_reload_resources_and_autocomplete_refresh() {
     };
 
     let args = [
+        "--classic",
         "--provider",
         "openai",
         "--model",
@@ -1473,6 +1580,10 @@ fn e2e_tui_quiet_startup_hides_welcome_message() {
     assert!(
         !pane.contains("Welcome to Pi!"),
         "Expected quiet startup to suppress welcome text; got:\n{pane}"
+    );
+    assert!(
+        !pane.contains("Tip: Type /help"),
+        "Expected quiet startup to suppress welcome tips; got:\n{pane}"
     );
 
     session.exit_gracefully();
@@ -1734,15 +1845,16 @@ fn e2e_tui_basic_chat_vcr() {
 
     // Diagnostic: write the expected request body for comparison
     let diag_path = session.harness.temp_path("expected_body.json");
-    let expected_body = json!({
+    let mut expected_body = json!({
         "model": VCR_MODEL,
         "messages": [
             { "role": "user", "content": [ { "type": "text", "text": VCR_BASIC_CHAT_PROMPT } ] }
         ],
         "system": &system_prompt,
-        "max_tokens": 8192,
+        "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
+    common::apply_prompt_cache_wire_shape(&mut expected_body);
     std::fs::write(
         &diag_path,
         serde_json::to_string_pretty(&expected_body).unwrap(),
@@ -1849,6 +1961,63 @@ fn e2e_tui_basic_chat_vcr() {
         "Expected >= 2 steps (startup + prompt), got {}",
         session.steps().len()
     );
+}
+
+/// E2E chrome: assistant text reaches the rich-markdown renderer in the
+/// shipped TUI rather than only exercising the module API in isolation.
+#[test]
+fn e2e_tui_rich_markdown_response_uses_chrome_renderer() {
+    let Some((_lock, mut session)) =
+        new_locked_tui_session("e2e_tui_rich_markdown_response_uses_chrome_renderer")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let cassette_dir = session.harness.temp_path("vcr");
+    let env_root = session.harness.temp_dir().join("env");
+    let system_prompt = build_vcr_system_prompt_for_args(
+        vcr_interactive_args_no_tools,
+        session.harness.temp_dir(),
+        &env_root,
+    );
+    let cassette_path = write_vcr_text_chat_cassette(
+        &cassette_dir,
+        &system_prompt,
+        VCR_RICH_MARKDOWN_TEST_NAME,
+        VCR_RICH_MARKDOWN_PROMPT,
+        VCR_RICH_MARKDOWN_RESPONSE,
+    );
+    session
+        .harness
+        .record_artifact("rich-markdown-cassette.json", &cassette_path);
+
+    session.set_env(VCR_ENV_MODE, "playback");
+    session.set_env(VCR_ENV_DIR, &cassette_dir.display().to_string());
+    session.set_env("PI_VCR_TEST_NAME", VCR_RICH_MARKDOWN_TEST_NAME);
+    session.set_env("PI_TEST_MODE", "1");
+
+    session.launch(&vcr_interactive_args_no_tools());
+    session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
+    let pane = session.send_text_and_wait(
+        "rich_markdown_response",
+        VCR_RICH_MARKDOWN_PROMPT,
+        "■ #33AAFF",
+        COMMAND_TIMEOUT,
+    );
+
+    assert!(pane.contains('α'), "LaTeX alpha was not enriched:\n{pane}");
+    assert!(
+        pane.contains('∞'),
+        "LaTeX infinity was not enriched:\n{pane}"
+    );
+    assert!(
+        pane.contains("■ #33AAFF"),
+        "Hex swatch was not enriched:\n{pane}"
+    );
+
+    session.exit_gracefully();
+    session.write_artifacts();
 }
 
 /// E2E interactive: regression for long streamed responses.
@@ -2701,22 +2870,22 @@ fn e2e_scenario_slash_command_workflow() {
         .artifacts
         .iter()
         .find(|a| a.name == "scenario-transcript.jsonl");
-    if let Some(artifact) = transcript_artifact {
-        if let Ok(actual_content) = std::fs::read_to_string(&artifact.path) {
-            let expected_lines = parse_transcript(&expected_jsonl);
-            let actual_lines = parse_transcript(&actual_content);
-            let diff = TranscriptDiff::compare(&expected_lines, &actual_lines);
+    if let Some(artifact) = transcript_artifact
+        && let Ok(actual_content) = std::fs::read_to_string(&artifact.path)
+    {
+        let expected_lines = parse_transcript(&expected_jsonl);
+        let actual_lines = parse_transcript(&actual_content);
+        let diff = TranscriptDiff::compare(&expected_lines, &actual_lines);
 
-            // Label and success should match; action format may differ slightly
-            assert!(
-                !diff
-                    .diffs
-                    .iter()
-                    .any(|d| d.field == "label" || d.field == "success"),
-                "Unexpected label/success diffs:\n{}",
-                diff.human_summary()
-            );
-        }
+        // Label and success should match; action format may differ slightly
+        assert!(
+            !diff
+                .diffs
+                .iter()
+                .any(|d| d.field == "label" || d.field == "success"),
+            "Unexpected label/success diffs:\n{}",
+            diff.human_summary()
+        );
     }
 }
 
@@ -2853,15 +3022,16 @@ fn e2e_scenario_error_api_failure() {
 
     let error_prompt = "trigger error";
     let cassette_path = cassette_dir.join(format!("{test_name}.json"));
-    let request = json!({
+    let mut request = json!({
         "model": VCR_MODEL,
         "messages": [
             { "role": "user", "content": [ { "type": "text", "text": error_prompt } ] }
         ],
         "system": &system_prompt,
-        "max_tokens": 8192,
+        "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
+    common::apply_prompt_cache_wire_shape(&mut request);
 
     let error_response = RecordedResponse {
         status: 500,
@@ -3088,46 +3258,45 @@ fn e2e_scenario_session_persistence_and_tree() {
         .artifacts
         .iter()
         .find(|a| a.name == "scenario-transcript.jsonl")
+        && let Ok(content) = std::fs::read_to_string(&transcript_artifact.path)
     {
-        if let Ok(content) = std::fs::read_to_string(&transcript_artifact.path) {
-            let lines = parse_transcript(&content);
+        let lines = parse_transcript(&content);
 
-            // Must have header
-            let headers: Vec<_> = lines
-                .iter()
-                .filter(|l| l.event_type.as_deref() == Some(EVENT_TYPE_HEADER))
-                .collect();
-            assert_eq!(headers.len(), 1, "transcript must have exactly 1 header");
-            assert_eq!(headers[0].value["scenario_name"].as_str(), Some(test_name));
+        // Must have header
+        let headers: Vec<_> = lines
+            .iter()
+            .filter(|l| l.event_type.as_deref() == Some(EVENT_TYPE_HEADER))
+            .collect();
+        assert_eq!(headers.len(), 1, "transcript must have exactly 1 header");
+        assert_eq!(headers[0].value["scenario_name"].as_str(), Some(test_name));
 
-            // Must have step results
-            let step_count = lines
-                .iter()
-                .filter(|l| l.event_type.as_deref() == Some(EVENT_TYPE_STEP))
-                .count();
-            assert_eq!(step_count, 2, "transcript must have 2 step results");
+        // Must have step results
+        let step_count = lines
+            .iter()
+            .filter(|l| l.event_type.as_deref() == Some(EVENT_TYPE_STEP))
+            .count();
+        assert_eq!(step_count, 2, "transcript must have 2 step results");
 
-            // Must have event boundaries
-            let boundary_count = lines
-                .iter()
-                .filter(|l| l.event_type.as_deref() == Some(EVENT_TYPE_BOUNDARY))
-                .count();
-            assert!(
-                boundary_count >= 6,
-                "transcript must have >= 6 boundaries (3 per step), got {boundary_count}"
-            );
-        }
+        // Must have event boundaries
+        let boundary_count = lines
+            .iter()
+            .filter(|l| l.event_type.as_deref() == Some(EVENT_TYPE_BOUNDARY))
+            .count();
+        assert!(
+            boundary_count >= 6,
+            "transcript must have >= 6 boundaries (3 per step), got {boundary_count}"
+        );
     }
 
     // If the session artifact exists, verify tree structure
-    if let Some(sess) = session_artifact {
-        if let Ok(content) = std::fs::read_to_string(&sess.path) {
-            let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-            if lines.len() >= 2 {
-                let header: Value = serde_json::from_str(lines[0]).expect("parse header");
-                assert_eq!(header["type"].as_str(), Some("session"));
-                assert_eq!(header["version"].as_u64(), Some(u64::from(SESSION_VERSION)));
-            }
+    if let Some(sess) = session_artifact
+        && let Ok(content) = std::fs::read_to_string(&sess.path)
+    {
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        if lines.len() >= 2 {
+            let header: Value = serde_json::from_str(lines[0]).expect("parse header");
+            assert_eq!(header["type"].as_str(), Some("session"));
+            assert_eq!(header["version"].as_u64(), Some(u64::from(SESSION_VERSION)));
         }
     }
 }
@@ -3161,6 +3330,7 @@ fn e2e_scenario_session_restore_explicit_path() {
     let session_path_str = session_file.display().to_string();
     let sessions_dir_str = sessions_dir.display().to_string();
     let scenario = CliScenario::new("session_restore_explicit_path")
+        .arg("--classic")
         .arg("--provider")
         .arg("openai")
         .arg("--model")
@@ -3457,17 +3627,18 @@ fn e2e_scenario_prompt_loop_multi_round() {
         }
     };
 
-    let request_1 = json!({
+    let mut request_1 = json!({
         "model": VCR_MODEL,
         "messages": [
             { "role": "user", "content": [ { "type": "text", "text": prompt_1 } ] }
         ],
         "system": &system_prompt,
-        "max_tokens": 8192,
+        "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
+    common::apply_prompt_cache_wire_shape(&mut request_1);
 
-    let request_2 = json!({
+    let mut request_2 = json!({
         "model": VCR_MODEL,
         "messages": [
             { "role": "user", "content": [ { "type": "text", "text": prompt_1 } ] },
@@ -3478,9 +3649,10 @@ fn e2e_scenario_prompt_loop_multi_round() {
             { "role": "user", "content": [ { "type": "text", "text": prompt_2 } ] }
         ],
         "system": &system_prompt,
-        "max_tokens": 8192,
+        "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
+    common::apply_prompt_cache_wire_shape(&mut request_2);
 
     let cassette = Cassette {
         version: "1.0".to_string(),
@@ -4054,5 +4226,371 @@ fn e2e_scenario_exit_strategy_roundtrip() {
     test(
         ExitStrategy::Timeout(Duration::from_secs(30)),
         "timeout_30000ms",
+    );
+}
+
+// ============================================================================
+// VCR cassette shape parity (no tmux needed).
+//
+// Every VCR e2e in this file synthesizes its cassette request bodies by hand.
+// When the Anthropic provider's wire shape evolves (e.g. the prompt-cache
+// work moved `system` from a string to a block array), the hand-written
+// templates silently stop matching and every VCR e2e dies with "No matching
+// interaction". This test rebuilds the real provider request for the
+// tool-read scenario's first turn and template-matches the synthesized
+// cassette against it, failing with both bodies printed so the drift is
+// obvious.
+// ============================================================================
+
+/// Recorded-template match with the same semantics as `pi::vcr`:
+/// object keys in `recorded` must match (incoming may have extras), arrays
+/// are strict length + per-element, scalars strict equality.
+fn vcr_template_matches(recorded: &Value, incoming: &Value) -> bool {
+    match (recorded, incoming) {
+        (Value::Object(recorded_obj), Value::Object(incoming_obj)) => {
+            recorded_obj.iter().all(|(key, recorded_value)| {
+                incoming_obj.get(key).map_or_else(
+                    || recorded_value.is_null(),
+                    |incoming_value| vcr_template_matches(recorded_value, incoming_value),
+                )
+            })
+        }
+        (Value::Array(recorded_items), Value::Array(incoming_items)) => {
+            recorded_items.len() == incoming_items.len()
+                && recorded_items
+                    .iter()
+                    .zip(incoming_items)
+                    .all(|(left, right)| vcr_template_matches(left, right))
+        }
+        _ => recorded == incoming,
+    }
+}
+
+#[test]
+fn vcr_tool_read_cassette_template_matches_provider_request() {
+    let harness = common::TestHarness::new("vcr_tool_read_cassette_template_matches_request");
+    let workdir = harness.temp_dir().to_path_buf();
+    let env_root = workdir.join("env");
+    let system_prompt = build_vcr_system_prompt(&workdir, &env_root);
+    let cassette_dir = harness.temp_path("vcr");
+    let cassette_path = write_vcr_cassette(&cassette_dir, "irrelevant tool output", &system_prompt);
+    let cassette: Value =
+        serde_json::from_str(&std::fs::read_to_string(&cassette_path).expect("read cassette"))
+            .expect("parse cassette");
+    let recorded = cassette["interactions"][0]["request"]["body"].clone();
+    assert!(!recorded.is_null(), "cassette first request body missing");
+
+    // Mirror the interactive binary's first-turn request for the same CLI
+    // args (`vcr_interactive_args`): anthropic provider, read tool only,
+    // thinking off, prompt-cache retention default (short).
+    let provider = pi::providers::anthropic::AnthropicProvider::new(VCR_MODEL);
+    let tools: Vec<pi::provider::ToolDef> = vcr_anthropic_tool_schemas(&workdir)
+        .iter()
+        .map(|schema| pi::provider::ToolDef {
+            name: schema["name"].as_str().unwrap_or_default().to_string(),
+            description: schema["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            parameters: schema["input_schema"].clone(),
+        })
+        .collect();
+    let messages = vec![pi::model::Message::User(pi::model::UserMessage {
+        content: pi::model::UserContent::Text(VCR_PROMPT.to_string()),
+        timestamp: 0,
+    })];
+    let context = pi::provider::Context {
+        system_prompt: Some(std::borrow::Cow::Borrowed(system_prompt.as_str())),
+        messages: std::borrow::Cow::Owned(messages),
+        tools: std::borrow::Cow::Owned(tools),
+    };
+    let options = pi::provider::StreamOptions {
+        cache_retention: pi::provider::CacheRetention::Short,
+        max_tokens: Some(VCR_MODEL_MAX_TOKENS),
+        thinking_level: Some(pi::model::ThinkingLevel::Off),
+        ..Default::default()
+    };
+    let actual = serde_json::to_value(provider.build_request(&context, &options))
+        .expect("serialize provider request");
+
+    assert!(
+        vcr_template_matches(&recorded, &actual),
+        "synthesized VCR cassette no longer matches the provider's request \
+         shape.\n--- recorded template ---\n{}\n--- actual provider request ---\n{}",
+        serde_json::to_string_pretty(&recorded).unwrap_or_default(),
+        serde_json::to_string_pretty(&actual).unwrap_or_default(),
+    );
+}
+
+// ============================================================================
+// Tool-call stress e2e (bd-d4um2): one turn with dozens of sequential real
+// tool executions through the live binary in tmux, then scroll integrity.
+// The agent's max_tool_iterations default is 50, so the round count stays
+// under it while still exercising the "lots of tool calls" failure mode HN
+// reported (frozen scrolling / corrupted transcript).
+// ============================================================================
+
+const VCR_STRESS_TEST_NAME: &str = "e2e_tui_tool_stress";
+// 35 = 70% of the default max_tool_iterations (50). At >=80% the agent
+// injects a "[runtime] Tool-iteration budget" notice into the conversation,
+// which a pre-recorded cassette cannot predict.
+const STRESS_TOOL_ROUNDS: usize = 35;
+const STRESS_PROMPT: &str = "Stress-read sample.txt thirty-five times";
+const STRESS_DONE_MARKER: &str = "STRESS-DONE";
+
+#[allow(clippy::too_many_lines)]
+fn write_vcr_stress_cassette(dir: &Path, tool_output: &str, system_prompt: &str) -> PathBuf {
+    let cassette_path = dir.join(format!("{VCR_STRESS_TEST_NAME}.json"));
+    let tool_schemas = vcr_anthropic_tool_schemas(dir);
+
+    let sse_chunk = |event: &str, data: serde_json::Value| -> String {
+        let payload = serde_json::to_string(&data).expect("serialize sse payload");
+        format!("event: {event}\ndata: {payload}\n\n")
+    };
+    let tool_args_json =
+        serde_json::to_string(&json!({ "path": SAMPLE_FILE_NAME })).expect("serialize tool args");
+
+    let request_for_history = |history: &[Value]| -> Value {
+        let mut request = json!({
+            "model": VCR_MODEL,
+            "messages": history,
+            "system": system_prompt,
+            "max_tokens": VCR_MODEL_MAX_TOKENS,
+            "stream": true,
+            "tools": tool_schemas.clone(),
+        });
+        common::apply_prompt_cache_wire_shape(&mut request);
+        request
+    };
+
+    let tool_use_response = |call_id: &str| RecordedResponse {
+        status: 200,
+        headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+        body_chunks: vec![
+            sse_chunk(
+                "message_start",
+                json!({ "type": "message_start", "message": { "usage": { "input_tokens": 42 }}}),
+            ),
+            sse_chunk(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "tool_use", "id": call_id, "name": "read" }
+                }),
+            ),
+            sse_chunk(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "input_json_delta", "partial_json": tool_args_json }
+                }),
+            ),
+            sse_chunk(
+                "content_block_stop",
+                json!({ "type": "content_block_stop", "index": 0 }),
+            ),
+            sse_chunk(
+                "message_delta",
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "tool_use" },
+                    "usage": { "output_tokens": 12 }
+                }),
+            ),
+            sse_chunk("message_stop", json!({ "type": "message_stop" })),
+        ],
+        body_chunks_base64: None,
+    };
+
+    let final_text = format!("All {STRESS_TOOL_ROUNDS} reads complete. {STRESS_DONE_MARKER}");
+    let final_response = RecordedResponse {
+        status: 200,
+        headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+        body_chunks: vec![
+            sse_chunk(
+                "message_start",
+                json!({ "type": "message_start", "message": { "usage": { "input_tokens": 64 }}}),
+            ),
+            sse_chunk(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "text" }
+                }),
+            ),
+            sse_chunk(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "text_delta", "text": final_text }
+                }),
+            ),
+            sse_chunk(
+                "content_block_stop",
+                json!({ "type": "content_block_stop", "index": 0 }),
+            ),
+            sse_chunk(
+                "message_delta",
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "end_turn" },
+                    "usage": { "output_tokens": 8 }
+                }),
+            ),
+            sse_chunk("message_stop", json!({ "type": "message_stop" })),
+        ],
+        body_chunks_base64: None,
+    };
+
+    let make_request = |body: Value| RecordedRequest {
+        method: "POST".to_string(),
+        url: "https://api.anthropic.com/v1/messages".to_string(),
+        headers: vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("Accept".to_string(), "text/event-stream".to_string()),
+        ],
+        body: Some(body),
+        body_text: None,
+    };
+
+    let mut history: Vec<Value> = vec![json!(
+        { "role": "user", "content": [ { "type": "text", "text": STRESS_PROMPT } ] }
+    )];
+    let mut interactions: Vec<Interaction> = Vec::with_capacity(STRESS_TOOL_ROUNDS + 1);
+    for round in 0..STRESS_TOOL_ROUNDS {
+        let call_id = format!("toolu_stress_{round}");
+        interactions.push(Interaction {
+            request: make_request(request_for_history(&history)),
+            response: tool_use_response(&call_id),
+        });
+        history.push(json!({
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": "read",
+                    "input": { "path": SAMPLE_FILE_NAME }
+                }
+            ]
+        }));
+        history.push(json!({
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": [ { "type": "text", "text": tool_output } ]
+                }
+            ]
+        }));
+    }
+    interactions.push(Interaction {
+        request: make_request(request_for_history(&history)),
+        response: final_response,
+    });
+
+    let cassette = Cassette {
+        version: "1.0".to_string(),
+        test_name: VCR_STRESS_TEST_NAME.to_string(),
+        recorded_at: "1970-01-01T00:00:00Z".to_string(),
+        interactions,
+    };
+
+    std::fs::create_dir_all(dir).expect("create cassette dir");
+    let json = serde_json::to_string_pretty(&cassette).expect("serialize cassette");
+    std::fs::write(&cassette_path, json).expect("write cassette");
+    cassette_path
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_tui_tool_call_stress_scroll_stays_functional() {
+    let Some((_lock, mut session)) = new_locked_tui_session("e2e_tui_tool_stress") else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    session.harness.section("setup");
+    let sample_path = session.harness.temp_path(SAMPLE_FILE_NAME);
+    let sample_content: String = (1..=40).fold(String::new(), |mut out, line| {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            out,
+            "stress line {line:02}: the quick brown fox jumps over the lazy dog"
+        );
+        out
+    });
+    std::fs::write(&sample_path, &sample_content).expect("write sample file");
+
+    let tool_output = read_output_for_sample(session.harness.temp_dir(), SAMPLE_FILE_NAME);
+    let cassette_dir = session.harness.temp_path("vcr");
+    let env_root = session.harness.temp_dir().join("env");
+    let system_prompt = build_vcr_system_prompt(session.harness.temp_dir(), &env_root);
+    let cassette_path = write_vcr_stress_cassette(&cassette_dir, &tool_output, &system_prompt);
+    session
+        .harness
+        .record_artifact("stress-cassette.json", &cassette_path);
+
+    let cassette_dir_str = cassette_dir.display().to_string();
+    session.set_env(VCR_ENV_MODE, "playback");
+    session.set_env(VCR_ENV_DIR, &cassette_dir_str);
+    session.set_env("PI_VCR_TEST_NAME", VCR_STRESS_TEST_NAME);
+    session.set_env("PI_TEST_MODE", "1");
+
+    session.launch(&vcr_interactive_args());
+    session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
+
+    // One turn, STRESS_TOOL_ROUNDS sequential tool executions, then the
+    // final text. Generous timeout: this is a real binary doing 40 provider
+    // round-trips plus 40 tool runs.
+    let pane = session.send_text_and_wait(
+        "stress_prompt",
+        STRESS_PROMPT,
+        STRESS_DONE_MARKER,
+        Duration::from_secs(120),
+    );
+    assert!(
+        !pane.contains("No matching interaction"),
+        "cassette drift during stress run.\nPane:\n{pane}"
+    );
+    let pct = parse_scroll_percent(&pane).expect("scroll indicator after stress");
+    assert_eq!(pct, 100, "tail-following viewport should end at the bottom");
+
+    // Scrolling must still work after the stress: page up moves off the
+    // bottom, and returning to the bottom is possible.
+    session.tmux.send_key("PPage");
+    session.tmux.send_key("PPage");
+    std::thread::sleep(Duration::from_millis(400));
+    let pane_up = session.wait_and_capture("after_pgup", "%]", Duration::from_secs(5));
+    let pct_up = parse_scroll_percent(&pane_up).expect("scroll indicator after PageUp");
+    assert!(
+        pct_up < 100,
+        "PageUp must scroll away from the bottom after a tool-heavy turn (got {pct_up}%)"
+    );
+    for _ in 0..80 {
+        session.tmux.send_key("NPage");
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    let pane_down = session.wait_and_capture("after_pgdn", "%]", Duration::from_secs(5));
+    let pct_down = parse_scroll_percent(&pane_down).expect("scroll indicator after PageDown");
+    assert_eq!(pct_down, 100, "PageDown must return to the bottom");
+
+    session.exit_gracefully();
+    session.write_artifacts();
+
+    // The session log must contain every tool round.
+    let sessions_dir = session.harness.temp_dir().join("env").join("sessions");
+    let session_file = find_session_jsonl(&sessions_dir).expect("expected session jsonl file");
+    let content = std::fs::read_to_string(&session_file).expect("read session jsonl");
+    let tool_mentions = content.matches("toolu_stress_").count();
+    assert!(
+        tool_mentions >= STRESS_TOOL_ROUNDS * 2,
+        "expected all {STRESS_TOOL_ROUNDS} tool rounds in the session log, \
+         found {tool_mentions} toolu_stress_ mentions"
     );
 }

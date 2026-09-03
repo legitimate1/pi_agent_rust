@@ -58,7 +58,11 @@ Resulting behavior:
 
 ### Appearance
 
-- `theme` (string): Theme name to apply. Defaults to `dark` if unset.
+- `theme` (string): Theme to apply. Built-ins: `dark`, `light`, `solarized`; also
+  accepts a discovered theme name or a path to a theme JSON file. `light/dark`,
+  `auto`, or `system` auto-detect dark/light from the terminal background via the
+  `COLORFGBG` environment variable (dark when unavailable). If unset, auto-detects
+  the same way.
 - `hide_thinking_block` (bool): Hide thinking blocks in interactive output. Default `false`.
 - `show_hardware_cursor` (bool): Show terminal hardware cursor. Default `false` unless
   `PI_HARDWARE_CURSOR=1`.
@@ -146,6 +150,33 @@ Accessor defaults:
 }
 ```
 
+### Search
+
+- `search_backend` (string): Backend for the `grep`/`find` tools. `inproc`
+  (default) searches in-process with the same engines ripgrep uses (no `rg`
+  or `fd` binaries required); `external` shells out to `rg`/`fd` as before —
+  kept as a debugging escape hatch. Alias: `searchBackend`.
+
+### Imported rules (foreign formats)
+
+- `foreign_rules` (bool): Import rules from other tools' native config files
+  found in the workspace — Cursor `.cursor/rules/*.mdc` and `.cursorrules`,
+  Cline `.clinerules`, Copilot `.github/copilot-instructions.md` and
+  `*.instructions.md` (`applyTo` globs), Windsurf `.windsurfrules` /
+  `.windsurf/rules/`, and `GEMINI.md`. Always-apply rules join the system
+  prompt with provenance headers; glob-scoped rules are delivered the first
+  time a tool call touches a matching path. Import is read-only, deduped
+  against `AGENTS.md`/`CLAUDE.md` (native wins), and budget-capped with a
+  truncation notice. Default `true`. Alias: `foreignRules`.
+
+### Ask tool
+
+- `ask_policy` (string): How the `ask` tool (opt-in via `--tools ...,ask`)
+  resolves in sessions without an interactive picker (print/JSON mode).
+  `recommended` (default) auto-answers with each question's recommended
+  option and loudly annotates the result; `error` fails the tool call.
+  Alias: `askPolicy`.
+
 ### Shell
 
 - `shell_path` (string): Shell binary path. Default `/bin/bash`.
@@ -156,6 +187,24 @@ Accessor defaults:
 {
   "shell_path": "/bin/bash",
   "shell_command_prefix": "set -e"
+}
+```
+
+### Subagents
+
+- `subagent_structured_results` (bool): Default `false`. Alias: `subagentStructuredResults`.
+  When `true`, the `subagent` tool appends a machine-readable
+  `<subagent-structured-result>` block to its result text: a compact JSON array
+  with one entry per child (`agent`, `step`, `status`, `exitCode`, `output`,
+  `error` — the same field names as the `pi.subagent.result.v1` details
+  schema). `output`/`error` are truncated to 2 KiB each and the whole block is
+  capped at 16 KiB; when entries must be dropped, the final array element is
+  `{"truncated": true, "omittedResults": N}`. Default `false` keeps the tool
+  output byte-identical to previous releases.
+
+```json
+{
+  "subagent_structured_results": true
 }
 ```
 
@@ -185,12 +234,41 @@ Accessor defaults:
 - `thinking_budgets.medium`: default `8192`
 - `thinking_budgets.high`: default `16384`
 - `thinking_budgets.xhigh`: default `32768`
+- `thinking_budgets.max`: default `65536`
 
 ### Packages and resources
 
 - `packages` (array): package sources (string or `{ source, local, kind }`).
 - `extensions`, `skills`, `prompts`, `themes` (arrays): resource filters.
 - `enable_skill_commands` (bool): default `true`.
+
+### Media (multimodal perception & speech)
+
+- `media.enable_media` (bool): Default `false`. When `true`, activates `inspect_image`, `generate_image`, and `tts`.
+- `media.tts_provider` (string): Default `"elevenlabs"`. Supported: `"openai"`, `"elevenlabs"`, `"system"`.
+- `media.tts_voice` (string): Voice identifier (e.g. `"alloy"`, `"rachel"`).
+- `media.image_gen_provider` (string): Default `"gemini"`. Supported: `"gemini"`, `"dall-e-3"`.
+- `media.output_dir` (string): Destination folder for generated media artifacts.
+
+### Computer (desktop automation)
+
+- `computer.enable_computer` (bool): Default `false`. When `true`, activates `computer` tool.
+- `computer.require_approval` (bool): Default `true`. Requires operator approval for mouse/keyboard inputs.
+- `computer.screenshot_dir` (string): Destination directory for captured screen artifacts.
+
+### Browser (headless Chromium automation)
+
+- `browser.enable_browser` (bool): Default `false`. When `true`, activates `browser` tool.
+- `browser.headless` (bool): Default `true`. Runs browser in headless mode.
+- `browser.remote_debugging_port` (integer): CDP debugging port (default `9222`).
+- `browser.domain_allowlist` (array of strings): Restricts browser navigation to approved hosts.
+
+### Web Remote & Collab
+
+- `web.port` (integer): Port for `pi web` WebSocket server (default `8080`).
+- `web.bind_mode` (string): `"loopback"`, `"tailscale"`, `"lan"`.
+- `web.view_only` (bool): Restricts all remote clients to view-only mode.
+- `web.max_viewers` (integer): Max concurrent viewer connections (default `4`).
 
 ## Full reference
 

@@ -7,10 +7,47 @@
 //! artifacts with a single deterministic command sequence. Also validates that
 //! replay metadata is consistent across scenario matrix, CI gates, and suite
 //! classification.
+//!
+//! Ordinary test runs validate replay bundles in memory without modifying
+//! tracked evidence. Set `PI_GENERATE_REPLAY_BUNDLE_ARTIFACTS=1` to regenerate
+//! the canonical examples explicitly.
 
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+const GENERATE_REPLAY_BUNDLE_ARTIFACTS_ENV: &str = "PI_GENERATE_REPLAY_BUNDLE_ARTIFACTS";
+
+fn replay_bundle_artifact_generation_requested() -> bool {
+    let raw = std::env::var(GENERATE_REPLAY_BUNDLE_ARTIFACTS_ENV).ok();
+    replay_bundle_artifact_generation_requested_from(raw.as_deref())
+}
+
+fn replay_bundle_artifact_generation_requested_from(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1"))
+}
+
+fn write_non_empty_replay_artifact(path: &Path, payload: &str) {
+    assert!(
+        !payload.trim().is_empty(),
+        "refusing to emit empty replay artifact {}",
+        path.display()
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap_or_else(|err| {
+            panic!(
+                "failed to create replay artifact directory {}: {err}",
+                parent.display()
+            )
+        });
+    }
+    std::fs::write(path, payload)
+        .unwrap_or_else(|err| panic!("failed to write replay artifact {}: {err}", path.display()));
+    let size = std::fs::metadata(path)
+        .unwrap_or_else(|err| panic!("failed to stat replay artifact {}: {err}", path.display()))
+        .len();
+    assert!(size > 0, "replay artifact is empty: {}", path.display());
+}
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -183,12 +220,12 @@ fn scenario_matrix_replay_commands_reference_valid_suites() {
             .and_then(|v| v.as_array());
         if let Some(ids) = suite_ids {
             for id in ids {
-                if let Some(s) = id.as_str() {
-                    if !classified.contains(s) {
-                        invalid_refs.push(format!(
-                            "{workflow_id}: suite_id '{s}' not in suite_classification.toml"
-                        ));
-                    }
+                if let Some(s) = id.as_str()
+                    && !classified.contains(s)
+                {
+                    invalid_refs.push(format!(
+                        "{workflow_id}: suite_id '{s}' not in suite_classification.toml"
+                    ));
                 }
             }
         }
@@ -227,32 +264,32 @@ fn gate_reproduce_commands_reference_valid_targets() {
     let mut invalid_refs: Vec<String> = Vec::new();
     let mut checked = 0;
 
-    if let Some(v) = &verdict {
-        if let Some(gates) = v["gates"].as_array() {
-            for gate in gates {
-                let gate_id = gate["id"].as_str().unwrap_or("unknown");
-                if let Some(cmd) = gate.get("reproduce_command").and_then(|v| v.as_str()) {
-                    if cmd.is_empty() {
-                        continue;
-                    }
-                    checked += 1;
+    if let Some(v) = &verdict
+        && let Some(gates) = v["gates"].as_array()
+    {
+        for gate in gates {
+            let gate_id = gate["id"].as_str().unwrap_or("unknown");
+            if let Some(cmd) = gate.get("reproduce_command").and_then(|v| v.as_str()) {
+                if cmd.is_empty() {
+                    continue;
+                }
+                checked += 1;
 
-                    // Extract test target from cargo test command
-                    if let Some(target) = extract_cargo_test_target(cmd) {
-                        if classified.contains(&target) {
-                            eprintln!("  [OK] {gate_id}: target '{target}' is valid");
-                        } else {
-                            invalid_refs.push(format!(
-                                "gate '{gate_id}': reproduce_command references unknown test target '{target}'"
-                            ));
-                            eprintln!("  [INVALID] {gate_id}: target '{target}' not classified");
-                        }
-                    } else if cmd.contains("python3") || cmd.contains("scripts/") {
-                        // Script-based commands are valid by definition
-                        eprintln!("  [OK] {gate_id}: script command");
+                // Extract test target from cargo test command
+                if let Some(target) = extract_cargo_test_target(cmd) {
+                    if classified.contains(&target) {
+                        eprintln!("  [OK] {gate_id}: target '{target}' is valid");
                     } else {
-                        eprintln!("  [WARN] {gate_id}: could not extract test target from: {cmd}");
+                        invalid_refs.push(format!(
+                            "gate '{gate_id}': reproduce_command references unknown test target '{target}'"
+                        ));
+                        eprintln!("  [INVALID] {gate_id}: target '{target}' not classified");
                     }
+                } else if cmd.contains("python3") || cmd.contains("scripts/") {
+                    // Script-based commands are valid by definition
+                    eprintln!("  [OK] {gate_id}: script command");
+                } else {
+                    eprintln!("  [WARN] {gate_id}: could not extract test target from: {cmd}");
                 }
             }
         }
@@ -361,12 +398,17 @@ fn replay_bundle_schema_validation() {
     eprintln!("  One-command replay: OK");
     eprintln!();
 
-    // Write the schema example as an artifact
+    // Write the schema example only in the explicit generation lane.
     let artifact_dir = repo_root().join("tests").join("full_suite_gate");
-    let _ = std::fs::create_dir_all(&artifact_dir);
     let artifact_path = artifact_dir.join("replay_bundle_schema_example.json");
-    let _ = std::fs::write(&artifact_path, &json);
-    eprintln!("  Schema example: {}", artifact_path.display());
+    if replay_bundle_artifact_generation_requested() {
+        write_non_empty_replay_artifact(&artifact_path, &json);
+        eprintln!("  Schema example: {}", artifact_path.display());
+    } else {
+        eprintln!(
+            "  Schema example validated in memory; set {GENERATE_REPLAY_BUNDLE_ARTIFACTS_ENV}=1 to write it"
+        );
+    }
 }
 
 /// Validate that env context restoration is properly captured in replay commands.
@@ -475,7 +517,6 @@ fn generate_and_validate_replay_bundle() {
 
     let root = repo_root();
     let report_dir = root.join("tests").join("full_suite_gate");
-    let _ = std::fs::create_dir_all(&report_dir);
     let classified = all_classified_suites(&root);
 
     eprintln!("\n=== Generate and Validate Replay Bundle ===\n");
@@ -484,12 +525,39 @@ fn generate_and_validate_replay_bundle() {
     let verdict_path = report_dir.join("full_suite_verdict.json");
     let mut failed_gates: Vec<GateReplayEntry> = Vec::new();
 
-    if let Some(v) = load_json(&verdict_path) {
-        if let Some(gates) = v["gates"].as_array() {
-            for gate in gates {
-                let status = gate["status"].as_str().unwrap_or("pass");
-                if status == "fail" {
-                    let gate_id = gate["id"].as_str().unwrap_or("unknown").to_string();
+    if let Some(v) = load_json(&verdict_path)
+        && let Some(gates) = v["gates"].as_array()
+    {
+        for gate in gates {
+            let status = gate["status"].as_str().unwrap_or("pass");
+            if status == "fail" {
+                let gate_id = gate["id"].as_str().unwrap_or("unknown").to_string();
+                let gate_name = gate["name"].as_str().unwrap_or("unknown").to_string();
+                let cmd = gate
+                    .get("reproduce_command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                failed_gates.push(GateReplayEntry {
+                    gate_id,
+                    gate_name,
+                    reproduce_command: cmd,
+                });
+            }
+        }
+    }
+
+    // ── Read preflight verdict for failed blocking gates ──
+    let preflight_path = report_dir.join("preflight_verdict.json");
+    if let Some(pf) = load_json(&preflight_path)
+        && let Some(blocking) = pf["blocking_gates"].as_array()
+    {
+        for gate in blocking {
+            let status = gate["status"].as_str().unwrap_or("pass");
+            if status == "fail" {
+                let gate_id = gate["id"].as_str().unwrap_or("unknown").to_string();
+                // Avoid duplicates
+                if !failed_gates.iter().any(|g| g.gate_id == gate_id) {
                     let gate_name = gate["name"].as_str().unwrap_or("unknown").to_string();
                     let cmd = gate
                         .get("reproduce_command")
@@ -501,33 +569,6 @@ fn generate_and_validate_replay_bundle() {
                         gate_name,
                         reproduce_command: cmd,
                     });
-                }
-            }
-        }
-    }
-
-    // ── Read preflight verdict for failed blocking gates ──
-    let preflight_path = report_dir.join("preflight_verdict.json");
-    if let Some(pf) = load_json(&preflight_path) {
-        if let Some(blocking) = pf["blocking_gates"].as_array() {
-            for gate in blocking {
-                let status = gate["status"].as_str().unwrap_or("pass");
-                if status == "fail" {
-                    let gate_id = gate["id"].as_str().unwrap_or("unknown").to_string();
-                    // Avoid duplicates
-                    if !failed_gates.iter().any(|g| g.gate_id == gate_id) {
-                        let gate_name = gate["name"].as_str().unwrap_or("unknown").to_string();
-                        let cmd = gate
-                            .get("reproduce_command")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        failed_gates.push(GateReplayEntry {
-                            gate_id,
-                            gate_name,
-                            reproduce_command: cmd,
-                        });
-                    }
                 }
             }
         }
@@ -549,16 +590,15 @@ fn generate_and_validate_replay_bundle() {
     // ── Validate all replay commands reference valid targets ──
     let mut all_valid = true;
     for gate in &failed_gates {
-        if !gate.reproduce_command.is_empty() {
-            if let Some(target) = extract_cargo_test_target(&gate.reproduce_command) {
-                if !classified.contains(&target) {
-                    eprintln!(
-                        "  [INVALID] gate '{}' references unknown target '{}'",
-                        gate.gate_id, target
-                    );
-                    all_valid = false;
-                }
-            }
+        if !gate.reproduce_command.is_empty()
+            && let Some(target) = extract_cargo_test_target(&gate.reproduce_command)
+            && !classified.contains(&target)
+        {
+            eprintln!(
+                "  [INVALID] gate '{}' references unknown target '{}'",
+                gate.gate_id, target
+            );
+            all_valid = false;
         }
     }
 
@@ -625,12 +665,25 @@ fn generate_and_validate_replay_bundle() {
     // ── Write the replay bundle ──
     let bundle_path = report_dir.join("replay_bundle.json");
     let json = serde_json::to_string_pretty(&bundle).expect("bundle must serialize");
-    let _ = std::fs::write(&bundle_path, &json);
+    assert!(
+        !json.trim().is_empty(),
+        "generated replay bundle must be non-empty"
+    );
+    let generate = replay_bundle_artifact_generation_requested();
+    if generate {
+        write_non_empty_replay_artifact(&bundle_path, &json);
+    }
 
     eprintln!("  Failed gates: {}", failed_gates.len());
     eprintln!("  Covered workflows: {covered_workflows}");
     eprintln!("  All commands valid: {all_valid}");
-    eprintln!("  Bundle: {}", bundle_path.display());
+    if generate {
+        eprintln!("  Bundle: {}", bundle_path.display());
+    } else {
+        eprintln!(
+            "  Bundle validated in memory; set {GENERATE_REPLAY_BUNDLE_ARTIFACTS_ENV}=1 to write it"
+        );
+    }
     eprintln!();
 
     // ── Verify the bundle is valid ──
@@ -648,6 +701,17 @@ fn generate_and_validate_replay_bundle() {
             !gate.reproduce_command.is_empty(),
             "gate '{}' has empty reproduce_command",
             gate.gate_id
+        );
+    }
+}
+
+#[test]
+fn replay_bundle_artifact_generation_requires_exact_one() {
+    assert!(replay_bundle_artifact_generation_requested_from(Some("1")));
+    for raw in [None, Some(""), Some("0"), Some("true"), Some(" 1 ")] {
+        assert!(
+            !replay_bundle_artifact_generation_requested_from(raw),
+            "unexpected generation request for {raw:?}"
         );
     }
 }

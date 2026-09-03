@@ -2,7 +2,28 @@
 
 ## Building
 
-Pi requires Rust nightly (2024 edition).
+Pi release builds use the exact `nightly-2026-07-05` toolchain pinned in
+`rust-toolchain.toml`. The locked dependency graph requires Rust 1.95 or newer;
+use the repository pin so compiler and Clippy results remain reproducible.
+
+The one authoritative quality entry point is the registered DSR recipe; it
+owns formatting, compiler checks, Clippy, tests, the installer regression, and
+module reachability, and it routes Cargo through `rch` so a shared host never
+compiles locally:
+
+```bash
+# Authoritative gate (registry entry in ~/.config/dsr/repos.yaml, or the
+# checked-in copy in .dsr/repos.yaml on a host that has not registered it)
+dsr quality --tool pi_agent_rust
+DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust
+
+# Cross-platform release artifacts (release operator's machine only)
+dsr build pi_agent_rust
+```
+
+The `rch exec -- cargo ...` commands below are the same invocations the recipe
+runs; use them for a tight inner development loop, never as a substitute for
+the DSR result when closing a Bead or making a quality claim.
 
 ```bash
 # Build dev binary
@@ -18,7 +39,7 @@ By default, `pi_agent_rust` depends on **published crates.io versions** of the s
 - `asupersync`
 - `rich_rust`
 - `charmed-*` (bubbletea/lipgloss/bubbles/glamour)
-- `sqlmodel-*` (core/sqlite)
+- `fsqlite` (FrankenSQLite, pure-Rust SQLite engine)
 
 If you want to hack on those repos locally (in lockstep), use a local-only Cargo patch. Assuming the sibling repos are checked out next to `pi_agent_rust` (e.g. `../asupersync`, `../rich_rust`, etc), add this to **your local checkout** (do not commit):
 
@@ -30,8 +51,7 @@ charmed-bubbletea = { path = "../charmed_rust/crates/bubbletea" }
 charmed-lipgloss = { path = "../charmed_rust/crates/lipgloss" }
 charmed-bubbles = { path = "../charmed_rust/crates/bubbles" }
 charmed-glamour = { path = "../charmed_rust/crates/glamour" }
-sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
-sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
+fsqlite = { path = "../frankensqlite/crates/fsqlite" }
 ```
 
 ## Testing
@@ -41,7 +61,11 @@ We enforce a strict "no mocks" policy for core logic. Tests use real filesystem 
 ### Unit & Integration Tests
 
 ```bash
-# Run all tests
+# Authoritative: the DSR recipe runs `cargo test --locked --all-targets --no-fail-fast`
+# through rch together with fmt/check/clippy/installer/reachability
+dsr quality --tool pi_agent_rust
+
+# Inner loop only (not a quality claim)
 rch exec -- cargo test
 
 # Run specific module

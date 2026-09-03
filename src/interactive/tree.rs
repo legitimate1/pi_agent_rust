@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use asupersync::sync::OwnedMutexGuard;
+
 use crate::model::{ContentBlock, UserContent};
 use crate::session::{Session, SessionEntry, SessionMessage};
 use crate::theme::TuiStyles;
@@ -277,8 +279,8 @@ fn fork_candidates(session: &Session) -> Vec<ForkCandidate> {
 impl PiApp {
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_fork(&mut self, args: &str) -> Option<Cmd> {
-        if self.agent_state != AgentState::Idle {
-            self.status_message = Some("Cannot fork while processing a request".to_string());
+        if let Some(reason) = self.session_transition_blocker() {
+            self.status_message = Some(reason.to_string());
             return None;
         }
 
@@ -343,6 +345,7 @@ impl PiApp {
         let event_tx = self.event_tx.clone();
         let session = Arc::clone(&self.session);
         let agent = Arc::clone(&self.agent);
+        let admission = self.session_action_admission.clone();
         let extensions = self.extensions.clone();
         let model_provider = self.model_entry.model.provider.clone();
         let model_id = self.model_entry.model.id.clone();
@@ -384,7 +387,7 @@ impl PiApp {
             }
 
             let (fork_plan, parent_path, session_dir) = {
-                let guard = match session.lock(&cx).await {
+                let guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         let _ = crate::interactive::enqueue_pi_event(
@@ -437,58 +440,31 @@ impl PiApp {
             }
 
             let messages_for_agent = new_session.to_messages_for_current_path();
+            let (messages, usage) = conversation_from_session(&new_session);
+            if let Err(err) = Self::try_install_session(
+                &session,
+                &agent,
+                &admission,
+                new_session,
+                messages_for_agent,
+                None,
+            )
+            .await
             {
-                let mut agent_guard = match agent.lock(&cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                agent_guard.replace_messages(messages_for_agent);
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::AgentError(err.to_string()),
+                )
+                .await;
+                return;
             }
-
-            {
-                let mut guard = match session.lock(&cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                *guard = new_session;
-            }
-
-            let (messages, usage) = {
-                let guard = match session.lock(&cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &cx,
-                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                conversation_from_session(&guard)
-            };
 
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
                 &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
                 PiMsg::ConversationReset {
+                    session_id: new_session_id.clone(),
                     messages,
                     usage,
                     status: Some(format!("Forked new session from {}", selection.summary)),
@@ -499,7 +475,10 @@ impl PiApp {
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
                 &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                PiMsg::SetEditorText(selected_text),
+                PiMsg::SetEditorText {
+                    owner_session_id: new_session_id.clone(),
+                    text: selected_text,
+                },
             )
             .await;
 

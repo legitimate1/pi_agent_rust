@@ -9,6 +9,9 @@ rustc-ice-*.txt
 # bv (beads viewer) local config and caches
 .bv/
 
+# Agent Mail doctor runs and backups
+.doctor/
+
 # br local history backups and quarantine
 .beads/.br_history/
 .beads/.br_history_quarantine/
@@ -121,11 +124,17 @@ tests/evidence_bundle/*
 !tests/evidence_bundle/index.json
 !tests/evidence_bundle/events.jsonl
 !tests/evidence_bundle/bundle_report.md
-tests/edit_repro.rs
-
 # Build artifacts (concurrent agent output)
 artifacts/
 release_artifacts/
+# The unanchored `artifacts/` rule above also swallows the vendored extension
+# conformance corpus; re-include only the vendored pi-better-compaction tree
+# (bd-8ma6q) without exposing ignored junk elsewhere under the corpus.
+!tests/ext_conformance/artifacts/
+tests/ext_conformance/artifacts/*
+!tests/ext_conformance/artifacts/third-party/
+tests/ext_conformance/artifacts/third-party/*
+!tests/ext_conformance/artifacts/third-party/lll9p-pi-better-compaction/
 
 # Python bytecode caches
 __pycache__/
@@ -218,8 +227,13 @@ src/bin/test_time.rs
 /fix_tools_write.rs
 
 # ACFS ephemeral patterns (auto-generated agent artifacts)
-core
-core.*
+# NOTE: a bare `core` pattern here used to swallow the vendored
+# legacy_pi_mono_code/.../src/core/ directory (the slash-differential
+# suite's pi-mono runner), so the pattern is anchored to the repo root.
+/core
+/core.*
+core.[0-9]*
+!src/extensions/tests/core.rs
 cline.mcp.json
 codex.mcp.json
 cursor.mcp.json
@@ -273,3 +287,21 @@ storage.sqlite3-wal.corrupt-*
 /ubs.txt
 /ubs_findings.jsonl
 /ubs_findings.txt
+.env
+agy.mcp.json
+factory.mcp.json
+
+# Crash-recovery / merge debris (must-pass source snapshot gate hygiene)
+*.orig
+*.rej
+*.root_full_recovery
+*.empty_recovery
+
+# Large ad-hoc fixture drops under ext conformance artifacts
+tests/ext_conformance/artifacts/doom-overlay/doom1.wad
+tests/ext_conformance/artifacts/doom-overlay/doom-debug.log
+
+# macOS metadata & host scratch debris
+.DS_Store
+README.md:*
+root@*

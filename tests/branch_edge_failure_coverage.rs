@@ -239,8 +239,12 @@ fn truncate_tail_many_empty_lines() {
 #[test]
 fn process_file_arguments_nonexistent_file() {
     let dir = TempDir::new().unwrap();
-    let result =
-        pi::tools::process_file_arguments(&["nonexistent.txt".to_string()], dir.path(), false);
+    let result = pi::tools::process_file_arguments(
+        &["nonexistent.txt".to_string()],
+        dir.path(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("Cannot access file"));
@@ -255,6 +259,7 @@ fn process_file_arguments_empty_file_skipped() {
         &[empty_file.to_string_lossy().to_string()],
         dir.path(),
         false,
+        &pi::workspace::WorkspaceHandle::default(),
     )
     .unwrap();
     assert!(result.text.is_empty());
@@ -271,6 +276,7 @@ fn process_file_arguments_rejects_outside_cwd() {
         &[outside_file.to_string_lossy().to_string()],
         dir.path(),
         false,
+        &pi::workspace::WorkspaceHandle::default(),
     );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -286,6 +292,7 @@ fn process_file_arguments_text_file_wrapped_in_tags() {
         &[text_file.to_string_lossy().to_string()],
         dir.path(),
         false,
+        &pi::workspace::WorkspaceHandle::default(),
     )
     .unwrap();
     assert!(result.text.contains("<file name="));
@@ -302,6 +309,7 @@ fn process_file_arguments_text_file_without_trailing_newline() {
         &[text_file.to_string_lossy().to_string()],
         dir.path(),
         false,
+        &pi::workspace::WorkspaceHandle::default(),
     )
     .unwrap();
     // The function adds a newline if content doesn't end with one
@@ -322,6 +330,7 @@ fn process_file_arguments_multiple_files() {
         ],
         dir.path(),
         false,
+        &pi::workspace::WorkspaceHandle::default(),
     )
     .unwrap();
     assert!(result.text.contains("first"));
@@ -352,6 +361,7 @@ fn process_file_arguments_png_image_detected() {
         &[img_file.to_string_lossy().to_string()],
         dir.path(),
         false,
+        &pi::workspace::WorkspaceHandle::default(),
     )
     .unwrap();
     assert!(!result.images.is_empty());
@@ -811,6 +821,7 @@ fn build_initial_content_text_only() {
     let initial = app::InitialMessage {
         text: "hello world".to_string(),
         images: vec![],
+        keyword_scan_source: "hello world".to_string(),
     };
     let blocks = app::build_initial_content(&initial);
     assert_eq!(blocks.len(), 1);
@@ -828,6 +839,7 @@ fn build_initial_content_with_images() {
             data: "base64data".to_string(),
             mime_type: "image/png".to_string(),
         }],
+        keyword_scan_source: "describe this".to_string(),
     };
     let blocks = app::build_initial_content(&initial);
     assert_eq!(blocks.len(), 2);
@@ -849,6 +861,7 @@ fn build_initial_content_multiple_images() {
                 mime_type: "image/jpeg".to_string(),
             },
         ],
+        keyword_scan_source: "compare".to_string(),
     };
     let blocks = app::build_initial_content(&initial);
     assert_eq!(blocks.len(), 3); // 1 text + 2 images
@@ -873,6 +886,8 @@ fn build_system_prompt_test_mode_uses_placeholders() {
         package_dir,
         true, // test_mode
         true, // include_cwd
+        None,
+        &pi::config::Config::default(),
     )
     .expect("build system prompt");
     assert!(prompt.contains("<TIMESTAMP>"));
@@ -895,6 +910,8 @@ fn build_system_prompt_non_test_mode_uses_real_values() {
         package_dir,
         false,
         true,
+        None,
+        &pi::config::Config::default(),
     )
     .expect("build system prompt");
     assert!(!prompt.contains("<TIMESTAMP>"));
@@ -916,6 +933,8 @@ fn build_system_prompt_with_skills_prompt() {
         package_dir,
         true,
         true,
+        None,
+        &pi::config::Config::default(),
     )
     .expect("build system prompt");
     assert!(prompt.contains("Available Skills"));
@@ -937,6 +956,8 @@ fn build_system_prompt_includes_hashline_edit_description_and_guideline() {
         package_dir,
         true,
         true,
+        None,
+        &pi::config::Config::default(),
     )
     .expect("build system prompt");
     assert!(
@@ -1057,7 +1078,7 @@ fn format_error_summary_skipped_when_contained_in_message() {
 
 #[test]
 fn format_error_with_hints_sqlite_locked() {
-    // Sqlite errors need special handling since we need the sqlmodel_core::Error type
+    // Sqlite errors need special handling since we need the fsqlite::FrankenError type
     // Test with session "locked" since that's matchable without sqlite
     let err = Error::session("session file locked by another process");
     let formatted = format_error_with_hints(&err);

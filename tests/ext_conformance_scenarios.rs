@@ -15,7 +15,7 @@ use pi::conformance::normalization::{is_path_key, path_suffix_match};
 use pi::extensions::{
     ExtensionAiCompletionRequest, ExtensionHostActions, ExtensionManager, ExtensionPolicy,
     ExtensionPolicyMode, ExtensionSendMessage, ExtensionSendUserMessage, ExtensionSession,
-    HostcallInterceptor, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
+    HostcallInterceptor, JsExtensionLoadSpec, JsExtensionRuntimeHandle, SessionActionOrigin,
 };
 use pi::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntimeConfig};
 use pi::resources::{
@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tempfile::TempDir;
 
 // ─── Paths ──────────────────────────────────────────────────────────────────
 
@@ -480,6 +481,86 @@ fn resolve_extension_path(extension_id: &str, items: &[SampleItem]) -> Option<Pa
     None
 }
 
+/// Copy a focused base-fixture entry into a one-entry root before loading it.
+///
+/// The production loader deliberately discovers sibling `index.*` files so a
+/// multi-entry extension package can be loaded from any declared entrypoint.
+/// `base_fixtures`, however, is a test corpus containing independent positive
+/// and negative extensions as siblings. Focused scenario fixtures must not let
+/// an intentionally-invalid sibling poison the selected case.
+struct FocusedFixtureIsolation {
+    entry_path: PathBuf,
+    // Keep the temporary root alive for as long as the isolated entry path is
+    // in use. The leading underscore documents the lifetime-only purpose and
+    // prevents an all-target Clippy run from treating it as dead state.
+    _root: TempDir,
+}
+
+fn copy_fixture_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir(destination)
+        .map_err(|error| format!("create isolated fixture directory: {error}"))?;
+    let entries = fs::read_dir(source)
+        .map_err(|error| format!("read focused scenario fixture directory: {error}"))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("read focused scenario fixture entry: {error}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("inspect focused scenario fixture entry: {error}"))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_fixture_tree(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &destination_path)
+                .map_err(|error| format!("copy focused scenario fixture file: {error}"))?;
+        } else {
+            return Err(format!(
+                "focused scenario fixture contains unsupported filesystem entry: {}",
+                source_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn isolate_focused_base_fixture_entry(
+    extension_path: &Path,
+) -> Result<FocusedFixtureIsolation, String> {
+    let base_fixtures = artifacts_dir().join("base_fixtures");
+    if !extension_path.starts_with(&base_fixtures) {
+        return Err(format!(
+            "focused fixture path is outside base_fixtures: {}",
+            extension_path.display()
+        ));
+    }
+
+    let fixture_dir = extension_path
+        .parent()
+        .ok_or_else(|| "focused scenario fixture has no parent directory".to_string())?;
+    let fixture_id = fixture_dir
+        .file_name()
+        .ok_or_else(|| "focused scenario fixture has no fixture id".to_string())?;
+    let relative_entry = extension_path
+        .strip_prefix(fixture_dir)
+        .map_err(|error| format!("resolve focused scenario fixture entry: {error}"))?;
+    let prefix = format!(
+        "pi-ext-scenario-fixture-{}-",
+        sanitize_path_for_dir(Path::new(fixture_id))
+    );
+    let root = tempfile::Builder::new()
+        .prefix(&prefix)
+        .tempdir()
+        .map_err(|error| format!("create isolated scenario fixture root: {error}"))?;
+    let isolated_fixture_dir = root.path().join(fixture_id);
+    copy_fixture_tree(fixture_dir, &isolated_fixture_dir)?;
+
+    Ok(FocusedFixtureIsolation {
+        entry_path: isolated_fixture_dir.join(relative_entry),
+        _root: root,
+    })
+}
+
 struct LoadedExtension {
     manager: ExtensionManager,
     runtime: JsExtensionRuntimeHandle,
@@ -508,6 +589,7 @@ fn load_extension(extension_path: &Path) -> Result<LoadedExtension, String> {
     env.insert("PI_DETERMINISTIC_CWD".to_string(), settings.cwd.clone());
     env.insert("PI_DETERMINISTIC_HOME".to_string(), settings.home.clone());
     env.insert("HOME".to_string(), settings.home.clone());
+    env.insert("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string());
     if let Some(random_value) = settings.random_value {
         env.insert("PI_DETERMINISTIC_RANDOM".to_string(), random_value);
     } else {
@@ -608,7 +690,7 @@ fn discover_template_paths(extension_root: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn execute_resource_discovery_scenario(extension_path: &Path) -> Result<Value, String> {
+fn execute_resource_discovery_scenario(extension_path: &Path) -> Value {
     let extension_root = extension_root_from_path(extension_path);
     let prompt_dir = extension_root.join("prompts");
     let skill_dir = extension_root.join("skills");
@@ -652,20 +734,20 @@ fn execute_resource_discovery_scenario(extension_path: &Path) -> Result<Value, S
     );
     let template_paths = relative_paths(&extension_root, discover_template_paths(&extension_root));
 
-    Ok(serde_json::json!({
+    serde_json::json!({
         "promptPaths": sorted_path_strings(prompt_paths),
         "skillPaths": sorted_path_strings(skill_paths),
         "themePaths": sorted_path_strings(theme_paths),
         "templatePaths": sorted_path_strings(template_paths),
-    }))
+    })
 }
 
-fn execute_template_scenario(extension_path: &Path) -> Result<Value, String> {
+fn execute_template_scenario(extension_path: &Path) -> Value {
     let extension_root = extension_root_from_path(extension_path);
     let template_paths = relative_paths(&extension_root, discover_template_paths(&extension_root));
-    Ok(serde_json::json!({
+    serde_json::json!({
         "templatePaths": sorted_path_strings(template_paths),
-    }))
+    })
 }
 
 /// Execute a tool scenario: call the tool and check expectations.
@@ -1185,12 +1267,12 @@ fn check_expectations_inner(
     }
 
     // Check returns_contains: deep partial match on result JSON
-    if let Some(expected) = &expect.returns_contains {
-        if !json_contains(result, expected) {
-            diffs.push(format!(
-                "returns_contains: expected {expected} to be contained in {result}"
-            ));
-        }
+    if let Some(expected) = &expect.returns_contains
+        && !json_contains(result, expected)
+    {
+        diffs.push(format!(
+            "returns_contains: expected {expected} to be contained in {result}"
+        ));
     }
 
     // Check action: check result action field (for input transforms)
@@ -1646,10 +1728,10 @@ impl MockSpecInterceptor {
             if rule.command != cmd {
                 continue;
             }
-            if let Some(expected_args) = &rule.args_pattern {
-                if *expected_args != args {
-                    continue;
-                }
+            if let Some(expected_args) = &rule.args_pattern
+                && *expected_args != args
+            {
+                continue;
             }
             return serde_json::json!({
                 "stdout": rule.result.get("stdout").and_then(Value::as_str).unwrap_or(""),
@@ -1670,15 +1752,15 @@ impl MockSpecInterceptor {
         let req_url = payload.get("url").and_then(Value::as_str).unwrap_or("");
 
         for rule in &self.http_rules {
-            if let Some(method) = &rule.method {
-                if !method.eq_ignore_ascii_case(req_method) {
-                    continue;
-                }
+            if let Some(method) = &rule.method
+                && !method.eq_ignore_ascii_case(req_method)
+            {
+                continue;
             }
-            if let Some(url_pat) = &rule.url_contains {
-                if !req_url.contains(url_pat.as_str()) {
-                    continue;
-                }
+            if let Some(url_pat) = &rule.url_contains
+                && !req_url.contains(url_pat.as_str())
+            {
+                continue;
             }
             return rule.response.clone();
         }
@@ -1870,12 +1952,20 @@ impl ExtensionSession for ConformanceSession {
         self.branch.lock().unwrap().clone()
     }
 
-    async fn set_name(&self, name: String) -> pi::error::Result<()> {
+    async fn set_name(
+        &self,
+        name: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         *self.name.lock().unwrap() = Some(name);
         Ok(())
     }
 
-    async fn append_message(&self, message: SessionMessage) -> pi::error::Result<()> {
+    async fn append_message(
+        &self,
+        message: SessionMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         self.messages.lock().unwrap().push(message);
         Ok(())
     }
@@ -1884,6 +1974,7 @@ impl ExtensionSession for ConformanceSession {
         &self,
         custom_type: String,
         data: Option<Value>,
+        _origin: Option<SessionActionOrigin>,
     ) -> pi::error::Result<()> {
         self.entries.lock().unwrap().push(serde_json::json!({
             "type": custom_type,
@@ -1892,7 +1983,12 @@ impl ExtensionSession for ConformanceSession {
         Ok(())
     }
 
-    async fn set_model(&self, provider: String, model_id: String) -> pi::error::Result<()> {
+    async fn set_model(
+        &self,
+        provider: String,
+        model_id: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         *self.model.lock().unwrap() = (Some(provider), Some(model_id));
         Ok(())
     }
@@ -1901,7 +1997,11 @@ impl ExtensionSession for ConformanceSession {
         self.model.lock().unwrap().clone()
     }
 
-    async fn set_thinking_level(&self, level: String) -> pi::error::Result<()> {
+    async fn set_thinking_level(
+        &self,
+        level: String,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         *self.thinking_level.lock().unwrap() = Some(level);
         Ok(())
     }
@@ -1910,7 +2010,12 @@ impl ExtensionSession for ConformanceSession {
         self.thinking_level.lock().unwrap().clone()
     }
 
-    async fn set_label(&self, target_id: String, label: Option<String>) -> pi::error::Result<()> {
+    async fn set_label(
+        &self,
+        target_id: String,
+        label: Option<String>,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         self.labels.lock().unwrap().push((target_id, label));
         Ok(())
     }
@@ -1966,6 +2071,7 @@ fn load_extension_with_mocks(
     env.insert("PI_DETERMINISTIC_CWD".to_string(), settings.cwd.clone());
     env.insert("PI_DETERMINISTIC_HOME".to_string(), settings.home.clone());
     env.insert("HOME".to_string(), settings.home.clone());
+    env.insert("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string());
     if let Some(random_value) = settings.random_value {
         env.insert("PI_DETERMINISTIC_RANDOM".to_string(), random_value);
     } else {
@@ -2177,44 +2283,41 @@ const fn needs_unsupported_setup(_scenario: &Scenario) -> Option<String> {
 
 /// Check whether a scenario needs mock infrastructure (interceptor, session, etc.).
 fn needs_mock_loader(scenario: &Scenario) -> bool {
-    if let Some(setup) = &scenario.setup {
-        if setup.get("mock_exec").is_some()
+    if let Some(setup) = &scenario.setup
+        && (setup.get("mock_exec").is_some()
             || setup.get("mock_http").is_some()
             || setup.get("mock_model_registry").is_some()
             || setup.get("session_branch").is_some()
             || setup.get("session_leaf_entry").is_some()
             || setup.get("flags").is_some()
-            || setup.get("state").is_some()
-        {
-            return true;
-        }
+            || setup.get("state").is_some())
+    {
+        return true;
     }
     // Scenarios with UI interaction responses
-    if let Some(input) = &scenario.input {
-        if input
+    if let Some(input) = &scenario.input
+        && input
             .pointer("/ctx/ui_responses")
             .is_some_and(|v| !v.is_null())
-        {
-            return true;
-        }
+    {
+        return true;
     }
     // Multi-step scenarios
     if scenario.steps.is_some() {
         return true;
     }
     // Scenarios that check interceptor-dependent expectations
-    if let Some(expect) = &scenario.expect {
-        if expect.ui_notify_contains.is_some()
+    if let Some(expect) = &scenario.expect
+        && (expect.ui_notify_contains.is_some()
             || expect.ui_status_key.is_some()
             || expect.ui_status_contains_sequence.is_some()
             || expect.exec_called.is_some()
             || expect.active_tools.is_some()
             || expect.returns_contains.is_some()
             || expect.action.is_some()
-            || expect.content_types.is_some()
-        {
-            return true;
-        }
+            || expect.content_types.is_some())
+    {
+        return true;
     }
     false
 }
@@ -2587,14 +2690,34 @@ fn run_scenario(
             ..base
         });
     };
+    let fixture_isolation = if item.is_some_and(|item| item.source_tier == "fixture") {
+        match isolate_focused_base_fixture_entry(&ext_path) {
+            Ok(isolation) => Some(isolation),
+            Err(error) => {
+                return finalize_scenario_result(ScenarioResult {
+                    status: "error".to_string(),
+                    error: Some(error),
+                    duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ..base
+                });
+            }
+        }
+    } else {
+        None
+    };
+    let load_path = fixture_isolation
+        .as_ref()
+        .map_or(ext_path.as_path(), |isolation| {
+            isolation.entry_path.as_path()
+        });
 
     // Decide whether to use mock-based or plain loader
     if needs_mock_loader(scenario) {
-        return run_scenario_with_mocks(ext, scenario, &ext_path, start, base);
+        return run_scenario_with_mocks(ext, scenario, load_path, start, base);
     }
 
     // Load extension (plain path - no mocks needed)
-    let loaded = match load_extension(&ext_path) {
+    let loaded = match load_extension(load_path) {
         Ok(loaded) => loaded,
         Err(err) => {
             return finalize_scenario_result(ScenarioResult {
@@ -2637,8 +2760,8 @@ fn run_scenario(
         }
         "command" => execute_command_scenario(&loaded, scenario, &ext_path),
         "event" => execute_event_scenario(&loaded, scenario, &ext_path),
-        "resource_discovery" => execute_resource_discovery_scenario(&ext_path),
-        "template" => execute_template_scenario(&ext_path),
+        "resource_discovery" => Ok(execute_resource_discovery_scenario(&ext_path)),
+        "template" => Ok(execute_template_scenario(&ext_path)),
         "mcp" => execute_mcp_scenario(
             &loaded.runtime,
             &loaded.manager,
@@ -2801,8 +2924,8 @@ fn run_scenario_with_mocks(
         }
         "command" => execute_command_scenario_with_mocks(&loaded, scenario, ext_path),
         "event" => execute_event_scenario_with_mocks(&loaded, scenario, ext_path),
-        "resource_discovery" => execute_resource_discovery_scenario(ext_path),
-        "template" => execute_template_scenario(ext_path),
+        "resource_discovery" => Ok(execute_resource_discovery_scenario(ext_path)),
+        "template" => Ok(execute_template_scenario(ext_path)),
         "mcp" => execute_mcp_scenario(
             &loaded.runtime,
             &loaded.manager,
@@ -3012,27 +3135,26 @@ fn write_triage_report(
             if let Some(ms) = obj.get("total_ms").and_then(Value::as_u64) {
                 obj.insert("total_ms".to_string(), Value::from(ms + r.duration_ms));
             }
-            if let Some(category) = &r.failure_category {
-                if let Some(category_map) = obj
+            if let Some(category) = &r.failure_category
+                && let Some(category_map) = obj
                     .get_mut("failure_categories")
                     .and_then(Value::as_object_mut)
-                {
-                    let count = category_map
-                        .get(category)
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    category_map.insert(category.clone(), Value::from(count + 1));
-                }
+            {
+                let count = category_map
+                    .get(category)
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                category_map.insert(category.clone(), Value::from(count + 1));
             }
-            if r.status == "fail" || r.status == "error" {
-                if let Some(arr) = obj.get_mut("failures").and_then(Value::as_array_mut) {
-                    arr.push(serde_json::json!({
-                        "scenario_id": r.scenario_id,
-                        "diffs": r.diffs,
-                        "error": r.error,
-                        "failure_category": r.failure_category,
-                    }));
-                }
+            if (r.status == "fail" || r.status == "error")
+                && let Some(arr) = obj.get_mut("failures").and_then(Value::as_array_mut)
+            {
+                arr.push(serde_json::json!({
+                    "scenario_id": r.scenario_id,
+                    "diffs": r.diffs,
+                    "error": r.error,
+                    "failure_category": r.failure_category,
+                }));
             }
         }
     }
@@ -3108,6 +3230,34 @@ fn load_scenario_fixture(name: &str) -> (ScenarioExtension, Vec<SampleItem>) {
     };
 
     (extension, vec![item])
+}
+
+#[test]
+fn focused_fixture_isolation_preserves_identity_and_assets() {
+    let original = artifacts_dir().join("base_fixtures/minimal_resources/index.ts");
+    let isolation = isolate_focused_base_fixture_entry(&original).expect("isolate focused fixture");
+
+    let spec = JsExtensionLoadSpec::from_entry_path(&isolation.entry_path)
+        .expect("derive isolated extension spec");
+    assert_eq!(spec.extension_id, "minimal_resources");
+    let isolated_fixture_dir = isolation
+        .entry_path
+        .parent()
+        .expect("isolated fixture directory");
+    assert!(
+        isolated_fixture_dir
+            .join("prompts/test-prompt.md")
+            .is_file()
+    );
+    assert!(isolated_fixture_dir.join("skills/test-skill.md").is_file());
+    assert!(
+        !isolation
+            ._root
+            .path()
+            .join("negative_invalid_tool_schema")
+            .exists(),
+        "focused isolation must not copy sibling fixtures"
+    );
 }
 
 #[test]
@@ -3625,12 +3775,384 @@ fn scenario_pi_ai_helpers_fail_closed() {
     );
 }
 
+/// Focused test: vendored pi-better-compaction (gh #167, bd-8ma6q) registers
+/// all three upstream hooks and fails open across the current host API
+/// surface.
+///
+/// `before_provider_request` is a known host event (bd-1q31s): the Responses
+/// provider fires it with the fully-built request body before each send.
+/// Dispatching it through the harness without a resolvable ctx.model must
+/// still resolve to the plugin's `missing-model` skip path rather than an
+/// error.
+#[test]
+fn scenario_pi_better_compaction_registers_and_fails_open() {
+    let (ext, mut items) = load_scenario_fixture("third-party__lll9p-pi-better-compaction");
+    // The vendored artifact lives in the third-party corpus tier, not in
+    // `base_fixtures`, so opt out of the focused base-fixture isolation that
+    // `source_tier == "fixture"` would trigger.
+    for item in &mut items {
+        item.source_tier = "third-party-github".to_string();
+    }
+
+    assert_eq!(
+        ext.scenarios.len(),
+        4,
+        "fixture should carry registration + three fail-open event scenarios"
+    );
+    for scenario in &ext.scenarios {
+        let result = run_scenario(&ext, scenario, &items);
+        assert_eq!(
+            result.status, "pass",
+            "pi-better-compaction scenario '{}' failed: diffs={:?} error={:?} skip={:?}",
+            scenario.id, result.diffs, result.error, result.skip_reason
+        );
+    }
+}
+
+/// Spy host bridge for the pi-better-compaction acceptance flow (gh #167,
+/// bd-8ma6q). Records every `ctx.compact()` / `pi.events("compact")` call so a
+/// test can prove whether the plugin actually reached the host compaction
+/// bridge, and returns the well-formed shape a real bridge produces
+/// (`AgentSessionHostActions::compact_session`, `src/agent.rs:3738`, +
+/// `tokensAfter` from the post-compaction notification, `src/agent.rs:9158`).
+struct CompactBridgeSpyHostActions {
+    compact_calls: Mutex<Vec<Value>>,
+}
+
+impl CompactBridgeSpyHostActions {
+    const fn new() -> Self {
+        Self {
+            compact_calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn compact_call_count(&self) -> usize {
+        self.compact_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+#[async_trait]
+impl ExtensionHostActions for CompactBridgeSpyHostActions {
+    async fn send_message(
+        &self,
+        _message: ExtensionSendMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
+        Ok(())
+    }
+
+    async fn send_user_message(
+        &self,
+        _message: ExtensionSendUserMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
+        Ok(())
+    }
+
+    async fn compact_session(&self, preparation: Value) -> pi::error::Result<Value> {
+        let first_kept = preparation
+            .get("firstKeptEntryId")
+            .and_then(Value::as_str)
+            .unwrap_or("entry-keep-1")
+            .to_string();
+        let tokens_before = preparation
+            .get("tokensBefore")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        self.compact_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(preparation);
+        // Mirror the real host bridge result contract: {summary,
+        // firstKeptEntryId, tokensBefore, details} plus the tokensAfter field
+        // the host attaches to compaction payloads.
+        Ok(serde_json::json!({
+            "summary": "recap: investigate the flaky scheduler test; keep open work items",
+            "firstKeptEntryId": first_kept,
+            "tokensBefore": tokens_before,
+            "tokensAfter": 8_200,
+            "details": { "readFiles": ["src/lib.rs"], "modifiedFiles": ["src/agent.rs"] }
+        }))
+    }
+}
+
+/// End-to-end acceptance flow for the vendored pi-better-compaction extension
+/// (gh #167, bd-8ma6q). Drives the 7-step acceptance flow against the *current*
+/// host API surface and asserts the real behavior — genuine E2E execution where
+/// the plugin can reach a landed API, documented graceful degradation where a
+/// deliberate host boundary keeps it fail-open.
+///
+/// KEY FINDING (credential boundary): pi-better-compaction gates *both* of its
+/// compaction branches on `ctx.modelRegistry.getApiKeyAndHeaders(model)`, which
+/// the host DELIBERATELY does not expose to sandboxed JS (gh #167 / bd-j8sxn;
+/// see `src/extensions_js.rs:1663`). The Responses branch (raw `fetch` to
+/// `/responses/compact` in compact-client.ts) needs that API key, and the
+/// native-fallback branch calls `getApiKeyAndHeaders` directly. With the key
+/// withheld, the Responses branch resolves `missing-api-key` and the fallback
+/// resolves `auth-failed`/`no-model-configured`, so the plugin returns
+/// undefined and pi's own native compaction proceeds. Consequently the landed
+/// `ctx.compact()` host bridge, `buildSessionContext`, `convertToLlm`, and the
+/// Responses `before_provider_request` rewrite re-ingest are all implemented and
+/// independently tested, but THIS plugin never reaches them end-to-end. Steps
+/// that depend on that credential are asserted as graceful degradation, not
+/// faked as passes.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn scenario_pi_better_compaction_e2e_acceptance() {
+    let (ext, items) = load_scenario_fixture("third-party__lll9p-pi-better-compaction");
+    let ext_path =
+        resolve_extension_path(&ext.extension_id, &items).expect("resolve pi-better-compaction");
+    let loaded = load_extension(&ext_path).expect("load pi-better-compaction extension");
+
+    // Install a spy compaction bridge so we can observe whether the plugin ever
+    // reaches ctx.compact() and provide a well-formed host response if it does.
+    let actions = Arc::new(CompactBridgeSpyHostActions::new());
+    loaded.manager.set_host_actions(actions.clone());
+
+    // ── Step 1: load + registration ─────────────────────────────────────────
+    // The extension loaded (above) and registered all three upstream hooks.
+    let hooks = loaded.manager.list_event_hooks();
+    for expected in [
+        "session_start",
+        "session_before_compact",
+        "before_provider_request",
+    ] {
+        assert!(
+            hooks.iter().any(|h| h == expected),
+            "step 1: expected hook '{expected}' registered, got {hooks:?}"
+        );
+    }
+
+    // Realistic host context for a Responses-family session mid-conversation:
+    // current model on the openai-responses API, a live session identity, a
+    // branch, a system prompt, and a model catalog for modelRegistry.find.
+    let settings = deterministic_settings_for(&ext_path);
+    let current_model = serde_json::json!({
+        "provider": "openai",
+        "id": "gpt-5.2-codex",
+        "api": "openai-responses",
+        "baseUrl": "https://api.openai.com/v1/responses",
+    });
+    let ctx = serde_json::json!({
+        "hasUI": false,
+        "cwd": settings.cwd,
+        "model": current_model,
+        "models": [
+            current_model,
+            {
+                "provider": "anthropic",
+                "id": "claude-sonnet-4-6",
+                "api": "anthropic-messages",
+                "baseUrl": "https://api.anthropic.com/v1/messages",
+            }
+        ],
+        "systemPrompt": "You are pi, a coding agent.",
+        "sessionState": {
+            "sessionId": "sess-e2e-8ma6q",
+            "sessionFile": "/private/tmp/pi-tests/sess-e2e-8ma6q.jsonl",
+        },
+        "sessionEntries": [],
+        "sessionBranch": [],
+        "modelRegistry": {},
+    });
+
+    // ── Steps 2 + 3: dispatch session_before_compact; handler is invoked ─────
+    // A full upstream preparation payload. The handler runs (config loads,
+    // resolveNativeCompactionEnvironment advances past model/api/baseUrl to the
+    // credential check). Reaching the plugin at all — without a dispatch error —
+    // proves the session_before_compact handler is invoked.
+    let compact_event = serde_json::json!({
+        "customInstructions": "focus on the open work items",
+        "preparation": {
+            "tokensBefore": 120_000,
+            "firstKeptEntryId": "entry-keep-1",
+            "previousSummary": null,
+            "messagesToSummarize": [
+                { "role": "user", "content": "investigate the flaky scheduler test" },
+                { "role": "assistant", "content": "looking into the scheduler now" }
+            ],
+            "turnPrefixMessages": []
+        }
+    });
+    let compact_result = common::run_async({
+        let runtime = loaded.runtime.clone();
+        let ctx = ctx.clone();
+        let event = compact_event.clone();
+        async move {
+            runtime
+                .dispatch_event(
+                    "session_before_compact".to_string(),
+                    event,
+                    Arc::new(ctx),
+                    DEFAULT_TIMEOUT_MS,
+                )
+                .await
+        }
+    })
+    .expect("step 3: session_before_compact dispatch must not error (handler invoked, fails open)");
+
+    // ── Step 4: native compaction result / host bridge ──────────────────────
+    // The plugin fails open here rather than producing a native result: with
+    // getApiKeyAndHeaders withheld the Responses branch is missing-api-key and
+    // the fallback is no-model-configured, so the handler returns undefined
+    // (serialized to null) — never {cancel:true} and never {compaction:...}.
+    assert!(
+        compact_result.is_null()
+            || (compact_result.get("compaction").is_none()
+                && compact_result.get("cancel") != Some(&Value::Bool(true))),
+        "step 4: expected fail-open (null / no compaction / no cancel), got {compact_result:?}"
+    );
+    // The plugin never reached ctx.compact(): it demands provider credentials the
+    // host deliberately withholds, so the host compaction bridge is not invoked.
+    assert_eq!(
+        actions.compact_call_count(),
+        0,
+        "step 4: plugin must fail open BEFORE the ctx.compact() bridge (credential boundary, bd-j8sxn)"
+    );
+
+    // Step 4 (positive half): prove the landed ctx.compact() host bridge is
+    // reachable and returns a well-formed {summary, firstKeptEntryId,
+    // tokensBefore, tokensAfter} when a plugin *does* call it. pi-better-
+    // compaction cannot (see credential boundary), so exercise the bridge wiring
+    // through a minimal probe extension: JS ctx.compact() -> pi.events("compact")
+    // -> ExtensionHostActions::compact_session -> value returned verbatim to JS.
+    let probe_dir = TempDir::new().expect("probe tempdir");
+    let probe_entry = probe_dir.path().join("index.mjs");
+    fs::write(
+        &probe_entry,
+        r#"export default function (pi) {
+  pi.on("session_before_compact", async (event, ctx) => {
+    const result = await ctx.compact(event.preparation);
+    return { probeCompact: result };
+  });
+}
+"#,
+    )
+    .expect("write probe extension");
+    let probe = load_extension(&probe_entry).expect("load probe extension");
+    let probe_actions = Arc::new(CompactBridgeSpyHostActions::new());
+    probe.manager.set_host_actions(probe_actions.clone());
+    let bridge_result = common::run_async({
+        let runtime = probe.runtime.clone();
+        let ctx = ctx.clone();
+        let event = compact_event.clone();
+        async move {
+            runtime
+                .dispatch_event(
+                    "session_before_compact".to_string(),
+                    event,
+                    Arc::new(ctx),
+                    DEFAULT_TIMEOUT_MS,
+                )
+                .await
+        }
+    })
+    .expect("probe ctx.compact() dispatch");
+    assert_eq!(
+        probe_actions.compact_call_count(),
+        1,
+        "step 4: probe must reach the host compaction bridge exactly once"
+    );
+    let bridge = bridge_result
+        .get("probeCompact")
+        .expect("step 4: ctx.compact() result returned to JS");
+    assert_eq!(
+        bridge.get("summary").and_then(Value::as_str),
+        Some("recap: investigate the flaky scheduler test; keep open work items"),
+        "step 4: bridge result carries a real summary, got {bridge:?}"
+    );
+    assert_eq!(
+        bridge.get("firstKeptEntryId").and_then(Value::as_str),
+        Some("entry-keep-1"),
+        "step 4: bridge echoes firstKeptEntryId from preparation"
+    );
+    assert_eq!(
+        bridge.get("tokensBefore").and_then(Value::as_u64),
+        Some(120_000),
+        "step 4: bridge echoes tokensBefore from preparation"
+    );
+    assert_eq!(
+        bridge.get("tokensAfter").and_then(Value::as_u64),
+        Some(8_200),
+        "step 4: bridge result carries tokensAfter"
+    );
+
+    // ── Step 5: before_provider_request fires; plugin replays/rewrites or ────
+    //            fails open. The host genuinely fires this event from the
+    //            Responses provider before each send (src/providers/
+    //            openai_responses.rs:316) and validates any rewrite via
+    //            validate_rewritten_responses_request (fail-open on rejection).
+    // Here the plugin caches request context (rememberRequestContext) then, with
+    // no resolvable API key, returns undefined — leaving the payload untouched.
+    let provider_event = serde_json::json!({
+        "payload": {
+            "model": "gpt-5.2-codex",
+            "input": [
+                { "type": "message", "role": "user", "content": "hello" }
+            ]
+        }
+    });
+    let provider_result = common::run_async({
+        let runtime = loaded.runtime.clone();
+        let ctx = ctx.clone();
+        let event = provider_event.clone();
+        async move {
+            runtime
+                .dispatch_event(
+                    "before_provider_request".to_string(),
+                    event,
+                    Arc::new(ctx),
+                    DEFAULT_TIMEOUT_MS,
+                )
+                .await
+        }
+    })
+    .expect("step 5: before_provider_request dispatch must not error");
+    // Fail-open: undefined (null) => original payload sent unchanged. If a
+    // rewrite were ever returned it would have to equal the original payload.
+    assert!(
+        provider_result.is_null()
+            || provider_result == *provider_event.get("payload").expect("payload"),
+        "step 5: expected fail-open (payload untouched), got {provider_result:?}"
+    );
+
+    // ── Step 6: Responses item fields survive raw-item replay ────────────────
+    // The plugin's rewrite path (unreached here) hands a Responses input array
+    // straight back to the provider. That the provider preserves Responses item
+    // fields on replay is proven end-to-end in the provider crate:
+    //   src/providers/openai_responses.rs
+    //     - test_stream_captures_raw_items_and_build_request_replays_them (:2396)
+    //     - validate_rewritten_responses_request re-ingest (:1487)
+    // These guarantee reasoning/message/function_call item ids and raw items
+    // round-trip verbatim, which is the invariant the plugin relies on.
+
+    // ── Step 7: normal conversation works when the plugin returns undefined ──
+    // Both dispatches above returned undefined (fail-open) with no error and no
+    // cancel, so pi's normal compaction + provider flow proceed untouched. The
+    // config-disabled path is observably identical: with config.enabled === false
+    // handleSessionBeforeCompact / handleBeforeProviderRequest return undefined
+    // immediately (extension-runtime.ts:243, :349), the same fail-open outcome
+    // asserted here.
+    assert!(
+        compact_result.is_null() || compact_result.get("compaction").is_none(),
+        "step 7: disabled/undefined path must leave native compaction to pi"
+    );
+    assert!(
+        provider_result.is_null()
+            || provider_result == *provider_event.get("payload").expect("payload"),
+        "step 7: disabled/undefined path must leave the provider request untouched"
+    );
+}
+
 struct PiAiProviderBridgeHostActions {
     completions: Mutex<Vec<ExtensionAiCompletionRequest>>,
 }
 
 impl PiAiProviderBridgeHostActions {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             completions: Mutex::new(Vec::new()),
         }
@@ -3639,11 +4161,19 @@ impl PiAiProviderBridgeHostActions {
 
 #[async_trait]
 impl ExtensionHostActions for PiAiProviderBridgeHostActions {
-    async fn send_message(&self, _message: ExtensionSendMessage) -> pi::error::Result<()> {
+    async fn send_message(
+        &self,
+        _message: ExtensionSendMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         Ok(())
     }
 
-    async fn send_user_message(&self, _message: ExtensionSendUserMessage) -> pi::error::Result<()> {
+    async fn send_user_message(
+        &self,
+        _message: ExtensionSendUserMessage,
+        _origin: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
         Ok(())
     }
 
@@ -4174,12 +4704,11 @@ fn parity_runner() {
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
     );
     let parity_dir = reports_dir().join("parity");
-    let _ = fs::create_dir_all(&parity_dir);
+    fs::create_dir_all(&parity_dir).expect("create parity report directory");
 
     eprintln!("[parity] run_id={run_id}");
 
     let mut results: Vec<ParityResult> = Vec::new();
-    let mut events: Vec<Value> = Vec::new();
 
     for ext in &sample.scenario_suite.items {
         let item = sample.items.iter().find(|i| i.id == ext.extension_id);
@@ -4320,22 +4849,6 @@ fn parity_runner() {
                 eprintln!("         {diff}");
             }
 
-            // Build per-event log
-            events.push(serde_json::json!({
-                "schema": "pi.ext.parity.v1",
-                "run_id": run_id,
-                "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-                "extension_id": ext.extension_id,
-                "scenario_id": scenario.id,
-                "kind": scenario.kind,
-                "source_tier": source_tier,
-                "runtime_tier": runtime_tier,
-                "status": status,
-                "ts_ms": ts_ms,
-                "rust_ms": rust_ms,
-                "diffs": diffs,
-            }));
-
             results.push(ParityResult {
                 status: status.to_string(),
                 diffs: diffs.clone(),
@@ -4348,17 +4861,43 @@ fn parity_runner() {
         }
     }
 
-    // Write parity JSONL
+    assert!(!results.is_empty(), "parity runner executed no scenarios");
+
+    // Write one canonical event for every result. In particular, skips and
+    // Rust/TS execution errors must not disappear into only the per-extension
+    // diagnostics, because aggregate release evidence consumes this stream.
     let parity_jsonl = parity_dir.join("parity_events.jsonl");
+    let events: Vec<Value> = results
+        .iter()
+        .map(|result| {
+            serde_json::json!({
+                "schema": "pi.ext.parity.v1",
+                "run_id": run_id,
+                "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                "extension_id": result.extension_id,
+                "scenario_id": result.scenario_id,
+                "kind": result.kind,
+                "summary": result.summary,
+                "source_tier": result.source_tier,
+                "runtime_tier": result.runtime_tier,
+                "status": result.status,
+                "ts_ms": result.ts_ms,
+                "rust_ms": result.rust_ms,
+                "diffs": result.diffs,
+                "error": result.error,
+                "skip_reason": result.skip_reason,
+            })
+        })
+        .collect();
     let lines: Vec<String> = events
         .iter()
-        .filter_map(|e| serde_json::to_string(e).ok())
+        .map(|event| serde_json::to_string(event).expect("serialize parity event"))
         .collect();
-    let _ = fs::write(&parity_jsonl, lines.join("\n") + "\n");
+    fs::write(&parity_jsonl, lines.join("\n") + "\n").expect("write canonical parity event stream");
 
     // Write per-extension parity diffs
     let ext_dir = parity_dir.join("extensions");
-    let _ = fs::create_dir_all(&ext_dir);
+    fs::create_dir_all(&ext_dir).expect("create per-extension parity report directory");
     let mut by_ext: HashMap<String, Vec<&ParityResult>> = HashMap::new();
     for r in &results {
         by_ext.entry(r.extension_id.clone()).or_default().push(r);
@@ -4367,9 +4906,11 @@ fn parity_runner() {
         let path = ext_dir.join(format!("{ext_id}.jsonl"));
         let ext_lines: Vec<String> = ext_results
             .iter()
-            .filter_map(|r| serde_json::to_string(r).ok())
+            .map(|result| {
+                serde_json::to_string(result).expect("serialize per-extension parity result")
+            })
             .collect();
-        let _ = fs::write(&path, ext_lines.join("\n") + "\n");
+        fs::write(&path, ext_lines.join("\n") + "\n").expect("write per-extension parity results");
     }
 
     // Write triage summary
@@ -4399,10 +4940,14 @@ fn parity_runner() {
         },
     });
     let triage_path = parity_dir.join("triage.json");
-    let _ = fs::write(
+    fs::write(
         &triage_path,
-        serde_json::to_string_pretty(&triage).unwrap_or_default(),
-    );
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&triage).expect("serialize parity triage")
+        ),
+    )
+    .expect("write parity triage");
 
     eprintln!(
         "[parity] Results: {matched} match, {mismatched} mismatch, {skipped} skip, {ts_errors} ts_error, {rust_errors} rust_error"
@@ -4424,6 +4969,27 @@ fn parity_runner() {
                 r.scenario_id,
                 r.extension_id,
                 r.diffs.join("; ")
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let execution_errors: Vec<&ParityResult> = results
+        .iter()
+        .filter(|result| matches!(result.status.as_str(), "ts_error" | "rust_error"))
+        .collect();
+    assert!(
+        execution_errors.is_empty(),
+        "Parity execution errors ({}):\n{}",
+        execution_errors.len(),
+        execution_errors
+            .iter()
+            .map(|result| format!(
+                "  {} ({}): {}: {}",
+                result.scenario_id,
+                result.extension_id,
+                result.status,
+                result.error.as_deref().unwrap_or("missing error detail")
             ))
             .collect::<Vec<_>>()
             .join("\n")

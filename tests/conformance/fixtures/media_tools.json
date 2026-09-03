@@ -1,0 +1,41 @@
+{
+  "version": "1.0",
+  "tool": "inspect_image",
+  "description": "inspect_image contract for bd-cv653.2.7 and bd-cv653.8.1: hermetic success, format boundary, and named error behavior.",
+  "cases": [
+    {
+      "name": "inspect_image_mock_png_success",
+      "description": "a local PNG is inspected through the hermetic mock backend",
+      "requirement_ids": ["MEDIA-1"],
+      "setup": [
+        {"type": "create_file", "path": "fixture.png", "content": "fixture-bytes"}
+      ],
+      "input": {"path": "fixture.png", "prompt": "Describe the fixture"},
+      "expected": {
+        "content_contains": ["Image Analysis for fixture.png", "Canned test fixture inspection completed successfully", "Describe the fixture"],
+        "details_exact": {"mime_type": "image/png", "size_bytes": 13}
+      }
+    },
+    {
+      "name": "inspect_image_rejects_unsupported_extension",
+      "description": "an existing file at the format boundary is rejected by extension taxonomy",
+      "requirement_ids": ["MEDIA-2"],
+      "setup": [
+        {"type": "create_file", "path": "fixture.txt", "content": "not-an-image"}
+      ],
+      "expect_error": true,
+      "error_contains": "unsupported image extension",
+      "input": {"path": "fixture.txt"},
+      "expected": {}
+    },
+    {
+      "name": "inspect_image_missing_file_error",
+      "description": "nonexistent image file produces file not found error",
+      "requirement_ids": ["MEDIA-3"],
+      "expect_error": true,
+      "error_contains": "file",
+      "input": {"path": "nonexistent_image_12345.png"},
+      "expected": {}
+    }
+  ]
+}

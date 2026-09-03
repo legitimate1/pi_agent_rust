@@ -143,7 +143,7 @@ fn is_valid_thinking_level(args: &str) -> bool {
     }
     matches!(
         level.to_ascii_lowercase().as_str(),
-        "off" | "minimal" | "low" | "medium" | "high" | "xhigh"
+        "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
     )
 }
 
@@ -172,16 +172,13 @@ pub fn canonicalize_response(mut response: Value) -> Value {
         obj.retain(|key, _| !is_nondeterministic_response_key(key));
         canonicalize_fixture_model_inventory(obj);
 
-        // Canonicalize paths to be relative
-        if let Some(path) = obj.get_mut("path") {
-            if let Some(path_str) = path.as_str() {
-                // Convert absolute paths to relative
-                if let Ok(canonical) = std::path::Path::new(path_str).canonicalize() {
-                    if let Some(file_name) = canonical.file_name() {
-                        *path = json!(file_name);
-                    }
-                }
-            }
+        // Canonicalize paths to be relative.
+        if let Some(path) = obj.get_mut("path")
+            && let Some(path_str) = path.as_str()
+            && let Ok(canonical) = std::path::Path::new(path_str).canonicalize()
+            && let Some(file_name) = canonical.file_name()
+        {
+            *path = json!(file_name);
         }
 
         // Recursively canonicalize nested objects
@@ -693,6 +690,22 @@ fn run_rust_rpc_sequence(
     run_rpc_sequence("rust", &mut child, commands)
 }
 
+/// Resolve the Node.js binary portably: prefer the pinned Linux CI path,
+/// fall back to Homebrew's darwin location, then to `node` on PATH.
+fn node_binary() -> PathBuf {
+    for candidate in [
+        "/usr/bin/node",
+        "/usr/local/bin/node",
+        "/opt/homebrew/bin/node",
+    ] {
+        let path = Path::new(candidate);
+        if path.is_file() {
+            return path.to_path_buf();
+        }
+    }
+    PathBuf::from("node")
+}
+
 fn run_pi_mono_rpc_sequence(
     paths: &RunnerPaths,
     scenario: &SlashCommandScenario,
@@ -708,7 +721,7 @@ fn run_pi_mono_rpc_sequence(
         .map_err(|err| anyhow::anyhow!("create {}: {err}", agent_dir.display()))?;
     write_fixture_models_json(&agent_dir)?;
 
-    let mut child = Command::new("/usr/bin/node")
+    let mut child = Command::new(node_binary())
         .arg(&paths.pi_mono_tsx)
         .args(["--tsconfig", "tsconfig.json"])
         .arg(&paths.pi_mono_cli)

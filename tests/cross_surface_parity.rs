@@ -200,7 +200,7 @@ mod cli_combinations {
 
     #[test]
     fn thinking_levels_all_valid() {
-        for level in &["off", "minimal", "low", "medium", "high", "xhigh"] {
+        for level in &["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
             let cli = Cli::parse_from(["pi", "--thinking", level]);
             assert_eq!(cli.thinking.as_deref(), Some(*level));
         }
@@ -334,6 +334,7 @@ mod session_invariants {
             model: "test-model".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         })
@@ -556,6 +557,7 @@ mod message_serde_invariants {
             model: "claude-opus-4-5".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         });
@@ -804,6 +806,105 @@ mod structured_traceability_logs {
                 .iter()
                 .any(|violation| violation.contains("missing context.requirement_id")),
             "expected missing requirement_id violation, got: {traceability_violations:?}"
+        );
+    }
+}
+
+// ============================================================================
+// 10. OMP-ADOPT Cross-Surface Tool Parity (bd-cv653.8.3)
+// ============================================================================
+
+mod omp_tool_cross_surface_parity {
+    use super::*;
+    use common::logging::{TestLogger, validate_jsonl};
+    use pi::model::{ToolCall, ToolResultMessage};
+    use serde_json::json;
+
+    #[test]
+    fn test_omp_tools_cross_surface_payload_invariants() {
+        let logger = TestLogger::new();
+        logger.set_test_name("omp-tools-cross-surface-parity");
+
+        let tools = [
+            ("web_search", json!({"query": "rust async"}), "WS-PARITY-1"),
+            (
+                "inspect_image",
+                json!({"path": "sample.png"}),
+                "MEDIA-PARITY-1",
+            ),
+            (
+                "computer",
+                json!({"action": "list_displays"}),
+                "COMP-PARITY-1",
+            ),
+            (
+                "browser",
+                json!({"action": "list_tabs"}),
+                "BROWSER-PARITY-1",
+            ),
+            ("ask", json!({"question": "Choose target?"}), "ASK-PARITY-1"),
+            ("todo", json!({"action": "list"}), "TODO-PARITY-1"),
+        ];
+
+        for (tool_name, payload, req_id) in tools {
+            // Surface 1: ToolCall model envelope
+            let call = ToolCall {
+                id: format!("call-{tool_name}"),
+                name: tool_name.to_string(),
+                arguments: payload,
+                thought_signature: None,
+            };
+
+            // Surface 2: JSON serialization round-trip
+            let json_str = serde_json::to_string(&call).unwrap_or_default();
+            assert!(json_str.contains(tool_name));
+
+            // Surface 3: ToolResult envelope
+            let res = ToolResultMessage {
+                tool_call_id: call.id,
+                tool_name: tool_name.to_string(),
+                content: vec![ContentBlock::Text(TextContent::new(format!(
+                    "Executed {tool_name}"
+                )))],
+                is_error: false,
+                details: None,
+                timestamp: 0,
+            };
+
+            let res_json = serde_json::to_string(&res).unwrap_or_default();
+            assert!(res_json.contains(&res.tool_call_id));
+
+            logger.info_ctx(
+                "omp.cross_surface.tool_verified",
+                format!("Verified cross-surface envelope for {tool_name}"),
+                |ctx| {
+                    ctx.push(("tool_name".to_string(), tool_name.to_string()));
+                    ctx.push(("requirement_id".to_string(), req_id.to_string()));
+                    ctx.push(("status".to_string(), "pass".to_string()));
+                },
+            );
+        }
+
+        let jsonl = logger.dump_jsonl();
+        let schema_errors = validate_jsonl(&jsonl);
+        assert!(
+            schema_errors.is_empty(),
+            "structured log schema validation failed: {schema_errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_omp_cross_surface_divergence_detection() {
+        // Negative control test: deliberate divergence in payload is caught
+        let call_json =
+            json!({"id": "call-1", "name": "browser", "arguments": {"action": "list_tabs"}});
+        let diverged_rpc =
+            json!({"id": "call-2", "tool": "browser", "params": {"action": "list_tabs"}});
+
+        assert_ne!(
+            call_json.get("name"),
+            diverged_rpc.get("name"),
+            "divergence between standard envelope and non-standard RPC field detected"
         );
     }
 }

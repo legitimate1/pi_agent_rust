@@ -414,10 +414,18 @@ fn validate_coverage_path(path: &str, field_name: &str, index: usize) -> Result<
         ));
     }
     let parsed = Path::new(&normalized);
+    // Repo-relative means the same string must resolve inside the repo on
+    // every platform, so the rejection checks operate on the normalized
+    // string rather than the host platform's `Path` semantics (gh #175: on
+    // Windows `Path::is_absolute()` requires a drive/UNC prefix, so a lone
+    // leading `/` — rooted but prefix-less — sailed through). After
+    // `normalize_coverage_path` every `\` is `/` and every `//` run is
+    // collapsed, so a single `starts_with('/')` also covers `\foo`,
+    // `//server/share`, and `\\server\share` forms. Any `X:` drive prefix
+    // (absolute `C:/x` or drive-relative `C:x`) is likewise non-portable.
     if parsed.is_absolute()
-        || looks_like_windows_absolute_path(&normalized)
-        || candidate.starts_with("\\\\")
-        || normalized.starts_with("//")
+        || normalized.starts_with('/')
+        || looks_like_windows_drive_path(&normalized)
     {
         return Err(format!(
             "{field_name}[{index}] must be repo-relative, got: {candidate}"
@@ -447,12 +455,12 @@ fn normalize_coverage_path(candidate: &str) -> String {
     normalized
 }
 
-const fn looks_like_windows_absolute_path(path: &str) -> bool {
+/// Detect any Windows drive prefix: absolute (`C:/x`, `C:\x`) and
+/// drive-relative (`C:x`) forms alike. A drive prefix can never appear in a
+/// portable repo-relative path, so all forms fail closed (gh #175).
+const fn looks_like_windows_drive_path(path: &str) -> bool {
     let bytes = path.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 fn format_elapsed_ms(elapsed_ms: u64) -> String {
@@ -961,10 +969,10 @@ impl TestLogger {
     /// Dump logs and artifacts to a file path.
     pub fn write_dump_to_path(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
         }
 
         let mut output = self.dump();
@@ -1345,10 +1353,10 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 fn write_string_to_path(path: &Path, contents: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
     fs::write(path, contents)
 }
@@ -1436,71 +1444,71 @@ pub fn validate_jsonl_line(line: &str, line_number: usize) -> Result<(), JsonlVa
     }
 
     // Type checks for numeric/string fields.
-    if let Some(seq) = obj.get("seq") {
-        if !seq.is_number() {
-            return Err(JsonlValidationError {
-                line: line_number,
-                field: "seq".to_string(),
-                message: format!("expected number, got {seq}"),
-            });
-        }
+    if let Some(seq) = obj.get("seq")
+        && !seq.is_number()
+    {
+        return Err(JsonlValidationError {
+            line: line_number,
+            field: "seq".to_string(),
+            message: format!("expected number, got {seq}"),
+        });
     }
-    if let Some(ts) = obj.get("ts") {
-        if !ts.is_string() {
-            return Err(JsonlValidationError {
-                line: line_number,
-                field: "ts".to_string(),
-                message: format!("expected string, got {ts}"),
-            });
-        }
+    if let Some(ts) = obj.get("ts")
+        && !ts.is_string()
+    {
+        return Err(JsonlValidationError {
+            line: line_number,
+            field: "ts".to_string(),
+            message: format!("expected string, got {ts}"),
+        });
     }
-    if let Some(t_ms) = obj.get("t_ms") {
-        if !t_ms.is_number() {
-            return Err(JsonlValidationError {
-                line: line_number,
-                field: "t_ms".to_string(),
-                message: format!("expected number, got {t_ms}"),
-            });
-        }
+    if let Some(t_ms) = obj.get("t_ms")
+        && !t_ms.is_number()
+    {
+        return Err(JsonlValidationError {
+            line: line_number,
+            field: "t_ms".to_string(),
+            message: format!("expected number, got {t_ms}"),
+        });
     }
 
     // V2 type checks for correlation fields.
     if schema == "pi.test.log.v2" {
-        if let Some(trace_id) = obj.get("trace_id") {
-            if !trace_id.is_string() {
-                return Err(JsonlValidationError {
-                    line: line_number,
-                    field: "trace_id".to_string(),
-                    message: format!("expected string, got {trace_id}"),
-                });
-            }
+        if let Some(trace_id) = obj.get("trace_id")
+            && !trace_id.is_string()
+        {
+            return Err(JsonlValidationError {
+                line: line_number,
+                field: "trace_id".to_string(),
+                message: format!("expected string, got {trace_id}"),
+            });
         }
-        if let Some(span_id) = obj.get("span_id") {
-            if !span_id.is_string() {
-                return Err(JsonlValidationError {
-                    line: line_number,
-                    field: "span_id".to_string(),
-                    message: format!("expected string, got {span_id}"),
-                });
-            }
+        if let Some(span_id) = obj.get("span_id")
+            && !span_id.is_string()
+        {
+            return Err(JsonlValidationError {
+                line: line_number,
+                field: "span_id".to_string(),
+                message: format!("expected string, got {span_id}"),
+            });
         }
-        if let Some(parent_span_id) = obj.get("parent_span_id") {
-            if !parent_span_id.is_string() {
-                return Err(JsonlValidationError {
-                    line: line_number,
-                    field: "parent_span_id".to_string(),
-                    message: format!("expected string, got {parent_span_id}"),
-                });
-            }
+        if let Some(parent_span_id) = obj.get("parent_span_id")
+            && !parent_span_id.is_string()
+        {
+            return Err(JsonlValidationError {
+                line: line_number,
+                field: "parent_span_id".to_string(),
+                message: format!("expected string, got {parent_span_id}"),
+            });
         }
-        if let Some(ci_correlation_id) = obj.get("ci_correlation_id") {
-            if !ci_correlation_id.is_string() {
-                return Err(JsonlValidationError {
-                    line: line_number,
-                    field: "ci_correlation_id".to_string(),
-                    message: format!("expected string, got {ci_correlation_id}"),
-                });
-            }
+        if let Some(ci_correlation_id) = obj.get("ci_correlation_id")
+            && !ci_correlation_id.is_string()
+        {
+            return Err(JsonlValidationError {
+                line: line_number,
+                field: "ci_correlation_id".to_string(),
+                message: format!("expected string, got {ci_correlation_id}"),
+            });
         }
     }
 
@@ -1522,18 +1530,15 @@ pub fn validate_jsonl_line_v2_only(
     validate_jsonl_line(line, line_number)?;
 
     // Then reject v1 log schema.
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-        if let Some(schema) = value.get("schema").and_then(|v| v.as_str()) {
-            if schema == TEST_LOG_SCHEMA_V1 {
-                return Err(JsonlValidationError {
-                    line: line_number,
-                    field: "schema".to_string(),
-                    message: format!(
-                        "deprecated schema '{schema}': new tests must use {TEST_LOG_SCHEMA}"
-                    ),
-                });
-            }
-        }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+        && let Some(schema) = value.get("schema").and_then(|v| v.as_str())
+        && schema == TEST_LOG_SCHEMA_V1
+    {
+        return Err(JsonlValidationError {
+            line: line_number,
+            field: "schema".to_string(),
+            message: format!("deprecated schema '{schema}': new tests must use {TEST_LOG_SCHEMA}"),
+        });
     }
 
     Ok(())
@@ -2899,6 +2904,38 @@ mod tests {
         let err = BeadCoverageLink::try_new("bd-3ar8v.6.11", &test_files, EvidenceType::Unit)
             .expect_err("windows absolute test-file path must fail closed");
         assert!(err.contains("repo-relative"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn bead_coverage_try_new_rejects_rooted_paths_on_every_platform() {
+        // gh #175: these shapes must fail closed on Unix AND Windows. The
+        // guard operates on the normalized string, so this test exercises
+        // the identical code path a Windows host takes.
+        for candidate in [
+            "/tmp/absolute-path.rs",      // POSIX-absolute (the reported gap)
+            "\\tmp\\absolute-path.rs",    // rooted backslash form
+            "//server/share/path.rs",     // forward-slash UNC
+            "\\\\server\\share\\path.rs", // backslash UNC
+            "C:\\temp\\absolute-path.rs", // drive-absolute, backslashes
+            "C:temp/drive-relative.rs",   // drive-relative (no root)
+            "c:onefile.rs",               // lowercase drive-relative
+        ] {
+            let test_files = vec![candidate.to_string()];
+            let err = BeadCoverageLink::try_new("bd-3ar8v.6.11", &test_files, EvidenceType::Unit)
+                .expect_err(&format!("non-portable path must fail closed: {candidate}"));
+            assert!(err.contains("repo-relative"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn bead_coverage_try_new_accepts_backslash_relative_path() {
+        // Planted negative for the gh #175 tightening: a genuinely
+        // repo-relative path written with backslashes must still be accepted
+        // (normalization maps it to forward slashes).
+        let test_files = vec!["src\\lib.rs".to_string()];
+        let link = BeadCoverageLink::try_new("bd-3ar8v.6.11", &test_files, EvidenceType::Unit)
+            .expect("backslash repo-relative path must remain accepted");
+        assert_eq!(link.test_files, vec!["src/lib.rs".to_string()]);
     }
 
     #[test]

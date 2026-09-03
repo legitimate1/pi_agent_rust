@@ -101,32 +101,34 @@ impl PiApp {
                 let action = prompt.selected_action();
                 let response = ExtensionUiResponse {
                     id: prompt.request.id.clone(),
-                    value: Some(Value::Bool(action.is_allow())),
+                    value: Some(json!({
+                        "allow": action.is_allow(),
+                        "persist": action.is_persistent(),
+                        "remember": action.is_persistent(),
+                    })),
                     cancelled: false,
                 };
-                // Record persistent decisions for "Always" choices.
-                if action.is_persistent() {
-                    if let Ok(mut store) = crate::permissions::PermissionStore::open_default() {
-                        let _ = store.record(
-                            &prompt.extension_id,
-                            &prompt.capability,
-                            action.is_allow(),
-                        );
-                    }
-                }
+                prompt.cancel_timer();
                 self.capability_prompt = None;
                 self.send_extension_ui_response(response);
+                return self.activate_next_capability_prompt();
             }
 
             // Escape = deny once.
             KeyType::Esc => {
                 let response = ExtensionUiResponse {
                     id: prompt.request.id.clone(),
-                    value: Some(Value::Bool(false)),
+                    value: Some(json!({
+                        "allow": false,
+                        "persist": false,
+                        "remember": false,
+                    })),
                     cancelled: true,
                 };
+                prompt.cancel_timer();
                 self.capability_prompt = None;
                 self.send_extension_ui_response(response);
+                return self.activate_next_capability_prompt();
             }
 
             _ => {}
@@ -351,11 +353,11 @@ impl PiApp {
             return (false, None);
         }
         let now = std::time::Instant::now();
-        if let Some(last_time) = self.last_escape_time {
-            if now.duration_since(last_time) < std::time::Duration::from_millis(500) {
-                self.last_escape_time = None;
-                return (true, self.trigger_double_escape_action());
-            }
+        if let Some(last_time) = self.last_escape_time
+            && now.duration_since(last_time) < std::time::Duration::from_millis(500)
+        {
+            self.last_escape_time = None;
+            return (true, self.trigger_double_escape_action());
         }
         self.last_escape_time = Some(now);
         (false, None)
@@ -530,8 +532,19 @@ impl PiApp {
     }
 
     pub(super) fn quit_cmd(&mut self) -> Cmd {
+        if let Some(handle) = self.abort_handle.take() {
+            handle.abort();
+        }
+        self.invalidate_input_cards_for_turn_end();
+        self.tree_ui = None;
+        self.extension_custom_active = false;
+        self.extension_custom_key_queue.clear();
+        self.extension_custom_overlay = None;
+        if let Some(ask_tool) = &self.ask_tool {
+            ask_tool.close_channel_ui();
+        }
         if let Some(manager) = &self.extensions {
-            manager.clear_ui_sender();
+            manager.close_ui_sender_and_cancel_pending();
         }
 
         // Schedule a guaranteed bridge shutdown instead of a lossy try_send so quit
@@ -560,6 +573,14 @@ impl PiApp {
             // Application actions
             // =========================================================
             AppAction::Interrupt => {
+                // Escape generically dismisses whichever input card owns the
+                // editor (bd-1qol9): ask cards resolve as dismissed and
+                // extension prompts as cancelled, WITHOUT aborting the
+                // provider turn. Only when no card is pending does Escape
+                // fall through to busy-turn interruption semantics.
+                if self.has_pending_input_card() && self.dismiss_active_input_card() {
+                    return None;
+                }
                 // Escape: Abort if processing, otherwise context-dependent
                 if self.agent_state != AgentState::Idle {
                     self.last_escape_time = None;
@@ -700,6 +721,15 @@ impl PiApp {
             // Text input actions
             // =========================================================
             AppAction::Submit => {
+                // A pending ask/extension card owns the input line. Cards
+                // only ever arrive mid-turn (the tool that raised them is
+                // still executing), so this must run before the busy gate
+                // below — otherwise the answer is silently queued as a
+                // steering message and the card can never be answered
+                // (gh #184).
+                if let Some(cmd) = self.submit_pending_card_answer() {
+                    return cmd;
+                }
                 // Enter: Submit when idle, queue steering when busy
                 if self.agent_state != AgentState::Idle {
                     self.queue_input(QueuedMessageKind::Steering);
@@ -720,6 +750,9 @@ impl PiApp {
             AppAction::FollowUp => {
                 // Alt+Enter: queue follow-up when busy. When idle, toggles multi-line mode if the
                 // editor is empty; otherwise it submits like Enter.
+                if let Some(cmd) = self.submit_pending_card_answer() {
+                    return cmd;
+                }
                 if self.agent_state != AgentState::Idle {
                     self.queue_input(QueuedMessageKind::FollowUp);
                     return None;
@@ -790,8 +823,11 @@ impl PiApp {
                 self.conversation_viewport.set_content(content.trim_end());
                 self.conversation_viewport.set_y_offset(saved_offset);
                 self.conversation_viewport.page_down();
-                // Re-enable auto-follow if the user scrolled back to the bottom.
-                if self.is_at_bottom() {
+                // Re-enable auto-follow if the user scrolled back to the
+                // bottom. Content/height were synced just above, so the
+                // viewport's own at_bottom() avoids a second full
+                // conversation rebuild (bd-k4l7w).
+                if self.conversation_viewport.at_bottom() {
                     self.follow_stream_tail = true;
                 }
                 None
@@ -1040,7 +1076,7 @@ mod tests {
     use crate::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
     use crate::resources::{ResourceCliOptions, ResourceLoader};
     use crate::session::Session;
-    use crate::tools::ToolRegistry;
+    use crate::tools::{Tool, ToolRegistry};
     use asupersync::channel::mpsc;
     use asupersync::runtime::RuntimeBuilder;
     use futures::stream;
@@ -1162,6 +1198,7 @@ mod tests {
                 current,
                 Vec::new(),
                 available,
+                None,
                 Vec::new(),
                 event_tx,
                 runtime_handle(),
@@ -1171,6 +1208,7 @@ mod tests {
                 Some(KeyBindings::new()),
                 Vec::new(),
                 Usage::default(),
+                None,
             ),
             event_rx,
         )
@@ -1645,9 +1683,117 @@ mod tests {
     }
 
     #[test]
+    fn capability_actions_return_explicit_one_shot_and_persistent_scope() {
+        let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), HashMap::new());
+        let mut app = build_test_app(current.clone(), vec![current]);
+        let manager = crate::extensions::ExtensionManager::new();
+        let (ui_tx, mut ui_rx) = asupersync::channel::mpsc::channel(2);
+        manager.set_ui_sender(ui_tx);
+        app.extensions = Some(manager.clone());
+
+        let mut run_action = |app: &mut PiApp, persistent: bool| {
+            let request_id = if persistent {
+                "scope-always"
+            } else {
+                "scope-once"
+            };
+            let mut attempt = Box::pin(
+                manager.request_ui(
+                    ExtensionUiRequest::new_capability_prompt(
+                        request_id,
+                        "scope-extension",
+                        "exec",
+                        serde_json::json!({"message": "Scope?"}),
+                    )
+                    .with_timeout_ms(50),
+                ),
+            );
+            let delivered = runtime().block_on(async {
+                assert!(futures::poll!(attempt.as_mut()).is_pending());
+                let cx = Cx::for_request();
+                ui_rx.recv(&cx).await.expect("capability prompt reaches UI")
+            });
+            let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(delivered));
+            if persistent {
+                let _ = app.handle_capability_prompt_key(&KeyMsg::from_type(KeyType::Right));
+            }
+            let _ = app.handle_capability_prompt_key(&KeyMsg::from_type(KeyType::Enter));
+            runtime()
+                .block_on(attempt)
+                .expect("capability action responds")
+                .expect("confirm response")
+        };
+
+        let once = run_action(&mut app, false);
+        assert_eq!(
+            once.value,
+            Some(serde_json::json!({
+                "allow": true,
+                "persist": false,
+                "remember": false,
+            }))
+        );
+        let always = run_action(&mut app, true);
+        assert_eq!(
+            always.value,
+            Some(serde_json::json!({
+                "allow": true,
+                "persist": true,
+                "remember": true,
+            }))
+        );
+    }
+
+    #[test]
     fn quit_cmd_schedules_shutdown_when_event_queue_is_full() {
         let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), HashMap::new());
         let (mut app, mut event_rx) = build_test_app_with_event_rx(current.clone(), vec![current]);
+        let manager = crate::extensions::ExtensionManager::new();
+        let (ui_tx, _ui_rx) = asupersync::channel::mpsc::channel(1);
+        manager.set_ui_sender(ui_tx);
+        app.extensions = Some(manager.clone());
+
+        let ask_tool = crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended);
+        let (ask_tx, mut ask_rx) = asupersync::channel::mpsc::channel(1);
+        ask_tool.install_channel_ui(ask_tx);
+        let mut ask_execution = Box::pin(ask_tool.execute(
+            "quit-ask-call",
+            serde_json::json!({
+                // validate_request requires MIN_OPTIONS (2) choices per question.
+                "questions": [{"question": "Quit?", "options": [{"label": "Yes"}, {"label": "No"}]}]
+            }),
+            None,
+        ));
+        let ask_request = runtime().block_on(async {
+            assert!(futures::poll!(ask_execution.as_mut()).is_pending());
+            let cx = Cx::for_request();
+            ask_rx.recv(&cx).await.expect("ask request reaches UI")
+        });
+        app.ask_tool = Some(ask_tool.clone());
+        let _ = app.handle_pi_message(PiMsg::AskUiRequest(ask_request));
+        assert!(app.active_ask_ui.is_some());
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(ExtensionUiRequest::new(
+            "quit-generic-card",
+            "confirm",
+            serde_json::json!({"title": "Generic"}),
+        )));
+        let capability_wake = app
+            .handle_pi_message(PiMsg::ExtensionUiRequest(
+                ExtensionUiRequest::new_capability_prompt(
+                    "quit-capability-card",
+                    "fixture",
+                    "exec",
+                    serde_json::json!({
+                        "extension_id": "fixture",
+                        "capability": "exec",
+                        "message": "Capability",
+                    }),
+                )
+                .with_timeout_ms(30_000),
+            ))
+            .expect("bounded capability prompt schedules a timer");
+        assert_eq!(app.extension_ui_queue.len(), 1);
+        assert!(app.capability_prompt.is_some());
         app.event_tx
             .try_send(PiMsg::System("busy".to_string()))
             .expect("fill bounded event channel");
@@ -1663,5 +1809,29 @@ mod tests {
 
         assert!(matches!(first, PiMsg::System(text) if text == "busy"));
         assert!(matches!(second, PiMsg::UiShutdown));
+        assert!(app.active_ask_ui.is_none());
+        assert!(app.ask_ui_queue.is_empty());
+        assert!(app.active_extension_ui.is_none());
+        assert!(app.extension_ui_queue.is_empty());
+        assert!(app.capability_prompt.is_none());
+        assert!(app.capability_prompt_queue.is_empty());
+        assert!(
+            capability_wake.execute().is_none(),
+            "quit must interrupt the outstanding capability timer"
+        );
+        let ask_error = runtime()
+            .block_on(ask_execution)
+            .expect_err("quit must dismiss the active Ask waiter");
+        assert!(ask_error.to_string().contains("dismissed"), "{ask_error}");
+        let late_request = runtime().block_on(manager.request_ui(ExtensionUiRequest::new(
+            "after-quit",
+            "notify",
+            serde_json::json!({"message": "too late"}),
+        )));
+        let error = late_request.expect_err("quit must terminally close the manager UI sender");
+        assert!(
+            error.to_string().contains("sender not configured"),
+            "{error}"
+        );
     }
 }

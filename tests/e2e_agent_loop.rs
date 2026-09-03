@@ -97,6 +97,7 @@ impl ScriptedProvider {
                 ..Usage::default()
             },
             stop_reason,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         }
@@ -439,6 +440,7 @@ impl Provider for ContextCaptureProvider {
                 ..Usage::default()
             },
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         };
@@ -484,7 +486,11 @@ const fn event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::AutoCompactionEnd { .. } => "auto_compaction_end",
         AgentEvent::AutoRetryStart { .. } => "auto_retry_start",
         AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
+        AgentEvent::FailoverStart { .. } => "failover_start",
+        AgentEvent::FailoverEnd { .. } => "failover_end",
         AgentEvent::ExtensionError { .. } => "extension_error",
+        AgentEvent::AdvisorNote { .. } => "advisor_note",
+        AgentEvent::ProviderError { .. } => "provider_error",
     }
 }
 
@@ -699,8 +705,15 @@ fn run_scenario(
                 ..StreamOptions::default()
             },
             block_images: false,
+            model_accepts_images: true,
             fail_closed_hooks: false,
             tool_approval: None,
+            keyword_settings: None,
+            max_time: None,
+            turn_recovery: pi::turn_recovery::TurnRecoveryMode::default(),
+            approval_state: None,
+            bash_settings: None,
+            secrets: None,
         };
         let agent = Agent::new(provider, tools, config);
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
@@ -986,8 +999,15 @@ fn context_intelligence_no_mock_harness() {
                 ..StreamOptions::default()
             },
             block_images: false,
+            model_accepts_images: true,
             fail_closed_hooks: false,
             tool_approval: None,
+            keyword_settings: None,
+            max_time: None,
+            turn_recovery: pi::turn_recovery::TurnRecoveryMode::default(),
+            approval_state: None,
+            bash_settings: None,
+            secrets: None,
         },
     );
     let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
@@ -1347,6 +1367,7 @@ impl Provider for StreamingToolCallProvider {
             model: self.model_id().to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         };
@@ -1362,6 +1383,7 @@ impl Provider for StreamingToolCallProvider {
             let done_message = AssistantMessage {
                 content: vec![ContentBlock::Text(TextContent::new("done streaming"))],
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 ..empty_partial.clone()
             };
             return Ok(Box::pin(futures::stream::iter(vec![
@@ -1378,6 +1400,7 @@ impl Provider for StreamingToolCallProvider {
         let final_message = AssistantMessage {
             content: vec![ContentBlock::ToolCall(tool_call.clone())],
             stop_reason: StopReason::ToolUse,
+            stop_details: None,
             ..empty_partial.clone()
         };
 
@@ -1385,7 +1408,11 @@ impl Provider for StreamingToolCallProvider {
             Ok(StreamEvent::Start {
                 partial: empty_partial,
             }),
-            Ok(StreamEvent::ToolCallStart { content_index: 0 }),
+            Ok(StreamEvent::ToolCallStart {
+                content_index: 0,
+                id: tool_call.id.clone(),
+                name: tool_call.name.clone(),
+            }),
         ];
         for fragment in self.fragments {
             events.push(Ok(StreamEvent::ToolCallDelta {
@@ -1451,8 +1478,15 @@ fn rpc_partial_tool_call_arguments_grow_during_stream() {
                 ..StreamOptions::default()
             },
             block_images: false,
+            model_accepts_images: true,
             fail_closed_hooks: false,
             tool_approval: None,
+            keyword_settings: None,
+            max_time: None,
+            turn_recovery: pi::turn_recovery::TurnRecoveryMode::default(),
+            approval_state: None,
+            bash_settings: None,
+            secrets: None,
         };
         let agent = Agent::new(provider, tools, config);
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
@@ -1528,6 +1562,28 @@ fn rpc_partial_tool_call_arguments_grow_during_stream() {
                 args, expected,
                 "delta {idx}: {label} arguments should be the best-effort \
                  completion of the accumulated fragment prefix"
+            );
+        }
+
+        // #129: the correlation key must be present on EVERY mid-stream
+        // partial, not only at toolcall_end — snapshot clients key the
+        // growing preview by tool-call id.
+        for (label, block) in [
+            ("message", &update["message"]["content"][0]),
+            (
+                "assistantMessageEvent.partial",
+                &update["assistantMessageEvent"]["partial"]["content"][0],
+            ),
+        ] {
+            assert_eq!(
+                block["id"], "read-stream-1",
+                "delta {idx}: {label} tool-call id must be populated mid-stream \
+                 (the #129 regression: id stayed \"\" until toolcall_end)"
+            );
+            assert_eq!(
+                block["name"], "read",
+                "delta {idx}: {label} tool-call name must be populated mid-stream \
+                 (the #129 regression: name stayed \"\" until toolcall_end)"
             );
         }
     }

@@ -3,41 +3,35 @@
     {
       "category": "command_provider",
       "failed": 0,
-      "passed": 33,
+      "passed": 36,
       "skipped": 0
     },
     {
       "category": "event_subscriber",
       "failed": 0,
-      "passed": 35,
+      "passed": 37,
       "skipped": 0
     },
     {
       "category": "multi_capability",
       "failed": 0,
-      "passed": 42,
-      "skipped": 0
-    },
-    {
-      "category": "passive",
-      "failed": 0,
-      "passed": 2,
+      "passed": 38,
       "skipped": 0
     },
     {
       "category": "tool_provider",
       "failed": 0,
-      "passed": 11,
+      "passed": 14,
       "skipped": 0
     }
   ],
   "failed": 0,
   "failures": [],
-  "generated_at": "2026-05-13T02:59:58.302Z",
-  "must_pass_count": 123,
+  "generated_at": "2026-08-17T17:05:09.710Z",
+  "must_pass_count": 125,
   "pass_rate_pct": 100.0,
-  "passed": 123,
+  "passed": 125,
   "schema": "pi.ext.journey_report.v1",
   "skipped": 0,
-  "tested": 123
+  "tested": 125
 }

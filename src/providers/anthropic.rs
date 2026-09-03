@@ -7,8 +7,8 @@ use crate::auth::unmark_anthropic_oauth_bearer_token;
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
-    AssistantMessage, ContentBlock, Message, RedactedThinkingContent, StopReason, StreamEvent,
-    TextContent, ThinkingContent, ThinkingLevel, ToolCall, Usage, UserContent,
+    AssistantMessage, ContentBlock, Message, RedactedThinkingContent, StopDetails, StopReason,
+    StreamEvent, TextContent, ThinkingContent, ThinkingLevel, ToolCall, Usage, UserContent,
 };
 use crate::models::CompatConfig;
 use crate::provider::{CacheRetention, Context, Provider, StreamOptions, ToolDef};
@@ -36,6 +36,10 @@ const ANTHROPIC_OAUTH_BETA_FLAGS: &str = "claude-code-20250219,oauth-2025-04-20"
 /// Beta flag for Anthropic prompt caching.
 /// Override via `PI_ANTHROPIC_CACHE_BETA_FLAG`.
 const ANTHROPIC_CACHE_BETA_FLAG: &str = "prompt-caching-2024-07-31";
+/// Beta flag for the extended (1h) prompt-cache TTL. Only sent when the request
+/// actually carries a `ttl: "1h"` cache breakpoint (first-party API + `Long`
+/// retention); relays commonly reject both the flag and the `ttl` field.
+const ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG: &str = "extended-cache-ttl-2025-04-11";
 const KIMI_SHARE_DIR_ENV_KEY: &str = "KIMI_SHARE_DIR";
 
 fn anthropic_oauth_beta_flags() -> String {
@@ -50,6 +54,43 @@ fn anthropic_cache_beta_flag() -> String {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| ANTHROPIC_CACHE_BETA_FLAG.to_string())
+}
+
+/// True when `base_url` targets Anthropic's first-party API host.
+///
+/// Relays and proxies (custom `base_url`s) generally accept the plain
+/// `{"type":"ephemeral"}` marker but reject the extended `ttl` field, so the
+/// 1h TTL is only emitted for the first-party endpoint.
+fn is_first_party_anthropic_base_url(base_url: &str) -> bool {
+    base_url
+        .strip_prefix("https://api.anthropic.com")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Derive the prompt-cache breakpoint marker for a request, if any.
+///
+/// This is the single source of truth for both the request body
+/// (`cache_control` on the system block and the last tool) and the header
+/// assembly (the extended-TTL beta flag is sent iff the returned marker
+/// carries a `ttl`), so the two can never drift apart.
+fn anthropic_cache_control_for(
+    retention: CacheRetention,
+    base_url: &str,
+) -> Option<AnthropicCacheControl> {
+    match retention {
+        CacheRetention::None => None,
+        CacheRetention::Short => Some(AnthropicCacheControl {
+            r#type: "ephemeral",
+            ttl: None,
+        }),
+        CacheRetention::Long => Some(AnthropicCacheControl {
+            r#type: "ephemeral",
+            // The 1h TTL requires the extended-cache-ttl beta and is only
+            // supported on the first-party API; degrade to the default 5m
+            // TTL elsewhere instead of risking a 400 from a relay.
+            ttl: is_first_party_anthropic_base_url(base_url).then_some("1h"),
+        }),
+    }
 }
 
 #[inline]
@@ -318,11 +359,13 @@ pub struct AnthropicProvider {
 /// `budget_tokens`.
 /// Ref: https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
 fn anthropic_model_uses_adaptive_thinking(model_id: &str) -> Option<bool> {
-    const ADAPTIVE_PREFIXES: [&str; 6] = [
+    const ADAPTIVE_PREFIXES: [&str; 8] = [
         "claude-opus-4-6",
         "claude-opus-4-7",
         "claude-opus-4-8",
+        "claude-opus-5",
         "claude-sonnet-4-6",
+        "claude-sonnet-5",
         "claude-fable-",
         "claude-mythos-",
     ];
@@ -342,8 +385,8 @@ fn anthropic_model_uses_adaptive_thinking(model_id: &str) -> Option<bool> {
 /// keyed by the lowercase `ThinkingLevel` name.
 ///
 /// Default mapping: `minimal`/`low -> "low"`, `medium -> "medium"`,
-/// `high -> "high"`, `xhigh -> "xhigh"` (Anthropic has no `minimal` effort, and
-/// pi has no `max` level — both collapse to the nearest Anthropic tier). `off`
+/// `high -> "high"`, `xhigh -> "xhigh"`, `max -> "max"` (Anthropic has no
+/// `minimal` effort — it collapses to the nearest Anthropic tier). `off`
 /// yields `None` (no effort emitted; thinking is not enabled for `off`).
 fn anthropic_effort_for_level(
     level: ThinkingLevel,
@@ -360,6 +403,32 @@ fn anthropic_effort_for_level(
         ThinkingLevel::Medium => Some("medium".to_string()),
         ThinkingLevel::High => Some("high".to_string()),
         ThinkingLevel::XHigh => Some("xhigh".to_string()),
+        ThinkingLevel::Max => Some("max".to_string()),
+    }
+}
+
+/// Mark the last content block of the last user-role message with a
+/// prompt-cache breakpoint so each turn re-reads the previous turn's cached
+/// conversation history instead of paying full input price for it (parity
+/// with pi-mono's `convertMessages`). Trailing assistant messages and block
+/// kinds that cannot carry `cache_control` are left untouched.
+fn mark_last_user_block_for_caching(
+    messages: &mut [AnthropicMessage<'_>],
+    cache_control: Option<AnthropicCacheControl>,
+) {
+    if let Some(cc) = cache_control
+        && let Some(last_message) = messages.last_mut()
+        && last_message.role == "user"
+        && let Some(last_block) = last_message.content.last_mut()
+    {
+        match last_block {
+            AnthropicContent::Text { cache_control, .. }
+            | AnthropicContent::Image { cache_control, .. }
+            | AnthropicContent::ToolResult { cache_control, .. } => {
+                *cache_control = Some(cc);
+            }
+            AnthropicContent::Thinking { .. } | AnthropicContent::ToolUse { .. } => {}
+        }
     }
 }
 
@@ -412,22 +481,34 @@ impl AnthropicProvider {
         context: &'a Context<'_>,
         options: &StreamOptions,
     ) -> AnthropicRequest<'a> {
-        let messages = context
+        let mut messages: Vec<AnthropicMessage<'_>> = context
             .messages
             .iter()
             .map(convert_message_to_anthropic)
             .collect();
 
+        // Prompt-cache breakpoints. One marker on the system block, one on the
+        // last tool, and one on the last user message's final content block
+        // (incremental conversation-history caching — parity with pi-mono's
+        // `convertMessages`). Anthropic caches everything before a marked
+        // block. `CacheRetention::None` emits no markers anywhere — cache
+        // writes bill at 1.25x, so caching must be strictly opt-in.
+        let cache_control = anthropic_cache_control_for(options.cache_retention, &self.base_url);
+
+        mark_last_user_block_for_caching(&mut messages, cache_control);
+
         let tools: Option<Vec<AnthropicTool<'_>>> = if context.tools.is_empty() {
             None
         } else {
-            Some(
-                context
-                    .tools
-                    .iter()
-                    .map(convert_tool_to_anthropic)
-                    .collect(),
-            )
+            let mut tools: Vec<AnthropicTool<'_>> = context
+                .tools
+                .iter()
+                .map(convert_tool_to_anthropic)
+                .collect();
+            if let Some(last) = tools.last_mut() {
+                last.cache_control = cache_control;
+            }
+            Some(tools)
         };
 
         // Decide between the modern adaptive-thinking API and the legacy
@@ -474,6 +555,7 @@ impl AnthropicProvider {
                         ThinkingLevel::Medium => b.medium,
                         ThinkingLevel::High => b.high,
                         ThinkingLevel::XHigh => b.xhigh,
+                        ThinkingLevel::Max => b.max,
                     },
                 );
                 let thinking = AnthropicThinking {
@@ -506,7 +588,21 @@ impl AnthropicProvider {
         AnthropicRequest {
             model: &self.model,
             messages,
-            system: context.system_prompt.as_deref(),
+            // An empty system prompt must be omitted entirely: as a bare
+            // string it was tolerated, but a `{"type":"text","text":""}`
+            // block is rejected by the API (min length 1). pi-mono's falsy
+            // check (`context.systemPrompt &&`) skips it the same way.
+            system: context
+                .system_prompt
+                .as_deref()
+                .filter(|text| !text.is_empty())
+                .map(|text| {
+                    vec![AnthropicSystemBlock {
+                        r#type: "text",
+                        text,
+                        cache_control,
+                    }]
+                }),
             max_tokens,
             temperature,
             tools,
@@ -615,22 +711,33 @@ impl Provider for AnthropicProvider {
         if anthropic_bearer_token {
             beta_flags.push(anthropic_oauth_beta_flags());
         }
-        if options.cache_retention != CacheRetention::None {
+        // Derived from the same helper that emits the body's cache_control
+        // markers, so headers and body cannot drift: whenever the body carries
+        // markers the right flags are present, and the extended-TTL beta is
+        // sent iff a marker would carry `ttl: "1h"`. (A degenerate request
+        // with no system prompt, no tools, and no markable trailing user
+        // block sends the flags without any marker — a harmless no-op.)
+        if let Some(cache_control) =
+            anthropic_cache_control_for(options.cache_retention, &self.base_url)
+        {
             beta_flags.push(anthropic_cache_beta_flag());
+            if cache_control.ttl.is_some() {
+                beta_flags.push(ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG.to_string());
+            }
         }
         if !beta_flags.is_empty() {
             request = request.header("anthropic-beta", beta_flags.join(","));
         }
 
         // Apply provider-specific custom headers from compat config.
-        if let Some(compat) = &self.compat {
-            if let Some(custom_headers) = &compat.custom_headers {
-                request = super::apply_headers_ignoring_blank_auth_overrides(
-                    request,
-                    custom_headers,
-                    &["authorization", "x-api-key"],
-                );
-            }
+        if let Some(compat) = &self.compat
+            && let Some(custom_headers) = &compat.custom_headers
+        {
+            request = super::apply_headers_ignoring_blank_auth_overrides(
+                request,
+                custom_headers,
+                &["authorization", "x-api-key"],
+            );
         }
 
         // Per-request headers from StreamOptions (highest priority).
@@ -640,7 +747,27 @@ impl Provider for AnthropicProvider {
             &["authorization", "x-api-key"],
         );
 
-        let request = request.json(&request_body)?;
+        let rewritten_body = super::offer_before_provider_request(
+            options,
+            self.name(),
+            self.api(),
+            self.model_id(),
+            &self.base_url,
+            &request_body,
+            |value| {
+                super::validate_streamed_json_rewrite(
+                    value,
+                    &["model"],
+                    &["messages"],
+                    &[("stream", serde_json::Value::Bool(true))],
+                )
+            },
+        )
+        .await;
+        let request = match &rewritten_body {
+            Some(body) => request.json(body)?,
+            None => request.json(&request_body)?,
+        };
 
         let response = Box::pin(request.send()).await?;
         let status = response.status();
@@ -723,14 +850,18 @@ impl Provider for AnthropicProvider {
                             let err = Error::sse(&e);
                             return Some((Err(err), state));
                         }
-                        // Stream ended before message_stop (e.g.
-                        // network disconnect).  Emit Done so the
-                        // agent loop receives the partial message.
+                        // A clean transport EOF is not a successful Anthropic
+                        // completion unless message_stop was observed. Return a
+                        // retry-classifiable error; the agent loop retains the
+                        // partial message while marking the turn as failed.
                         None => {
                             state.done = true;
-                            let reason = state.partial.stop_reason;
-                            let message = std::mem::take(&mut state.partial);
-                            return Some((Ok(StreamEvent::Done { reason, message }), state));
+                            return Some((
+                                Err(Error::api(
+                                    "Anthropic stream ended before message_stop (unexpected EOF)",
+                                )),
+                                state,
+                            ));
                         }
                     }
                 }
@@ -787,6 +918,7 @@ where
                 model,
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             },
@@ -816,7 +948,7 @@ where
                 Ok(self.handle_content_block_stop(index))
             }
             AnthropicStreamEvent::MessageDelta { delta, usage } => {
-                self.handle_message_delta(&delta, usage);
+                self.handle_message_delta(&delta, usage)?;
                 Ok(None)
             }
             AnthropicStreamEvent::MessageStop => {
@@ -885,12 +1017,16 @@ where
                     },
                 );
                 self.partial.content.push(ContentBlock::ToolCall(ToolCall {
-                    id,
-                    name,
+                    id: id.clone(),
+                    name: name.clone(),
                     arguments: serde_json::Value::Null,
                     thought_signature: None,
                 }));
-                StreamEvent::ToolCallStart { content_index }
+                StreamEvent::ToolCallStart {
+                    content_index,
+                    id,
+                    name,
+                }
             }
             AnthropicContentBlock::RedactedThinking { data } => {
                 // Redacted thinking arrives in a single `content_block_start` —
@@ -958,10 +1094,10 @@ where
                 // The Anthropic API sends signature_delta for thinking blocks
                 // to deliver the thinking_signature required for multi-turn
                 // extended thinking conversations.
-                if let Some(sig) = signature {
-                    if let Some(ContentBlock::Thinking(t)) = self.partial.content.get_mut(idx) {
-                        t.thinking_signature = Some(sig);
-                    }
+                if let Some(sig) = signature
+                    && let Some(ContentBlock::Thinking(t)) = self.partial.content.get_mut(idx)
+                {
+                    t.thinking_signature = Some(sig);
                 }
                 None
             }
@@ -1032,21 +1168,33 @@ where
         &mut self,
         delta: &AnthropicMessageDelta,
         usage: Option<AnthropicDeltaUsage>,
-    ) {
-        if let Some(stop_reason) = delta.stop_reason {
+    ) -> Result<()> {
+        if let Some(stop_reason) = delta.stop_reason.as_deref() {
             self.partial.stop_reason = match stop_reason {
-                AnthropicStopReason::MaxTokens => StopReason::Length,
-                AnthropicStopReason::ToolUse => StopReason::ToolUse,
-                AnthropicStopReason::EndTurn | AnthropicStopReason::StopSequence => {
-                    StopReason::Stop
+                "end_turn" | "stop_sequence" => StopReason::Stop,
+                // Our normalized model has one truncation outcome; Anthropic's
+                // context-window stop is therefore intentionally represented as
+                // `Length`, alongside ordinary output-token exhaustion.
+                "max_tokens" | "model_context_window_exceeded" => StopReason::Length,
+                "tool_use" => StopReason::ToolUse,
+                "pause_turn" => StopReason::PauseTurn,
+                "refusal" => StopReason::Refusal,
+                unknown => {
+                    return Err(Error::provider(
+                        "anthropic",
+                        format!("unsupported Anthropic stop_reason `{unknown}`"),
+                    ));
                 }
             };
+            self.partial.stop_details.clone_from(&delta.stop_details);
         }
 
         if let Some(u) = usage {
             self.partial.usage.output = u.output_tokens;
             self.recompute_total_tokens();
         }
+
+        Ok(())
     }
 }
 
@@ -1059,7 +1207,7 @@ pub struct AnthropicRequest<'a> {
     model: &'a str,
     messages: Vec<AnthropicMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<&'a str>,
+    system: Option<Vec<AnthropicSystemBlock<'a>>>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
@@ -1107,6 +1255,10 @@ struct AnthropicMessage<'a> {
 enum AnthropicContent<'a> {
     Text {
         text: &'a str,
+        /// Prompt-cache breakpoint for incremental conversation caching.
+        /// Set only on the final block of the last user-role message.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
     Thinking {
         thinking: &'a str,
@@ -1114,6 +1266,8 @@ enum AnthropicContent<'a> {
     },
     Image {
         source: AnthropicImageSource<'a>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
     ToolUse {
         id: &'a str,
@@ -1125,6 +1279,8 @@ enum AnthropicContent<'a> {
         content: Vec<AnthropicToolResultContent<'a>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
 }
 
@@ -1147,6 +1303,30 @@ struct AnthropicTool<'a> {
     name: &'a str,
     description: &'a str,
     input_schema: &'a serde_json::Value,
+    /// Prompt-cache breakpoint. Set on the LAST tool only: Anthropic caches
+    /// everything up to and including a marked block, so one marker covers
+    /// the whole tools array.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<AnthropicCacheControl>,
+}
+
+/// Typed system-prompt block. The `system` field must be an array of blocks
+/// (rather than a bare string) for a block to carry `cache_control`.
+#[derive(Debug, Serialize)]
+struct AnthropicSystemBlock<'a> {
+    r#type: &'static str,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<AnthropicCacheControl>,
+}
+
+/// Prompt-cache breakpoint marker (`{"type":"ephemeral"}`, optionally with
+/// `"ttl":"1h"`). See [`anthropic_cache_control_for`].
+#[derive(Debug, Clone, Copy, Serialize)]
+struct AnthropicCacheControl {
+    r#type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<&'static str>,
 }
 
 // ============================================================================
@@ -1260,20 +1440,12 @@ enum AnthropicDelta {
 
 /// Stop reason from `message_delta`.
 ///
-/// Using an enum avoids allocating a `String` for the stop reason.
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum AnthropicStopReason {
-    EndTurn,
-    MaxTokens,
-    ToolUse,
-    StopSequence,
-}
-
 #[derive(Debug, Deserialize)]
 struct AnthropicMessageDelta {
     #[serde(default)]
-    stop_reason: Option<AnthropicStopReason>,
+    stop_reason: Option<String>,
+    #[serde(default)]
+    stop_details: Option<StopDetails>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1295,6 +1467,7 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
             role: "user",
             content: vec![AnthropicContent::Text {
                 text: &custom.content,
+                cache_control: None,
             }],
         },
         Message::Assistant(assistant) => AnthropicMessage {
@@ -1327,6 +1500,7 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
                     })
                     .collect(),
                 is_error: if result.is_error { Some(true) } else { None },
+                cache_control: None,
             }],
         },
     }
@@ -1334,17 +1508,24 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
 
 fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent<'_>> {
     match content {
-        UserContent::Text(text) => vec![AnthropicContent::Text { text }],
+        UserContent::Text(text) => vec![AnthropicContent::Text {
+            text,
+            cache_control: None,
+        }],
         UserContent::Blocks(blocks) => blocks
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text(t) => Some(AnthropicContent::Text { text: &t.text }),
+                ContentBlock::Text(t) => Some(AnthropicContent::Text {
+                    text: &t.text,
+                    cache_control: None,
+                }),
                 ContentBlock::Image(img) => Some(AnthropicContent::Image {
                     source: AnthropicImageSource {
                         r#type: "base64",
                         media_type: &img.mime_type,
                         data: &img.data,
                     },
+                    cache_control: None,
                 }),
                 _ => None,
             })
@@ -1354,7 +1535,10 @@ fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent<'_>> {
 
 fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicContent<'_>> {
     match block {
-        ContentBlock::Text(t) => Some(AnthropicContent::Text { text: &t.text }),
+        ContentBlock::Text(t) => Some(AnthropicContent::Text {
+            text: &t.text,
+            cache_control: None,
+        }),
         ContentBlock::ToolCall(tc) => Some(AnthropicContent::ToolUse {
             id: &tc.id,
             name: &tc.name,
@@ -1366,6 +1550,15 @@ fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicC
         ContentBlock::Thinking(t) => {
             t.thinking_signature
                 .as_ref()
+                // Only echo a signature that is actually an Anthropic one.
+                // A session recorded on the openai-responses route stores its
+                // raw reasoning item (a JSON object) in `thinking_signature`;
+                // on a mid-session switch to an Anthropic model that JSON would
+                // be sent as an Anthropic `signature` and rejected with a 400.
+                // Anthropic signatures are opaque base64 tokens, so they never
+                // begin with `{` — foreign JSON payloads are dropped, matching
+                // the TS reference's cross-model signature stripping.
+                .filter(|sig| !is_foreign_reasoning_signature(sig))
                 .map(|sig| AnthropicContent::Thinking {
                     thinking: &t.thinking,
                     signature: sig,
@@ -1378,11 +1571,20 @@ fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicC
     }
 }
 
+/// True when a `thinking_signature` is a foreign (non-Anthropic) reasoning
+/// payload rather than a native Anthropic base64 signature. The openai-responses
+/// route stores its raw reasoning item — a JSON object — in this field; a native
+/// Anthropic signature is opaque base64 and can never begin with `{`.
+fn is_foreign_reasoning_signature(signature: &str) -> bool {
+    signature.trim_start().starts_with('{')
+}
+
 fn convert_tool_to_anthropic(tool: &ToolDef) -> AnthropicTool<'_> {
     AnthropicTool {
         name: &tool.name,
         description: &tool.description,
         input_schema: &tool.parameters,
+        cache_control: None,
     }
 }
 
@@ -1404,6 +1606,37 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn thinking_block_drops_foreign_reasoning_signature() {
+        // A native Anthropic signature (opaque base64) is echoed back.
+        let native = ContentBlock::Thinking(ThinkingContent {
+            thinking: "step".to_string(),
+            thinking_signature: Some("Cg8KDXNvbWViYXNlNjQ=".to_string()),
+        });
+        match convert_content_block_to_anthropic(&native) {
+            Some(AnthropicContent::Thinking { signature, .. }) => {
+                assert_eq!(signature, "Cg8KDXNvbWViYXNlNjQ=");
+            }
+            other => panic!("expected thinking block with signature, got {other:?}"),
+        }
+
+        // A foreign openai-responses raw reasoning item (JSON) is dropped so it
+        // is never sent to Anthropic as a signature (would 400).
+        let foreign = ContentBlock::Thinking(ThinkingContent {
+            thinking: "step".to_string(),
+            thinking_signature: Some(
+                r#"{"type":"reasoning","id":"rs_1","encrypted_content":"x"}"#.to_string(),
+            ),
+        });
+        assert!(
+            convert_content_block_to_anthropic(&foreign).is_none(),
+            "foreign JSON reasoning signature must be dropped, not echoed to Anthropic"
+        );
+
+        assert!(is_foreign_reasoning_signature("  {\"type\":\"reasoning\"}"));
+        assert!(!is_foreign_reasoning_signature("Cg8KDXNvbWViYXNlNjQ="));
+    }
 
     #[test]
     fn home_dir_lookup_falls_back_to_userprofile() {
@@ -1479,13 +1712,19 @@ mod tests {
                 medium: 9000,
                 high: 16384,
                 xhigh: 32768,
+                max: 65536,
             }),
             ..Default::default()
         };
 
         let request = provider.build_request(&context, &options);
         assert_eq!(request.model, "claude-test");
-        assert_eq!(request.system, Some("System prompt"));
+        let system = request.system.as_ref().expect("system blocks");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].r#type, "text");
+        assert_eq!(system[0].text, "System prompt");
+        // Default retention is None: no cache breakpoint on the system block.
+        assert!(system[0].cache_control.is_none());
         assert_eq!(request.temperature, Some(1.0)); // thinking forces temperature to 1.0
         assert!(request.stream);
         assert_eq!(request.max_tokens, 13_096);
@@ -1501,7 +1740,7 @@ mod tests {
         assert_eq!(request.messages[0].role, "user");
         assert_eq!(request.messages[0].content.len(), 1);
         match &request.messages[0].content[0] {
-            AnthropicContent::Text { text } => assert_eq!(*text, "Ping"),
+            AnthropicContent::Text { text, .. } => assert_eq!(*text, "Ping"),
             other => panic!(),
         }
 
@@ -1529,12 +1768,250 @@ mod tests {
 
         let request = provider.build_request(&context, &options);
         assert_eq!(request.model, "claude-test");
-        assert_eq!(request.system, None);
+        assert!(request.system.is_none());
         assert!(request.tools.is_none());
         assert!(request.thinking.is_none());
         assert!(request.output_config.is_none());
         assert_eq!(request.max_tokens, DEFAULT_MAX_TOKENS);
         assert!(request.stream);
+    }
+
+    fn cache_test_tool(name: &str) -> ToolDef {
+        ToolDef {
+            name: name.to_string(),
+            description: format!("{name} tool"),
+            parameters: json!({ "type": "object" }),
+        }
+    }
+
+    fn cache_test_context() -> Context<'static> {
+        Context {
+            system_prompt: Some("System prompt".to_string().into()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: vec![cache_test_tool("alpha"), cache_test_tool("beta")].into(),
+        }
+    }
+
+    /// Short retention: one `{"type":"ephemeral"}` breakpoint on the system
+    /// block, one on the LAST tool only, and one on the last user message's
+    /// final content block (incremental conversation caching — pi-mono
+    /// parity), and all survive serde serialization to the wire body.
+    #[test]
+    fn test_build_request_short_retention_marks_system_and_last_tool_only() {
+        let provider = AnthropicProvider::new("claude-test");
+        let context = cache_test_context();
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Short,
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        let system = request.system.as_ref().expect("system blocks");
+        assert_eq!(system.len(), 1);
+        let system_cc = system[0].cache_control.as_ref().expect("system marker");
+        assert_eq!(system_cc.r#type, "ephemeral");
+        assert!(system_cc.ttl.is_none(), "Short retention must not set ttl");
+        let tools = request.tools.as_ref().expect("tools");
+        assert_eq!(tools.len(), 2);
+        assert!(
+            tools[0].cache_control.is_none(),
+            "only the last tool carries the marker"
+        );
+        assert!(tools[1].cache_control.is_some());
+
+        let body = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert!(
+            body["tools"][0].get("cache_control").is_none(),
+            "non-final tools must not carry cache_control"
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" }),
+            "last user message's final block carries the history breakpoint"
+        );
+        let wire = body.to_string();
+        assert_eq!(
+            wire.matches("cache_control").count(),
+            3,
+            "exactly three breakpoints: system + last tool + last user block"
+        );
+    }
+
+    /// The conversation-history breakpoint goes only on user-role trailing
+    /// messages; a trailing assistant message must stay unmarked (pi-mono
+    /// guards on `lastMessage.role === "user"`).
+    #[test]
+    fn test_build_request_short_retention_skips_marker_on_trailing_assistant() {
+        let provider = AnthropicProvider::new("claude-test");
+        let mut context = cache_test_context();
+        let mut messages = context.messages.to_vec();
+        messages.push(Message::Assistant(
+            AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent {
+                    text: "Pong".to_string(),
+                    text_signature: None,
+                })],
+                ..Default::default()
+            }
+            .into(),
+        ));
+        context.messages = messages.into();
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Short,
+            ..Default::default()
+        };
+
+        let body = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert!(
+            body["messages"][1]["content"][0]
+                .get("cache_control")
+                .is_none(),
+            "trailing assistant content must not carry a cache breakpoint"
+        );
+        // System + last tool markers still present.
+        assert_eq!(body.to_string().matches("cache_control").count(), 2);
+    }
+
+    /// An empty system prompt must be omitted entirely: the API rejects
+    /// `{"type":"text","text":""}` blocks (min length 1), and pi-mono's
+    /// falsy check skips it the same way.
+    #[test]
+    fn test_build_request_empty_system_prompt_is_omitted() {
+        let provider = AnthropicProvider::new("claude-test");
+        let mut context = cache_test_context();
+        context.system_prompt = Some(String::new().into());
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Short,
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        assert!(
+            request.system.is_none(),
+            "Some(\"\") must serialize as no system field, not an empty block"
+        );
+        let body = serde_json::to_value(&request).expect("serialize request");
+        assert!(body.get("system").is_none());
+    }
+
+    /// None retention (the default) must emit zero `cache_control` markers —
+    /// cache writes bill at 1.25x, so caching is strictly opt-in.
+    #[test]
+    fn test_build_request_none_retention_emits_no_cache_control() {
+        let provider = AnthropicProvider::new("claude-test");
+        let context = cache_test_context();
+        let options = StreamOptions::default();
+
+        let body = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert!(
+            !body.to_string().contains("cache_control"),
+            "CacheRetention::None must not emit any cache_control marker"
+        );
+    }
+
+    /// Long retention against the first-party API gets `ttl: "1h"` (which the
+    /// header assembly pairs with the extended-cache-ttl beta flag).
+    #[test]
+    fn test_build_request_long_retention_first_party_uses_1h_ttl() {
+        // Default base_url is the first-party endpoint.
+        let provider = AnthropicProvider::new("claude-test");
+        let context = cache_test_context();
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Long,
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        let system = request.system.as_ref().expect("system blocks");
+        let system_cc = system[0].cache_control.as_ref().expect("system marker");
+        assert_eq!(system_cc.ttl, Some("1h"));
+
+        let body = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+    }
+
+    /// Long retention through a relay (non-first-party base_url) degrades to
+    /// the default 5m TTL: markers are emitted, but no `ttl` field.
+    #[test]
+    fn test_build_request_long_retention_relay_degrades_to_default_ttl() {
+        let provider = AnthropicProvider::new("claude-test")
+            .with_base_url("https://relay.example.com/v1/messages");
+        let context = cache_test_context();
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Long,
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        let system = request.system.as_ref().expect("system blocks");
+        let system_cc = system[0].cache_control.as_ref().expect("system marker");
+        assert!(system_cc.ttl.is_none(), "relays must not receive ttl");
+        assert!(
+            !serde_json::to_value(&request)
+                .expect("serialize request")
+                .to_string()
+                .contains("ttl"),
+            "no ttl anywhere in the relay body"
+        );
+    }
+
+    /// The ttl decision (and therefore the extended-TTL beta flag, which is
+    /// derived from `ttl.is_some()` in `stream()`) hinges on the base URL.
+    #[test]
+    fn test_anthropic_cache_control_for_matrix() {
+        for base_url in [
+            "https://api.anthropic.com/v1/messages",
+            "https://api.anthropic.com",
+            "https://relay.example.com/v1/messages",
+        ] {
+            assert!(
+                anthropic_cache_control_for(CacheRetention::None, base_url).is_none(),
+                "None emits no marker for {base_url}"
+            );
+            let short =
+                anthropic_cache_control_for(CacheRetention::Short, base_url).expect("short marker");
+            assert!(short.ttl.is_none(), "Short never sets ttl for {base_url}");
+        }
+        let long_first_party = anthropic_cache_control_for(
+            CacheRetention::Long,
+            "https://api.anthropic.com/v1/messages",
+        )
+        .expect("long marker");
+        assert_eq!(long_first_party.ttl, Some("1h"));
+        let long_relay = anthropic_cache_control_for(
+            CacheRetention::Long,
+            "https://relay.example.com/v1/messages",
+        )
+        .expect("long marker");
+        assert!(long_relay.ttl.is_none());
+        // Prefix-alike hosts are NOT first-party.
+        assert!(!is_first_party_anthropic_base_url(
+            "https://api.anthropic.com.evil.example/v1/messages"
+        ));
+        assert!(!is_first_party_anthropic_base_url(
+            "http://api.anthropic.com/v1/messages"
+        ));
     }
 
     /// gh #116: an adaptive-thinking Anthropic model must emit the modern
@@ -1888,6 +2365,102 @@ mod tests {
     }
 
     #[test]
+    fn all_stable_anthropic_stop_reasons_are_handled() {
+        let cases = [
+            ("end_turn", StopReason::Stop),
+            ("max_tokens", StopReason::Length),
+            ("stop_sequence", StopReason::Stop),
+            ("tool_use", StopReason::ToolUse),
+            ("pause_turn", StopReason::PauseTurn),
+            ("refusal", StopReason::Refusal),
+            ("model_context_window_exceeded", StopReason::Length),
+        ];
+
+        for (wire_reason, expected_reason) in cases {
+            let mut delta = json!({ "stop_reason": wire_reason });
+            if wire_reason == "refusal" {
+                delta["stop_details"] = json!({
+                    "type": "refusal",
+                    "category": "cyber",
+                    "explanation": "The request could enable cyber harm."
+                });
+            }
+            let events = vec![
+                json!({
+                    "type": "message_start",
+                    "message": { "usage": { "input_tokens": 5 } }
+                }),
+                json!({
+                    "type": "message_delta",
+                    "delta": delta,
+                    "usage": { "output_tokens": 7 }
+                }),
+                json!({ "type": "message_stop" }),
+            ];
+
+            let out = collect_events(&events);
+            assert_eq!(out.len(), 2, "{wire_reason}");
+            let StreamEvent::Done { reason, message } = &out[1] else {
+                panic!("expected terminal Done event for {wire_reason}");
+            };
+            assert_eq!(*reason, expected_reason, "{wire_reason}");
+            assert_eq!(message.stop_reason, expected_reason, "{wire_reason}");
+            assert_eq!(message.usage.total_tokens, 12, "{wire_reason}");
+
+            if wire_reason == "refusal" {
+                assert_eq!(
+                    message.stop_details.as_ref().map(|details| (
+                        details.kind.as_str(),
+                        details.category.as_deref(),
+                        details.explanation.as_deref(),
+                    )),
+                    Some((
+                        "refusal",
+                        Some("cyber"),
+                        Some("The request could enable cyber harm."),
+                    )),
+                );
+            } else {
+                assert!(message.stop_details.is_none(), "{wire_reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_anthropic_stop_reason_is_an_explicit_protocol_error() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let byte_stream = stream::iter(vec![Ok::<_, std::io::Error>(
+                b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"future_reason\"}}\n\n"
+                    .to_vec(),
+            )]);
+            let mut state = StreamState::new(
+                crate::sse::SseStream::new(Box::pin(byte_stream)),
+                "claude-test".to_string(),
+                "anthropic-messages".to_string(),
+                "anthropic".to_string(),
+            );
+            let event = state
+                .event_source
+                .next()
+                .await
+                .expect("event")
+                .expect("SSE event");
+            let error = state
+                .process_event(&event.data)
+                .expect_err("unknown stop reason must fail the protocol");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsupported Anthropic stop_reason `future_reason`"),
+                "unexpected error: {error}"
+            );
+        });
+    }
+
+    #[test]
     fn test_usage_total_tokens_saturates_on_large_values() {
         let events = vec![
             json!({
@@ -1983,6 +2556,40 @@ mod tests {
             .filter(|item| matches!(item, Ok(StreamEvent::Done { .. })))
             .count();
         assert_eq!(done_count, 1, "expected exactly one terminal Done event");
+    }
+
+    #[test]
+    fn test_stream_rejects_transport_eof_before_message_stop() {
+        let body = [
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}"#,
+            "",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}"#,
+            "",
+        ]
+        .join("\n");
+
+        let out = collect_stream_items_from_body(&body);
+        assert!(
+            out.iter()
+                .any(|item| matches!(item, Ok(StreamEvent::TextDelta { delta, .. }) if delta == "partial")),
+            "partial content should be emitted before the terminal error"
+        );
+        assert!(
+            !out.iter()
+                .any(|item| matches!(item, Ok(StreamEvent::Done { .. }))),
+            "premature EOF must never be reported as Done"
+        );
+        let error = out
+            .last()
+            .expect("terminal stream item")
+            .as_ref()
+            .expect_err("premature EOF must be a stream error")
+            .to_string();
+        assert!(error.contains("message_stop"), "{error}");
+        assert!(error.contains("unexpected EOF"), "{error}");
+        assert!(crate::error::is_retryable_error(&error, None, None));
     }
 
     #[test]
@@ -2145,6 +2752,24 @@ mod tests {
             captured.headers.get("anthropic-beta").map(String::as_str),
             Some("prompt-caching-2024-07-31")
         );
+        // Short retention: breakpoint marker present, no ttl anywhere.
+        assert!(captured.body.contains("\"cache_control\""));
+        assert!(!captured.body.contains("\"ttl\""));
+    }
+
+    /// Long retention through a relay base URL (the test server is not
+    /// api.anthropic.com): the caching beta is sent, but the extended-TTL
+    /// beta flag and the `ttl` field are both withheld together.
+    #[test]
+    fn test_stream_long_retention_via_relay_omits_extended_ttl_flag() {
+        let captured = run_stream_and_capture_headers(CacheRetention::Long)
+            .expect("captured request for long retention via relay");
+        assert_eq!(
+            captured.headers.get("anthropic-beta").map(String::as_str),
+            Some("prompt-caching-2024-07-31")
+        );
+        assert!(captured.body.contains("\"cache_control\""));
+        assert!(!captured.body.contains("\"ttl\""));
     }
 
     #[test]
@@ -2749,6 +3374,8 @@ mod tests {
             StopReason::Stop => "stop",
             StopReason::Length => "length",
             StopReason::ToolUse => "tool_use",
+            StopReason::PauseTurn => "pause_turn",
+            StopReason::Refusal => "refusal",
             StopReason::Error => "error",
             StopReason::Aborted => "aborted",
         }
@@ -2817,6 +3444,108 @@ mod tests {
             captured.headers.get("x-api-key").map(String::as_str),
             Some("sk-ant-test-key"),
         );
+    }
+
+    /// bd-dzddo: a `before_provider_request` rewrite must reach the wire on
+    /// the Anthropic route (hook breadth beyond the Responses API), with
+    /// `stream: true` re-imposed on the accepted rewrite.
+    #[test]
+    fn test_before_provider_request_rewrite_reaches_wire() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = AnthropicProvider::new("claude-test").with_base_url(base_url);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions {
+            api_key: Some("sk-ant-test-key".to_string()),
+            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                |event| {
+                    Box::pin(async move {
+                        let mut payload = event.payload;
+                        payload["metadata"] = serde_json::json!({"user_id": "pi-rewrite-marker"});
+                        payload["stream"] = serde_json::json!(false);
+                        Some(payload)
+                    })
+                },
+            )),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        let body: serde_json::Value = serde_json::from_str(&captured.body).expect("json body");
+        assert_eq!(body["metadata"]["user_id"], "pi-rewrite-marker");
+        assert_eq!(
+            body["stream"],
+            serde_json::Value::Bool(true),
+            "stream: true must be re-imposed on accepted rewrites"
+        );
+    }
+
+    /// bd-dzddo: a structurally invalid rewrite must fail open — the original
+    /// request body goes out unchanged.
+    #[test]
+    fn test_before_provider_request_invalid_rewrite_fails_open() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = AnthropicProvider::new("claude-test").with_base_url(base_url);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions {
+            api_key: Some("sk-ant-test-key".to_string()),
+            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                |_event| Box::pin(async move { Some(serde_json::json!("not an object")) }),
+            )),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        let body: serde_json::Value = serde_json::from_str(&captured.body).expect("json body");
+        assert_eq!(body["model"], "claude-test");
+        assert!(
+            body.get("metadata").is_none(),
+            "rejected rewrite must not alter the body"
+        );
+        assert!(body["messages"].is_array());
     }
 
     #[test]

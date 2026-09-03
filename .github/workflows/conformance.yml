@@ -155,14 +155,6 @@ jobs:
           path: charmed_rust
           fetch-depth: 1
 
-      - name: Checkout sqlmodel_rust
-        if: env.SHOULD_RUN == 'true'
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/sqlmodel_rust
-          path: sqlmodel_rust
-          fetch-depth: 1
-
       - name: Install system deps (fd, rg, xcb) [linux]
         if: env.SHOULD_RUN == 'true'
         run: |
@@ -173,8 +165,9 @@ jobs:
 
       - name: Install Rust toolchain (nightly)
         if: env.SHOULD_RUN == 'true'
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pinned 2026-08-04
         with:
+          toolchain: nightly-2026-07-05
           components: rustfmt, clippy
 
       - name: Cargo cache

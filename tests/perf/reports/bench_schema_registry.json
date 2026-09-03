@@ -1,4 +1,66 @@
 {
+  "budget_summary_contract": {
+    "budget_definition_required_fields": [
+      "name",
+      "category",
+      "metric",
+      "unit",
+      "threshold",
+      "comparison",
+      "ci_enforced",
+      "methodology"
+    ],
+    "claim_readiness": {
+      "authorization_requires": [
+        "strict_mode",
+        "bound_source_commit",
+        "matching_nonempty_run_and_correlation_ids",
+        "all_declared_budgets_have_data",
+        "all_declared_budgets_pass",
+        "zero_data_contract_failures"
+      ],
+      "blocked_lineage_evaluation": "canonical_all_no_data_sentinel_without_artifact_discovery",
+      "blocking_reason_codes": [
+        "budget_data_missing",
+        "budget_failed",
+        "ci_budget_data_missing",
+        "ci_budget_failed",
+        "correlation_id_missing",
+        "data_contract_failure",
+        "run_id_missing",
+        "source_commit_unbound",
+        "strict_mode_disabled"
+      ],
+      "blocking_reason_order": "lexicographic_ascending",
+      "scope": "all_declared_budgets"
+    },
+    "comparison_semantics": {
+      "maximum": "actual <= threshold",
+      "minimum": "actual >= threshold"
+    },
+    "comparison_values": [
+      "maximum",
+      "minimum"
+    ],
+    "inventory_digest": {
+      "algorithm": "sha256",
+      "budget_order": "producer_declaration_order",
+      "canonical_v0_2_0_sha256": "4e24380af0ca4fe8fd94850d63e607868d15d704a42d434bdb1c762e7e327663",
+      "container": "compact_json_array",
+      "field_order": [
+        "name",
+        "category",
+        "metric",
+        "unit",
+        "threshold",
+        "comparison",
+        "ci_enforced",
+        "methodology"
+      ],
+      "threshold_representation": "exactly_six_decimal_places"
+    },
+    "schema": "pi.perf.budget_summary.v2"
+  },
   "env_fingerprint_fields": [
     {
       "description": "Operating system name and version",
@@ -113,6 +175,50 @@
       "realistic": 0.7,
       "weights_sum_to": 1.0
     },
+    "pijs_regression_gate_admission": {
+      "inherits": "regression_gate_admission",
+      "required_build_profile": "perf",
+      "required_build_profile_verified": true,
+      "required_iterations": 2000,
+      "required_measurement_boundary": "production_extension_manager",
+      "required_measurement_contract_version": "production_extension_manager.v1",
+      "required_record_fields": [
+        "timestamp",
+        "run_id",
+        "correlation_id",
+        "source_commit",
+        "source_dirty",
+        "binary_path",
+        "executable_build_profile",
+        "executable_profile_verified",
+        "binary_sha256",
+        "build_profile_verified",
+        "build_fingerprint_contract",
+        "build_fingerprint_verified",
+        "debug_assertions",
+        "compiled_profile_family",
+        "compiled_opt_level",
+        "compiled_debug",
+        "compiled_features",
+        "config_hash",
+        "allocator_requested",
+        "allocator_request_source",
+        "allocator_effective",
+        "allocator_fallback_reason",
+        "elapsed_us",
+        "elapsed_us_f64",
+        "per_call_us_f64"
+      ],
+      "required_runtime_engine": "quickjs",
+      "required_scenario": "tool_call_roundtrip",
+      "required_schema": "pi.perf.workload.v1",
+      "required_tool": "pijs_workload",
+      "required_tool_calls_per_iteration": [
+        1,
+        10
+      ],
+      "scope": "pi.perf.workload.v1/pijs_workload"
+    },
     "realistic_replay_inputs": [
       {
         "partition": "realistic",
@@ -172,6 +278,77 @@
       1000000,
       5000000
     ],
+    "regression_gate_admission": {
+      "allowed_disk_cache_policies": [
+        "disabled",
+        "not_applicable",
+        "not_applicable_synthetic",
+        "unique_per_scenario_shared_across_warmup_and_runs"
+      ],
+      "allowed_host_page_cache_policies": [
+        "not_applicable_measured_region",
+        "not_applicable_synthetic",
+        "uncontrolled"
+      ],
+      "allowed_measurement_boundaries": [
+        "in_process_preview",
+        "production_extension_manager",
+        "production_extension_runtime",
+        "synthetic_seed_generation",
+        "synthetic_seed_projection"
+      ],
+      "allowed_measurement_methods": [
+        "wall_clock_observation",
+        "synthetic_seed_projection"
+      ],
+      "eligible_confidence": "high",
+      "eligible_evidence_class": "measured",
+      "eligible_measurement_boundaries": [
+        "production_extension_manager",
+        "production_extension_runtime"
+      ],
+      "eligible_measurement_method": "wall_clock_observation",
+      "load_scenario_required_fields": [
+        "disk_cache_policy",
+        "host_page_cache_policy"
+      ],
+      "positive_sample_count_fields": [
+        "runs",
+        "iterations",
+        "total_calls"
+      ],
+      "require_positive_sample_count": true,
+      "required_eligible_host_page_cache_policy": "not_applicable_measured_region",
+      "required_eligible_provenance_fields": [
+        "source_commit",
+        "source_dirty",
+        "build_profile",
+        "executable_build_profile",
+        "executable_profile_verified",
+        "build_fingerprint_verified",
+        "build_profile_verified",
+        "build_fingerprint_contract",
+        "compiled_profile_family",
+        "compiled_opt_level",
+        "compiled_debug",
+        "compiled_features",
+        "binary_path",
+        "binary_sha256",
+        "debug_assertions",
+        "config_hash"
+      ],
+      "required_record_fields": [
+        "evidence_class",
+        "confidence",
+        "eligible_for_regression_gate",
+        "measurement_method",
+        "measurement_boundary",
+        "measurement_contract_version",
+        "disk_cache_policy"
+      ],
+      "scope": "generic_benchmark_record",
+      "uncontrolled_host_page_cache_eligible": false
+    },
     "required_metadata_fields": [
       "runtime",
       "build_profile",
@@ -440,8 +617,8 @@
       "name": "pi.perf.budget.v1"
     },
     {
-      "description": "Aggregate budget summary with pass/fail counts",
-      "name": "pi.perf.budget_summary.v1"
+      "description": "Strict provenance-bound budget summary with per-budget results and claim readiness",
+      "name": "pi.perf.budget_summary.v2"
     },
     {
       "description": "Per-extension conformance report event",

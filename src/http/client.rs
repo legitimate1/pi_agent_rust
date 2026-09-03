@@ -180,6 +180,14 @@ fn resolve_timeout(_setting: RequestTimeout, _url: &str) -> Option<std::time::Du
     None
 }
 
+/// Resolve the same provider-aware/global timeout used by an otherwise
+/// unmodified [`RequestBuilder`]. Finite, non-streaming operations can use this
+/// to add an overall wall-clock deadline in addition to the client's
+/// connect/write/header and body-idle bounds.
+pub(crate) fn effective_default_request_timeout(url: &str) -> Option<std::time::Duration> {
+    resolve_timeout(RequestTimeout::Default, url)
+}
+
 /// Build a self-documenting timeout error message that tells the user the
 /// timeout that fired and how to raise it. Adds Ollama/local-provider-specific
 /// guidance (cold-start model load, model not pulled) when the target is a
@@ -223,18 +231,72 @@ pub struct Client {
 static TLS_CONNECTOR: std::sync::OnceLock<std::result::Result<TlsConnector, String>> =
     std::sync::OnceLock::new();
 
-/// Build (or fetch the cached) TLS connector backed by the bundled webpki
-/// root certificates.
+/// Explicit opt-in env var for the OS trust store instead of the bundled
+/// webpki roots (gh #186).
+pub const USE_SYSTEM_CERTS_ENV: &str = "PI_HTTP_USE_SYSTEM_CERTS";
+
+/// Custom-CA env vars that also imply the system-trust opt-in, matching
+/// curl/requests/OpenSSL semantics: exporting one of these *is* the signal
+/// that a custom trust anchor (e.g. a TLS-terminating corporate proxy CA)
+/// should be honored.
+const CA_BUNDLE_ENV_VARS: [&str; 4] = [
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+];
+
+/// Whether the operator opted in to the OS trust store (plus any custom CA
+/// bundle the standard env vars point at) instead of the bundled webpki
+/// roots (gh #186).
 ///
-/// Using webpki roots avoids hitting the OS trust store, which on macOS calls
-/// into Security.framework (`SecTrustSettingsCopyTrustSettings`) and can spend
-/// many seconds at high CPU parsing the system cert trust plist on startup.
-/// See pi_agent_rust#101.
+/// `PI_HTTP_USE_SYSTEM_CERTS` decides explicitly when set to a non-empty
+/// value: truthy values opt in, and `0`/`false`/`off`/`no` force webpki roots
+/// even when a custom-CA var is present (the escape hatch back to gh #101's
+/// cheap startup for users with an ambient `SSL_CERT_FILE`). When it is unset
+/// or empty, setting any of the OpenSSL-style custom-CA vars opts in
+/// implicitly, since a custom bundle is useless unless it is actually loaded.
+fn want_system_certs(explicit: Option<&str>, ca_env_set: impl Fn(&str) -> bool) -> bool {
+    if let Some(v) = explicit.map(str::trim).filter(|v| !v.is_empty()) {
+        let disabled = v == "0"
+            || v.eq_ignore_ascii_case("false")
+            || v.eq_ignore_ascii_case("off")
+            || v.eq_ignore_ascii_case("no");
+        return !disabled;
+    }
+    CA_BUNDLE_ENV_VARS.iter().any(|var| ca_env_set(var))
+}
+
+fn want_system_certs_from_env() -> bool {
+    want_system_certs(std::env::var(USE_SYSTEM_CERTS_ENV).ok().as_deref(), |var| {
+        std::env::var_os(var).is_some_and(|v| !v.is_empty())
+    })
+}
+
+/// Build (or fetch the cached) TLS connector.
+///
+/// Default: the bundled webpki root certificates. Using webpki roots avoids
+/// hitting the OS trust store, which on macOS calls into Security.framework
+/// (`SecTrustSettingsCopyTrustSettings`) and can spend many seconds at high
+/// CPU parsing the system cert trust plist on startup. See pi_agent_rust#101.
+///
+/// Opt-in (gh #186): [`want_system_certs`] switches to the OS trust store,
+/// with `enable_env_cert_loading()` so `SSL_CERT_FILE` / `SSL_CERT_DIR` /
+/// `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` bundles are merged in — needed
+/// behind TLS-terminating corporate proxies with custom CAs.
 fn shared_tls_connector() -> std::result::Result<TlsConnector, String> {
     TLS_CONNECTOR
         .get_or_init(|| {
-            TlsConnectorBuilder::new()
-                .with_webpki_roots()
+            let builder = TlsConnectorBuilder::new();
+            let builder = if want_system_certs_from_env() {
+                builder
+                    .enable_env_cert_loading()
+                    .with_native_roots()
+                    .map_err(|e| e.to_string())?
+            } else {
+                builder.with_webpki_roots()
+            };
+            builder
                 .alpn_protocols(vec![b"http/1.1".to_vec()])
                 .build()
                 .map_err(|e| e.to_string())
@@ -267,6 +329,10 @@ impl Client {
         RequestBuilder::new(self, Method::Get, url)
     }
 
+    pub fn delete(&self, url: &str) -> RequestBuilder<'_> {
+        RequestBuilder::new(self, Method::Delete, url)
+    }
+
     #[must_use]
     pub fn with_vcr(mut self, recorder: VcrRecorder) -> Self {
         self.vcr = Some(recorder);
@@ -286,6 +352,7 @@ impl Default for Client {
 
 #[derive(Debug, Clone, Copy)]
 enum Method {
+    Delete,
     Get,
     Post,
 }
@@ -293,6 +360,7 @@ enum Method {
 impl Method {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Delete => "DELETE",
             Self::Get => "GET",
             Self::Post => "POST",
         }
@@ -334,6 +402,15 @@ impl<'a> RequestBuilder<'a> {
         let key = key.into();
         let value = value.into();
         validate_request_header(&key, &value)?;
+        let replaces_existing = self
+            .headers
+            .iter()
+            .any(|(existing_key, _)| existing_key.eq_ignore_ascii_case(&key));
+        if !replaces_existing && self.headers.len() >= MAX_REQUEST_HEADERS {
+            return Err(Error::api(format!(
+                "HTTP request exceeds the {MAX_REQUEST_HEADERS}-header limit"
+            )));
+        }
         self.upsert_header(key, value);
         Ok(self)
     }
@@ -667,10 +744,29 @@ impl Response {
     }
 
     pub async fn text(self) -> Result<String> {
+        self.text_limited(MAX_TEXT_BODY_BYTES).await
+    }
+
+    /// Collect the response body with a caller-specific byte limit.
+    ///
+    /// This is useful for small structured endpoints whose safe bound is much
+    /// tighter than the generic response limit.
+    pub async fn text_limited(self, max_bytes: usize) -> Result<String> {
+        let bytes = self.bytes_limited(max_bytes).await?;
+
+        match String::from_utf8(bytes) {
+            Ok(s) => Ok(s),
+            Err(e) => Ok(String::from_utf8_lossy(e.as_bytes()).into_owned()),
+        }
+    }
+
+    /// Collect response bytes without changing invalid UTF-8, bounded by a
+    /// caller-specific limit.
+    pub async fn bytes_limited(self, max_bytes: usize) -> Result<Vec<u8>> {
         let stream = wrap_stream_with_idle_timeout(self.stream, self.timeout_info);
-        let bytes = stream
+        stream
             .try_fold(Vec::new(), |mut acc, chunk| async move {
-                if acc.len().saturating_add(chunk.len()) > MAX_TEXT_BODY_BYTES {
+                if acc.len().saturating_add(chunk.len()) > max_bytes {
                     return Err(std::io::Error::other("response body too large"));
                 }
                 acc.extend_from_slice(&chunk);
@@ -687,12 +783,7 @@ impl Response {
                 } else {
                     Error::from(err)
                 }
-            })?;
-
-        match String::from_utf8(bytes) {
-            Ok(s) => Ok(s),
-            Err(e) => Ok(String::from_utf8_lossy(e.as_bytes()).into_owned()),
-        }
+            })
     }
 }
 
@@ -750,10 +841,10 @@ fn is_retryable_not_connected(err: &std::io::Error) -> bool {
     // each link back to `io::Error` where possible.
     let mut source = std::error::Error::source(err);
     while let Some(cause) = source {
-        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
-            if matches_not_connected(io_err) {
-                return true;
-            }
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
+            && matches_not_connected(io_err)
+        {
+            return true;
         }
         source = cause.source();
     }
@@ -771,19 +862,19 @@ fn is_retryable_not_connected(err: &std::io::Error) -> bool {
 /// the fresh-socket retry fires regardless of which variant the connector
 /// chose to report (pi_agent_rust#111 / #106).
 fn is_retryable_not_connected_tls(err: &TlsError) -> bool {
-    if let TlsError::Io(io_err) = err {
-        if is_retryable_not_connected(io_err) {
-            return true;
-        }
+    if let TlsError::Io(io_err) = err
+        && is_retryable_not_connected(io_err)
+    {
+        return true;
     }
     // Walk the generic source chain; any link that is (or wraps) a
     // "socket not connected" io::Error makes the connect retryable.
     let mut source = std::error::Error::source(err);
     while let Some(cause) = source {
-        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
-            if is_retryable_not_connected(io_err) {
-                return true;
-            }
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
+            && is_retryable_not_connected(io_err)
+        {
+            return true;
         }
         source = cause.source();
     }
@@ -1237,10 +1328,10 @@ impl BodyStreamState {
     async fn read_more(&mut self) -> std::io::Result<usize> {
         let mut scratch = [0u8; READ_CHUNK_BYTES];
         let n = read_some(&mut self.transport, &mut scratch).await?;
-        if n > 0 {
-            if let Err(err) = self.buf.extend(&scratch[..n]) {
-                return Err(std::io::Error::other(err.to_string()));
-            }
+        if n > 0
+            && let Err(err) = self.buf.extend(&scratch[..n])
+        {
+            return Err(std::io::Error::other(err.to_string()));
         }
         Ok(n)
     }
@@ -1484,6 +1575,11 @@ mod tests {
     use std::collections::VecDeque;
 
     // ── Method ──────────────────────────────────────────────────────────
+    #[test]
+    fn method_as_str_delete() {
+        assert_eq!(Method::Delete.as_str(), "DELETE");
+    }
+
     #[test]
     fn method_as_str_get() {
         assert_eq!(Method::Get.as_str(), "GET");
@@ -2152,6 +2248,34 @@ mod tests {
     }
 
     #[test]
+    fn request_builder_try_header_reports_capacity_and_still_allows_replacement() {
+        let client = Client::new();
+        let mut builder = client.post("https://api.example.com");
+        for i in 0..MAX_REQUEST_HEADERS {
+            builder = builder
+                .try_header(format!("X-Header-{i}"), "value")
+                .expect("headers within the cap");
+        }
+
+        let Err(error) = builder.try_header("X-Over-Limit", "must-not-be-dropped-silently") else {
+            panic!("a distinct header beyond the cap must be reported");
+        };
+        assert!(error.to_string().contains("header limit"), "{error}");
+
+        let mut replaceable = client.post("https://api.example.com");
+        for i in 0..MAX_REQUEST_HEADERS {
+            replaceable = replaceable
+                .try_header(format!("X-Header-{i}"), "value")
+                .expect("headers within the cap");
+        }
+        replaceable = replaceable
+            .try_header("x-header-0", "replacement")
+            .expect("case-insensitive replacement at capacity");
+        assert_eq!(replaceable.headers.len(), MAX_REQUEST_HEADERS);
+        assert_eq!(replaceable.headers[0].1, "replacement");
+    }
+
+    #[test]
     fn request_builder_json() {
         let client = Client::new();
         let builder = client
@@ -2619,6 +2743,25 @@ mod tests {
         });
     }
 
+    #[test]
+    fn response_text_limited_honors_caller_specific_limit() {
+        asupersync::test_utils::run_test(|| async {
+            let chunks: Vec<std::io::Result<Vec<u8>>> =
+                vec![Ok(b"1234".to_vec()), Ok(b"5".to_vec())];
+            let response = Response {
+                status: 200,
+                headers: Vec::new(),
+                stream: Box::pin(futures::stream::iter(chunks)),
+                timeout_info: None,
+            };
+            let error = response
+                .text_limited(4)
+                .await
+                .expect_err("fifth byte must exceed the endpoint-specific limit");
+            assert!(error.to_string().contains("too large"), "{error}");
+        });
+    }
+
     // ── PI_AI_ANTIGRAVITY_VERSION env var ─────────────────────────────
 
     #[test]
@@ -2631,6 +2774,38 @@ mod tests {
 
         // Verify default user agent contains crate version.
         assert!(DEFAULT_USER_AGENT.starts_with("pi_agent_rust/"));
+    }
+
+    // ── System-cert opt-in predicate (gh #186) ────────────────────────
+
+    #[test]
+    fn want_system_certs_predicate() {
+        let no_ca_env = |_: &str| false;
+        // Default: webpki roots.
+        assert!(!want_system_certs(None, no_ca_env));
+        // Explicit opt-in.
+        assert!(want_system_certs(Some("1"), no_ca_env));
+        assert!(want_system_certs(Some("true"), no_ca_env));
+        assert!(want_system_certs(Some("yes"), no_ca_env));
+        // Explicitly disabled values don't opt in.
+        assert!(!want_system_certs(Some(""), no_ca_env));
+        assert!(!want_system_certs(Some("0"), no_ca_env));
+        assert!(!want_system_certs(Some("false"), no_ca_env));
+        assert!(!want_system_certs(Some("OFF"), no_ca_env));
+        assert!(!want_system_certs(Some("no"), no_ca_env));
+        // Any custom-CA env var implies the opt-in (curl/requests semantics).
+        for var in CA_BUNDLE_ENV_VARS {
+            assert!(
+                want_system_certs(None, |v| v == var),
+                "{var} should imply system certs"
+            );
+        }
+        // An explicit disable beats an ambient custom-CA var: the escape
+        // hatch back to webpki (gh #101 startup cost) must stay available.
+        assert!(!want_system_certs(Some("0"), |v| v == "SSL_CERT_FILE"));
+        assert!(!want_system_certs(Some("off"), |v| v == "REQUESTS_CA_BUNDLE"));
+        // Empty explicit value defers to the CA vars.
+        assert!(want_system_certs(Some(""), |v| v == "SSL_CERT_FILE"));
     }
 
     #[test]

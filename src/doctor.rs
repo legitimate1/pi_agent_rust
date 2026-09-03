@@ -66,6 +66,7 @@ const SWARM_RESOURCE_PREFLIGHT_RCH_QUEUE_JSON_ENV: &str = "PI_DOCTOR_RCH_QUEUE_J
 const SWARM_RESOURCE_PREFLIGHT_RCH_QUEUE_JSON_PATH_ENV: &str = "PI_DOCTOR_RCH_QUEUE_JSON_PATH";
 const SWARM_RESOURCE_PREFLIGHT_LOCAL_BUILD_PROCESS_COUNT_ENV: &str =
     "PI_DOCTOR_LOCAL_BUILD_PROCESS_COUNT";
+const SWARM_RESOURCE_PREFLIGHT_LOGICAL_CPU_CORES_ENV: &str = "PI_DOCTOR_LOGICAL_CPU_CORES";
 const SWARM_VALIDATION_BROKER_STORE_ENV: &str = "PI_VALIDATION_BROKER_STORE";
 const SWARM_PROGRESS_SLO_JSON_ENV: &str = "PI_SWARM_PROGRESS_SLO_JSON";
 const SWARM_BUILD_SLOT_SOON_EXPIRING_MINUTES: i64 = 30;
@@ -1838,9 +1839,13 @@ fn build_swarm_resource_preflight_snapshot(
     sample: &HostResourceSample,
 ) -> SwarmResourcePreflightSnapshot {
     let mut source_errors = Vec::new();
-    let logical_cpu_cores = std::thread::available_parallelism()
-        .ok()
-        .and_then(|value| u64::try_from(value.get()).ok())
+    let logical_cpu_cores = env_u64(SWARM_RESOURCE_PREFLIGHT_LOGICAL_CPU_CORES_ENV)
+        .filter(|cores| *cores > 0)
+        .or_else(|| {
+            std::thread::available_parallelism()
+                .ok()
+                .and_then(|value| u64::try_from(value.get()).ok())
+        })
         .unwrap_or(1);
     let cpu_quota = read_cgroup_cpu_quota(&mut source_errors);
     let cpuset = read_cpuset_snapshot(&mut source_errors);
@@ -10352,17 +10357,19 @@ fn swarm_temp_dir_finding(
     let cat = CheckCategory::Swarm;
     let data = swarm_temp_dir_data(env_name, Some(path), true, available_kb);
 
-    if let Some(available_kb) = available_kb {
-        if available_kb < SWARM_DISK_WARN_AVAILABLE_KB {
-            return Finding::warn(cat, format!("{env_name} has low free space"))
-                .with_detail(format!(
-                    "{} available at {}",
-                    format_available_kb(available_kb),
-                    path.display()
-                ))
-                .with_remediation("Switch to a larger /data/tmp target or wait for cleanup before heavy cargo checks")
-                .with_data(data);
-        }
+    if let Some(available_kb) = available_kb
+        && available_kb < SWARM_DISK_WARN_AVAILABLE_KB
+    {
+        return Finding::warn(cat, format!("{env_name} has low free space"))
+            .with_detail(format!(
+                "{} available at {}",
+                format_available_kb(available_kb),
+                path.display()
+            ))
+            .with_remediation(
+                "Switch to a larger /data/tmp target or wait for cleanup before heavy cargo checks",
+            )
+            .with_data(data);
     }
 
     if !path_under_swarm_scratch_root(path) {
@@ -10728,7 +10735,20 @@ fn check_sessions(findings: &mut Vec<Finding>) {
         findings.push(
             Finding::warn(cat, format!("{total} sessions, {corrupt} corrupt"))
                 .with_detail("Some session files are empty or have invalid headers")
-                .with_remediation("Corrupt sessions can be safely deleted"),
+                .with_remediation(
+                    "Move corrupt sessions aside with `pi gc` (trash + grace period) rather than deleting them",
+                ),
+        );
+    }
+
+    let pressure = crate::gc::check_storage_pressure(&sessions_dir, 30);
+    if pressure.is_elevated
+        && let Some(rec) = pressure.recommendation
+    {
+        findings.push(
+            Finding::warn(cat, "Storage pressure detected in sessions store")
+                .with_detail(rec)
+                .with_remediation("Run `pi gc --yes` to prune aged sessions and free disk space"),
         );
     }
 }
@@ -13841,7 +13861,7 @@ fn doctor_swarm_context_intelligence_json_reports_posture() {
             ..SessionHeader::default()
         };
         futures::executor::block_on(async {
-            crate::session_sqlite::save_session(&path, &header, &[])
+            crate::session_sqlite::save_session(&path, &header, &[], true)
                 .await
                 .expect("save sqlite session");
         });
@@ -13858,7 +13878,7 @@ fn doctor_swarm_context_intelligence_json_reports_posture() {
             ..SessionHeader::default()
         };
         futures::executor::block_on(async {
-            crate::session_sqlite::save_session(&path, &header, &[])
+            crate::session_sqlite::save_session(&path, &header, &[], true)
                 .await
                 .expect("save sqlite session");
         });
@@ -13868,13 +13888,17 @@ fn doctor_swarm_context_intelligence_json_reports_posture() {
         };
         let invalid_json =
             serde_json::to_string(&invalid_header).expect("serialize invalid session header");
-        let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string_lossy())
-            .flags(sqlmodel_sqlite::OpenFlags::create_read_write());
-        let conn = sqlmodel_sqlite::SqliteConnection::open(&config).expect("open sqlite db");
-        conn.execute_sync(
-            "UPDATE pi_session_header SET json = ?1",
-            &[sqlmodel_core::Value::Text(invalid_json)],
-        )
+        crate::session_sqlite::run_on_sqlite_thread(|| {
+            let conn = crate::session_sqlite::SqliteConnection::open_read_write(&path)
+                .map_err(|err| crate::error::Error::session(err.to_string()))?;
+            conn.execute_sync(
+                "UPDATE pi_session_header SET json = ?1",
+                &[fsqlite::SqliteValue::from(invalid_json)],
+            )
+            .map_err(|err| crate::error::Error::session(err.to_string()))?;
+            conn.close()
+                .map_err(|err| crate::error::Error::session(err.to_string()))
+        })
         .expect("corrupt sqlite header row");
         assert!(!is_session_healthy(&path));
     }

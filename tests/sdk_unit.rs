@@ -164,9 +164,9 @@ fn callback_ordering_stream_event_hook_extracts_from_message_update() {
 fn transport_session_transport_event_variants_debug() {
     let harness = TestHarness::new("transport_session_transport_event_variants_debug");
 
-    let in_process_event = SessionTransportEvent::InProcess(AgentEvent::AgentStart {
+    let in_process_event = SessionTransportEvent::InProcess(Box::new(AgentEvent::AgentStart {
         session_id: "test".into(),
-    });
+    }));
     let rpc_event = SessionTransportEvent::Rpc(json!({"type": "agent_start"}));
 
     let dbg_ip = format!("{in_process_event:?}");
@@ -194,10 +194,11 @@ fn transport_session_prompt_result_variants() {
         model: "test".to_string(),
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
+        stop_details: None,
         error_message: None,
         timestamp: 0,
     };
-    let in_process = SessionPromptResult::InProcess(msg);
+    let in_process = SessionPromptResult::InProcess(Box::new(msg));
     let rpc = SessionPromptResult::RpcEvents(vec![json!({"type": "agent_end"})]);
 
     // Debug works
@@ -605,15 +606,30 @@ fn rpc_compaction_result_serde() {
         "summary": "Compacted 10 messages into 2",
         "firstKeptEntryId": "entry-5",
         "tokensBefore": 12000,
+        "tokensAfter": 3400,
         "details": {"removed": 8}
     });
     let result: RpcCompactionResult = serde_json::from_value(value.clone()).expect("deserialize");
     assert_eq!(result.summary, "Compacted 10 messages into 2");
     assert_eq!(result.first_kept_entry_id, "entry-5");
     assert_eq!(result.tokens_before, 12000);
+    assert_eq!(result.tokens_after, 3400);
 
     let reencoded = serde_json::to_value(&result).expect("serialize");
     assert_eq!(reencoded, value);
+
+    // Backward compatibility: a payload emitted before `tokensAfter` existed
+    // still deserializes, defaulting the additive field to 0.
+    let legacy = json!({
+        "summary": "old",
+        "firstKeptEntryId": "entry-1",
+        "tokensBefore": 500,
+        "details": {}
+    });
+    let legacy_result: RpcCompactionResult =
+        serde_json::from_value(legacy).expect("deserialize legacy");
+    assert_eq!(legacy_result.tokens_before, 500);
+    assert_eq!(legacy_result.tokens_after, 0);
 
     harness
         .log()
@@ -622,6 +638,7 @@ fn rpc_compaction_result_serde() {
                 "tokens_before".to_string(),
                 result.tokens_before.to_string(),
             ));
+            ctx.push(("tokens_after".to_string(), result.tokens_after.to_string()));
         });
 }
 

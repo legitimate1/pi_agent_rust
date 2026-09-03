@@ -46,6 +46,46 @@ pub struct Config {
     pub default_thinking_level: Option<String>,
     #[serde(alias = "enabledModels")]
     pub enabled_models: Option<Vec<String>>,
+    /// Per-role model assignments (see [`ModelRoleSettings`], bd-cv653.3.1).
+    #[serde(alias = "modelRoles")]
+    pub model_roles: Option<ModelRoleSettings>,
+    /// Automatic session titling (see [`TitlingSettings`], bd-cv653.3.1).
+    pub titling: Option<TitlingSettings>,
+    /// Providers whose models are hidden from selection and cycling
+    /// (bd-cv653.3.2). Canonical ids or aliases, case-insensitive.
+    #[serde(alias = "disabledProviders")]
+    pub disabled_providers: Option<Vec<String>>,
+    /// Path-scoped model sets (bd-cv653.3.2): pin a different model set on
+    /// one repo without touching the global config. Most specific matching
+    /// path prefix wins.
+    #[serde(alias = "modelScopeOverrides")]
+    pub model_scope_overrides: Option<Vec<ModelScopeOverride>>,
+    /// Tool load modes (`tools.loadMode`, bd-cv653.1.6).
+    pub tools: Option<ToolSettings>,
+    /// Plan-mode settings (bd-cv653.3.5).
+    pub plan: Option<PlanSettings>,
+    /// Read-tool settings (bd-cv653.2.2 URL reads).
+    pub read: Option<ReadSettings>,
+    /// Bash-tool mediation settings (bd-cv653.1.7).
+    pub bash: Option<BashSettings>,
+    /// Memory-bank settings (bd-cv653.4.1).
+    pub memory: Option<MemorySettings>,
+    /// Opt-in media trio settings (bd-cv653.2.7).
+    pub media: Option<crate::media_tools::MediaSettings>,
+    /// Opt-in computer tool settings (bd-cv653.2.5).
+    pub computer: Option<crate::computer::ComputerSettings>,
+    /// Opt-in browser tool settings (bd-cv653.2.4).
+    pub browser: Option<crate::browser::BrowserSettings>,
+    /// Secrets vault settings (bd-cv653.7.9).
+    pub secrets: Option<crate::secrets::SecretsSettings>,
+    /// Magic-keyword settings (bd-cv653.3.6).
+    pub keywords: Option<crate::magic_keywords::KeywordSettings>,
+    /// Advisor settings (bd-cv653.3.3).
+    pub advisor: Option<AdvisorSettings>,
+    /// LSP tool settings (bd-cv653.1.1).
+    pub lsp: Option<LspSettings>,
+    /// Approval mode settings (bd-cv653.3.19).
+    pub approval: Option<ApprovalSettings>,
 
     /// HTTP request timeout in seconds for provider API calls.
     ///
@@ -92,6 +132,23 @@ pub struct Config {
     /// Session durability mode: `strict`, `balanced` (default), or `throughput`.
     #[serde(alias = "sessionDurability")]
     pub session_durability: Option<String>,
+    /// Search backend for the grep/find tools: `inproc` (default; in-process
+    /// ignore/grep crates, no external binaries) or `external` (shell out to
+    /// `rg`/`fd`, the pre-bd-cv653.1.5 behavior — kept as a debugging escape
+    /// hatch).
+    #[serde(alias = "searchBackend")]
+    pub search_backend: Option<String>,
+    /// Import rules from other tools' native config files found in the
+    /// workspace — Cursor MDC/.cursorrules, Cline, Copilot instructions,
+    /// Windsurf, GEMINI.md (bd-cv653.6.2). Read-only; native AGENTS.md /
+    /// CLAUDE.md conventions always win. Default `true`.
+    #[serde(alias = "foreignRules")]
+    pub foreign_rules: Option<bool>,
+    /// How the `ask` tool resolves in non-interactive sessions
+    /// (bd-cv653.3.8): `recommended` (default; auto-answer with the
+    /// recommended option, loudly) or `error` (fail the tool call).
+    #[serde(alias = "askPolicy")]
+    pub ask_policy: Option<String>,
 
     // Compaction
     pub compaction: Option<CompactionSettings>,
@@ -112,6 +169,23 @@ pub struct Config {
     #[serde(alias = "ghPath")]
     pub gh_path: Option<String>,
 
+    // Subagent tool
+    /// Append a machine-readable `<subagent-structured-result>` JSON block to
+    /// the `subagent` tool's result text. See pi_agent_rust#163.
+    ///
+    /// Providers only serialize a tool result's text content, so the
+    /// structured `details` payload (`pi.subagent.result.v1`) never reaches
+    /// the parent model. When `true`, the subagent tool appends a compact
+    /// JSON array (field names match the `pi.subagent.result.v1` schema)
+    /// wrapped in `<subagent-structured-result>...</subagent-structured-result>`
+    /// so parents can parse per-child results. `output`/`error` fields are
+    /// truncated to 2 KiB each and the whole block is capped at 16 KiB.
+    ///
+    /// Default `false` keeps subagent tool output byte-identical to previous
+    /// releases.
+    #[serde(alias = "subagentStructuredResults")]
+    pub subagent_structured_results: Option<bool>,
+
     // Images
     pub images: Option<ImageSettings>,
 
@@ -125,6 +199,12 @@ pub struct Config {
     #[serde(alias = "thinkingBudgets")]
     pub thinking_budgets: Option<ThinkingBudgets>,
 
+    // Workspace trust (GH #151): trust every workspace's project-local
+    // configuration without the first-use prompt. Automation escape hatch;
+    // only honored when set in the GLOBAL settings file.
+    #[serde(alias = "trustAllWorkspaces")]
+    pub trust_all_workspaces: Option<bool>,
+
     // Extensions/Skills/etc.
     pub packages: Option<Vec<PackageSource>>,
     pub extensions: Option<Vec<String>>,
@@ -137,6 +217,16 @@ pub struct Config {
     // Extension tool hook behavior
     #[serde(alias = "failClosedHooks")]
     pub fail_closed_hooks: Option<bool>,
+
+    /// Auto-compaction mode (bd-cv653.3.18): "summary" (default) |
+    /// "shake-first" | "aggressive".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_mode: Option<crate::compaction::AutoCompactionMode>,
+
+    /// Auto-continue policy for unexpected mid-task stops (bd-cv653.3.15):
+    /// "off" | "conservative" (default) | "aggressive".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_recovery: Option<crate::turn_recovery::TurnRecoveryMode>,
 
     // Extension Policy
     #[serde(alias = "extensionPolicy")]
@@ -264,6 +354,10 @@ pub struct CompactionSettings {
     pub reserve_tokens: Option<u32>,
     #[serde(alias = "keepRecentTokens")]
     pub keep_recent_tokens: Option<u32>,
+    /// Compaction output rendering: "text" (default) | "snapcompact"
+    /// (bd-cv653.7.6).
+    #[serde(alias = "mode")]
+    pub mode: Option<crate::compaction::CompactionRenderMode>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -283,6 +377,204 @@ pub struct RetrySettings {
     pub base_delay_ms: Option<u32>,
     #[serde(alias = "maxDelayMs")]
     pub max_delay_ms: Option<u32>,
+    /// Cross-model failover chains (bd-cv653.3.2): maps a role name
+    /// (`default`/`smol`/…) or an exact `provider/model` spec to an ordered
+    /// list of fallback `provider/model` specs. On a classified transient
+    /// failure (429/quota/overload after the retry budget) the NEXT entry
+    /// continues the turn; the primary is restored after the cooldown.
+    #[serde(alias = "fallbackChains")]
+    pub fallback_chains: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// Seconds before the primary model is retried after a failover
+    /// (default 300).
+    #[serde(alias = "failoverCooldownSecs", alias = "cooldownSecs")]
+    pub failover_cooldown_secs: Option<u64>,
+    /// Maximum failovers within a single turn (default 8, hard cap).
+    #[serde(alias = "maxFailoversPerTurn")]
+    pub max_failovers_per_turn: Option<u32>,
+}
+
+/// Per-role model assignments (bd-cv653.3.1).
+///
+/// Each value is a model spec string: `"provider/model"` (optionally with a
+/// `:thinking-level` suffix, e.g. `"openai/gpt-5:high"`). All roles are
+/// optional; unset roles fall back to the `default` role, which itself falls
+/// back to `defaultProvider`/`defaultModel` and then the built-in auto-select.
+/// CLI role flags (`--smol`/`--slow`/`--plan`) override these values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelRoleSettings {
+    pub default: Option<String>,
+    pub smol: Option<String>,
+    pub slow: Option<String>,
+    pub plan: Option<String>,
+    pub commit: Option<String>,
+    pub vision: Option<String>,
+    pub designer: Option<String>,
+    pub task: Option<String>,
+    pub advisor: Option<String>,
+    pub tiny: Option<String>,
+}
+
+/// Automatic session titling (bd-cv653.3.1 round-4 scope).
+///
+/// After the first exchange of a new session, a tiny/smol-role model call
+/// summarizes the task into a short session name (the `SessionInfo` entry),
+/// making `--resume` pickers and status lines readable. Never blocks the turn
+/// and silently no-ops when no cheap role resolves or credentials are missing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TitlingSettings {
+    /// Master switch for automatic session titling (default: true).
+    #[serde(alias = "autoTitle", alias = "auto")]
+    pub auto_title: Option<bool>,
+}
+
+/// A path-scoped model-set override (bd-cv653.3.2).
+///
+/// Applies when the current working directory is inside `path` (or `path`
+/// itself); the most specific matching prefix wins over less specific
+/// prefixes and the global settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelScopeOverride {
+    /// Directory prefix this override applies to (absolute or `~`-rooted).
+    pub path: String,
+    #[serde(alias = "enabledModels")]
+    pub enabled_models: Option<Vec<String>>,
+    #[serde(alias = "disabledProviders")]
+    pub disabled_providers: Option<Vec<String>>,
+}
+
+/// Tool load-mode configuration (bd-cv653.1.6).
+///
+/// `loadMode` maps a tool name to `essential` (always in the provider
+/// schema), `discoverable` (behind the xdev dispatcher), or `off`. The
+/// `--tools` CLI flag wins over every entry here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolSettings {
+    #[serde(alias = "loadMode")]
+    pub load_mode: Option<std::collections::HashMap<String, String>>,
+}
+
+/// Plan-mode configuration (bd-cv653.3.5).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlanSettings {
+    /// Auto-approve submitted plans without interactive review
+    /// (`--plan-yolo` wins over this). Default: false.
+    #[serde(alias = "autoApprove", alias = "yolo")]
+    pub auto_approve: Option<bool>,
+}
+
+/// Advisor configuration (bd-cv653.3.5 -> .3.3).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdvisorSettings {
+    /// Master switch when the advisor role is configured (default: true).
+    pub enabled: Option<bool>,
+    /// Hard timeout per advisor call in seconds (default 15).
+    #[serde(alias = "timeoutSecs")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// LSP tool configuration (bd-cv653.1.1).
+///
+/// `servers` merges over the built-in defaults table per server name
+/// (set fields win); unknown names add new servers and require `command`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LspSettings {
+    /// Per-server overrides/extensions, keyed by server name.
+    pub servers: Option<std::collections::HashMap<String, LspServerSettings>>,
+    /// Default per-request timeout in seconds (default 120).
+    #[serde(alias = "requestTimeoutSecs")]
+    pub request_timeout_secs: Option<u64>,
+    /// Idle shutdown TTL in seconds (default 300).
+    #[serde(alias = "idleShutdownSecs")]
+    pub idle_shutdown_secs: Option<u64>,
+}
+
+/// One `lsp.servers.<name>` entry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LspServerSettings {
+    /// Executable (required for new servers).
+    pub command: Option<String>,
+    /// argv after the executable.
+    pub args: Option<Vec<String>>,
+    /// Extra environment overrides.
+    pub env: Option<std::collections::HashMap<String, String>>,
+    /// LSP language ids served.
+    pub languages: Option<Vec<String>>,
+    /// File extensions routed to this server (with leading dot).
+    pub extensions: Option<Vec<String>>,
+    /// Workspace root marker filenames.
+    #[serde(alias = "rootMarkers")]
+    pub root_markers: Option<Vec<String>>,
+    /// `initializationOptions` payload for the handshake.
+    #[serde(alias = "initializationOptions")]
+    pub initialization_options: Option<serde_json::Value>,
+}
+
+/// Approval mode configuration (bd-cv653.3.19).
+///
+/// `approval.mode`: `always-ask` (default) | `write` | `yolo`.
+/// `approval.dualConfirmClasses`: danger classes that always require typed confirmation even in yolo.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ApprovalSettings {
+    /// Approval mode: `always-ask` | `write` | `yolo`.
+    pub mode: Option<String>,
+    /// Dangerous command classes requiring a second typed confirmation even in yolo mode.
+    #[serde(alias = "dualConfirmClasses")]
+    pub dual_confirm_classes: Option<Vec<String>>,
+}
+
+/// Read-tool configuration (bd-cv653.2.2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReadSettings {
+    /// Allow fetching private/loopback/link-local URL targets (SSRF override).
+    /// Default: false (blocked with a named `[SSRF_BLOCKED]` error).
+    #[serde(alias = "urlAllowPrivateTargets")]
+    pub url_allow_private_targets: Option<bool>,
+}
+
+/// Bash-tool mediation configuration (bd-cv653.1.7).
+///
+/// `bash.mediation`: `off` (default) | `warn` | `block-critical` | `block-high`.
+/// `bash.mediationForced`: when true, mediation applies even under yolo-style
+/// approval overrides (forced beats yolo). `bash.mediationDcg`: use a `dcg`
+/// binary on PATH as the authoritative verdict source when present
+/// (default true); the in-tree classifier is the fallback.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BashSettings {
+    /// Mediation mode: off | warn | block-critical | block-high.
+    pub mediation: Option<String>,
+    /// Forced mediation: applies regardless of yolo/approval overrides.
+    #[serde(alias = "mediationForced")]
+    pub mediation_forced: Option<bool>,
+    /// Prefer the `dcg` binary's verdicts when available (default true).
+    #[serde(alias = "mediationDcg")]
+    pub mediation_dcg: Option<bool>,
+    /// PTY allocation for isatty-requiring commands: `off`, `auto`
+    /// (default), or `always` (bd-cv653.1.7).
+    pub pty: Option<String>,
+}
+
+/// `memory.backend` (bd-cv653.4.1).
+///
+/// `off` (default while experimental, omp's setting-gated posture) |
+/// `local` (per-project SQLite+FTS5 bank with
+/// retain/recall/reflect/memory_edit tools and a mental-model block on the
+/// first turn) | `cass` (reserved, not yet implemented).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemorySettings {
+    /// Memory backend: off | local | cass.
+    pub backend: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -303,6 +595,22 @@ pub struct MarkdownSettings {
         deserialize_with = "deserialize_code_block_indent_option"
     )]
     pub code_block_indent: Option<u8>,
+    /// Vertical spacing policy for rendered markdown in the transcript
+    /// (issue #202): "comfortable" (default) keeps the renderer's blank line
+    /// after every block; "compact" drops the blanks between paragraphs and
+    /// list items while keeping one line of air around headings and fences.
+    pub spacing: Option<MarkdownSpacing>,
+}
+
+/// Inter-block spacing policy for transcript markdown (issue #202).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MarkdownSpacing {
+    /// Renderer default: one blank line after every block.
+    #[default]
+    Comfortable,
+    /// Blank lines survive only around headings and code fences.
+    Compact,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -322,6 +630,7 @@ pub struct ThinkingBudgets {
     pub medium: Option<u32>,
     pub high: Option<u32>,
     pub xhigh: Option<u32>,
+    pub max: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -453,6 +762,18 @@ impl Config {
         global_dir: &std::path::Path,
         cwd: &std::path::Path,
     ) -> Result<Self> {
+        Self::load_with_roots_and_project_trust(config_path, global_dir, cwd, true)
+    }
+
+    /// [`Self::load_with_roots`], but skipping the project settings merge when
+    /// the workspace is untrusted (GH #151). An explicit `PI_CONFIG_PATH`
+    /// override is user-provided and always honored.
+    pub fn load_with_roots_and_project_trust(
+        config_path: Option<&std::path::Path>,
+        global_dir: &std::path::Path,
+        cwd: &std::path::Path,
+        project_trusted: bool,
+    ) -> Result<Self> {
         if let Some(path) = config_path {
             let config = Self::load_from_path(&Self::resolve_config_override_path(path, cwd))?;
             config.emit_queue_mode_diagnostics();
@@ -460,10 +781,39 @@ impl Config {
         }
 
         let global = Self::load_from_path(&global_dir.join("settings.json"))?;
+        if !project_trusted {
+            global.emit_queue_mode_diagnostics();
+            return Ok(global);
+        }
         let project = Self::load_from_path(&cwd.join(Self::project_dir()).join("settings.json"))?;
         let merged = Self::merge(global, project);
         merged.emit_queue_mode_diagnostics();
         Ok(merged)
+    }
+
+    /// Load only the global settings (plus any `PI_CONFIG_PATH` override),
+    /// ignoring project-local `.pi/settings.json`. Used for untrusted
+    /// workspaces and for pre-trust reads of global-only knobs such as
+    /// `trustAllWorkspaces`.
+    pub fn load_global_only() -> Result<Self> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let config_path = Self::config_path_override_from_env(&cwd);
+        Self::load_with_roots_and_project_trust(
+            config_path.as_deref(),
+            &Self::global_dir(),
+            &cwd,
+            false,
+        )
+    }
+
+    /// [`Self::load`], but skipping the project settings merge when the
+    /// workspace is untrusted (GH #151).
+    pub fn load_with_project_trust(project_trusted: bool) -> Result<Self> {
+        if project_trusted {
+            Self::load()
+        } else {
+            Self::load_global_only()
+        }
     }
 
     pub fn settings_path_with_roots(
@@ -507,6 +857,23 @@ impl Config {
             default_model: other.default_model.or(base.default_model),
             default_thinking_level: other.default_thinking_level.or(base.default_thinking_level),
             enabled_models: other.enabled_models.or(base.enabled_models),
+            model_roles: merge_model_roles(base.model_roles, other.model_roles),
+            titling: merge_titling(base.titling, other.titling),
+            disabled_providers: other.disabled_providers.or(base.disabled_providers),
+            model_scope_overrides: other.model_scope_overrides.or(base.model_scope_overrides),
+            tools: merge_tools(base.tools, other.tools),
+            plan: merge_plan(base.plan, other.plan),
+            read: merge_read(base.read, other.read),
+            bash: merge_bash(base.bash, other.bash),
+            memory: merge_memory(base.memory, other.memory),
+            media: merge_media(base.media, other.media),
+            computer: merge_computer(base.computer, other.computer),
+            browser: merge_browser(base.browser, other.browser),
+            secrets: other.secrets.or(base.secrets),
+            keywords: merge_keywords(base.keywords, other.keywords),
+            advisor: merge_advisor(base.advisor, other.advisor),
+            lsp: merge_lsp(base.lsp, other.lsp),
+            approval: merge_approval(base.approval, other.approval),
             request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
 
             // Message Handling
@@ -528,6 +895,9 @@ impl Config {
             session_picker_input: other.session_picker_input.or(base.session_picker_input),
             session_store: other.session_store.or(base.session_store),
             session_durability: other.session_durability.or(base.session_durability),
+            search_backend: other.search_backend.or(base.search_backend),
+            foreign_rules: other.foreign_rules.or(base.foreign_rules),
+            ask_policy: other.ask_policy.or(base.ask_policy),
 
             // Compaction
             compaction: merge_compaction(base.compaction, other.compaction),
@@ -543,6 +913,11 @@ impl Config {
             shell_command_prefix: other.shell_command_prefix.or(base.shell_command_prefix),
             gh_path: other.gh_path.or(base.gh_path),
 
+            // Subagent tool
+            subagent_structured_results: other
+                .subagent_structured_results
+                .or(base.subagent_structured_results),
+
             // Images
             images: merge_images(base.images, other.images),
 
@@ -555,6 +930,9 @@ impl Config {
             // Thinking Budgets
             thinking_budgets: merge_thinking_budgets(base.thinking_budgets, other.thinking_budgets),
 
+            // Workspace trust
+            trust_all_workspaces: other.trust_all_workspaces.or(base.trust_all_workspaces),
+
             // Extensions/Skills/etc.
             packages: other.packages.or(base.packages),
             extensions: other.extensions.or(base.extensions),
@@ -563,6 +941,8 @@ impl Config {
             themes: other.themes.or(base.themes),
             enable_skill_commands: other.enable_skill_commands.or(base.enable_skill_commands),
             fail_closed_hooks: other.fail_closed_hooks.or(base.fail_closed_hooks),
+            compaction_mode: other.compaction_mode.or(base.compaction_mode),
+            turn_recovery: other.turn_recovery.or(base.turn_recovery),
 
             // Extension Policy
             extension_policy: merge_extension_policy(base.extension_policy, other.extension_policy),
@@ -584,12 +964,117 @@ impl Config {
             .unwrap_or(true)
     }
 
+    /// Compaction output rendering mode (bd-cv653.7.6). Default: text-only.
+    pub fn compaction_render_mode(&self) -> crate::compaction::CompactionRenderMode {
+        self.compaction
+            .as_ref()
+            .and_then(|c| c.mode)
+            .unwrap_or_default()
+    }
+
+    /// Whether automatic session titling is enabled (bd-cv653.3.1).
+    /// Default: true — it degrades to a silent no-op without a tiny/smol role.
+    pub fn auto_title_enabled(&self) -> bool {
+        self.titling
+            .as_ref()
+            .and_then(|t| t.auto_title)
+            .unwrap_or(true)
+    }
+
+    /// Seconds before the primary model is retried after a failover
+    /// (bd-cv653.3.2). Default: 300.
+    pub fn failover_cooldown_secs(&self) -> u64 {
+        self.retry
+            .as_ref()
+            .and_then(|r| r.failover_cooldown_secs)
+            .unwrap_or(300)
+    }
+
+    /// Maximum failovers within a single turn (bd-cv653.3.2). Default: 8.
+    pub fn max_failovers_per_turn(&self) -> u32 {
+        self.retry
+            .as_ref()
+            .and_then(|r| r.max_failovers_per_turn)
+            .unwrap_or(8)
+            .min(8)
+    }
+
+    /// Whether submitted plans auto-approve (bd-cv653.3.5). Default: false.
+    pub fn plan_auto_approve(&self) -> bool {
+        self.plan
+            .as_ref()
+            .and_then(|p| p.auto_approve)
+            .unwrap_or(false)
+    }
+
+    /// Active tool approval mode (bd-cv653.3.19). Default: `always-ask`.
+    #[must_use]
+    pub fn approval_mode(&self) -> crate::approval::ApprovalMode {
+        self.approval
+            .as_ref()
+            .and_then(|a| a.mode.as_deref())
+            .map_or(crate::approval::ApprovalMode::AlwaysAsk, |s| {
+                crate::approval::ApprovalMode::from_setting(Some(s))
+            })
+    }
+
+    /// Dangerous command classes requiring dual confirmation even under YOLO mode (bd-cv653.3.19).
+    #[must_use]
+    pub fn approval_dual_confirm_classes(&self) -> Vec<crate::extensions::DangerousCommandClass> {
+        self.approval
+            .as_ref()
+            .and_then(|a| a.dual_confirm_classes.as_ref())
+            .map_or_else(Vec::new, |list| {
+                list.iter()
+                    .filter_map(|s| crate::approval::parse_dangerous_command_class(s))
+                    .collect()
+            })
+    }
+
+    /// Whether the advisor is enabled when its role resolves (bd-cv653.3.3).
+    /// Default: true.
+    pub fn advisor_enabled(&self) -> bool {
+        self.advisor
+            .as_ref()
+            .and_then(|a| a.enabled)
+            .unwrap_or(true)
+    }
+
+    /// Memory backend (bd-cv653.4.1): `off` (default while experimental) |
+    /// `local` | `cass` (reserved). Unknown values degrade to off.
+    pub fn memory_backend(&self) -> &str {
+        match self
+            .memory
+            .as_ref()
+            .and_then(|m| m.backend.as_deref())
+            .map(str::trim)
+        {
+            Some("local") => "local",
+            Some("cass") => "cass",
+            _ => "off",
+        }
+    }
+
+    /// Advisor per-call timeout in seconds (bd-cv653.3.3). Default: 15.
+    pub fn advisor_timeout_secs(&self) -> u64 {
+        self.advisor
+            .as_ref()
+            .and_then(|a| a.timeout_secs)
+            .unwrap_or(15)
+    }
+
     pub fn steering_queue_mode(&self) -> QueueMode {
         parse_queue_mode_or_default(self.steering_mode.as_deref())
     }
 
     pub fn follow_up_queue_mode(&self) -> QueueMode {
         parse_queue_mode_or_default(self.follow_up_mode.as_deref())
+    }
+
+    /// Resolved auto-compaction mode (bd-cv653.3.18).
+    #[must_use]
+    pub fn compaction_mode(&self) -> crate::compaction::AutoCompactionMode {
+        self.compaction_mode.unwrap_or_default()
     }
 
     pub fn compaction_reserve_tokens(&self) -> u32 {
@@ -633,6 +1118,12 @@ impl Config {
             .as_ref()
             .and_then(|r| r.max_delay_ms)
             .unwrap_or(60000)
+    }
+
+    /// Whether foreign-format workspace rules are imported (bd-cv653.6.2).
+    #[must_use]
+    pub fn foreign_rules_enabled(&self) -> bool {
+        self.foreign_rules.unwrap_or(true)
     }
 
     pub fn image_auto_resize(&self) -> bool {
@@ -683,6 +1174,7 @@ impl Config {
             "medium" => budgets.and_then(|b| b.medium).unwrap_or(8192),
             "high" => budgets.and_then(|b| b.high).unwrap_or(16384),
             "xhigh" => budgets.and_then(|b| b.xhigh).unwrap_or(32768),
+            "max" => budgets.and_then(|b| b.max).unwrap_or(65536),
             _ => 0,
         }
     }
@@ -694,8 +1186,23 @@ impl Config {
             .unwrap_or(2)
     }
 
+    /// Resolved transcript markdown spacing policy (issue #202).
+    #[must_use]
+    pub fn markdown_spacing(&self) -> MarkdownSpacing {
+        self.markdown
+            .as_ref()
+            .and_then(|m| m.spacing)
+            .unwrap_or_default()
+    }
+
     pub fn enable_skill_commands(&self) -> bool {
         self.enable_skill_commands.unwrap_or(true)
+    }
+
+    /// Resolved turn-recovery mode (bd-cv653.3.15).
+    #[must_use]
+    pub fn turn_recovery_mode(&self) -> crate::turn_recovery::TurnRecoveryMode {
+        self.turn_recovery.unwrap_or_default()
     }
 
     pub fn fail_closed_hooks(&self) -> bool {
@@ -1096,6 +1603,7 @@ fn merge_compaction(
             enabled: other.enabled.or(base.enabled),
             reserve_tokens: other.reserve_tokens.or(base.reserve_tokens),
             keep_recent_tokens: other.keep_recent_tokens.or(base.keep_recent_tokens),
+            mode: other.mode.or(base.mode),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -1124,6 +1632,9 @@ fn merge_retry(base: Option<RetrySettings>, other: Option<RetrySettings>) -> Opt
             max_retries: other.max_retries.or(base.max_retries),
             base_delay_ms: other.base_delay_ms.or(base.base_delay_ms),
             max_delay_ms: other.max_delay_ms.or(base.max_delay_ms),
+            fallback_chains: other.fallback_chains.or(base.fallback_chains),
+            failover_cooldown_secs: other.failover_cooldown_secs.or(base.failover_cooldown_secs),
+            max_failovers_per_turn: other.max_failovers_per_turn.or(base.max_failovers_per_turn),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -1138,7 +1649,272 @@ fn merge_markdown(
     match (base, other) {
         (Some(base), Some(other)) => Some(MarkdownSettings {
             code_block_indent: other.code_block_indent.or(base.code_block_indent),
+            spacing: other.spacing.or(base.spacing),
         }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge per-role model assignments field-wise (other wins per role).
+fn merge_model_roles(
+    base: Option<ModelRoleSettings>,
+    other: Option<ModelRoleSettings>,
+) -> Option<ModelRoleSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(ModelRoleSettings {
+            default: other.default.or(base.default),
+            smol: other.smol.or(base.smol),
+            slow: other.slow.or(base.slow),
+            plan: other.plan.or(base.plan),
+            commit: other.commit.or(base.commit),
+            vision: other.vision.or(base.vision),
+            designer: other.designer.or(base.designer),
+            task: other.task.or(base.task),
+            advisor: other.advisor.or(base.advisor),
+            tiny: other.tiny.or(base.tiny),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge titling settings (other wins).
+fn merge_titling(
+    base: Option<TitlingSettings>,
+    other: Option<TitlingSettings>,
+) -> Option<TitlingSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(TitlingSettings {
+            auto_title: other.auto_title.or(base.auto_title),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge advisor settings (other wins).
+fn merge_advisor(
+    base: Option<AdvisorSettings>,
+    other: Option<AdvisorSettings>,
+) -> Option<AdvisorSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(AdvisorSettings {
+            enabled: other.enabled.or(base.enabled),
+            timeout_secs: other.timeout_secs.or(base.timeout_secs),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge magic-keyword settings field-wise. Scalar toggles inherit from the
+/// lower-precedence layer when omitted; an explicitly supplied custom-word
+/// list replaces the lower layer's list (including an explicit empty list).
+fn merge_keywords(
+    base: Option<crate::magic_keywords::KeywordSettings>,
+    other: Option<crate::magic_keywords::KeywordSettings>,
+) -> Option<crate::magic_keywords::KeywordSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(crate::magic_keywords::KeywordSettings {
+            ultrathink: other.ultrathink.or(base.ultrathink),
+            orchestrate: other.orchestrate.or(base.orchestrate),
+            workflowz: other.workflowz.or(base.workflowz),
+            extra: other.extra.or(base.extra),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge bash mediation settings field-wise (bd-cv653.1.7).
+fn merge_bash(base: Option<BashSettings>, other: Option<BashSettings>) -> Option<BashSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(BashSettings {
+            mediation: other.mediation.or(base.mediation),
+            mediation_forced: other.mediation_forced.or(base.mediation_forced),
+            mediation_dcg: other.mediation_dcg.or(base.mediation_dcg),
+            pty: other.pty.or(base.pty),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge memory settings field-wise (bd-cv653.4.1).
+fn merge_memory(
+    base: Option<MemorySettings>,
+    other: Option<MemorySettings>,
+) -> Option<MemorySettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(MemorySettings {
+            backend: other.backend.or(base.backend),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge media trio settings field-wise (bd-cv653.2.7).
+fn merge_media(
+    base: Option<crate::media_tools::MediaSettings>,
+    other: Option<crate::media_tools::MediaSettings>,
+) -> Option<crate::media_tools::MediaSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(crate::media_tools::MediaSettings {
+            enable_inspect_image: other.enable_inspect_image.or(base.enable_inspect_image),
+            enable_generate_image: other.enable_generate_image.or(base.enable_generate_image),
+            enable_tts: other.enable_tts.or(base.enable_tts),
+            vision_model: other.vision_model.or(base.vision_model),
+            vision_provider: other.vision_provider.or(base.vision_provider),
+            image_gen_provider: other.image_gen_provider.or(base.image_gen_provider),
+            image_gen_model: other.image_gen_model.or(base.image_gen_model),
+            tts_voice: other.tts_voice.or(base.tts_voice),
+            tts_provider: other.tts_provider.or(base.tts_provider),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge computer settings field-wise (bd-cv653.2.5).
+fn merge_computer(
+    base: Option<crate::computer::ComputerSettings>,
+    other: Option<crate::computer::ComputerSettings>,
+) -> Option<crate::computer::ComputerSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(crate::computer::ComputerSettings {
+            enable_computer: other.enable_computer.or(base.enable_computer),
+            require_approval: other.require_approval.or(base.require_approval),
+            screenshot_dir: other.screenshot_dir.or(base.screenshot_dir),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge browser settings field-wise (bd-cv653.2.4).
+fn merge_browser(
+    base: Option<crate::browser::BrowserSettings>,
+    other: Option<crate::browser::BrowserSettings>,
+) -> Option<crate::browser::BrowserSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(crate::browser::BrowserSettings {
+            enable_browser: other.enable_browser.or(base.enable_browser),
+            executable_path: other.executable_path.or(base.executable_path),
+            remote_debugging_port: other.remote_debugging_port.or(base.remote_debugging_port),
+            headless: other.headless.or(base.headless),
+            user_agent: other.user_agent.or(base.user_agent),
+            domain_allowlist: other.domain_allowlist.or(base.domain_allowlist),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge LSP settings: server maps union (other wins per server name),
+/// scalars prefer `other` (bd-cv653.1.1).
+fn merge_lsp(base: Option<LspSettings>, other: Option<LspSettings>) -> Option<LspSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => {
+            let mut servers = base.servers.unwrap_or_default();
+            if let Some(other_servers) = other.servers {
+                servers.extend(other_servers);
+            }
+            Some(LspSettings {
+                servers: if servers.is_empty() {
+                    None
+                } else {
+                    Some(servers)
+                },
+                request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
+                idle_shutdown_secs: other.idle_shutdown_secs.or(base.idle_shutdown_secs),
+            })
+        }
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge approval settings (other wins per scalar, classes union).
+fn merge_approval(
+    base: Option<ApprovalSettings>,
+    other: Option<ApprovalSettings>,
+) -> Option<ApprovalSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => {
+            let mut classes = base.dual_confirm_classes.unwrap_or_default();
+            if let Some(other_classes) = other.dual_confirm_classes {
+                for c in other_classes {
+                    if !classes.contains(&c) {
+                        classes.push(c);
+                    }
+                }
+            }
+            Some(ApprovalSettings {
+                mode: other.mode.or(base.mode),
+                dual_confirm_classes: if classes.is_empty() {
+                    None
+                } else {
+                    Some(classes)
+                },
+            })
+        }
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge read settings (other wins).
+fn merge_read(base: Option<ReadSettings>, other: Option<ReadSettings>) -> Option<ReadSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(ReadSettings {
+            url_allow_private_targets: other
+                .url_allow_private_targets
+                .or(base.url_allow_private_targets),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge plan-mode settings (other wins).
+fn merge_plan(base: Option<PlanSettings>, other: Option<PlanSettings>) -> Option<PlanSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(PlanSettings {
+            auto_approve: other.auto_approve.or(base.auto_approve),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge tool settings (other wins per tool-mode entry).
+fn merge_tools(base: Option<ToolSettings>, other: Option<ToolSettings>) -> Option<ToolSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => {
+            let mut modes = base.load_mode.unwrap_or_default();
+            if let Some(other_modes) = other.load_mode {
+                modes.extend(other_modes);
+            }
+            Some(ToolSettings {
+                load_mode: if modes.is_empty() { None } else { Some(modes) },
+            })
+        }
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
         (None, None) => None,
@@ -1209,6 +1985,7 @@ fn merge_thinking_budgets(
             medium: other.medium.or(base.medium),
             high: other.high.or(base.high),
             xhigh: other.xhigh.or(base.xhigh),
+            max: other.max.or(base.max),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -1387,8 +2164,8 @@ fn sync_settings_parent_dir(_path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::{
         BranchSummarySettings, CompactionSettings, Config, ExtensionPolicyConfig,
-        ExtensionRiskConfig, ImageSettings, RepairPolicyConfig, RetrySettings, SettingsScope,
-        TerminalSettings, ThinkingBudgets, deep_merge_settings_value,
+        ExtensionRiskConfig, ImageSettings, MarkdownSpacing, RepairPolicyConfig, RetrySettings,
+        SettingsScope, TerminalSettings, ThinkingBudgets, deep_merge_settings_value,
         extension_index_path_from_env, global_dir_from_env, merge_branch_summary, merge_compaction,
         merge_extension_policy, merge_extension_risk, merge_images, merge_repair_policy,
         merge_retry, merge_terminal, merge_thinking_budgets, package_dir_from_env,
@@ -1402,6 +2179,125 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
+
+    #[test]
+    fn failover_settings_parse_chains_cooldown_and_cap() {
+        let json = json!({
+            "retry": {
+                "enabled": true,
+                "maxRetries": 2,
+                "fallbackChains": {
+                    "default": ["openai/gpt-5-mini", "google/gemini-3-pro"],
+                    "anthropic/claude-opus-4-7": ["openai/gpt-5.5"]
+                },
+                "failoverCooldownSecs": 120,
+                "maxFailoversPerTurn": 3
+            }
+        });
+        let config: Config = serde_json::from_value(json).expect("parse failover settings");
+        let retry = config.retry.clone().expect("retry settings present");
+        let chains = retry.fallback_chains.expect("chains present");
+        assert_eq!(
+            chains.get("default").unwrap(),
+            &vec![
+                "openai/gpt-5-mini".to_string(),
+                "google/gemini-3-pro".to_string()
+            ]
+        );
+        assert_eq!(
+            chains.get("anthropic/claude-opus-4-7").unwrap(),
+            &vec!["openai/gpt-5.5".to_string()]
+        );
+        assert_eq!(retry.failover_cooldown_secs, Some(120));
+        assert_eq!(retry.max_failovers_per_turn, Some(3));
+        assert_eq!(config.failover_cooldown_secs(), 120);
+        assert_eq!(config.max_failovers_per_turn(), 3);
+    }
+
+    #[test]
+    fn failover_settings_defaults_apply_when_unset() {
+        let config = Config::default();
+        assert_eq!(config.failover_cooldown_secs(), 300);
+        assert_eq!(config.max_failovers_per_turn(), 8);
+        assert!(config.disabled_providers.is_none());
+        assert!(config.model_scope_overrides.is_none());
+    }
+
+    #[test]
+    fn disabled_providers_and_scope_overrides_parse() {
+        let json = json!({
+            "disabledProviders": ["anthropic", "OpenAI"],
+            "modelScopeOverrides": [
+                {
+                    "path": "/repo/a",
+                    "enabledModels": ["openai/gpt-5.5"],
+                    "disabledProviders": ["google"]
+                },
+                {"path": "/repo", "disabledProviders": ["mistral"]}
+            ]
+        });
+        let config: Config = serde_json::from_value(json).expect("parse scope settings");
+        assert_eq!(
+            config.disabled_providers.as_deref(),
+            Some(["anthropic".to_string(), "OpenAI".to_string()].as_slice())
+        );
+        let overrides = config.model_scope_overrides.expect("overrides");
+        assert_eq!(overrides.len(), 2);
+        assert_eq!(overrides[0].path, "/repo/a");
+        assert_eq!(
+            overrides[0].enabled_models.as_deref(),
+            Some(["openai/gpt-5.5".to_string()].as_slice())
+        );
+        assert_eq!(
+            overrides[1].disabled_providers.as_deref(),
+            Some(["mistral".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn failover_chains_merge_field_wise() {
+        let base = RetrySettings {
+            fallback_chains: Some(HashMap::from([(
+                "default".to_string(),
+                vec!["openai/gpt-5-mini".to_string()],
+            )])),
+            failover_cooldown_secs: Some(60),
+            ..Default::default()
+        };
+        let other = RetrySettings {
+            max_retries: Some(5),
+            ..Default::default()
+        };
+        let merged = merge_retry(Some(base), Some(other)).expect("merged");
+        assert!(merged.fallback_chains.is_some(), "base chains preserved");
+        assert_eq!(merged.failover_cooldown_secs, Some(60));
+        assert_eq!(merged.max_retries, Some(5));
+    }
+
+    #[test]
+    fn scope_override_and_disabled_round_trip_serialization() {
+        let config = Config {
+            disabled_providers: Some(vec!["anthropic".to_string()]),
+            model_scope_overrides: Some(vec![super::ModelScopeOverride {
+                path: "/repo/a".to_string(),
+                enabled_models: Some(vec!["openai/gpt-5.5".to_string()]),
+                disabled_providers: Some(vec!["google".to_string()]),
+            }]),
+            ..Config::default()
+        };
+        let json = serde_json::to_value(&config).expect("serialize");
+        let parsed: Config = serde_json::from_value(json).expect("round-trip");
+        assert_eq!(
+            parsed.disabled_providers.as_deref(),
+            Some(["anthropic".to_string()].as_slice())
+        );
+        let overrides = parsed.model_scope_overrides.expect("overrides");
+        assert_eq!(overrides[0].path, "/repo/a");
+        assert_eq!(
+            overrides[0].disabled_providers.as_deref(),
+            Some(["google".to_string()].as_slice())
+        );
+    }
 
     fn write_file(path: &std::path::Path, contents: &str) {
         if let Some(parent) = path.parent() {
@@ -1446,6 +2342,36 @@ mod tests {
             Config::load_with_roots(Some(&override_path), &global_dir, &cwd).expect("load config");
         assert_eq!(config.theme.as_deref(), Some("override"));
         assert_eq!(config.default_provider.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn untrusted_load_ignores_project_settings() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{ "theme": "global", "trustAllWorkspaces": false }"#,
+        );
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{ "theme": "project", "packages": ["npm:evil"] }"#,
+        );
+
+        let trusted = Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, true)
+            .expect("load trusted config");
+        assert_eq!(trusted.theme.as_deref(), Some("project"));
+        assert!(trusted.packages.is_some());
+
+        let untrusted = Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, false)
+            .expect("load untrusted config");
+        assert_eq!(
+            untrusted.theme.as_deref(),
+            Some("global"),
+            "untrusted workspaces must not merge project settings"
+        );
+        assert!(untrusted.packages.is_none());
+        assert_eq!(untrusted.trust_all_workspaces, Some(false));
     }
 
     #[test]
@@ -1528,6 +2454,57 @@ mod tests {
         assert!(!config.compaction_enabled());
         assert_eq!(config.compaction_reserve_tokens(), 1234);
         assert_eq!(config.compaction_keep_recent_tokens(), 5678);
+    }
+
+    #[test]
+    fn load_merges_keyword_settings_fieldwise() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{
+                "keywords": {
+                    "ultrathink": true,
+                    "orchestrate": false,
+                    "workflowz": false,
+                    "extra": [{"word": "deepdive", "directive": "go deep"}]
+                }
+            }"#,
+        );
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{"keywords":{"ultrathink":false}}"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load config");
+        let keywords = config.keywords.expect("merged keyword settings");
+        assert_eq!(keywords.ultrathink, Some(false));
+        assert_eq!(keywords.orchestrate, Some(false));
+        assert_eq!(keywords.workflowz, Some(false));
+        let extra = keywords.extra.expect("inherited custom keywords");
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].word, "deepdive");
+        assert_eq!(extra[0].directive, "go deep");
+    }
+
+    #[test]
+    fn keyword_custom_list_is_explicitly_replaceable() {
+        let base: Config = serde_json::from_str(
+            r#"{"keywords":{"extra":[{"word":"deepdive","directive":"go deep"}]}}"#,
+        )
+        .expect("base config");
+        let other: Config =
+            serde_json::from_str(r#"{"keywords":{"extra":[]}}"#).expect("other config");
+
+        let merged = Config::merge(base, other);
+        assert!(
+            merged
+                .keywords
+                .and_then(|keywords| keywords.extra)
+                .is_some_and(|extra| extra.is_empty()),
+            "an explicit higher-precedence empty list must clear inherited custom words"
+        );
     }
 
     #[test]
@@ -1837,6 +2814,7 @@ mod tests {
         assert_eq!(config.thinking_budget("medium"), 8192);
         assert_eq!(config.thinking_budget("high"), 16384);
         assert_eq!(config.thinking_budget("xhigh"), 32768);
+        assert_eq!(config.thinking_budget("max"), 65536);
         assert_eq!(config.thinking_budget("unknown-level"), 0);
     }
 
@@ -1849,6 +2827,7 @@ mod tests {
                 medium: Some(300),
                 high: Some(400),
                 xhigh: Some(500),
+                max: Some(600),
             }),
             ..Config::default()
         };
@@ -1857,6 +2836,7 @@ mod tests {
         assert_eq!(config.thinking_budget("medium"), 300);
         assert_eq!(config.thinking_budget("high"), 400);
         assert_eq!(config.thinking_budget("xhigh"), 500);
+        assert_eq!(config.thinking_budget("max"), 600);
     }
 
     // ── enable_skill_commands ──────────────────────────────────────────
@@ -2108,6 +3088,7 @@ mod tests {
                 enabled: Some(true),
                 reserve_tokens: Some(1000),
                 keep_recent_tokens: Some(2000),
+                mode: None,
             }),
             ..Config::default()
         };
@@ -3056,6 +4037,35 @@ mod tests {
         assert_eq!(merged.markdown.as_ref().unwrap().code_block_indent, Some(4));
     }
 
+    // ── markdown.spacing config (issue #202) ──────────────────────────
+
+    #[test]
+    fn markdown_spacing_deserializes_compact() {
+        let json = r#"{"markdown":{"spacing":"compact"}}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.markdown_spacing(), MarkdownSpacing::Compact);
+    }
+
+    #[test]
+    fn markdown_spacing_defaults_to_comfortable() {
+        let config: Config = serde_json::from_str(r"{}").unwrap();
+        assert_eq!(config.markdown_spacing(), MarkdownSpacing::Comfortable);
+        let config: Config = serde_json::from_str(r#"{"markdown":{}}"#).unwrap();
+        assert_eq!(config.markdown_spacing(), MarkdownSpacing::Comfortable);
+        let config: Config =
+            serde_json::from_str(r#"{"markdown":{"spacing":"comfortable"}}"#).unwrap();
+        assert_eq!(config.markdown_spacing(), MarkdownSpacing::Comfortable);
+    }
+
+    #[test]
+    fn markdown_spacing_merge_prefers_other_and_survives_partial() {
+        let base: Config = serde_json::from_str(r#"{"markdown":{"spacing":"compact"}}"#).unwrap();
+        let other: Config = serde_json::from_str(r#"{"markdown":{"codeBlockIndent":4}}"#).unwrap();
+        let merged = Config::merge(base, other);
+        assert_eq!(merged.markdown_spacing(), MarkdownSpacing::Compact);
+        assert_eq!(merged.markdown_code_block_indent(), 4);
+    }
+
     // ── check_for_updates config ──────────────────────────────────────
 
     #[test]
@@ -3105,7 +4115,7 @@ mod tests {
                 reserve in prop::option::of(1u32..100_000),
                 keep in prop::option::of(1u32..100_000),
             ) {
-                let base = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep };
+                let base = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep, mode: None };
                 let result = merge_compaction(Some(base.clone()), None).unwrap();
                 assert_eq!(result.enabled, base.enabled);
                 assert_eq!(result.reserve_tokens, base.reserve_tokens);
@@ -3118,7 +4128,7 @@ mod tests {
                 reserve in prop::option::of(1u32..100_000),
                 keep in prop::option::of(1u32..100_000),
             ) {
-                let other = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep };
+                let other = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep, mode: None };
                 let result = merge_compaction(None, Some(other.clone())).unwrap();
                 assert_eq!(result.enabled, other.enabled);
                 assert_eq!(result.reserve_tokens, other.reserve_tokens);
@@ -3132,8 +4142,8 @@ mod tests {
                 o_en in prop::option::of(any::<bool>()),
                 o_res in prop::option::of(1u32..100_000),
             ) {
-                let base = CompactionSettings { enabled: b_en, reserve_tokens: b_res, keep_recent_tokens: None };
-                let other = CompactionSettings { enabled: o_en, reserve_tokens: o_res, keep_recent_tokens: None };
+                let base = CompactionSettings { enabled: b_en, reserve_tokens: b_res, keep_recent_tokens: None, mode: None };
+                let other = CompactionSettings { enabled: o_en, reserve_tokens: o_res, keep_recent_tokens: None, mode: None };
                 let result = merge_compaction(Some(base), Some(other)).unwrap();
                 assert_eq!(result.enabled, o_en.or(b_en));
                 assert_eq!(result.reserve_tokens, o_res.or(b_res));
@@ -3175,8 +4185,8 @@ mod tests {
                 o_en in prop::option::of(any::<bool>()),
                 o_base_delay in prop::option::of(100u32..5000),
             ) {
-                let base = RetrySettings { enabled: b_en, max_retries: b_max, base_delay_ms: None, max_delay_ms: None };
-                let other = RetrySettings { enabled: o_en, max_retries: None, base_delay_ms: o_base_delay, max_delay_ms: None };
+                let base = RetrySettings { enabled: b_en, max_retries: b_max, base_delay_ms: None, max_delay_ms: None, ..Default::default() };
+                let other = RetrySettings { enabled: o_en, max_retries: None, base_delay_ms: o_base_delay, max_delay_ms: None, ..Default::default() };
                 let result = merge_retry(Some(base), Some(other)).unwrap();
                 assert_eq!(result.enabled, o_en.or(b_en));
                 assert_eq!(result.max_retries, b_max); // other had None, base passes through
@@ -3245,8 +4255,8 @@ mod tests {
                 o_med in prop::option::of(1u32..65536),
                 o_high in prop::option::of(1u32..65536),
             ) {
-                let base = ThinkingBudgets { minimal: b_min, low: b_low, medium: None, high: None, xhigh: None };
-                let other = ThinkingBudgets { minimal: None, low: None, medium: o_med, high: o_high, xhigh: None };
+                let base = ThinkingBudgets { minimal: b_min, low: b_low, medium: None, high: None, xhigh: None, max: None };
+                let other = ThinkingBudgets { minimal: None, low: None, medium: o_med, high: o_high, xhigh: None, max: None };
                 let result = merge_thinking_budgets(Some(base), Some(other)).unwrap();
                 assert_eq!(result.minimal, b_min); // only in base
                 assert_eq!(result.low, b_low); // only in base
