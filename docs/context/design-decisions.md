@@ -653,3 +653,16 @@
 
 **何时重新考虑**：若需按任务动态覆盖或按调用链实时收敛白名单，可在 SubagentTask 上扩展 allowedSkills 覆盖 AgentDefinition，并在 effective_allowed_skills 中引入任务层交集策略。
 
+
+---
+
+## D64: OpenCode 网关会话关联 — stream() 按 provider+base_url 注入 x-opencode-session
+
+**决策**：opencode 系请求自动带 x-opencode-session: session_id，不选 models.json 手动配 custom_headers
+
+**理由**：邮件点名 opencode-go，同服务 sibling 的 opencode 必然同策略；session.header.id 天然每 conversation 稳定，无需另造 ID 生成器
+
+**不选 B 的原因**：只按 provider 规范 id 判定会漏掉用户自定义 id 指过去的情形；只按 base_url 判定则 registry 里 `opencode-go` 的测试构造（loopback URL）会误判
+
+**何时重新考虑**：OpenCode 改头名/策略，或 opencode 与 opencode-go 行为分叉时重估
+
