@@ -94,6 +94,30 @@ fn openrouter_default_x_title() -> String {
         .unwrap_or_else(|| OPENROUTER_DEFAULT_X_TITLE.to_string())
 }
 
+/// Request header the OpenCode gateway requires for session correlation.
+///
+/// Every request to `opencode.ai` must carry one stable ID per conversation
+/// (starting 09/06 requests missing it may error). The value is the Pi
+/// session id (`StreamOptions.session_id`), which is stable per conversation.
+const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
+
+/// Whether this request targets the OpenCode gateway (`opencode` / `opencode-go`).
+///
+/// Matches on the canonical provider id first, then the raw provider name
+/// (case-insensitive), then the base URL — so a user-defined provider id
+/// pointing at `opencode.ai` is still covered.
+fn provider_targets_opencode(provider: &str, base_url: &str) -> bool {
+    if canonical_provider_id(provider)
+        .is_some_and(|canonical| canonical == "opencode" || canonical == "opencode-go")
+    {
+        return true;
+    }
+    if provider.eq_ignore_ascii_case("opencode") || provider.eq_ignore_ascii_case("opencode-go") {
+        return true;
+    }
+    base_url.to_ascii_lowercase().contains("opencode.ai")
+}
+
 // ============================================================================
 // OpenAI Provider
 // ============================================================================
@@ -456,6 +480,27 @@ impl Provider for OpenAIProvider {
                 || compat_headers.is_some_and(|headers| map_has_any_header(headers, &["x-title"]));
             if !has_title {
                 request = request.header("X-Title", openrouter_default_x_title());
+            }
+        }
+
+        // OpenCode gateway session correlation: one stable ID per
+        // conversation. Injected before custom headers so an explicit user
+        // override (compat `custom_headers` / per-request `options.headers`)
+        // wins via upsert. Skipped when there is no session id (e.g.
+        // compaction) or the user already set the header.
+        if provider_targets_opencode(&self.provider, &self.base_url) {
+            if let Some(session_id) = options.session_id.as_deref().filter(|id| !id.is_empty()) {
+                let user_set = map_has_any_header(&options.headers, &[OPENCODE_SESSION_HEADER])
+                    || self
+                        .compat
+                        .as_ref()
+                        .and_then(|c| c.custom_headers.as_ref())
+                        .is_some_and(|headers| {
+                            map_has_any_header(headers, &[OPENCODE_SESSION_HEADER])
+                        });
+                if !user_set {
+                    request = request.header(OPENCODE_SESSION_HEADER, session_id);
+                }
             }
         }
 
@@ -2375,6 +2420,125 @@ mod tests {
         assert_eq!(
             captured.headers.get("x-title").map(String::as_str),
             Some("Custom OpenRouter Client")
+        );
+    }
+
+    // ── x-opencode-session (OpenCode gateway session correlation) ──────
+
+    #[test]
+    fn opencode_session_header_targets_opencode_gateway() {
+        // Canonical ids + raw names hit on the provider-id leg …
+        assert!(provider_targets_opencode(
+            "opencode",
+            "http://127.0.0.1:1/v1"
+        ));
+        assert!(provider_targets_opencode(
+            "opencode-go",
+            "http://127.0.0.1:1/v1"
+        ));
+        assert!(provider_targets_opencode(
+            "OpenCode-Go",
+            "http://127.0.0.1:1/v1"
+        ));
+        // … a custom provider id pointing at the gateway hits on the URL leg …
+        assert!(provider_targets_opencode(
+            "my-custom-id",
+            "https://opencode.ai/zen/go/v1/chat/completions"
+        ));
+        // … unrelated OpenAI-compatible providers stay out.
+        assert!(!provider_targets_opencode(
+            "openai",
+            "https://api.openai.com/v1"
+        ));
+        assert!(!provider_targets_opencode(
+            "openrouter",
+            "https://openrouter.ai/api/v1"
+        ));
+        assert!(!provider_targets_opencode(
+            "my-proxy",
+            "https://proxy.example.test/v1"
+        ));
+    }
+
+    #[test]
+    fn test_stream_opencode_go_injects_session_header() {
+        let options = StreamOptions {
+            api_key: Some("test-opencode-key".to_string()),
+            session_id: Some("session-abc-123".to_string()),
+            ..Default::default()
+        };
+        let captured = run_stream_and_capture_headers_with(
+            OpenAIProvider::new("deepseek-v4-flash").with_provider_name("opencode-go"),
+            &options,
+        )
+        .expect("captured request");
+
+        assert_eq!(
+            captured
+                .headers
+                .get("x-opencode-session")
+                .map(String::as_str),
+            Some("session-abc-123")
+        );
+    }
+
+    #[test]
+    fn test_stream_non_opencode_provider_omits_session_header() {
+        let options = StreamOptions {
+            api_key: Some("test-openai-key".to_string()),
+            session_id: Some("session-abc-123".to_string()),
+            ..Default::default()
+        };
+        let captured = run_stream_and_capture_headers().expect("captured request");
+
+        assert!(
+            !captured.headers.contains_key("x-opencode-session"),
+            "plain openai provider must not send the header, got: {:?}",
+            captured.headers.get("x-opencode-session")
+        );
+    }
+
+    #[test]
+    fn test_stream_opencode_go_without_session_id_omits_header() {
+        let options = StreamOptions {
+            api_key: Some("test-opencode-key".to_string()),
+            ..Default::default()
+        };
+        let captured = run_stream_and_capture_headers_with(
+            OpenAIProvider::new("deepseek-v4-flash").with_provider_name("opencode-go"),
+            &options,
+        )
+        .expect("captured request");
+
+        assert!(
+            !captured.headers.contains_key("x-opencode-session"),
+            "missing session_id must not send an empty header"
+        );
+    }
+
+    #[test]
+    fn test_stream_opencode_go_respects_explicit_session_header() {
+        let options = StreamOptions {
+            api_key: Some("test-opencode-key".to_string()),
+            session_id: Some("session-abc-123".to_string()),
+            headers: HashMap::from([(
+                "X-OpenCode-Session".to_string(),
+                "user-override-999".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let captured = run_stream_and_capture_headers_with(
+            OpenAIProvider::new("deepseek-v4-flash").with_provider_name("opencode-go"),
+            &options,
+        )
+        .expect("captured request");
+
+        assert_eq!(
+            captured
+                .headers
+                .get("x-opencode-session")
+                .map(String::as_str),
+            Some("user-override-999")
         );
     }
 
