@@ -64,6 +64,29 @@ fn subagent_session_path(global_dir: &Path, hub_id: &str) -> PathBuf {
         .join(format!("{hub_id}.jsonl"))
 }
 
+/// Claim a fresh hub entry whose canonical session file does not yet exist.
+///
+/// Fresh `hubId`s are globally unique (`agent_hub::new_hub_id`), so a hit
+/// here is infeasible outside clock skew / copied `global_dir` / crashed
+/// parents. Bounded retries: give up loudly instead of looping forever.
+/// Takes `&mut AgentHubRegistry` so tests can use an isolated registry
+/// instead of the process-global one.
+fn claim_fresh_hub_entry(
+    reg: &mut crate::agent_hub::AgentHubRegistry,
+    global_dir: &Path,
+    agent_name: &str,
+    task_text: &str,
+    kind: crate::agent_hub::ChildKind,
+) -> Option<crate::agent_hub::ChildEntry> {
+    for _ in 0..8 {
+        let entry = reg.register_kind(agent_name, task_text, kind).ok()?;
+        if !subagent_session_path(global_dir, &entry.id).exists() {
+            return Some(entry);
+        }
+    }
+    None
+}
+
 /// Validate a hub/session id for filesystem safety.
 fn is_valid_hub_id(hub_id: &str) -> bool {
     let trimmed = hub_id.trim();
@@ -1441,14 +1464,37 @@ impl ChildRunner {
                         })
                     })
             } else {
+                // Fresh run: globally unique hubId from `register_kind`, but
+                // defensively skip ids whose canonical session file already
+                // exists — otherwise a stale
+                // `<global>/sessions/subagents/<hubId>.jsonl` would be
+                // silently replayed via `--session` (the "fresh call
+                // inherits 48w tokens" failure).
                 crate::agent_hub::registry()
                     .lock()
                     .ok()
                     .and_then(|mut reg| {
-                        reg.register_kind(&agent.name, &task.task, self.hub_kind)
-                            .ok()
+                        claim_fresh_hub_entry(
+                            &mut reg,
+                            &self.global_dir,
+                            &agent.name,
+                            &task.task,
+                            self.hub_kind,
+                        )
                     })
             };
+        // Fresh allocation must never silently degrade: `hub_entry=None`
+        // would fall through to `--no-session` with no hubId, losing
+        // persistence without a trace. Fail loudly instead.
+        if continue_session_path.is_none() && hub_entry.is_none() {
+            return SubagentResult::failed(
+                agent,
+                task,
+                step,
+                "Failed to allocate a fresh hubId (registry locked or hub dir unwritable)."
+                    .to_string(),
+            );
+        }
 
         // Determine the final session path (canonical hubId for fresh).
         let mut final_session_path: Option<PathBuf> = continue_session_path.clone();
@@ -3469,6 +3515,119 @@ printf '{{"type":"agent_end","messages":[{{"role":"assistant","content":[{{"type
             args.contains(expected.to_string_lossy().as_ref()),
             "session path must be canonical {}, got: {args}",
             expected.display()
+        );
+    }
+
+    /// Fresh hub claims never hand out an id whose session file already
+    /// exists — the "48w stale replay" guard. Cross-platform: no child
+    /// process involved, so it runs on Windows too.
+    #[test]
+    fn claim_fresh_hub_entry_skips_existing_session_files() {
+        let temp = TempDir::new().expect("tempdir");
+        let global_dir = temp.path().join("global");
+        let mut reg = crate::agent_hub::AgentHubRegistry::default();
+        // Keep hub artifacts out of the real global dir.
+        reg.set_dir_for_tests(temp.path().join("agent-hub"));
+        // Occupy each claimed session file so the next claim must mint a
+        // different id; every claim must map to a nonexistent file.
+        for _ in 0..4 {
+            let entry = claim_fresh_hub_entry(
+                &mut reg,
+                &global_dir,
+                "scout",
+                "fresh task",
+                crate::agent_hub::ChildKind::Subagent,
+            )
+            .expect("claim fresh hub");
+            let path = subagent_session_path(&global_dir, &entry.id);
+            assert!(
+                !path.exists(),
+                "claimed hubId must map to a fresh session file: {}",
+                path.display()
+            );
+            // Occupy it so the next claim must mint a different id.
+            std::fs::create_dir_all(path.parent().expect("session parent"))
+                .expect("create session dir");
+            std::fs::write(&path, "{\"role\":\"user\",\"content\":\"occupied\"}\n")
+                .expect("occupy session file");
+        }
+        // All four claims are distinct ids.
+        assert_eq!(reg.roster().len(), 4);
+        let mut ids: Vec<String> = reg.roster().iter().map(|e| e.id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 4, "each claim must mint a distinct hubId");
+    }
+
+    /// Two fresh delegations in the same process must mint distinct hubIds
+    /// and distinct `--session` paths — never reuse a stale session file.
+    /// Regression for fresh parents replaying 48w tokens of stale history
+    /// because every process restarted at `<agent>-1`.
+    #[test]
+    #[cfg(unix)]
+    fn continuable_fresh_runs_never_reuse_hub_or_session() {
+        let temp = TempDir::new().expect("tempdir");
+        let global_dir = temp.path().join("global");
+        write_agent(
+            &global_dir.join("agents"),
+            "scout",
+            "---\nname: scout\ndescription: continuable distinct\n---\nbody",
+        );
+        let log_path = temp.path().join("distinct-args.log");
+        let child = write_arg_logging_child(temp.path(), &log_path, "done");
+        let tool = SubagentTool::with_paths(temp.path().to_path_buf(), global_dir.clone(), child);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let run = |id: &str| {
+            runtime
+                .block_on(tool.execute(
+                    id,
+                    json!({"agent": "scout", "task": "fresh task"}),
+                    None,
+                    None,
+                ))
+                .expect("fresh run")
+        };
+        let first = run("distinct-first");
+        let second = run("distinct-second");
+        assert!(!first.is_error, "{first:?}");
+        assert!(!second.is_error, "{second:?}");
+        let first_hub = first.details.as_ref().expect("details")["hubId"]
+            .as_str()
+            .expect("hubId")
+            .to_string();
+        let second_hub = second.details.as_ref().expect("details")["hubId"]
+            .as_str()
+            .expect("hubId")
+            .to_string();
+        assert_ne!(
+            first_hub, second_hub,
+            "fresh runs must mint distinct hubIds, got {first_hub} twice"
+        );
+        // The second run must not point at the first run's session file:
+        // seed the first session path, then verify the second argv avoids it.
+        let first_session = global_dir
+            .join("sessions")
+            .join("subagents")
+            .join(format!("{first_hub}.jsonl"));
+        std::fs::create_dir_all(first_session.parent().expect("session parent"))
+            .expect("create session dir");
+        std::fs::write(
+            &first_session,
+            "{\"role\":\"user\",\"content\":\"stale\"}\n",
+        )
+        .expect("seed stale session");
+        let third = run("distinct-third");
+        assert!(!third.is_error, "{third:?}");
+        let third_hub = third.details.as_ref().expect("details")["hubId"]
+            .as_str()
+            .expect("hubId");
+        assert_ne!(third_hub, first_hub);
+        let args = std::fs::read_to_string(&log_path).expect("args log");
+        assert!(
+            !args.contains(&first_session.to_string_lossy().into_owned()),
+            "fresh run must not reuse stale session {first_session:?}, got: {args}"
         );
     }
 

@@ -150,7 +150,8 @@ impl ChildStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChildEntry {
-    /// Unique run id: `<agent>-<seq>` (seq is per-registry monotonic).
+    /// Unique run id: `<agent>-p<pid>-t<millis>-s<seq>-<rand8>` (globally
+    /// unique across processes; see `new_hub_id`).
     /// For continuable subagents this is also `hubId == sessionId`.
     pub id: String,
     /// Agent definition name (e.g. `scout`).
@@ -266,9 +267,17 @@ impl AgentHubRegistry {
     }
 
     /// Register a child with an explicit spawn kind.
+    ///
+    /// The id is globally unique across processes
+    /// (`<agent>-p<pid>-t<millis>-s<seq>-<rand8>`) so a fresh run in a new
+    /// process can never collide with a stale
+    /// `<global_dir>/sessions/subagents/<hubId>.jsonl` left by an earlier
+    /// process. The old `<agent>-<seq>` scheme restarted at `seq=1` in every
+    /// process, so every fresh parent silently replayed the previous run's
+    /// session file via `--session`.
     pub fn register_kind(&mut self, name: &str, task: &str, kind: ChildKind) -> Result<ChildEntry> {
         self.seq = self.seq.saturating_add(1);
-        let id = format!("{}-{}", sanitize_id(name), self.seq);
+        let id = new_hub_id(name, self.seq);
         let dir = self.dir()?;
         let entry = ChildEntry {
             id: id.clone(),
@@ -538,6 +547,28 @@ pub fn drain_steer_file(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Generate a globally unique hub/session id.
+///
+/// Format: `<agent>-p<pid>-t<millis>-s<seq>-<rand8>`. Every component after
+/// the agent name exists to prevent cross-process collision: two parent
+/// processes both start with `seq=1`, so the old `<agent>-<seq>` scheme made
+/// every fresh parent reuse the previous run's
+/// `<global_dir>/sessions/subagents/<hubId>.jsonl` via `--session`,
+/// silently replaying up to hundreds of thousands of tokens of stale
+/// history. `pid + millis + rand8` makes that collision infeasible; `seq`
+/// keeps ids ordered within one process.
+#[must_use]
+pub fn new_hub_id(name: &str, seq: u64) -> String {
+    let rand8 = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+    format!(
+        "{}-p{}-t{}-s{}-{}",
+        sanitize_id(name),
+        std::process::id(),
+        now_ms(),
+        seq,
+        rand8
+    )
+}
 fn sanitize_id(name: &str) -> String {
     name.chars()
         .map(|c| {
@@ -744,6 +775,30 @@ mod tests {
         reg.settle(&entry.id, ChildStatus::Failed);
         assert!(!reg.is_continuable(&entry.id));
         assert!(!reg.can_reuse(&entry.id));
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn hub_ids_are_unique_across_registries_and_filesystem_safe() {
+        // Regression: two fresh registries (two parent processes) both
+        // started at `seq=1`, so both minted `<name>-1` and the second
+        // parent silently replayed the first run's session file. New ids
+        // must differ even at the same seq and stay filesystem-safe.
+        let mut first = fresh_registry();
+        let mut second = fresh_registry();
+        let temp = std::env::temp_dir().join(format!("pi-agent-hub-test8-{}", std::process::id()));
+        first.dir = Some(temp.clone());
+        second.dir = Some(temp.clone());
+        let a = first.register("scout", "task").expect("register a");
+        let b = second.register("scout", "task").expect("register b");
+        assert_ne!(a.id, b.id, "fresh hubIds must not collide across processes");
+        assert!(a.id.starts_with("scout-"), "keeps agent prefix: {}", a.id);
+        assert!(b.id.starts_with("scout-"), "keeps agent prefix: {}", b.id);
+        for id in [&a.id, &b.id] {
+            assert!(!id.contains('/') && !id.contains('\\') && !id.contains('\0'));
+            assert_ne!(id.trim(), ".");
+            assert_ne!(id.trim(), "..");
+        }
         let _ = fs::remove_dir_all(&temp);
     }
 }
