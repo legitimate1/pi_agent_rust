@@ -21,7 +21,7 @@
     },
     {
       "id": "pt_1788080146164_syww0z0",
-      "content": "!gh workflow run my-build-windows.yml --ref custom 2>&1",
+      "content": "!.\\scripts\\bump-and-build.ps1",
       "done": false,
       "createdAt": 1788080146164
     },
