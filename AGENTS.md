@@ -16,6 +16,7 @@
   - `main` — 上游镜像分支，**禁止直接提交业务代码**，只用于同步 `upstream`：`git checkout main && git fetch upstream && git merge upstream/main && git push origin main`。`upstream` = `https://github.com/Dicklesworthstone/pi_agent_rust.git`
   - `custom` — 个人二开主分支，所有功能/修复都在此，推送到 `origin/custom` **不自动触发** CI，全量校验需手动 `gh workflow run my-check.yml --ref custom`（无需查看 `my-check.yml`）
   - 新分支从 `custom` 切出，合回 `custom`；需要同步上游时先合到 `main` 再 `git checkout custom && git merge main`
+  - **上游机器人隔离** — `main` 不运行上游机器人；同步上游时不得把会自动运行的上游 bot 配置或相关自动化带入 `main`。尤其保持 `.github/dependabot.yml` 中的 Dependabot 更新项全部禁用。除非用户明确授权，不启用或合入上游 Dependabot 配置。
 
 ## 工具链
 
