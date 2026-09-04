@@ -674,3 +674,16 @@
 
 **何时重新考虑**：OpenCode 改头名/策略，或 opencode 与 opencode-go 行为分叉时重估
 
+
+---
+
+## D65: 新鲜 subagent hubId 全局唯一 — 防跨进程撞号误重放
+
+**决策**：选全局唯一 hubId（`<agent>-p<pid>-t<millis>-s<seq>-<rand8>`）+ 新鲜分配撞 session 文件则换新（claim_fresh_hub_entry，最多 8 次，耗尽或注册失败则显式 failed），不选进程内 `<agent>-<seq>` 单调 id。
+
+**理由**：hub registry 是进程内 OnceLock 单例，跨进程无共享计数；session 文件与 worktree 落在跨进程持久的 global_dir 下，id 必须跨进程唯一。pid+millis+rand8 使碰撞不可行，seq 保留进程内有序；claim 兜底覆盖时钟回拨/拷贝 global_dir/崩溃残留等极端撞号，宁可显式失败也不静默重放。
+
+**不选 B 的原因**：旧 `<agent>-<seq>` 在每个新父进程都从 seq=1 重起，新鲜父进程第一次调用必撞上一个进程留下的 `<global>/sessions/subagents/<hubId>.jsonl`，--session 全量重放数十万 token 陈旧历史，效果等同默认续接；新鲜撞文件时静默复用或静默回 --no-session 则丢持久性且无迹可查。
+
+**何时重新考虑**：若未来引入跨主会话 PID 恢复/常驻进程池，或 hubId 需要人类可读短 id，可在保持跨进程唯一前缀的前提下重估编码格式；若 session 存储迁出文件系统，claim 兜底需同步迁移。
+
