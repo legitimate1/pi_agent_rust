@@ -50,7 +50,7 @@
 
 ### 规则
 
-1. 版本号唯一写者是 `.\scripts\deploy-artifact.ps1` — 部署云产物成功后自动 `--bump patch` 并仅提交 `Cargo.toml`/`Cargo.lock`；本地构建、云构建工作流均不 bump（`my-build.yml` / `my-build-windows.yml` 只读当前版本）
+1. 版本号由本地显式递增 — `Cargo.toml` 是什么版本就构建什么版本（`my-build.yml` / `my-build-windows.yml` / `.\scripts\deploy-artifact.ps1` 均只读不 bump）；发版前先 `cargo set-version --bump patch` 并 `git push`，推荐用 `.\scripts\bump-and-build.ps1` 一键完成 `bump → push → 触发云构建`
 2. 构建和部署分离 — 构建后等用户指令再部署
 3. 不得私自构建或部署
 4. **构建策略（本 Fork 专用）**：本地要快、云上要狠
@@ -62,9 +62,9 @@
 ```
 用户说「构建」→ git add + commit → cargo build --release → 停下（不 bump 版本）
 用户说「部署」→ .\scripts\deploy-release.ps1（本地 release 产物部署，不 bump 版本）
-用户说「部署云产物」→ .\scripts\deploy-artifact.ps1（下载最新 my-build-windows 产物，重命名为 pi.exe，备份旧版后部署，成功后自动 bump patch 并仅提交 Cargo.toml/lock，支持 -Tag / -RunId）
+用户说「部署云产物」→ .\scripts\deploy-artifact.ps1（下载最新 my-build-windows 产物，重命名为 pi.exe，备份旧版后部署，仅部署不 bump，支持 -Tag / -RunId）
 用户说「云构建/发包（全平台）」→ git tag my-v0.x.y && git push origin my-v0.x.y → 触发 my-build.yml（或网页 workflow_dispatch），产物 dist/pi.exe + dist/pi
-用户说「云构建/发包（仅 Windows）」→ git tag my-win-v0.x.y && git push origin my-win-v0.x.y → 触发 my-build-windows.yml（或 gh workflow run my-build-windows.yml --ref custom），产物 dist/pi.exe
+用户说「云构建/发包（仅 Windows）」→ .\scripts\bump-and-build.ps1（一键 bump patch + push + 触发 my-build-windows.yml）或 git tag my-win-v0.x.y && git push origin my-win-v0.x.y → 触发 my-build-windows.yml，产物 dist/pi.exe
 ```
 
 > 构建前**不**重复跑全量测试 — 收尾门禁已验证过。若用户中途要求构建（改动未收尾），先跑针对性测试确认无误再构建。部署脚本自动执行 `cargo sweep --file` + `--stamp` 清理旧产物，无需手动清理。

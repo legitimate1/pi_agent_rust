@@ -38,7 +38,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      # NOTE: 版本号唯一写者在本地 deploy-artifact.ps1；云端只构建当前版本，不 bump。
+      # NOTE: A 方案：Cargo.toml 即构建版本；云端/部署脚本均只读不 bump，版本递增由本地 bump-and-build.ps1 显式完成。
 
       - name: Cache apt packages (xcb) [linux]
         if: runner.os == 'Linux'

@@ -226,7 +226,7 @@ try {
     if ($beforeVer) {
         $beforeTrim = $beforeVer.Trim()
         if ($verTrim -eq $beforeTrim) {
-            Write-Warning "版本未变化 ($verTrim) —— 可能命中缓存（云端构建不再 bump 版本；新版本号在部署成功后由本脚本递增并提交）"
+            Write-Warning "版本未变化 ($verTrim) —— 可能下载了旧产物；请确认云构建已基于最新 Cargo.toml 完成（版本管理见 bump-and-build.ps1，Cargo.toml 即构建版本）"
         } else {
             Write-Host "    版本已更新: $beforeTrim -> $verTrim" -ForegroundColor Green
         }
@@ -235,46 +235,8 @@ try {
     Write-Warning "执行 $Destination --version 失败: $($_.Exception.Message)"
 }
 
-# 版本递增 + 提交（本脚本是版本号唯一写者；云端构建工作流只读不 bump）
-# 部署成功后 patch +1，只提交 Cargo.toml/Cargo.lock，不碰其他文件。
-$projectRootForSync = Resolve-Path (Join-Path $PSScriptRoot "..") -ErrorAction SilentlyContinue
-if ($projectRootForSync -and (Test-Path (Join-Path $projectRootForSync "Cargo.toml"))) {
-    Push-Location $projectRootForSync
-    try {
-        if (-not (Get-Command cargo.exe -ErrorAction SilentlyContinue)) {
-            Write-Warning "cargo.exe 不可用，跳过版本递增（Cargo.toml 保持 $currentVer）"
-        } else {
-            $null = cargo.exe set-version --bump patch -p pi_agent_rust 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warning "cargo set-version --bump patch 失败 (exit $LASTEXITCODE)，跳过版本递增"
-            } else {
-                $newContent = Get-Content (Join-Path $projectRootForSync "Cargo.toml") -Raw
-                $newVer = $null
-                if ($newContent -match '(?m)^\[package\][\s\S]*?^\s*version\s*=\s*"([^"]+)"') {
-                    $newVer = $Matches[1]
-                }
-                if (-not $newVer) {
-                    Write-Warning "无法从 Cargo.toml 解析递增后版本号"
-                } else {
-                    Write-Host "==> 版本已递增到 $newVer" -ForegroundColor Green
-                    git add Cargo.toml Cargo.lock 2>&1 | Out-Null
-                    git diff --cached --quiet 2>&1 | Out-Null
-                    if ($LASTEXITCODE -eq 0) {
-                        Write-Host "    版本文件无变化，跳过提交" -ForegroundColor DarkGray
-                    } else {
-                        git commit -m "chore: bump version to $newVer [skip ci]" 2>&1 | Write-Host
-                        if ($LASTEXITCODE -ne 0) {
-                            Write-Warning "版本提交失败 (exit $LASTEXITCODE)，请手动提交 Cargo.toml/Cargo.lock"
-                        } else {
-                            Write-Host "    已提交（仅 Cargo.toml/Cargo.lock）" -ForegroundColor Green
-                            Write-Host "    提示: 记得 git push origin custom" -ForegroundColor DarkGray
-                        }
-                    }
-                }
-            }
-        }
-    } finally { Pop-Location }
-}
+# 版本管理已移至 bump-and-build.ps1；本脚本仅部署，不再自动 bump。
+# 如需发新版：先 cargo set-version --bump patch 并 push，或直接运行 .\scripts\bump-and-build.ps1
 
 # 清理 cargo 产物（复用 deploy-release 逻辑：先 --file 再 --stamp）
 $projectRoot = Resolve-Path (Join-Path $PSScriptRoot "..") -ErrorAction SilentlyContinue
