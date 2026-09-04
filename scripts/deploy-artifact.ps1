@@ -241,10 +241,10 @@ $projectRootForSync = Resolve-Path (Join-Path $PSScriptRoot "..") -ErrorAction S
 if ($projectRootForSync -and (Test-Path (Join-Path $projectRootForSync "Cargo.toml"))) {
     Push-Location $projectRootForSync
     try {
-        if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-            Write-Warning "cargo 不可用，跳过版本递增（Cargo.toml 保持 $currentVer）"
+        if (-not (Get-Command cargo.exe -ErrorAction SilentlyContinue)) {
+            Write-Warning "cargo.exe 不可用，跳过版本递增（Cargo.toml 保持 $currentVer）"
         } else {
-            $null = cargo set-version --bump patch -p pi_agent_rust 2>&1
+            $null = cargo.exe set-version --bump patch -p pi_agent_rust 2>&1
             if ($LASTEXITCODE -ne 0) {
                 Write-Warning "cargo set-version --bump patch 失败 (exit $LASTEXITCODE)，跳过版本递增"
             } else {
@@ -283,7 +283,7 @@ if ($projectRoot) {
     try {
         if (Get-Command cargo-sweep -ErrorAction SilentlyContinue) {
             if (Test-Path "sweep.timestamp") {
-                cargo sweep --file 2>&1 | Write-Host
+                cargo.exe sweep --file 2>&1 | Write-Host
                 if ($LASTEXITCODE -ne 0) {
                     Write-Warning "cargo sweep --file 失败 (exit $LASTEXITCODE)"
                 } else {
@@ -292,7 +292,7 @@ if ($projectRoot) {
             } else {
                 Write-Host "cargo-sweep: no previous stamp, skipping --file" -ForegroundColor DarkGray
             }
-            cargo sweep --stamp 2>&1 | Write-Host
+            cargo.exe sweep --stamp 2>&1 | Write-Host
             Write-Host "cargo-sweep: timestamp updated" -ForegroundColor DarkGray
         }
     } finally {
