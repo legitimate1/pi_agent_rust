@@ -469,7 +469,7 @@ impl Tool for SubagentTool {
                 "tasks": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Independent tasks to run in parallel."},
                 "chain": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Sequential tasks; {previous} is replaced with the prior child output, and {{previous.data.<field.path>}} addresses the prior task's schema-validated data."},
                 "concurrency": {"type": "integer", "minimum": 1, "maximum": MAX_PARALLEL_TASKS},
-                "scope": {"type": "string", "enum": ["both", "user", "project"], "default": "both"},
+                "scope": {"type": "string", "enum": ["both", "user", "project"], "default": "both", "description": "Agent definition discovery scope: `both` loads global agents from $PI_CODING_AGENT_DIR/agents and project agents from the nearest .pi/agents; project definitions override same-name global definitions. `user` loads only global agents. `project` loads only project agents and excludes global agents. Use `both` for a globally defined agent such as worker."},
                 "continue": {"type": "boolean", "description": "When true, continue the existing subagent session identified by hubId with a new task. Requires hubId."},
                 "hubId": {"type": "string", "description": "Existing subagent session/hub id to continue. Required when continue is true."}
             },
@@ -2750,6 +2750,65 @@ mod tests {
         let error = discover_agents_with_roots(temp.path(), &global, AgentScope::User)
             .expect_err("invalid schema must fail agent loading");
         assert!(error.to_string().contains("output_schema"), "{error}");
+    }
+
+    #[test]
+    fn scope_selects_global_and_project_agent_definitions() {
+        let temp = TempDir::new().expect("tempdir");
+        let global = temp.path().join("global");
+        let cwd = temp.path().join("workspace").join("nested");
+        let project_agents = cwd.parent().expect("parent").join(".pi/agents");
+        write_agent(
+            &global.join("agents"),
+            "global-only",
+            "---\nname: global-only\ndescription: global\n---\nglobal prompt",
+        );
+        write_agent(
+            &project_agents,
+            "project-only",
+            "---\nname: project-only\ndescription: project\n---\nproject prompt",
+        );
+
+        let user_agents = discover_agents_with_roots(&cwd, &global, AgentScope::User)
+            .expect("discover global agents");
+        assert!(user_agents.contains_key("global-only"));
+        assert!(!user_agents.contains_key("project-only"));
+
+        let project_agents = discover_agents_with_roots(&cwd, &global, AgentScope::Project)
+            .expect("discover project agents");
+        assert!(!project_agents.contains_key("global-only"));
+        assert!(project_agents.contains_key("project-only"));
+
+        let both_agents = discover_agents_with_roots(&cwd, &global, AgentScope::Both)
+            .expect("discover both agent scopes");
+        assert!(both_agents.contains_key("global-only"));
+        assert!(both_agents.contains_key("project-only"));
+    }
+
+    /// The schema text is part of the model-facing contract: keep the three
+    /// scopes explicit so a global agent is not accidentally requested as a
+    /// project-only agent.
+    #[test]
+    fn tool_schema_documents_agent_scope_directories_and_precedence() {
+        let tool =
+            SubagentTool::with_paths(PathBuf::from("."), PathBuf::from("."), PathBuf::from("pi"));
+        let schema = tool.parameters();
+        let description = schema["properties"]["scope"]["description"]
+            .as_str()
+            .expect("scope description");
+
+        for phrase in [
+            "`both` loads global agents from $PI_CODING_AGENT_DIR/agents and project agents from the nearest .pi/agents",
+            "project definitions override same-name global definitions",
+            "`user` loads only global agents",
+            "`project` loads only project agents and excludes global agents",
+            "Use `both` for a globally defined agent such as worker",
+        ] {
+            assert!(
+                description.contains(phrase),
+                "missing scope contract: {phrase}"
+            );
+        }
     }
 
     #[test]
