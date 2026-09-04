@@ -656,7 +656,15 @@
 
 ---
 
-## D64: OpenCode 网关会话关联 — stream() 按 provider+base_url 注入 x-opencode-session
+## D64: OpenCode 网关会话关联 — 三条 stream() 按 provider+base_url 注入 x-opencode-session
+
+**决策**：opencode 系请求自动带 x-opencode-session: session_id，不选 models.json 手动配 custom_headers
+
+**理由**：邮件点名 opencode-go，同服务 sibling 的 opencode 必然同策略；session.header.id 天然每 conversation 稳定，无需另造 ID 生成器；判定与注入收拢到 providers::mod 共享，三条发送路径（completions/responses/anthropic-messages）复用
+
+**不选 B 的原因**：只按 provider 规范 id 判定会漏掉用户自定义 id 指过去的情形；只按 base_url 判定则 registry 里 `opencode-go` 的测试构造（loopback URL）会误判；只在 completions 注入会漏掉 Go 的 responses（muse-spark 系）与 messages（minimax/qwen 系）路由——官方 Endpoints 表一家占全三条路由
+
+**何时重新考虑**：OpenCode 改头名/策略，或 opencode 与 opencode-go 行为分叉时重估
 
 **决策**：opencode 系请求自动带 x-opencode-session: session_id，不选 models.json 手动配 custom_headers
 
