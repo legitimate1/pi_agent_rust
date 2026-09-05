@@ -1825,11 +1825,8 @@ impl MonitorResources {
 
 impl Drop for MonitorResources {
     fn drop(&mut self) {
-        let _ = self.child.kill_and_wait();
-        self.output_sealed.store(true, Ordering::Release);
-        let deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
-        let _ = self.stop_pumps(deadline);
-        self.seal_output_best_effort();
+        // Publish the terminal state before best-effort cleanup so a panic cannot
+        // leave waiters observing `running` while process or pump cleanup stalls.
         if !self.settlement_published {
             if self.monitor_started {
                 settle_job_and_enqueue_notice(&self.id, JobStatus::Failed, None, false);
@@ -1838,6 +1835,12 @@ impl Drop for MonitorResources {
             }
             self.settlement_published = true;
         }
+
+        let _ = self.child.kill_and_wait();
+        self.output_sealed.store(true, Ordering::Release);
+        let deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
+        let _ = self.stop_pumps(deadline);
+        self.seal_output_best_effort();
     }
 }
 
@@ -5063,7 +5066,19 @@ mod tests {
         assert_eq!(settled.pid, None);
         assert!(!settled.output_complete);
         #[cfg(unix)]
-        assert_eq!(JOB_PUMP_THREADS_IN_FLIGHT.load(Ordering::Acquire), 0);
+        {
+            let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+            while JOB_PUMP_THREADS_IN_FLIGHT.load(Ordering::Acquire) != 0
+                && Instant::now() < cleanup_deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(
+                JOB_PUMP_THREADS_IN_FLIGHT.load(Ordering::Acquire),
+                0,
+                "monitor panic cleanup must eventually join output pumps"
+            );
+        }
         assert_eq!(take_completion_notices(&owner).len(), 1);
         assert!(take_completion_notices(&owner).is_empty());
     }
