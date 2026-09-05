@@ -2859,7 +2859,12 @@ impl ToolRegistry {
                 "hashline_edit" => tools.push(Box::new(HashlineEditTool::new(cwd))),
                 "ast_grep" => tools.push(Box::new(crate::ast_tools::AstGrepTool::new(cwd))),
                 "ast_edit" => tools.push(Box::new(crate::ast_tools::AstEditTool::new(cwd))),
-                "subagent" => tools.push(Box::new(crate::subagents::SubagentTool::new(cwd))),
+                "subagent" => tools.push(Box::new(
+                    crate::subagents::SubagentTool::with_inherited_tools(
+                        cwd,
+                        Some(enabled.iter().map(|name| (*name).to_string()).collect()),
+                    ),
+                )),
                 _ => {}
             }
         }

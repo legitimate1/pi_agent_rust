@@ -48,7 +48,8 @@ const STRUCTURED_BLOCK_LIMIT_BYTES: usize = 16 * 1024;
 const STRUCTURED_BLOCK_OPEN: &str = "<subagent-structured-result>";
 const STRUCTURED_BLOCK_CLOSE: &str = "</subagent-structured-result>";
 const STRUCTURED_TRUNCATION_MARKER: &str = "…[truncated]";
-const DEFAULT_CHILD_TOOLS: &str = "read,bash,edit,write,grep,find,ls,hashline_edit";
+const DEFAULT_CHILD_TOOLS: &str =
+    "read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit";
 const TAN_RESULT_SCHEMA: &str = "pi.background-tan.result.v1";
 const TAN_AGENT_NAME: &str = "tan";
 const TAN_SYSTEM_PROMPT: &str = "You are a background tangential coding agent. Complete the assigned work autonomously in the current working directory. Keep your final response concise and lead with the concrete outcome, changed files, and verification performed. Do not ask follow-up questions.";
@@ -201,6 +202,10 @@ pub struct SubagentTool {
     cwd: PathBuf,
     global_dir: PathBuf,
     child_binary: PathBuf,
+    /// Tool names enabled in the parent run. Agent definitions may override
+    /// this list with an explicit `tools` field. `None` is retained for
+    /// standalone/test construction where no parent registry is available.
+    inherited_tools: Option<Vec<String>>,
     structured_results: bool,
     /// Model spec children run with when their agent definition does not pin
     /// `model:` — the `task` role spec, else `smol` (bd-cv653.3.1).
@@ -211,6 +216,12 @@ pub struct SubagentTool {
 impl SubagentTool {
     #[must_use]
     pub fn new(cwd: &Path) -> Self {
+        Self::with_inherited_tools(cwd, None)
+    }
+
+    /// Construct a subagent tool with the parent run's enabled tool names.
+    #[must_use]
+    pub fn with_inherited_tools(cwd: &Path, inherited_tools: Option<Vec<String>>) -> Self {
         let child_binary = std::env::var_os("PI_SUBAGENT_PI_BINARY")
             .filter(|path| !path.is_empty())
             .map(PathBuf::from)
@@ -223,6 +234,7 @@ impl SubagentTool {
             cwd: cwd.to_path_buf(),
             global_dir: Config::global_dir(),
             child_binary,
+            inherited_tools,
             structured_results: false,
             role_model_spec: None,
             retry_config,
@@ -294,6 +306,7 @@ impl SubagentTool {
             self.role_model_spec.clone(),
             crate::agent_hub::ChildKind::Tan,
         )
+        .with_inherited_tools(None)
         .with_retry_config(self.retry_config.clone())
         .run_one(&agents, request, None, None)
         .await;
@@ -312,6 +325,7 @@ impl SubagentTool {
             cwd,
             global_dir,
             child_binary,
+            inherited_tools: None,
             structured_results: false,
             role_model_spec: None,
             retry_config: SubagentRetryConfig {
@@ -397,6 +411,7 @@ impl SubagentTool {
                 let global_dir = self.global_dir.clone();
                 let binary = self.child_binary.clone();
                 let role_spec = self.role_model_spec.clone();
+                let inherited_tools = self.inherited_tools.clone();
                 let retry_config = self.retry_config.clone();
                 let update = on_update.clone();
                 let results = stream::iter(tasks.into_iter().enumerate())
@@ -406,6 +421,7 @@ impl SubagentTool {
                         let global_dir = global_dir.clone();
                         let binary = binary.clone();
                         let role_spec = role_spec.clone();
+                        let inherited_tools = inherited_tools.clone();
                         let retry_config = retry_config.clone();
                         let update = update.clone();
                         async move {
@@ -416,6 +432,7 @@ impl SubagentTool {
                                 role_spec,
                                 crate::agent_hub::ChildKind::Subagent,
                             )
+                            .with_inherited_tools(inherited_tools)
                             .with_retry_config(retry_config);
                             (index, runner.run_one(&agents, task, None, update).await)
                         }
@@ -461,6 +478,7 @@ impl SubagentTool {
             self.role_model_spec.clone(),
             crate::agent_hub::ChildKind::Subagent,
         )
+        .with_inherited_tools(self.inherited_tools.clone())
         .with_retry_config(self.retry_config.clone())
         .run_one(agents, task, step, on_update)
         .await
@@ -1144,6 +1162,7 @@ struct ChildRunner {
     child_binary: PathBuf,
     role_model_spec: Option<String>,
     hub_kind: crate::agent_hub::ChildKind,
+    inherited_tools: Option<Vec<String>>,
     retry_config: SubagentRetryConfig,
 }
 
@@ -1161,8 +1180,15 @@ impl ChildRunner {
             child_binary,
             role_model_spec,
             hub_kind,
+            inherited_tools: None,
             retry_config: SubagentRetryConfig::default(),
         }
+    }
+
+    #[must_use]
+    fn with_inherited_tools(mut self, inherited_tools: Option<Vec<String>>) -> Self {
+        self.inherited_tools = inherited_tools;
+        self
     }
 
     #[must_use]
@@ -1556,6 +1582,7 @@ impl ChildRunner {
             output_schema,
             final_session_path.as_deref(),
             inherited_allowed.as_deref(),
+            self.inherited_tools.as_deref(),
         );
         let mut pending_continue_session = final_session_path.clone();
         let mut result = SubagentResult::starting(
@@ -1565,6 +1592,7 @@ impl ChildRunner {
             &self.child_binary,
             &run_cwd,
             &args,
+            self.inherited_tools.as_deref(),
         );
         // Agent-hub registration already done above — wire result fields.
         if let Some(entry) = hub_entry.as_ref() {
@@ -1580,6 +1608,7 @@ impl ChildRunner {
                     output_schema,
                     Some(&canonical),
                     inherited_allowed.as_deref(),
+                    self.inherited_tools.as_deref(),
                 );
                 args = new_args;
                 pending_continue_session = Some(canonical);
@@ -1851,6 +1880,7 @@ fn child_args(
         output_schema,
         session_path,
         allowed_skills_env().as_deref(),
+        None,
     )
 }
 
@@ -1897,6 +1927,7 @@ fn child_args_inner(
     output_schema: Option<&Value>,
     session_path: Option<&Path>,
     inherited: Option<&[String]>,
+    inherited_tools: Option<&[String]>,
 ) -> Vec<OsString> {
     let effective_allowed = effective_allowed_skills(inherited, agent.allowed_skills.as_deref());
     let mut args = vec!["--mode".into(), "json".into(), "--print".into()];
@@ -1909,14 +1940,12 @@ fn child_args_inner(
     } else {
         args.push("--no-session".into());
     }
-    args.extend([
-        "--tools".into(),
-        agent
-            .tools
-            .as_ref()
-            .map_or_else(|| DEFAULT_CHILD_TOOLS.to_string(), |tools| tools.join(","))
-            .into(),
-    ]);
+    let child_tools = agent
+        .tools
+        .as_deref()
+        .or(inherited_tools)
+        .map_or_else(|| DEFAULT_CHILD_TOOLS.to_string(), |tools| tools.join(","));
+    args.extend(["--tools".into(), child_tools.into()]);
     // Model precedence (bd-cv653.3.1): agent-def `model:` pin > task/smol role
     // spec from settings > nothing (child inherits the parent's ambient model).
     if let Some(model) = &agent.model {
@@ -2138,6 +2167,7 @@ impl SubagentResult {
         binary: &Path,
         cwd: &Path,
         _args: &[OsString],
+        inherited_tools: Option<&[String]>,
     ) -> Self {
         Self {
             agent: agent.name.clone(),
@@ -2151,6 +2181,7 @@ impl SubagentResult {
             tools: agent
                 .tools
                 .clone()
+                .or_else(|| inherited_tools.map(<[String]>::to_vec))
                 .unwrap_or_else(|| split_csv(DEFAULT_CHILD_TOOLS)),
             cwd: cwd.to_path_buf(),
             binary: binary.to_path_buf(),
@@ -2207,7 +2238,7 @@ impl SubagentResult {
         step: Option<usize>,
         error: String,
     ) -> Self {
-        let mut result = Self::starting(agent, task, step, Path::new(""), Path::new(""), &[]);
+        let mut result = Self::starting(agent, task, step, Path::new(""), Path::new(""), &[], None);
         result.fail(error);
         result
     }
@@ -2562,6 +2593,107 @@ mod tests {
             model_value(&args).is_none(),
             "no role spec and no pin must not inject --model"
         );
+    }
+
+    #[test]
+    fn child_args_inherit_parent_tools_when_definition_omits_tools() {
+        let agent = AgentDefinition {
+            name: "scout".to_string(),
+            description: "inspect".to_string(),
+            model: None,
+            reasoning: None,
+            tools: None,
+            skills: Vec::new(),
+            allowed_skills: None,
+            system_prompt: String::new(),
+            output_schema: None,
+            source: AgentSource::User,
+            file_path: PathBuf::from("/tmp/scout.md"),
+        };
+        let inherited = vec![
+            "read".to_string(),
+            "shell".to_string(),
+            "edit".to_string(),
+            "subagent".to_string(),
+        ];
+        let args = child_args_inner(
+            &agent,
+            "inspect provider",
+            None,
+            None,
+            None,
+            None,
+            Some(&inherited),
+        )
+        .iter()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--tools", "read,shell,edit,subagent"] })
+        );
+    }
+
+    #[test]
+    fn child_args_explicit_tools_override_parent_tools() {
+        let agent = AgentDefinition {
+            name: "scout".to_string(),
+            description: "inspect".to_string(),
+            model: None,
+            reasoning: None,
+            tools: Some(vec!["read".to_string(), "grep".to_string()]),
+            skills: Vec::new(),
+            allowed_skills: None,
+            system_prompt: String::new(),
+            output_schema: None,
+            source: AgentSource::User,
+            file_path: PathBuf::from("/tmp/scout.md"),
+        };
+        let inherited = vec!["read".to_string(), "shell".to_string()];
+        let args = child_args_inner(
+            &agent,
+            "inspect provider",
+            None,
+            None,
+            None,
+            None,
+            Some(&inherited),
+        )
+        .iter()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair == ["--tools", "read,grep"]));
+    }
+
+    #[test]
+    fn child_args_preserve_an_empty_parent_tool_list() {
+        let agent = AgentDefinition {
+            name: "scout".to_string(),
+            description: "inspect".to_string(),
+            model: None,
+            reasoning: None,
+            tools: None,
+            skills: Vec::new(),
+            allowed_skills: None,
+            system_prompt: String::new(),
+            output_schema: None,
+            source: AgentSource::User,
+            file_path: PathBuf::from("/tmp/scout.md"),
+        };
+        let inherited: Vec<String> = Vec::new();
+        let args = child_args_inner(
+            &agent,
+            "inspect provider",
+            None,
+            None,
+            None,
+            None,
+            Some(&inherited),
+        )
+        .iter()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair == ["--tools", ""]));
     }
 
     #[test]
