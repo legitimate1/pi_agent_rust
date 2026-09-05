@@ -269,6 +269,55 @@ mv "$staged" "$destination"
 
 ---
 
+## Playbook 6：后台 jobs monitor panic 后状态未结算
+
+### 症状
+
+- 后台 job 的 monitor 线程发生 panic，但 `wait` 在超时前仍返回 `status = "running"`。
+- `MonitorResources` 负责兜底清理，但 waiter 没有及时收到终态快照或唤醒通知。
+- 本地单测可能稳定通过，CI 并发运行全量测试时在固定等待窗口耗尽后失败。
+- 该问题与正常 job 的取消、超时升级路径不同；先隔离 panic 兜底路径，避免把无关的 TERM/KILL 时序失败混入分析。
+
+### 前 3 条命令
+
+```bash
+cargo test --lib jobs::tests::monitor_panic_settles_the_published_job_and_wakes_waiters -- --nocapture
+cargo test --lib jobs -- --test-threads=8
+rg -n "MonitorResources|monitor_job|settle_job|wait_with_handle|kill_and_wait|OUTPUT_DRAIN_GRACE" src/jobs.rs
+```
+
+### 最小复现模板
+
+```bash
+# 测试通过 SpawnBackgroundTestHooks 注入 monitor 启动后的 panic
+cargo test --lib jobs::tests::monitor_panic_settles_the_published_job_and_wakes_waiters -- --nocapture
+```
+
+### 根因与修复约束
+
+`MonitorResources::Drop` 若先执行进程终止、pump 排空，再发布 `Failed` 状态，进程组扫描、阻塞式 `Child::wait()` 或有界 pump 清理就可能耗尽 waiter 的等待窗口。`wait` 读取的是 `settled_snapshot`，因此在 settlement 发布前只能看到运行态快照。
+
+修复时应遵循以下顺序：
+
+1. monitor 已启动时，先发布 `Failed` 状态和 completion notice，并唤醒 waiter。
+2. monitor 尚未启动时，只发布 `Failed` 状态，不发送 completion notice；这是 monitor 创建失败路径，不能伪造完成通知。
+3. 终态发布后仍执行子进程终止、pump 清理及 artifact/tail seal，不能用提前唤醒替代资源清理。
+4. 测试分别验证 waiter 及时获得终态，以及 pump 最终退出，避免把两个时序契约合并成一个无界断言。
+
+### 修复验证清单
+
+- [ ] 注入 monitor panic 时，waiter 在超时窗口内返回 `failed`，且 `pid` 已清空。
+- [ ] panic 兜底仍最终回收 stdout/stderr pump 和子进程资源。
+- [ ] monitor spawn failure 路径不产生 completion notice。
+- [ ] `cargo test --lib jobs -- --test-threads=8` 无本次 panic 结算回归。
+- [ ] `cargo clippy --lib -- -D warnings` 通过。
+- [ ] `cargo fmt --check` 通过。
+- [ ] 云端 `my-check.yml` 通过后再视为全量校验完成。
+
+本次修复已在 commit `846f113` 中通过云端 `my-check.yml`；未修改正常取消/超时升级逻辑。
+
+---
+
 ## 标准升级路径
 
 仅在针对性复现 + 聚焦切片确认有必要之后，才按此顺序扩大范围：
