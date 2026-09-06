@@ -8074,6 +8074,124 @@ mod turn_event_tests {
     }
 
     #[test]
+    fn normal_agent_run_persists_user_assistant_and_tool_messages() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let provider = Arc::new(ToolTurnProvider::new());
+        let tools = ToolRegistry::from_tools(vec![Box::new(EchoTool)]);
+        let agent = Agent::new(provider, tools, AgentConfig::default());
+        let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+            temp_dir.path().to_path_buf(),
+        ))));
+        let mut agent_session = AgentSession::new(
+            agent,
+            Arc::clone(&session),
+            true,
+            ResolvedCompactionSettings::default(),
+        );
+
+        runtime.block_on(async move {
+            let result = agent_session
+                .run_text("persisted".to_string(), |_| {})
+                .await
+                .expect("normal run");
+            assert_eq!(result.stop_reason, StopReason::Stop);
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let path = session
+                .lock(cx.cx())
+                .await
+                .expect("lock session")
+                .path
+                .clone()
+                .expect("session path");
+            let saved = Session::open(path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen persisted session");
+            let messages = saved.to_messages_for_current_path();
+
+            assert_eq!(
+                messages.len(),
+                4,
+                "unexpected persisted messages: {messages:?}"
+            );
+            match &messages[0] {
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) => assert_eq!(text, "persisted"),
+                other => panic!("expected persisted user message, got {other:?}"),
+            }
+            assert!(matches!(messages[1], Message::Assistant(_)));
+            assert!(matches!(messages[2], Message::ToolResult(_)));
+            match &messages[3] {
+                Message::Assistant(message) => {
+                    assert!(message.content.iter().any(|block| {
+                        matches!(block, ContentBlock::Text(text) if text.text == "final")
+                    }));
+                    assert_eq!(message.stop_reason, StopReason::Stop);
+                }
+                other => panic!("expected final assistant message, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn failed_agent_run_persists_user_without_synthetic_error_assistant() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let provider = Arc::new(StreamSetupErrorProvider);
+        let tools = ToolRegistry::new(&[], Path::new("."), None);
+        let agent = Agent::new(provider, tools, AgentConfig::default());
+        let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+            temp_dir.path().to_path_buf(),
+        ))));
+        let mut agent_session = AgentSession::new(
+            agent,
+            Arc::clone(&session),
+            true,
+            ResolvedCompactionSettings::default(),
+        );
+
+        runtime.block_on(async move {
+            agent_session
+                .run_text("persisted before failure".to_string(), |_| {})
+                .await
+                .expect_err("stream setup should fail");
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let path = session
+                .lock(cx.cx())
+                .await
+                .expect("lock session")
+                .path
+                .clone()
+                .expect("session path");
+            let saved = Session::open(path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen persisted session");
+            let messages = saved.to_messages_for_current_path();
+
+            assert_eq!(
+                messages.len(),
+                1,
+                "unexpected persisted messages: {messages:?}"
+            );
+            match &messages[0] {
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) => assert_eq!(text, "persisted before failure"),
+                other => panic!("expected persisted user message, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
     fn turn_events_include_tool_execution_and_tool_result_messages() {
         let runtime = RuntimeBuilder::current_thread()
             .build()

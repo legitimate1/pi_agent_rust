@@ -32,7 +32,7 @@ use crate::models::{ModelEntry, model_requires_configured_credential, normalize_
 use crate::provider_metadata::provider_ids_match;
 use crate::providers;
 use crate::resources::ResourceLoader;
-use crate::session::{EntryBase, MessageEntry, SessionEntry, SessionMessage};
+use crate::session::SessionMessage;
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeHandle;
@@ -217,192 +217,15 @@ fn resolve_extension_command(
         .then_some((command_name, args))
 }
 
-// =============================================================================
-// RPC Session Persister — process-side proactive session persistence
-// =============================================================================
-//
-// Writes completed messages to the JSONL session file in real-time as the
-// agent produces them, ensuring data survives an Obsidian crash mid-turn.
-// The session's final persist_new_messages rewrites the file with canonical
-// entry IDs, so our entries are temporary but good enough for crash recovery.
-
-enum PersistOp {
-    Message(Message),
-    Flush,
-}
-
-/// Thread-safe handle to the background JSONL writer thread.
-#[derive(Clone)]
-struct RpcSessionPersister {
-    inner: Arc<RpcSessionPersisterHandle>,
-}
-
-struct RpcSessionPersisterHandle {
-    tx: std::sync::mpsc::Sender<PersistOp>,
-}
-
-impl RpcSessionPersister {
-    fn new(path: PathBuf) -> Result<Self> {
-        let (tx, rx) = std::sync::mpsc::channel::<PersistOp>();
-
-        std::thread::Builder::new()
-            .name("rpc-persist".into())
-            .spawn(move || {
-                Self::writer_thread(path, rx);
-            })
-            .map_err(|e| Error::session(format!("Failed to spawn persist thread: {e}")))?;
-
-        Ok(Self {
-            inner: Arc::new(RpcSessionPersisterHandle { tx }),
-        })
-    }
-
-    fn persist_messages(&self, messages: Vec<Message>) {
-        for msg in messages {
-            let _ = self.inner.tx.send(PersistOp::Message(msg));
-        }
-    }
-
-    fn flush(&self) {
-        let _ = self.inner.tx.send(PersistOp::Flush);
-    }
-
-    fn writer_thread(path: PathBuf, rx: std::sync::mpsc::Receiver<PersistOp>) {
-        use std::io::Write;
-
-        // Count existing entries to generate non-conflicting IDs.
-        let mut entry_count: u64 = 0;
-        let mut last_entry_id: Option<String> = None;
-        if let Ok(file) = std::fs::File::open(&path) {
-            let reader = std::io::BufReader::new(file);
-            let mut lines = reader.lines();
-            while let Some(Ok(line)) = lines.next() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                        // The session header (type="session") carries the chain
-                        // root id but is not a message entry: record it as the
-                        // parent of the first persisted message without counting
-                        // it toward the rp_* sequence. Previously the header was
-                        // skipped, so the first entry had no parentId and the
-                        // leaf-backtracking chain was cut at the root.
-                        let is_header = val.get("type").and_then(|v| v.as_str()) == Some("session");
-                        if !is_header {
-                            entry_count += 1;
-                        }
-                        if let Some(id) = val.get("id").and_then(|v| v.as_str()) {
-                            last_entry_id = Some(id.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Reusable file handle — open on first write, keep for the session.
-        let mut file: Option<std::fs::File> = None;
-
-        while let Ok(op) = rx.recv() {
-            match op {
-                PersistOp::Message(message) => {
-                    entry_count += 1;
-                    let id = format!("rp_{entry_count:06}");
-                    let parent_id = last_entry_id.clone();
-                    last_entry_id = Some(id.clone());
-
-                    let base = EntryBase::new(parent_id, id);
-                    let session_message = SessionMessage::from(message);
-                    let entry = SessionEntry::Message(MessageEntry {
-                        base,
-                        message: session_message,
-                    });
-
-                    let json_line = match serde_json::to_string(&entry) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::warn!("rpc-persist: failed to serialize session entry: {e}");
-                            continue;
-                        }
-                    };
-
-                    if file.is_none() {
-                        match std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&path)
-                        {
-                            Ok(f) => file = Some(f),
-                            Err(e) => {
-                                tracing::warn!("rpc-persist: cannot open session file: {e}");
-                                continue;
-                            }
-                        }
-                    }
-
-                    if let Some(ref mut f) = file {
-                        if let Err(e) = writeln!(f, "{json_line}") {
-                            tracing::warn!("rpc-persist: write failed: {e}");
-                            file = None;
-                        }
-                    }
-                }
-                PersistOp::Flush => {
-                    if let Some(ref mut f) = file {
-                        if let Err(e) = f.sync_all() {
-                            tracing::warn!("rpc-persist: fsync failed: {e}");
-                        }
-                    }
-                }
-            }
-        }
-
-        // Final sync on shutdown.
-        if let Some(ref f) = file {
-            let _ = f.sync_all();
-        }
-    }
-}
-
 fn rpc_agent_event_handler(
     out_tx: std::sync::mpsc::SyncSender<String>,
     runtime_handle: RuntimeHandle,
     extensions: Option<ExtensionManager>,
-    session_persister: Option<RpcSessionPersister>,
 ) -> impl Fn(AgentEvent) + Send + Sync + 'static {
     let coalescer = extensions.map(crate::extensions::EventCoalescer::new);
     let output_pressure = Arc::new(std::sync::Mutex::new(RpcOutputPressureState::default()));
 
     move |event: AgentEvent| {
-        // === RPC session persister: write completed messages in real-time ===
-        if let Some(ref persister) = session_persister {
-            match &event {
-                AgentEvent::MessageStart { message } => {
-                    // Persist user messages as they are submitted, not only at
-                    // TurnEnd (which carries assistant + tool results). The main
-                    // session.save path also writes users; writing them here too
-                    // is harmless (user entries carry no usage and the leaf
-                    // backtracking chain stays unique per id) and guarantees the
-                    // user is on disk even if session.save is disabled.
-                    if matches!(message, Message::User(_)) {
-                        persister.persist_messages(vec![message.clone()]);
-                    }
-                }
-                AgentEvent::TurnEnd {
-                    message,
-                    tool_results,
-                    ..
-                } => {
-                    let mut msgs = Vec::with_capacity(1 + tool_results.len());
-                    msgs.push(message.clone());
-                    msgs.extend(tool_results.iter().cloned());
-                    persister.persist_messages(msgs);
-                }
-                AgentEvent::AgentEnd { .. } => {
-                    persister.flush();
-                }
-                _ => {}
-            }
-        }
-
         let serialized = if let AgentEvent::AgentEnd {
             messages,
             error,
@@ -2756,24 +2579,6 @@ async fn run_prompt_with_retry(
     retry_abort.store(false, Ordering::SeqCst);
     is_streaming.store(true, Ordering::SeqCst);
 
-    // Build the session persister once (not per retry) — it writes completed
-    // messages to the JSONL file in real-time to survive Obsidian crashes.
-    let session_persister: Option<RpcSessionPersister> = 'block: {
-        let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await else {
-            break 'block None;
-        };
-        if !guard.save_enabled() {
-            break 'block None;
-        }
-        let Ok(inner) = guard.session.lock(&cx).await else {
-            break 'block None;
-        };
-        let Some(path) = inner.path.clone() else {
-            break 'block None;
-        };
-        break 'block RpcSessionPersister::new(path).ok();
-    };
-
     let mut counters = crate::retry_state::RetryCounters::new(options.config.retry_max_retries());
     let has_progress = crate::retry_state::RetryProgress::new();
     let mut success = false;
@@ -2809,12 +2614,7 @@ async fn run_prompt_with_retry(
             };
             let extensions = guard.extensions.as_ref().map(|r| r.manager().clone());
             let event_handler = {
-                let base = rpc_agent_event_handler(
-                    out_tx.clone(),
-                    runtime_for_events,
-                    extensions,
-                    session_persister.clone(),
-                );
+                let base = rpc_agent_event_handler(out_tx.clone(), runtime_for_events, extensions);
                 has_progress.wrap(base)
             };
 
@@ -3038,8 +2838,7 @@ async fn run_extension_command(
             .extensions
             .as_ref()
             .map(|region| region.manager().clone());
-        let event_handler =
-            rpc_agent_event_handler(out_tx.clone(), runtime_handle, extensions, None);
+        let event_handler = rpc_agent_event_handler(out_tx.clone(), runtime_handle, extensions);
         guard
             .execute_extension_command_with_abort(
                 &command_name,
@@ -9478,64 +9277,27 @@ export default function init(pi) {
         assert_eq!(resp.value, Some(json!("Beta")));
     }
 
-    /// The RPC persister must (1) link its first entry to the session header
-    /// id — previously the header was skipped during startup scanning, leaving
-    /// rp_000001 with no parentId and cutting the leaf-backtracking chain —
-    /// and (2) persist user messages from MessageStart so the chain contains
-    /// the user prompt even when session.save is disabled.
     #[test]
-    fn persister_links_first_entry_to_header_and_persists_user() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("session.jsonl");
-        let header_id = "test-header-0001";
-        std::fs::write(
-            &path,
-            format!("{{\"type\":\"session\",\"id\":\"{header_id}\"}}\n"),
-        )
-        .unwrap();
-
-        let (out_tx, _out_rx) = std::sync::mpsc::sync_channel::<String>(8);
+    fn rpc_agent_event_handler_forwards_agent_end_without_session_writer() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
-        let persister = RpcSessionPersister::new(path.clone()).expect("persister");
-        let handler = rpc_agent_event_handler(out_tx, runtime.handle(), None, Some(persister));
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1);
+        let handler = rpc_agent_event_handler(out_tx, runtime.handle(), None);
 
-        let user = Message::User(UserMessage {
-            content: UserContent::Text("hello".to_string()),
-            timestamp: 1,
-        });
-        handler(AgentEvent::MessageStart { message: user });
         handler(AgentEvent::AgentEnd {
             session_id: Arc::from("test-session"),
-            messages: vec![],
-            error: None,
+            messages: Vec::new(),
+            error: Some("test failure".to_string()),
         });
 
-        // The writer thread consumes asynchronously; poll until the user line lands.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let content = loop {
-            let current = std::fs::read_to_string(&path).unwrap_or_default();
-            if current.lines().count() >= 2 || Instant::now() > deadline {
-                break current;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-
-        let lines: Vec<serde_json::Value> = content
-            .lines()
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
-        assert_eq!(lines.len(), 2, "header + user entry, got: {content}");
-        let user_entry = &lines[1];
-        assert_eq!(user_entry["type"], "message");
-        assert_eq!(user_entry["id"], "rp_000001");
-        assert_eq!(
-            user_entry["parentId"], header_id,
-            "first persisted entry must link to the session header id (chain root)"
-        );
-        assert_eq!(user_entry["message"]["role"], "user");
-        assert_eq!(user_entry["message"]["content"], "hello");
+        let serialized = out_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("agent_end event");
+        let value: Value = serde_json::from_str(&serialized).expect("valid agent_end JSON");
+        assert_eq!(value["type"], "agent_end");
+        assert_eq!(value["sessionId"], "test-session");
+        assert_eq!(value["error"], "test failure");
     }
 
     /// The `append_custom_entry` RPC endpoint appends a Custom entry and
