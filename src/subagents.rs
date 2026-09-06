@@ -2258,11 +2258,32 @@ fn render_results(results: &[SubagentResult]) -> String {
                 || result.agent.clone(),
                 |step| format!("step {step}: {}", result.agent),
             );
-            let body = if result.output.trim().is_empty() {
-                result.error.as_deref().unwrap_or("(no output)")
+            let output = result.output.trim();
+            let error = result.error.as_deref().unwrap_or("").trim();
+            let stderr = result.stderr.trim();
+            let mut body = if output.is_empty() {
+                if error.is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    error.to_string()
+                }
             } else {
-                result.output.trim()
+                output.to_string()
             };
+
+            // stderr is intentionally model-visible only for failed runs: a
+            // successful child may write harmless diagnostic noise, while a
+            // failed child often puts the actionable provider error there.
+            if result.is_error {
+                if !output.is_empty() && !error.is_empty() {
+                    body.push_str("\n\nError: ");
+                    body.push_str(error);
+                }
+                if !stderr.is_empty() {
+                    body.push_str("\n\nStderr:\n");
+                    body.push_str(stderr);
+                }
+            }
             format!("## {heading}\n{body}")
         })
         .collect::<Vec<_>>()
@@ -3025,6 +3046,52 @@ mod tests {
             panic!("expected text output");
         };
         text.text.clone()
+    }
+
+    #[test]
+    fn render_results_exposes_stderr_for_failed_child_without_output() {
+        let task = SubagentTask {
+            agent: "worker".to_string(),
+            task: "inspect provider".to_string(),
+            cwd: None,
+            isolation: None,
+            iso_apply: None,
+            output_schema: None,
+            schema_mode: SchemaMode::default(),
+            continue_flag: None,
+            hub_id: None,
+        };
+        let mut result = SubagentResult::unknown(task, None);
+        result.error = Some("Child exited with code 1.".to_string());
+        result.stderr = "API error: Request timed out after 60s".to_string();
+        let rendered = render_results(&[result]);
+
+        assert!(rendered.contains("Child exited with code 1."));
+        assert!(rendered.contains("API error: Request timed out after 60s"));
+    }
+
+    #[test]
+    fn render_results_exposes_error_and_stderr_alongside_partial_output() {
+        let task = SubagentTask {
+            agent: "worker".to_string(),
+            task: "inspect provider".to_string(),
+            cwd: None,
+            isolation: None,
+            iso_apply: None,
+            output_schema: None,
+            schema_mode: SchemaMode::default(),
+            continue_flag: None,
+            hub_id: None,
+        };
+        let mut result = SubagentResult::unknown(task, None);
+        result.output = "partial child output".to_string();
+        result.error = Some("Child exited with code 1.".to_string());
+        result.stderr = "provider authentication failed".to_string();
+        let rendered = render_results(&[result]);
+
+        assert!(rendered.contains("partial child output"));
+        assert!(rendered.contains("Error: Child exited with code 1."));
+        assert!(rendered.contains("Stderr:\nprovider authentication failed"));
     }
 
     #[test]
