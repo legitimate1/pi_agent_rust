@@ -40,7 +40,7 @@
 ## 工具系统
 
 - **工具注册表** — 内置/扩展工具统一注册、JSON Schema 定义、按名路由 | `src/tools/mod.rs`
-- **内置 11 工具** — read/shell/edit/write/grep/find/ls/hashline/ast_grep/ast_edit/subagent（shell 统一 bash/pwsh 为单一 `shell(shell, command, timeout?)`，显式方言 `bash|pwsh`，当前 cwd，薄转发复用；`bash`/`pwsh` 仅 `PI_ENABLE_LEGACY_SHELL=1|true|yes|on` 时带外恢复；ast_grep/ast_edit 按语法树搜索与分阶段重写；`subagent` 默认可见，`src/subagents.rs`，派生 `pi` 子进程，限深 3 层） | `src/tools/` 各子模块 + `src/ast_tools.rs` + `src/subagents.rs`
+- **内置 11 工具** — read/shell/edit/write/grep/find/ls/hashline/ast_grep/ast_edit/subagent（shell 统一 bash/pwsh 为单一 `shell(shell, command, timeout?)`，显式方言 `bash|pwsh`，当前 cwd，薄转发复用；`bash`/`pwsh` 仅 `PI_ENABLE_LEGACY_SHELL=1|true|yes|on` 时带外恢复；ast_grep/ast_edit 按语法树搜索与分阶段重写；`subagent` 默认可见，派生 `pi` 子进程，限深 3 层）| `src/tools/` 各子模块 + `src/ast_tools.rs` + `src/subagents.rs`
 - **子进程统一生命周期管理** — spawn 子进程受控清理（abort/超时/Drop），杀整棵进程树防孤儿 | `src/tools/mod.rs` + `src/abort.rs` + `src/tools/shell.rs` + `src/tools/bash.rs` + `src/tools/pwsh.rs` + `src/tools/grep.rs` + `src/tools/find.rs`
 - **工具可取消执行** — abort 信号穿透到工具层，长任务循环检查并主动终止 | `src/tools/mod.rs` + `src/abort.rs`
 - **ReadTool** — 任意路径读取，head/tail/info/diff 参数，编码自动检测 | `src/tools/read.rs`
@@ -59,7 +59,7 @@
 
 ## 子代理与后台任务
 
-- **子代理并行执行** — 派生独立子代理完成指定任务，支持结构化输出校验、网络瞬断自动重试、工作区隔离与按代理技能白名单；Agent 定义未声明工具时继承当前启用工具，显式工具列表优先；可续命 — Done 后通过 `hubId` + 新任务在同一会话与同一 Worktree 上增量继续 | `src/subagents.rs` + `src/agent_hub.rs` + `src/worktree_iso.rs` + `src/resources.rs` + `src/tools/mod.rs` + `src/main.rs` + `src/cli.rs`
+- **子代理并行执行** — 派生独立子代理完成指定任务，支持单任务/并行/chain、`{previous}` 与结构化数据引用、结构化输出校验、网络瞬断自动重试、工作区隔离、技能白名单与错误 stderr 透传；Agent 定义未声明工具时继承当前启用工具，显式工具列表优先；可续命 — `continue=true` 搭配 `hubId` 在同一会话与同一 Worktree 上增量继续；深度契约与排障见 `docs/context/subagent.md` | `src/subagents.rs` + `src/agent_hub.rs` + `src/worktree_iso.rs` + `src/resources.rs` + `src/tools/mod.rs` + `src/main.rs` + `src/cli.rs`
 - **后台任务管理** — 后台执行命令并支持查询、等待与取消，完成通知在下一轮投递 | `src/jobs.rs`
 - **Hub 常驻服务** — 托管长驻进程与观察就绪条件，提供日志与生命周期管理 | `src/hub.rs`
 - **代理中心子进程登记** — 登记与管理子进程运行态、对话记录与消息投递 | `src/agent_hub.rs`

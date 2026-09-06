@@ -156,6 +156,8 @@ cargo test -- --nocapture                # 带输出
   - 做架构级改动、理解决策背景时读；过时决策在 `docs/context/design-decisions-archive.md`
 - **verify 验证引擎** — `docs/context/verify-tool.md`
   - 新增静态检查工具 / 优化 verify 检查逻辑时读
+- **Subagent 工具** — `docs/context/subagent.md`
+  - 调度单任务/并行/chain、续跑 `continue` 会话、worktree 隔离合入、schema 校验或排查子 Agent API/stderr 错误时读
 - **症状排查手册** — `docs/context/debugging.md`
   - 症状已知但根因不明时读：症状路由表、调试 playbook、安装器补丁模式
 - **追上游 / 合并上游** — `docs/upstream/`
