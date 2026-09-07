@@ -8247,6 +8247,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn print_mode_retry_resumes_same_agent_session_after_transient_provider_failure() {
         use async_trait::async_trait;
         use futures::Stream;
@@ -8259,16 +8260,17 @@ mod tests {
         }
 
         #[async_trait]
+        #[allow(clippy::unnecessary_literal_bound)]
         impl pi::provider::Provider for TransientThenSuccessProvider {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "test-provider"
             }
 
-            fn api(&self) -> &str {
+            fn api(&self) -> &'static str {
                 "test-api"
             }
 
-            fn model_id(&self) -> &str {
+            fn model_id(&self) -> &'static str {
                 "test-model"
             }
 
