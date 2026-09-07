@@ -12,8 +12,9 @@ Tool Registry (built-ins + extension tools + subagents/hub/jobs) ↔ Extension R
 Surfaces: Interactive TUI + RPC/stdin modes
                          ↓
 Session persistence + index (JSONL, optional SQLite)
-    • RPC 模式: 额外有 RpcSessionPersister 背景线程实时追加写入
-       (TurnEnd/ToolResult 等消息无需等 turn 结束即可落盘)
+    • All surfaces use Session autosave as the sole Pi-owned session JSONL writer
+       (user messages are saved before the turn; assistant/tool messages are saved at turn boundaries,
+       with Windows contention retries and atomic checkpoints)
 ```
 
 ## 工具系统架构
@@ -95,7 +96,7 @@ CLI --tools read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit,s
 - **`extensions_js.rs`** → QuickJS 运行时、虚拟模块、HostcallKind
 - **`hostcall_amac.rs`** → AMAC 批量调度器：hostcall 按类型分组，遥测驱动并发/串行决策
 - **`extension_tools.rs`** → 扩展工具包装器 + 收集函数
-- **`rpc.rs`** → RPC/stdin 服务器模式、RPC 方法分发、RpcSessionPersister（进程侧主动会话持久化）；`run_prompt_with_retry` 统一走 `retry_state::RetryCounters/RetryProgress` 的 `consecutive`（有进展重置）/`total`（`max*3` 封顶）双计数器与 `Config::retry_delay_ms` 退避，`Aborted` 统一 `success:false + final_error=Some("Aborted")` 且仅 `has_retried()` 时发 `AutoRetryEnd`（D61）
+- **`rpc.rs`** → RPC/stdin 服务器模式、RPC 方法分发；事件 handler 负责流式事件序列化、输出压力控制和扩展事件分发，不直接写会话 JSONL；`run_prompt_with_retry` 统一走 `retry_state::RetryCounters/RetryProgress` 的 `consecutive`（有进展重置）/`total`（`max*3` 封顶）双计数器与 `Config::retry_delay_ms` 退避，`Aborted` 统一 `success:false + final_error=Some("Aborted")` 且仅 `has_retried()` 时发 `AutoRetryEnd`（D61）
 - **`main.rs` 的 print 重试环** → 与 `rpc.rs` 同款 `retry_state` 公共语义，`Aborted` 契约一致（D61）
 - **`providers/mod.rs`** → Provider 工厂 + 扩展 stream-simple 桥接
 - **`providers/`** → native provider 实现：anthropic/openai/openai_responses/gemini/cohere/azure/bedrock/vertex/copilot/gitlab/cursor/model_fetch
@@ -118,7 +119,7 @@ CLI --tools read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit,s
 1. **Turn 作用域的 agent 生命周期** — 主循环按稳定顺序发 `AgentStart → TurnStart → TurnEnd → AgentEnd`；工具递归由 `max_tool_iterations`（默认 50）封顶
 2. **Abort/超时行为显式化** — abort 检查在 turn 边界与工具执行处；bash 超时走升级路径（终止进程树 → 宽限期 → 硬杀）；`Aborted` 统一 `success:false + final_error=Some("Aborted")`，`AutoRetryEnd` 仅 `has_retried()` 时发射（`rpc.rs`/`main.rs`，D61）；未重试的中断不误发重试结束
 3. **重试双计数器与进展语义** — `RetryCounters{consecutive,total,max_total=max*3}`：`consecutive` 在 `TextDelta|ThinkingDelta|ToolCallDelta` 非空 `delta`（`is_progress_event`）时先重置为 0 再递增，`total` 单调递增并以 `max_total` 封顶防无限循环；退避统一 `Config::retry_delay_ms(consecutive)`，无本地 `retry_delay_ms`（`retry_state.rs`，D61）
-4. **会话写入 crash-resilient** — JSONL 保存经临时文件 + 原子 persist；会话索引用 SQLite WAL + 锁文件协调多实例
+4. **会话写入 crash-resilient 且单写入者** — 所有入口由 `Session` autosave 统一写入 JSONL；用户消息在 turn 开始阶段保存，assistant/tool 消息在 turn 边界保存；写入经 sidecar 锁、临时文件 + 原子 persist/追加、Windows 瞬态占锁重试；RPC 事件 handler 不直接写会话文件
 5. **Compaction 阈值驱动、边界感知** — 触发条件为估算 token 超 `context_window - reserve_tokens`；cut-point 优先 user turn 边界，保留近期上下文预算
 6. **能力策略 fail-closed、优先级明确** — 解析顺序：per-extension deny → 全局 deny → per-extension allow → 默认 caps → 模式回退
 7. **流式解析器容忍真实网络分块** — CR/LF 变体、多行 `data:`、UTF-8 部分尾部、EOF flush

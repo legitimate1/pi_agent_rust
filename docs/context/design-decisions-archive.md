@@ -2,9 +2,21 @@
 
 > ⚠️ **勿作为当前实现参考** — 本文件仅存档已过时/被替代的设计决策，编号不回收、不重用（新决策编号取 `design-decisions.md` 当前最大 D 编号 + 1）。
 
+## D16: RPC 进程侧主动会话持久化（2026-07-19）
+
+**决策**：`pi --mode rpc` 捕获 `TurnEnd` 事件，背景线程 `RpcSessionPersister` 将已完成的消息实时追加写入 JSONL。
+
+**理由**：Obsidian 崩溃时正在进行的会话数据全部丢失；持久化原完全依赖 pidian 触发 `saveConversation()`，只在 turn 结束后一次性写入。
+
+**不选 B 的原因**：agent 核心循环中加中间落盘（侵入性强，影响所有模式）；定时器 flush（turn 运行中的消息在内存中，不在 session 对象里）；提高 pidian 保存频率（仍依赖客户端，Obsidian 崩溃时没用）。
+
+**何时重新考虑**：如果以后完全迁移到 SQLite 后端，可移除或替换。
+
+**状态**：已由 D66 替代。
+
 ---
 
-## D56: subagent 工具注册 — ToolRegistry 显式分支 opt-in
+
 
 **决策**：选在 ToolRegistry::new 增加 "subagent" 显式分支按名启用，需 --tools subagent 显式开启，不选自动注册或扩展隐式拉起。
 

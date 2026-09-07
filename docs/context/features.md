@@ -82,11 +82,11 @@
 
 ## 会话管理
 
-- **JSONL 会话存储** — 增量追加的会话文件格式 | `src/session.rs`
+- **JSONL 会话存储** — 由 Session 统一管理增量追加、检查点和错误路径持久化 | `src/session.rs` + `src/agent.rs`
 - **分支 / 树结构** — 会话可分支、多叶 | `src/session.rs`
 - **SQLite 会话后端** — 可选替代存储 | `src/session.rs`
 - **会话索引元数据** — 按目录/时间索引会话供选择器与恢复 | `src/session_index.rs`
-- **RPC 模式进程侧主动会话持久化** — 消息实时落盘，客户端崩溃不丢数据 | `src/rpc.rs` + `src/session.rs`
+- **非交互模式会话边界持久化** — 用户消息先保存，assistant/tool 消息在回合边界保存；事件流不直接写会话文件 | `src/rpc.rs` + `src/agent.rs` + `src/session.rs`
 - **Windows 文件竞争自动重试** — 保存遇瞬态句柄占用退避重试 | `src/session.rs`
 - **分段日志 Sidecar 存储** — 快速恢复大会话，损坏帧 fail-closed | `src/session_store_v2.rs`
 - **会话存储迁移命令** — `pi migrate` 将 JSONL 迁移到 sidecar，支持 dry-run 校验 | `src/cli.rs` + `src/session_store_v2.rs`

@@ -146,16 +146,6 @@
 
 **对策**：日常使用始终 `cargo build --release`；Debug 构建调试需增大栈大小（`.cargo/config.toml` 加 `link-args=/STACK:4194304`）；release profile 已从激进体积优化改为速度优先。
 
-## D16: RPC 进程侧主动会话持久化（2026-07-19）
-
-**决策**：`pi --mode rpc` 捕获 `TurnEnd` 事件，背景线程 `RpcSessionPersister` 将已完成的消息实时追加写入 JSONL。
-
-**理由**：Obsidian 崩溃时正在进行的会话数据全部丢失；持久化原完全依赖 pidian 触发 `saveConversation()`，只在 turn 结束后一次性写入。
-
-**不选 B 的原因**：agent 核心循环中加中间落盘（侵入性强，影响所有模式）；定时器 flush（turn 运行中的消息在内存中，不在 session 对象里）；提高 pidian 保存频率（仍依赖客户端，Obsidian 崩溃时没用）。
-
-**何时重新考虑**：如果以后完全迁移到 SQLite 后端，可移除或替换。
-
 ## D17: 项目级 `.pi/SYSTEM.md` 覆盖（2026-07-20）
 
 **决策**：新增项目级 `.pi/SYSTEM.md` 检查，优先级链：`--system-prompt > .pi/SYSTEM.md > ~/.pi/agent/SYSTEM.md > default`。
@@ -687,3 +677,17 @@
 
 **何时重新考虑**：若未来引入跨主会话 PID 恢复/常驻进程池，或 hubId 需要人类可读短 id，可在保持跨进程唯一前缀的前提下重估编码格式；若 session 存储迁出文件系统，claim 兜底需同步迁移。
 
+
+---
+
+## D66: RPC 会话 JSONL 写入 — Session autosave 单一写入者
+
+**决策**：由 Session autosave 统一写入 Pi 所有会话 JSONL。用户消息在回合开始阶段保存，assistant/tool 消息在回合边界保存；RPC 事件 handler 只负责事件转发。
+
+**理由**：避免 RPC 实时写入器与正式 Session autosave 同时操作同一文件，保留 sidecar 锁、原子检查点、索引更新和 Windows 占锁重试的一致语义。
+
+**不选 B 的原因**：第二个 RPC 后台写入器无法共享 Session 的合并与索引状态，会引入重复写入和文件竞争；token 级恢复不是当前产品要求。
+
+**何时重新考虑**：如果产品明确要求强杀前的部分回合恢复，再重新评估独立增量日志协议；不得直接恢复同文件双写。
+
+**替代**：已由 D66 替代 D16。
