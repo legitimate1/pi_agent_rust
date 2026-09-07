@@ -596,15 +596,13 @@
 
 ---
 
-## D60: subagent 网络瞬断重试 — 外进程重试环复用 is_retryable_error + Config.retry 指数退避
+## D60: subagent 网络瞬断重试 — 已由子进程内部 print-mode retry 取代
 
-**决策**：选 ChildRunner 外层网络重试环（扁平 error+output+stderr 喂 is_retryable_error + Config.retry_delay_ms 指数退避 + AgentCx::checkpoint 取消 + 每次重试新建进程/worktree），不选复用 rpc::run_prompt_with_retry 的 AgentSession 续跑。
+**状态（P0 修复）**：原先的 ChildRunner 外层网络重试环已移除。子进程使用 `pi --mode json --print`，瞬时 provider/API 错误由子进程内部 Main Agent 的 print-mode retry 处理，并在同一 `AgentSession` 中通过 `revert_incomplete_response` + `run_continue_with_abort` 恢复失败请求；父进程不再重新 spawn 子任务。
 
-**理由**：subagent 为 pi --mode json --print --no-session 外进程，仅有 exit_code/stderr/output，无 AgentSession；瞬断重试需在子进程模型下重建隔离环境并支持取消，直接复用主链路重试语义错配。
+**历史实现**：此前曾选 ChildRunner 外层网络重试环（扁平 `error+output+stderr` 喂 `is_retryable_error` + `Config.retry_delay_ms` 指数退避 + `AgentCx::checkpoint` 取消 + 每次重试新建进程/worktree）。该实现会在已有工具调用完成后从零重新提交原始 Task，存在重复执行风险，因此不再使用。
 
-**不选 B 的原因**：复用主链路的 revert_incomplete_response + run_continue_with_abort 依赖 AgentSession 回退/续跑，在 subagent 外进程路径不存在对应状态，且无法处理 worktree 重建与 none 隔离幂等约束。
-
-**何时重新考虑**：若 subagent 改为基于 AgentSession 或统一瞬断错误分类为结构化信号，再评估收敛为共用重试器。
+**保留边界**：schema 校验失败后的 corrective retry 仍是最多一次的有意新 child prompt，不属于 provider 网络重试；用户显式 `continue=true + hubId` 仍按续跑契约追加新的 user task。
 
 ---
 

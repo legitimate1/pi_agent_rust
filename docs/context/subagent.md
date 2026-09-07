@@ -48,8 +48,8 @@
 
 - **Schema 来源** — 任务级 `outputSchema` 优先于 Agent 定义中的 schema；无法编译的 schema 会在启动子进程前失败。
 - **纠正重跑** — 子 Agent 输出未通过 schema 时最多执行一次带校验反馈的纠正重跑。`schemaMode: "permissive"` 保留结果并标注校验失败；`strict` 将仍失败的结果标记为工具错误。
-- **网络重试** — 可重试的瞬时 provider/API 错误在 schema 处理前重试；默认启用，最多额外重试 3 次，采用指数退避并受父取消检查控制。不可重试错误不会重复启动子进程。
-- **两类重试独立** — 网络重试解决瞬时通信失败，schema 纠正重跑解决输出格式失败；不要把 schema 不匹配误判为 API 失败。
+- **Provider 网络重试** — 子进程使用 `pi --mode json --print`；瞬时 provider/API 错误由子进程内部 Main Agent 的 print-mode retry 处理。重试在同一个 `AgentSession` 内通过 `revert_incomplete_response` + `run_continue_with_abort` 恢复失败请求，不由父进程重新 spawn，也不会重新执行已完成的工具调用。
+- **两类重试独立** — provider 网络重试恢复同一 child turn；schema 纠正重跑解决输出格式失败，最多一次且是有意的新 child prompt。不要把 schema 不匹配误判为 API 失败。
 
 ## 已知陷阱
 

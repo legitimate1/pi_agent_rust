@@ -158,47 +158,7 @@ impl TanCompletion {
 
 /// A native tool that delegates bounded work to isolated Pi child processes.
 #[derive(Debug, Clone)]
-pub(crate) struct SubagentRetryConfig {
-    enabled: bool,
-    max_retries: u32,
-    base_delay_ms: u32,
-    max_delay_ms: u32,
-}
-
-impl Default for SubagentRetryConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            max_retries: 3,
-            base_delay_ms: 2000,
-            max_delay_ms: 60000,
-        }
-    }
-}
-
-impl From<&Config> for SubagentRetryConfig {
-    fn from(config: &Config) -> Self {
-        Self {
-            enabled: config.retry_enabled(),
-            max_retries: config.retry_max_retries(),
-            base_delay_ms: config.retry_base_delay_ms(),
-            max_delay_ms: config.retry_max_delay_ms(),
-        }
-    }
-}
-
-impl SubagentRetryConfig {
-    fn delay_ms(&self, attempt: u32) -> u32 {
-        let base = u64::from(self.base_delay_ms);
-        let max = u64::from(self.max_delay_ms);
-        let shift = attempt.saturating_sub(1);
-        let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
-        let delay = base.saturating_mul(multiplier).min(max);
-        u32::try_from(delay).unwrap_or(u32::MAX)
-    }
-}
-
-pub struct SubagentTool {
+pub(crate) struct SubagentTool {
     cwd: PathBuf,
     global_dir: PathBuf,
     child_binary: PathBuf,
@@ -210,7 +170,6 @@ pub struct SubagentTool {
     /// Model spec children run with when their agent definition does not pin
     /// `model:` — the `task` role spec, else `smol` (bd-cv653.3.1).
     role_model_spec: Option<String>,
-    retry_config: SubagentRetryConfig,
 }
 
 impl SubagentTool {
@@ -227,9 +186,6 @@ impl SubagentTool {
             .map(PathBuf::from)
             .or_else(|| std::env::current_exe().ok())
             .unwrap_or_else(|| PathBuf::from("<current executable unavailable>"));
-        let retry_config = Config::load()
-            .map(|c| SubagentRetryConfig::from(&c))
-            .unwrap_or_default();
         Self {
             cwd: cwd.to_path_buf(),
             global_dir: Config::global_dir(),
@@ -237,15 +193,7 @@ impl SubagentTool {
             inherited_tools,
             structured_results: false,
             role_model_spec: None,
-            retry_config,
         }
-    }
-
-    /// Override retry config (used by `ToolRegistry` and tests).
-    #[must_use]
-    pub(crate) fn with_retry_config(mut self, config: SubagentRetryConfig) -> Self {
-        self.retry_config = config;
-        self
     }
 
     /// Set the role model spec children fall back to when their agent
@@ -307,7 +255,6 @@ impl SubagentTool {
             crate::agent_hub::ChildKind::Tan,
         )
         .with_inherited_tools(None)
-        .with_retry_config(self.retry_config.clone())
         .run_one(&agents, request, None, None)
         .await;
         Ok(TanCompletion::from_result(result))
@@ -328,21 +275,7 @@ impl SubagentTool {
             inherited_tools: None,
             structured_results: false,
             role_model_spec: None,
-            retry_config: SubagentRetryConfig {
-                enabled: true,
-                max_retries: 3,
-                base_delay_ms: 2000,
-                max_delay_ms: 60000,
-            },
         }
-    }
-
-    /// Test-only helper to inject a deterministic retry schedule.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn with_retry_config_for_test(mut self, config: SubagentRetryConfig) -> Self {
-        self.retry_config = config;
-        self
     }
 
     fn discover(&self, scope: AgentScope) -> Result<BTreeMap<String, AgentDefinition>> {
@@ -412,7 +345,6 @@ impl SubagentTool {
                 let binary = self.child_binary.clone();
                 let role_spec = self.role_model_spec.clone();
                 let inherited_tools = self.inherited_tools.clone();
-                let retry_config = self.retry_config.clone();
                 let update = on_update.clone();
                 let results = stream::iter(tasks.into_iter().enumerate())
                     .map(move |(index, task)| {
@@ -422,7 +354,6 @@ impl SubagentTool {
                         let binary = binary.clone();
                         let role_spec = role_spec.clone();
                         let inherited_tools = inherited_tools.clone();
-                        let retry_config = retry_config.clone();
                         let update = update.clone();
                         async move {
                             let runner = ChildRunner::new(
@@ -432,8 +363,7 @@ impl SubagentTool {
                                 role_spec,
                                 crate::agent_hub::ChildKind::Subagent,
                             )
-                            .with_inherited_tools(inherited_tools)
-                            .with_retry_config(retry_config);
+                            .with_inherited_tools(inherited_tools);
                             (index, runner.run_one(&agents, task, None, update).await)
                         }
                     })
@@ -479,7 +409,6 @@ impl SubagentTool {
             crate::agent_hub::ChildKind::Subagent,
         )
         .with_inherited_tools(self.inherited_tools.clone())
-        .with_retry_config(self.retry_config.clone())
         .run_one(agents, task, step, on_update)
         .await
     }
@@ -1163,7 +1092,6 @@ struct ChildRunner {
     role_model_spec: Option<String>,
     hub_kind: crate::agent_hub::ChildKind,
     inherited_tools: Option<Vec<String>>,
-    retry_config: SubagentRetryConfig,
 }
 
 impl ChildRunner {
@@ -1181,7 +1109,6 @@ impl ChildRunner {
             role_model_spec,
             hub_kind,
             inherited_tools: None,
-            retry_config: SubagentRetryConfig::default(),
         }
     }
 
@@ -1191,29 +1118,20 @@ impl ChildRunner {
         self
     }
 
-    #[must_use]
-    fn with_retry_config(mut self, config: SubagentRetryConfig) -> Self {
-        self.retry_config = config;
-        self
-    }
-
     /// Run one task, applying the typed-output contract (bd-cv653.5.1) when
     /// an `outputSchema` is in play: the child gets a schema directive
     /// appended to its system prompt; the parent validates the final output,
     /// grants exactly one corrective re-run on failure, and then either
     /// annotates (permissive) or fails (strict) a still-invalid result.
     ///
-    /// Children are ephemeral (`--no-session`), so the corrective retry is a
-    /// fresh child run carrying the validation errors, not an in-session
-    /// follow-up. Tolerant-dialect repair before validation (bd-cv653.7.8)
-    /// composes here once that layer exists.
+    /// Child processes use persistent sessions for the normal delegation, while
+    /// the schema corrective retry is intentionally a fresh child run carrying
+    /// validation feedback rather than an in-session follow-up.
     ///
-    /// Network-transient failures are additionally retried here (IMPLEMENT C1):
-    /// the flattened `error+output+stderr` of a failed run is fed to
-    /// `crate::error::is_retryable_error`; on a hit the loop sleeps
-    /// `retry_config.delay_ms(attempt)` with `AgentCx::checkpoint` cancellation
-    /// before re-launching the child. Schema validation remains a separate
-    /// single corrective retry that runs only after the network layer settles.
+    /// Child processes run `pi --mode json --print`, whose Main Agent owns
+    /// provider/network retry. Keeping that retry inside the child preserves
+    /// its `AgentSession` and lets it resume the failed provider request
+    /// without re-spawning the task or re-running completed tool calls.
     async fn run_one(
         &self,
         agents: &BTreeMap<String, AgentDefinition>,
@@ -1221,79 +1139,8 @@ impl ChildRunner {
         step: Option<usize>,
         on_update: Option<UpdateCallback>,
     ) -> SubagentResult {
-        // Network layer: retry transient child failures before schema handling.
-        let mut attempt: u32 = 0;
-        let mut last_result: Option<SubagentResult> = None;
-        let max_attempts = if self.retry_config.enabled {
-            self.retry_config.max_retries.saturating_add(1)
-        } else {
-            1
-        };
-        loop {
-            let schema_aware = self
-                .run_one_schema_aware(agents, task.clone(), step, on_update.clone())
-                .await;
-            let is_transient_failure = schema_aware.is_error
-                && Self::is_retryable_subagent_failure(&schema_aware)
-                && !matches!(schema_aware.status, SubagentStatus::Cancelled);
-            if !is_transient_failure {
-                return schema_aware;
-            }
-            attempt = attempt.saturating_add(1);
-            if last_result.is_some() {
-                let _ = last_result.take();
-            }
-            last_result = Some(schema_aware);
-            if attempt >= max_attempts {
-                break;
-            }
-            // Cancellation before sleeping is itself a terminal signal.
-            let cx = AgentCx::for_current_or_request();
-            if cx.checkpoint().is_err() {
-                break;
-            }
-            let delay_ms = self.retry_config.delay_ms(attempt);
-            let delay = Duration::from_millis(u64::from(delay_ms));
-            let cx_for_sleep = cx.cx();
-            let start = cx_for_sleep
-                .timer_driver()
-                .map_or_else(asupersync::time::wall_now, |t| t.now());
-            // Cancellable sleep: short ticks so checkpoint/abort propagates.
-            let deadline = start + delay;
-            loop {
-                if cx.checkpoint().is_err() {
-                    break;
-                }
-                let now = cx_for_sleep
-                    .timer_driver()
-                    .map_or_else(asupersync::time::wall_now, |t| t.now());
-                if now >= deadline {
-                    break;
-                }
-                let remaining = deadline.duration_since(now);
-                let tick =
-                    std::cmp::min(Duration::from_millis(50), Duration::from_millis(remaining));
-                asupersync::time::sleep(now, tick).await;
-            }
-            if cx.checkpoint().is_err() {
-                break;
-            }
-        }
-        // Exhausted retries — surface the last transient failure.
-        last_result.expect("at least one run")
-    }
-
-    fn is_retryable_subagent_failure(result: &SubagentResult) -> bool {
-        // Flatten like the provider retry classifier does: error + output + stderr.
-        let mut flat = String::new();
-        if let Some(error) = &result.error {
-            flat.push_str(error);
-            flat.push(' ');
-        }
-        flat.push_str(&result.output);
-        flat.push(' ');
-        flat.push_str(&result.stderr);
-        crate::error::is_retryable_error(&flat, None, None)
+        self.run_one_schema_aware(agents, task, step, on_update)
+            .await
     }
 
     async fn run_one_schema_aware(
@@ -3471,36 +3318,26 @@ fi
         }
     }
 
-    // ——— Network retry (IMPLEMENT C4) ———
+    // ——— Child process retry boundary ———
 
     #[cfg(unix)]
-    fn write_network_retry_child(temp: &Path, retryable: bool) -> PathBuf {
-        let child = temp.join("network-retry-child.sh");
-        let marker = temp.join("network-retry-marker");
-        let first_text = if retryable {
-            "fetch failed: transient connection drop"
-        } else {
-            "prompt is too long: not retryable"
-        };
+    fn write_network_failure_child(temp: &Path) -> PathBuf {
+        let child = temp.join("network-failure-child.sh");
+        let marker = temp.join("network-failure-marker");
         std::fs::write(
             &child,
             format!(
                 r#"#!/bin/sh
-if [ -f "{marker}" ]; then
-  printf '%s\n' '{{"type":"agent_end","messages":[{{"role":"assistant","content":[{{"type":"text","text":"recovered"}}]}}]}}'
-  exit 0
-else
-  : > "{marker}"
-  printf '%s\n' '{{"type":"agent_end","messages":[{{"role":"assistant","content":[{{"type":"text","text":"{first_text}"}}]}}]}}' >&2
-  printf '%s\n' '{first_text}' >&2
-  exit 1
-fi
+: > "{marker}"
+printf 'x\n' >> "{marker}"
+printf '%s\n' '{{"type":"agent_end","messages":[{{"role":"assistant","content":[{{"type":"text","text":"fetch failed: transient connection drop"}}]}}]}}' >&2
+printf '%s\n' 'fetch failed: transient connection drop' >&2
+exit 1
 "#,
                 marker = marker.display(),
-                first_text = first_text,
             ),
         )
-        .expect("write network retry child");
+        .expect("write network failure child");
         let mut permissions = std::fs::metadata(&child)
             .expect("child metadata")
             .permissions();
@@ -3509,126 +3346,140 @@ fi
         child
     }
 
-    #[test]
-    #[cfg(unix)]
-    fn network_retry_transient_succeeds_on_second_attempt() {
-        let temp = TempDir::new().expect("tempdir");
-        let global_dir = temp.path().join("global");
-        write_agent(
-            &global_dir.join("agents"),
-            "scout",
-            "---\nname: scout\ndescription: network retry\n---\nbody",
-        );
-        let child = write_network_retry_child(temp.path(), true);
-        let tool = SubagentTool::with_paths(temp.path().to_path_buf(), global_dir, child)
-            .with_retry_config_for_test(SubagentRetryConfig {
-                enabled: true,
-                max_retries: 3,
-                base_delay_ms: 1,
-                max_delay_ms: 5,
-            });
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        let output = runtime
-            .block_on(tool.execute(
-                "net-retry",
-                json!({"agent": "scout", "task": "do work"}),
-                None,
-                None,
-            ))
-            .expect("network retry run");
-        assert!(!output.is_error, "{output:?}");
-        let details = output.details.expect("details");
-        assert_eq!(details["results"][0]["status"], "completed");
-        // Second attempt's output wins.
-        let ContentBlock::Text(text) = &output.content[0] else {
-            panic!("expected text");
-        };
-        assert!(text.text.contains("recovered"), "{text:?}");
+    #[cfg(windows)]
+    fn write_network_failure_child(temp: &Path) -> PathBuf {
+        let child = temp.join("network-failure-child.cmd");
+        let marker = temp.join("network-failure-marker");
+        std::fs::write(
+            &child,
+            format!(
+                "@echo off\r\necho x>>\"{}\"\r\necho fetch failed: transient connection drop 1>&2\r\nexit /b 1\r\n",
+                marker.display()
+            ),
+        )
+        .expect("write network failure child");
+        child
     }
 
     #[test]
-    #[cfg(unix)]
-    fn network_retry_non_retryable_does_not_retry() {
+    fn transient_child_failure_does_not_spawn_outer_retry() {
         let temp = TempDir::new().expect("tempdir");
         let global_dir = temp.path().join("global");
         write_agent(
             &global_dir.join("agents"),
             "scout",
-            "---\nname: scout\ndescription: network retry\n---\nbody",
+            "---\nname: scout\ndescription: child retry boundary\n---\nbody",
         );
-        let child = write_network_retry_child(temp.path(), false);
-        let tool = SubagentTool::with_paths(temp.path().to_path_buf(), global_dir, child)
-            .with_retry_config_for_test(SubagentRetryConfig {
-                enabled: true,
-                max_retries: 3,
-                base_delay_ms: 1,
-                max_delay_ms: 5,
-            });
+        let child = write_network_failure_child(temp.path());
+        let marker = temp.path().join("network-failure-marker");
+        let tool = SubagentTool::with_paths(temp.path().to_path_buf(), global_dir, child);
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
         let output = runtime
             .block_on(tool.execute(
-                "net-no-retry",
+                "no-outer-retry",
                 json!({"agent": "scout", "task": "do work"}),
                 None,
                 None,
             ))
-            .expect("non-retryable run");
-        assert!(output.is_error, "{output:?}");
+            .expect("child failure should be returned as a tool result");
+
+        assert!(
+            output.is_error,
+            "transient child failure must remain failed: {output:?}"
+        );
         assert_eq!(
             output.details.as_ref().unwrap()["results"][0]["status"],
             "failed"
         );
-        // Must not have recovered — still the first failure.
+        assert_eq!(
+            std::fs::read_to_string(&marker)
+                .expect("read spawn marker")
+                .lines()
+                .count(),
+            1,
+            "transient failure must not trigger a second child spawn"
+        );
         let ContentBlock::Text(text) = &output.content[0] else {
             panic!("expected text");
         };
+        assert!(text.text.contains("transient connection drop"), "{text:?}");
         assert!(!text.text.contains("recovered"), "{text:?}");
     }
 
-    #[test]
     #[cfg(unix)]
-    fn network_retry_disabled_does_not_retry() {
+    fn write_cancelled_child(temp: &Path) -> (PathBuf, PathBuf) {
+        let child = temp.join("cancelled-child.sh");
+        let marker = temp.join("cancelled-child-marker");
+        std::fs::write(
+            &child,
+            format!("#!/bin/sh\n: > \"{}\"\nsleep 5\n", marker.display()),
+        )
+        .expect("write cancelled child");
+        let mut permissions = std::fs::metadata(&child)
+            .expect("child metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&child, permissions).expect("make child executable");
+        (child, marker)
+    }
+
+    #[cfg(windows)]
+    fn write_cancelled_child(temp: &Path) -> (PathBuf, PathBuf) {
+        let child = temp.join("cancelled-child.cmd");
+        let marker = temp.join("cancelled-child-marker");
+        std::fs::write(
+            &child,
+            format!(
+                "@echo off\r\necho x>>\"{}\"\r\ntimeout /t 5 /nobreak > nul\r\n",
+                marker.display()
+            ),
+        )
+        .expect("write cancelled child");
+        (child, marker)
+    }
+
+    #[test]
+    fn cancelled_child_does_not_retry() {
         let temp = TempDir::new().expect("tempdir");
         let global_dir = temp.path().join("global");
         write_agent(
             &global_dir.join("agents"),
             "scout",
-            "---\nname: scout\ndescription: network retry\n---\nbody",
+            "---\nname: scout\ndescription: cancellation boundary\n---\nbody",
         );
-        let child = write_network_retry_child(temp.path(), true);
-        let tool = SubagentTool::with_paths(temp.path().to_path_buf(), global_dir, child)
-            .with_retry_config_for_test(SubagentRetryConfig {
-                enabled: false,
-                max_retries: 3,
-                base_delay_ms: 1,
-                max_delay_ms: 5,
-            });
+        let (child, _marker) = write_cancelled_child(temp.path());
+
+        let tool = SubagentTool::with_paths(temp.path().to_path_buf(), global_dir, child);
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
-        let output = runtime
-            .block_on(tool.execute(
-                "net-disabled",
+        let output = runtime.block_on(async {
+            let ambient_cx = asupersync::Cx::for_testing();
+            ambient_cx.set_cancel_requested(true);
+            let _current = asupersync::Cx::set_current(Some(ambient_cx));
+            tool.execute(
+                "cancelled-child",
                 json!({"agent": "scout", "task": "do work"}),
                 None,
                 None,
-            ))
-            .expect("disabled retry run");
-        assert!(output.is_error, "{output:?}");
+            )
+            .await
+            .expect("cancelled child should be returned as a tool result")
+        });
+
+        assert!(
+            output.is_error,
+            "cancelled child must be an error result: {output:?}"
+        );
         assert_eq!(
             output.details.as_ref().unwrap()["results"][0]["status"],
-            "failed"
+            "cancelled"
         );
     }
 
     // ——— Continuable subagent (C5) ———
-    // Fresh→continue must reuse the same hubId/session/worktree. The child is a
-    // tiny shell stub; persistence is verified via the hubId round-trip and the
-    // `--session <global>/sessions/subagents/<hubId>.jsonl` argv.
 
     #[cfg(unix)]
     fn write_arg_logging_child(temp: &Path, log_path: &Path, output_text: &str) -> PathBuf {

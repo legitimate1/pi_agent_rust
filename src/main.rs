@@ -8247,6 +8247,122 @@ mod tests {
     }
 
     #[test]
+    fn print_mode_retry_resumes_same_agent_session_after_transient_provider_failure() {
+        use async_trait::async_trait;
+        use futures::Stream;
+        use std::pin::Pin;
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Debug)]
+        struct TransientThenSuccessProvider {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl pi::provider::Provider for TransientThenSuccessProvider {
+            fn name(&self) -> &str {
+                "test-provider"
+            }
+
+            fn api(&self) -> &str {
+                "test-api"
+            }
+
+            fn model_id(&self) -> &str {
+                "test-model"
+            }
+
+            async fn stream(
+                &self,
+                _context: &pi::provider::Context<'_>,
+                _options: &pi::provider::StreamOptions,
+            ) -> pi::error::Result<
+                Pin<Box<dyn Stream<Item = pi::error::Result<pi::model::StreamEvent>> + Send>>,
+            > {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return Err(pi::error::Error::api(
+                        "fetch failed: transient connection drop",
+                    ));
+                }
+
+                let partial = pi::model::AssistantMessage {
+                    content: Vec::new(),
+                    api: self.api().to_string(),
+                    provider: self.name().to_string(),
+                    model: self.model_id().to_string(),
+                    usage: pi::model::Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    timestamp: 0,
+                };
+                let message = pi::model::AssistantMessage {
+                    content: vec![ContentBlock::Text(pi::model::TextContent::new(
+                        "resumed in the same child session",
+                    ))],
+                    ..partial.clone()
+                };
+                Ok(Box::pin(futures::stream::iter([
+                    Ok(pi::model::StreamEvent::Start { partial }),
+                    Ok(pi::model::StreamEvent::Done {
+                        reason: StopReason::Stop,
+                        message,
+                    }),
+                ])))
+            }
+        }
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            let provider = std::sync::Arc::new(TransientThenSuccessProvider {
+                calls: AtomicUsize::new(0),
+            });
+            let calls = std::sync::Arc::clone(&provider);
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let mut session = AgentSession::new(
+                Agent::new(provider, tools, AgentConfig::default()),
+                std::sync::Arc::new(Mutex::new(Session::in_memory())),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            let config = Config {
+                retry: Some(pi::config::RetrySettings {
+                    enabled: Some(true),
+                    max_retries: Some(1),
+                    base_delay_ms: Some(0),
+                    max_delay_ms: Some(0),
+                }),
+                ..Config::default()
+            };
+            let (_abort_handle, abort_signal) = AbortHandle::new();
+            let text_stream_state = Arc::new(StdMutex::new(PrintTextStreamState::default()));
+            let make_event_handler = || |_: AgentEvent| {};
+
+            let message = run_print_prompt_with_retry(
+                &mut session,
+                &config,
+                &abort_signal,
+                &make_event_handler,
+                true,
+                1,
+                true,
+                &text_stream_state,
+                PromptInput::Text("continue this task".to_string()),
+            )
+            .await
+            .expect("print-mode retry should recover");
+
+            assert_eq!(calls.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(message.stop_reason, StopReason::Stop);
+            assert!(matches!(
+                message.content.first(),
+                Some(ContentBlock::Text(text)) if text.text.contains("same child session")
+            ));
+        });
+    }
+
+    #[test]
     fn emit_json_event_serializes_retry_events() {
         let start = AgentEvent::AutoRetryStart {
             attempt: 1,
