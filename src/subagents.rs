@@ -425,23 +425,23 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. Agent definitions live in $PI_CODING_AGENT_DIR/agents/*.md or .pi/agents/*.md. Workspace isolation: per-task `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; serial application, conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>)."
+        "Delegate work to named Pi child agents. Supports a single delegation, bounded parallel task groups, and sequential task chains that can reference the immediately preceding output. Non-isolated children share the parent checkout, so concurrent edits to the same files must be coordinated. Per-task Git worktree isolation is available for tasks that need isolated changes."
     }
 
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "agent": {"type": "string", "description": "Named agent for a single delegation."},
-                "task": {"type": "string", "description": "Task for a single delegation."},
-                "outputSchema": {"type": "object", "description": "JSON Schema the single delegation's final output must match; the parent validates and returns parsed data."},
-                "schemaMode": {"type": "string", "enum": ["permissive", "strict"], "default": "permissive", "description": "permissive keeps an invalid result with a warning; strict fails the task."},
-                "tasks": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Independent tasks to run in parallel."},
-                "chain": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Sequential tasks; {previous} is replaced with the prior child output, and {{previous.data.<field.path>}} addresses the prior task's schema-validated data."},
-                "concurrency": {"type": "integer", "minimum": 1, "maximum": MAX_PARALLEL_TASKS},
-                "scope": {"type": "string", "enum": ["both", "user", "project"], "default": "both", "description": "Agent definition discovery scope: `both` loads global agents from $PI_CODING_AGENT_DIR/agents and project agents from the nearest .pi/agents; project definitions override same-name global definitions. `user` loads only global agents. `project` loads only project agents and excludes global agents. Use `both` for a globally defined agent such as worker."},
-                "continue": {"type": "boolean", "description": "When true, continue the existing subagent session identified by hubId with a new task. Requires hubId."},
-                "hubId": {"type": "string", "description": "Existing subagent session/hub id to continue. Required when continue is true."}
+                "agent": {"type": "string", "description": "Named Agent role for a single delegation. Use with `task` for the normal single-task form."},
+                "task": {"type": "string", "description": "Task for a child Agent, including its goal, scope, constraints, and expected output."},
+                "outputSchema": {"type": "object", "description": "JSON Schema for the final output, used when downstream processing requires validated JSON. Omit it for ordinary natural-language reports. A schema mismatch may trigger one additional correction attempt. When supplied, instruct the child to return only a JSON value matching this schema."},
+                "schemaMode": {"type": "string", "enum": ["permissive", "strict"], "default": "permissive", "description": "Controls the result after schema validation still fails: `permissive` keeps the result with validation warnings; `strict` marks the task as failed. This does not disable the correction attempt."},
+                "tasks": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Independent task entries with bounded parallelism. Also supports a single entry when per-task settings such as `cwd` or `isolation` are needed."},
+                "chain": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Sequential task entries. `{previous}` inserts the immediately preceding child output; `{{previous.data.<field.path>}}` reads fields from the immediately preceding result when it passed schema validation."},
+                "concurrency": {"type": "integer", "minimum": 1, "maximum": MAX_PARALLEL_TASKS, "description": "Maximum number of `tasks` entries to run concurrently."},
+                "scope": {"type": "string", "enum": ["both", "user", "project"], "default": "both", "description": "Controls Agent definition discovery: `both` loads global definitions from $PI_CODING_AGENT_DIR/agents and project definitions from the nearest .pi/agents; `user` loads only global definitions; `project` loads only project definitions. Project definitions override same-name global definitions."},
+                "continue": {"type": "boolean", "description": "Continue an existing single child session with a new task. Requires `hubId` and cannot be combined with `tasks` or `chain`."},
+                "hubId": {"type": "string", "description": "Existing child session identifier used with top-level `continue: true`."}
             },
             "definitions": {
                 "task": {
@@ -450,13 +450,13 @@ impl Tool for SubagentTool {
                     "properties": {
                         "agent": {"type": "string"},
                         "task": {"type": "string"},
-                        "cwd": {"type": "string"},
-                        "isolation": {"type": "string", "enum": ["none", "worktree"], "default": "none", "description": "worktree runs the child in a git worktree with the parent's uncommitted state; non-git dirs refuse with PI_ISO_NOT_GIT."},
-                        "isoApply": {"type": "string", "enum": ["keep", "apply", "drop"], "default": "apply", "description": "What to do with the isolated worktree after completion."},
-                        "outputSchema": {"type": "object", "description": "JSON Schema this task's final output must match."},
-                        "schemaMode": {"type": "string", "enum": ["permissive", "strict"], "default": "permissive"},
-                        "continue": {"type": "boolean", "description": "When true, continue the existing subagent session identified by hubId."},
-                        "hubId": {"type": "string", "description": "Existing subagent session/hub id to continue."}
+                        "cwd": {"type": "string", "description": "Working directory for this child task. Omit it to use the parent working directory."},
+                        "isolation": {"type": "string", "enum": ["none", "worktree"], "default": "none", "description": "Workspace isolation for this task: `none` shares the parent checkout; `worktree` runs in a Git worktree carrying the parent's uncommitted state. Worktree isolation requires a Git repository."},
+                        "isoApply": {"type": "string", "enum": ["keep", "apply", "drop"], "default": "apply", "description": "How to handle an isolated worktree after completion: `keep` preserves it for review, `apply` attempts to apply its patch, and `drop` discards it. Conflicts are reported and never forced."},
+                        "outputSchema": {"type": "object", "description": "JSON Schema for this task's final output, used when downstream processing requires validated JSON."},
+                        "schemaMode": {"type": "string", "enum": ["permissive", "strict"], "default": "permissive", "description": "Controls the result after schema validation still fails: `permissive` keeps the result with validation warnings; `strict` marks the task as failed."},
+                        "continue": {"type": "boolean", "description": "Continue the child session identified by `hubId` with a new task."},
+                        "hubId": {"type": "string", "description": "Existing child session identifier used with this task's `continue: true`."}
                     }
                 }
             },
@@ -2887,11 +2887,10 @@ mod tests {
             .expect("scope description");
 
         for phrase in [
-            "`both` loads global agents from $PI_CODING_AGENT_DIR/agents and project agents from the nearest .pi/agents",
-            "project definitions override same-name global definitions",
-            "`user` loads only global agents",
-            "`project` loads only project agents and excludes global agents",
-            "Use `both` for a globally defined agent such as worker",
+            "`both` loads global definitions from $PI_CODING_AGENT_DIR/agents and project definitions from the nearest .pi/agents",
+            "Project definitions override same-name global definitions",
+            "`user` loads only global definitions",
+            "`project` loads only project definitions",
         ] {
             assert!(
                 description.contains(phrase),
