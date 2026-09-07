@@ -1817,6 +1817,10 @@ fn child_args_inner(
         // env propagation (no extra CLI flag needed). The Env path below still
         // forwards PI_SUBAGENT_ALLOWED_SKILLS so grandchildren stay bounded.
     }
+    // Explicit prompt scope (typed, not depth/env inference): the child must
+    // not auto-inject Main-only SYSTEM.md files. Role prompt + schema
+    // directive still ride --append-system-prompt below.
+    args.extend(["--prompt-scope".into(), "subagent".into()]);
     // The schema directive rides the same appended system prompt as the
     // definition body (bd-cv653.5.1): one --append-system-prompt carrying
     // both keeps the child argv shape identical for schema-free tasks.
@@ -2562,6 +2566,37 @@ mod tests {
         .map(|arg| arg.to_string_lossy().to_string())
         .collect::<Vec<_>>();
         assert!(args.windows(2).any(|pair| pair == ["--tools", ""]));
+    }
+
+    #[test]
+    fn child_args_always_carry_subagent_prompt_scope() {
+        let agent = AgentDefinition {
+            name: "scout".to_string(),
+            description: "inspect".to_string(),
+            model: None,
+            reasoning: None,
+            tools: None,
+            skills: Vec::new(),
+            allowed_skills: None,
+            system_prompt: "be precise".to_string(),
+            output_schema: None,
+            source: AgentSource::User,
+            file_path: PathBuf::from("/tmp/scout.md"),
+        };
+        let args = child_args(&agent, "inspect provider", None, None, None)
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--prompt-scope", "subagent"]),
+            "child argv must carry explicit Subagent prompt scope, got: {args:?}"
+        );
+        // Role prompt still rides --append-system-prompt alongside the scope.
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--append-system-prompt", "be precise"])
+        );
     }
 
     #[test]

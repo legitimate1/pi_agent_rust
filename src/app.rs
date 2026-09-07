@@ -154,6 +154,18 @@ pub fn build_initial_content(initial: &InitialMessage) -> Vec<ContentBlock> {
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::implicit_hasher)]
+/// Build the system prompt for a run.
+///
+/// `cli.prompt_scope` selects the prompt scope (explicit, typed — never
+/// inferred from depth or env):
+/// - [`PromptScope::Main`] — full behavior: `--system-prompt` >
+///   `<cwd>/.pi/SYSTEM.md` (project) > `<global_dir>/SYSTEM.md` (user) >
+///   built-in default.
+/// - [`PromptScope::Subagent`] — skips the automatic project-level and
+///   user-level `SYSTEM.md` lookups (they belong to Main only). An explicit
+///   `--system-prompt` still applies, and shared `AGENTS.md`/`CLAUDE.md`
+///   context, `--append-system-prompt` (Agent role prompt + schema
+///   directive), skills and runtime facts are preserved.
 pub fn build_system_prompt(
     cli: &cli::Cli,
     cwd: &Path,
@@ -177,8 +189,11 @@ pub fn build_system_prompt(
     };
 
     // Priority: --system-prompt > .pi/SYSTEM.md (project) > ~/.pi/agent/SYSTEM.md (user) > default
-    let project_system_md = custom_prompt
-        .is_none()
+    // Subagent scope skips both automatic SYSTEM.md lookups: SYSTEM.md is a
+    // Main-only override. Shared AGENTS.md/CLAUDE.md context is loaded below
+    // regardless of scope.
+    let is_subagent = cli.prompt_scope == crate::cli::PromptScope::Subagent;
+    let project_system_md = (custom_prompt.is_none() && !is_subagent)
         .then(|| -> Result<String> {
             let path = cwd.join(".pi/SYSTEM.md");
             if path.exists() {
@@ -192,7 +207,8 @@ pub fn build_system_prompt(
         .filter(|s| !s.is_empty());
 
     // If --system-prompt and project SYSTEM.md not given, fall back to ~/.pi/agent/SYSTEM.md
-    let user_system_md = (custom_prompt.is_none() && project_system_md.is_none())
+    // (Main scope only; Subagent never reads either SYSTEM.md level.)
+    let user_system_md = (custom_prompt.is_none() && project_system_md.is_none() && !is_subagent)
         .then(|| -> Result<String> {
             let path = global_dir.join("SYSTEM.md");
             if path.exists() {
@@ -1409,6 +1425,181 @@ mod tests {
         let selected = default_model_from_available(&available);
         assert_eq!(selected.model.provider, "openai-codex");
         assert_eq!(selected.model.id, "GPT-5.4");
+    }
+
+    #[test]
+    fn main_scope_reads_user_level_system_md() {
+        let cwd_dir = tempdir().expect("tempdir");
+        let global_dir = tempdir().expect("tempdir");
+        let package_dir = tempdir().expect("tempdir");
+        std::fs::write(
+            global_dir.path().join("SYSTEM.md"),
+            "MAIN-USER-SYSTEM-SENTINEL-7f3a",
+        )
+        .expect("write user SYSTEM.md");
+
+        let cli = cli::Cli::parse_from(["pi"]);
+        assert_eq!(cli.prompt_scope, crate::cli::PromptScope::Main);
+        let prompt = build_system_prompt(
+            &cli,
+            cwd_dir.path(),
+            &[],
+            None,
+            global_dir.path(),
+            package_dir.path(),
+            false,
+            false,
+            None,
+        )
+        .expect("build system prompt");
+
+        assert!(
+            prompt.contains("MAIN-USER-SYSTEM-SENTINEL-7f3a"),
+            "Main scope must inject user-level SYSTEM.md"
+        );
+    }
+
+    #[test]
+    fn main_scope_prefers_project_system_md_over_user() {
+        let cwd_dir = tempdir().expect("tempdir");
+        let global_dir = tempdir().expect("tempdir");
+        let package_dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(cwd_dir.path().join(".pi")).expect("create .pi");
+        std::fs::write(
+            cwd_dir.path().join(".pi/SYSTEM.md"),
+            "MAIN-PROJECT-SYSTEM-SENTINEL-9c1e",
+        )
+        .expect("write project SYSTEM.md");
+        std::fs::write(
+            global_dir.path().join("SYSTEM.md"),
+            "MAIN-USER-SYSTEM-SENTINEL-7f3a",
+        )
+        .expect("write user SYSTEM.md");
+
+        let cli = cli::Cli::parse_from(["pi"]);
+        let prompt = build_system_prompt(
+            &cli,
+            cwd_dir.path(),
+            &[],
+            None,
+            global_dir.path(),
+            package_dir.path(),
+            false,
+            false,
+            None,
+        )
+        .expect("build system prompt");
+
+        assert!(
+            prompt.contains("MAIN-PROJECT-SYSTEM-SENTINEL-9c1e"),
+            "Main scope must inject project-level SYSTEM.md"
+        );
+        assert!(
+            !prompt.contains("MAIN-USER-SYSTEM-SENTINEL-7f3a"),
+            "project SYSTEM.md must win over user SYSTEM.md"
+        );
+    }
+
+    #[test]
+    fn subagent_scope_skips_both_system_md_levels() {
+        let cwd_dir = tempdir().expect("tempdir");
+        let global_dir = tempdir().expect("tempdir");
+        let package_dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(cwd_dir.path().join(".pi")).expect("create .pi");
+        std::fs::write(
+            cwd_dir.path().join(".pi/SYSTEM.md"),
+            "MAIN-PROJECT-SYSTEM-SENTINEL-9c1e",
+        )
+        .expect("write project SYSTEM.md");
+        std::fs::write(
+            global_dir.path().join("SYSTEM.md"),
+            "MAIN-USER-SYSTEM-SENTINEL-7f3a",
+        )
+        .expect("write user SYSTEM.md");
+
+        let mut cli = cli::Cli::parse_from(["pi"]);
+        cli.prompt_scope = crate::cli::PromptScope::Subagent;
+        let prompt = build_system_prompt(
+            &cli,
+            cwd_dir.path(),
+            &[],
+            None,
+            global_dir.path(),
+            package_dir.path(),
+            false,
+            false,
+            None,
+        )
+        .expect("build system prompt");
+
+        assert!(
+            !prompt.contains("MAIN-PROJECT-SYSTEM-SENTINEL-9c1e"),
+            "Subagent scope must not inject project SYSTEM.md"
+        );
+        assert!(
+            !prompt.contains("MAIN-USER-SYSTEM-SENTINEL-7f3a"),
+            "Subagent scope must not inject user SYSTEM.md"
+        );
+    }
+
+    #[test]
+    fn subagent_scope_keeps_shared_context_and_role_prompt() {
+        let cwd_dir = tempdir().expect("tempdir");
+        let global_dir = tempdir().expect("tempdir");
+        let package_dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(cwd_dir.path().join(".pi")).expect("create .pi");
+        std::fs::write(
+            cwd_dir.path().join(".pi/SYSTEM.md"),
+            "MAIN-PROJECT-SYSTEM-SENTINEL-9c1e",
+        )
+        .expect("write project SYSTEM.md");
+        std::fs::write(
+            global_dir.path().join("SYSTEM.md"),
+            "MAIN-USER-SYSTEM-SENTINEL-7f3a",
+        )
+        .expect("write user SYSTEM.md");
+        std::fs::write(
+            cwd_dir.path().join("AGENTS.md"),
+            "SHARED-AGENTS-SENTINEL-4b2d",
+        )
+        .expect("write AGENTS.md");
+
+        let mut cli =
+            cli::Cli::parse_from(["pi", "--append-system-prompt", "ROLE-PROMPT-SENTINEL-8e6f"]);
+        cli.prompt_scope = crate::cli::PromptScope::Subagent;
+        let prompt = build_system_prompt(
+            &cli,
+            cwd_dir.path(),
+            &[],
+            Some("\nSKILLS-SENTINEL-2a9c\n"),
+            global_dir.path(),
+            package_dir.path(),
+            false,
+            false,
+            None,
+        )
+        .expect("build system prompt");
+
+        assert!(
+            !prompt.contains("MAIN-PROJECT-SYSTEM-SENTINEL-9c1e"),
+            "Subagent scope must not inject project SYSTEM.md"
+        );
+        assert!(
+            !prompt.contains("MAIN-USER-SYSTEM-SENTINEL-7f3a"),
+            "Subagent scope must not inject user SYSTEM.md"
+        );
+        assert!(
+            prompt.contains("SHARED-AGENTS-SENTINEL-4b2d"),
+            "Subagent scope must keep shared AGENTS.md context"
+        );
+        assert!(
+            prompt.contains("ROLE-PROMPT-SENTINEL-8e6f"),
+            "Subagent scope must keep the Agent role prompt"
+        );
+        assert!(
+            prompt.contains("SKILLS-SENTINEL-2a9c"),
+            "Subagent scope must keep skills prompt"
+        );
     }
 
     #[test]

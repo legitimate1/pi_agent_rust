@@ -22,6 +22,33 @@ pub struct ParsedCli {
     pub extension_flags: Vec<ExtensionCliFlag>,
 }
 
+/// System-prompt scope: controls whether `SYSTEM.md` files are auto-injected.
+///
+/// `Main` (default) preserves the existing behavior: `--system-prompt` >
+/// `<cwd>/.pi/SYSTEM.md` (project) > `<global_dir>/SYSTEM.md` (user) >
+/// built-in default. `Subagent` skips both `SYSTEM.md` lookups while keeping
+/// shared `AGENTS.md`/`CLAUDE.md` context, `--append-system-prompt` (Agent
+/// definition role prompt + schema directive), skills and runtime facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum PromptScope {
+    /// Main Agent: full prompt with the `SYSTEM.md` override chain.
+    #[default]
+    #[value(name = "main")]
+    Main,
+    /// Subagent child: no automatic `SYSTEM.md` injection.
+    #[value(name = "subagent")]
+    Subagent,
+}
+
+impl std::fmt::Display for PromptScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Main => write!(f, "main"),
+            Self::Subagent => write!(f, "subagent"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LongOptionSpec {
     takes_value: bool,
@@ -73,6 +100,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "thinking"
         | "system-prompt"
         | "append-system-prompt"
+        | "prompt-scope"
         | "session"
         | "session-dir"
         | "session-durability"
@@ -334,6 +362,12 @@ pub struct Cli {
     /// Append to system prompt (text or file path)
     #[arg(long)]
     pub append_system_prompt: Option<String>,
+
+    /// System-prompt scope. Internal subagent-launch path only: the parent
+    /// passes `--prompt-scope subagent` so the child skips automatic
+    /// `SYSTEM.md` injection. Not for interactive use.
+    #[arg(long, value_enum, default_value_t = PromptScope::Main, hide = true)]
+    pub prompt_scope: PromptScope,
 
     // === Session Management ===
     /// Continue previous session
@@ -714,6 +748,15 @@ mod tests {
         ]);
         assert_eq!(cli.system_prompt.as_deref(), Some("You are a helper"));
         assert_eq!(cli.append_system_prompt.as_deref(), Some("Be concise"));
+    }
+
+    #[test]
+    fn prompt_scope_defaults_to_main_and_parses_subagent() {
+        use super::PromptScope;
+        let cli = Cli::parse_from(["pi"]);
+        assert_eq!(cli.prompt_scope, PromptScope::Main);
+        let cli = Cli::parse_from(["pi", "--prompt-scope", "subagent"]);
+        assert_eq!(cli.prompt_scope, PromptScope::Subagent);
     }
 
     #[test]
