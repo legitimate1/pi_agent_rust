@@ -4530,7 +4530,7 @@ dependencies = [
 
 [[package]]
 name = "pi_agent_rust"
-version = "0.1.99"
+version = "0.1.100"
 dependencies = [
  "anyhow",
  "arbitrary",
