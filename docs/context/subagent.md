@@ -12,6 +12,7 @@
 
 - **子进程模型** — 工具派生当前 `pi` 可执行文件（可由 `PI_SUBAGENT_PI_BINARY` 覆盖），以 JSON print 模式运行；stdin 关闭，stdout/stderr 分别通过管道读取。子进程由生命周期 guard 管理，避免父工具取消后留下孤儿进程。
 - **Agent 定义发现** — 默认同时发现全局 `$PI_CODING_AGENT_DIR/agents/*.md` 和项目最近的 `.pi/agents/*.md`；同名项目定义覆盖全局定义。`scope` 可切换为 `both`、`user` 或 `project`。
+- **SYSTEM.md 隔离** — Subagent 以显式 `--prompt-scope subagent` 启动，不自动加载用户级 `~/.pi/agent/SYSTEM.md` 或项目级 `<cwd>/.pi/SYSTEM.md`；这些文件仅属于 Main Agent 的系统提示词覆盖。Subagent 仍加载共享 `AGENTS.md`/`CLAUDE.md` 上下文，并接收 Agent 定义角色提示词与 schema 指令。该隔离是 prompt 自动注入边界，不是文件系统权限隔离。
 - **工具继承** — Agent 定义显式声明 `tools` 时使用该列表，否则继承父 Agent 当前启用的工具；两者都没有时使用默认子工具列表。默认列表不包含 `subagent`，并通过最大深度限制阻止无限递归。
 - **任务分发** — 单任务直接执行；`tasks` 使用受限并发执行后恢复输入顺序；`chain` 按顺序执行，前一步失败即停止后续步骤。
 - **结果聚合** — 子进程 stdout 事件和 stderr 汇总为 `SubagentResult`，再生成工具的 `content` 与 `details.results`。可选结构化结果块会附加受限大小的 JSON，不能替代标准 `details`。

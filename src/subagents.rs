@@ -2658,7 +2658,15 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["--tools", DEFAULT_CHILD_TOOLS])
         );
-        assert!(!args.iter().any(|arg| arg == "subagent"));
+        let tools_value = args
+            .windows(2)
+            .find(|pair| pair[0] == "--tools")
+            .map(|pair| pair[1].as_str())
+            .expect("default tools argument");
+        assert!(
+            !tools_value.split(',').any(|tool| tool == "subagent"),
+            "default child tools must remain non-recursive"
+        );
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--append-system-prompt", TAN_SYSTEM_PROMPT])

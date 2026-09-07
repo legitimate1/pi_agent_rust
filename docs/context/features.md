@@ -18,8 +18,9 @@
 - **Extended Thinking 级别** — off/minimal/low/medium/high/xhigh，`--thinking` 或 `/thinking` 切换 | `src/agent.rs` + `src/models.rs`
 - **交互式 Autocomplete** — `@` 文件引用 + `/` 斜杠命令补全，背景自动重建项目索引 | `src/autocomplete.rs` + `src/interactive/`
 - **凭据感知模型选择** — `Ctrl+L` 选择器（只列凭据就绪模型），`Ctrl+P`/`Ctrl+Shift+P` 循环切换 | `src/model_selector.rs` + `src/interactive/model_selector_ui.rs`
-- **用户级系统提示词覆盖** — `~/.pi/agent/SYSTEM.md` 替代默认提示词 | `src/app.rs`
-- **项目级系统提示词覆盖** — `.pi/SYSTEM.md`，优先级高于用户级 | `src/app.rs`
+- **用户级系统提示词覆盖** — `~/.pi/agent/SYSTEM.md` 替代默认提示词，仅由 Main Agent 自动加载 | `src/app.rs`
+- **项目级系统提示词覆盖** — `.pi/SYSTEM.md`，优先级高于用户级，仅由 Main Agent 自动加载 | `src/app.rs`
+- **Subagent 系统提示词隔离** — Subagent 不自动加载用户级或项目级 `SYSTEM.md`，仍使用共享项目上下文与角色提示词 | `src/app.rs` + `src/subagents.rs`
 - **系统提示词运行时事实注入** — 自动追加当前日期、工作目录、临时目录（test_mode 下用 `<TIMESTAMP>`/`<CWD>`/`<TEMP>` 占位符）| `src/app.rs`
 
 ## Provider 层
