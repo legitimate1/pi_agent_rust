@@ -425,7 +425,7 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate work to named Pi child agents. Supports a single delegation, bounded parallel task groups, and sequential task chains that can reference the immediately preceding output. Non-isolated children share the parent checkout, so concurrent edits to the same files must be coordinated. Per-task Git worktree isolation is available for tasks that need isolated changes."
+        "Delegate work to named Pi child agents. Supports a single delegation, bounded parallel task groups, and sequential task chains that can reference the immediately preceding output. Non-isolated children share the parent checkout, so concurrent edits to the same files must be coordinated. Per-task Git worktree isolation is available for tasks that need isolated changes. Each persistent-session result includes its `hubId` in the model-visible content and structured details; pass that id with top-level `continue: true` to resume the same child session."
     }
 
     fn parameters(&self) -> Value {
@@ -440,8 +440,8 @@ impl Tool for SubagentTool {
                 "chain": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Sequential task entries. `{previous}` inserts the immediately preceding child output; `{{previous.data.<field.path>}}` reads fields from the immediately preceding result when it passed schema validation."},
                 "concurrency": {"type": "integer", "minimum": 1, "maximum": MAX_PARALLEL_TASKS, "description": "Maximum number of `tasks` entries to run concurrently."},
                 "scope": {"type": "string", "enum": ["both", "user", "project"], "default": "both", "description": "Controls Agent definition discovery: `both` loads global definitions from $PI_CODING_AGENT_DIR/agents and project definitions from the nearest .pi/agents; `user` loads only global definitions; `project` loads only project definitions. Project definitions override same-name global definitions."},
-                "continue": {"type": "boolean", "description": "Continue an existing single child session with a new task. Requires `hubId` and cannot be combined with `tasks` or `chain`."},
-                "hubId": {"type": "string", "description": "Existing child session identifier used with top-level `continue: true`."}
+                "continue": {"type": "boolean", "description": "Continue an existing single child session with a new task. Requires `hubId` and cannot be combined with `tasks` or `chain`. The continued session returns the same `hubId` in the result."},
+                "hubId": {"type": "string", "description": "Existing child session identifier returned in the previous result's model-visible content and `details`; use it with top-level `continue: true`."}
             },
             "definitions": {
                 "task": {
@@ -455,8 +455,8 @@ impl Tool for SubagentTool {
                         "isoApply": {"type": "string", "enum": ["keep", "apply", "drop"], "default": "apply", "description": "How to handle an isolated worktree after completion: `keep` preserves it for review, `apply` attempts to apply its patch, and `drop` discards it. Conflicts are reported and never forced."},
                         "outputSchema": {"type": "object", "description": "JSON Schema for this task's final output, used when downstream processing requires validated JSON."},
                         "schemaMode": {"type": "string", "enum": ["permissive", "strict"], "default": "permissive", "description": "Controls the result after schema validation still fails: `permissive` keeps the result with validation warnings; `strict` marks the task as failed."},
-                        "continue": {"type": "boolean", "description": "Continue the child session identified by `hubId` with a new task."},
-                        "hubId": {"type": "string", "description": "Existing child session identifier used with this task's `continue: true`."}
+                        "continue": {"type": "boolean", "description": "Continue the child session identified by `hubId` with a new task. The continued session returns the same `hubId` in the result."},
+                        "hubId": {"type": "string", "description": "Existing child session identifier returned in the previous result's model-visible content and `details`; use it with this task's `continue: true`."}
                     }
                 }
             },
@@ -2135,6 +2135,13 @@ fn render_results(results: &[SubagentResult]) -> String {
                     body.push_str(stderr);
                 }
             }
+            if let Some(hub_id) = result.hub_id.as_deref() {
+                body.push_str("\n\nhubId: ");
+                body.push_str(hub_id);
+                body.push_str(
+                    "\nTo continue this session, call subagent with `continue: true` and this `hubId`.",
+                );
+            }
             format!("## {heading}\n{body}")
         })
         .collect::<Vec<_>>()
@@ -3585,6 +3592,18 @@ printf '{{"type":"agent_end","messages":[{{"role":"assistant","content":[{{"type
             Some(hub_id.as_str()),
             "result hubId must mirror top-level hubId"
         );
+        let content = match &output.content[0] {
+            ContentBlock::Text(text) => &text.text,
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(
+            content.contains(&format!("hubId: {hub_id}")),
+            "model-visible content must include the returned hubId, got: {content}"
+        );
+        assert!(
+            content.contains("continue: true"),
+            "model-visible content must explain how to continue the session, got: {content}"
+        );
         let expected = global_dir
             .join("sessions")
             .join("subagents")
@@ -3830,6 +3849,11 @@ printf '{{"type":"agent_end","messages":[{{"role":"assistant","content":[{{"type
         assert!(
             text.text.contains("second done"),
             "second turn output must be visible, got: {}",
+            text.text
+        );
+        assert!(
+            text.text.contains(&format!("hubId: {hub_id}")),
+            "continued content must return the same hubId, got: {}",
             text.text
         );
         assert!(

@@ -31,7 +31,7 @@
 
 ## 会话与工作区隔离
 
-- **持久会话** — 新任务会分配全局唯一 hubId，并以 `<global>/sessions/subagents/<hubId>.jsonl` 保存会话；规范关系是 `hubId == sessionId == worktreeId`。新任务产生的 hubId 会随工具结果返回，供后续 `continue` 使用。
+- **持久会话** — 新任务会分配全局唯一 hubId，并以 `<global>/sessions/subagents/<hubId>.jsonl` 保存会话；规范关系是 `hubId == sessionId == worktreeId`。新任务产生的 hubId 会同时出现在模型可见的 `content` 文本和结构化 `details.hubId` 中，供后续 `continue` 使用；续跑会复用并返回同一个 hubId。
 - **会话回退** — 正常路径使用 `--session <path>`；部分内部调用仍可能在没有会话路径时回退到 `--no-session`，不要把所有子任务都假设为可续跑。
 - **worktree 模式** — `isolation: "worktree"` 创建或重开隔离工作树；`isoApply` 可选 `keep`、`apply` 或 `drop`，默认按 `apply` 处理。
 - **失败保护** — 失败或取消的子任务不会自动把半成品 apply 到父工作区；请求 apply 时会降级为 keep。补丁冲突会报告冲突文件并保留 worktree，绝不强制合入。
@@ -39,7 +39,7 @@
 
 ## 输出与错误契约
 
-- **正常输出** — `content` 展示子 Agent 的最终 `output`；普通成功 stderr 不默认混入模型可见文本。
+- **正常输出** — `content` 展示子 Agent 的最终 `output`，并在存在持久会话时返回 `hubId: <id>` 及续跑提示；普通成功 stderr 不默认混入模型可见文本。
 - **失败输出** — 失败时 `content` 会展示已有部分 output，并追加 `error` 与 `stderr`。API 超时、认证失败、provider 错误等通常位于 stderr，因此排查失败时先看 `content` 中的 `Error:` 和 `Stderr:` 段。
 - **结构化结果** — `details` 包含 `schema`、`mode`、`sessionIsolation`、`hubId` 和 `results`。每个 result 还可能包含 `status`、`exitCode`、`output`、`stderr`、`error`、`data`、schema 校验结果和 worktree 结果。
 - **状态** — 子任务状态包括 `starting`、`running`、`completed`、`failed` 和 `cancelled`；非零退出码会标记为 failed，父取消会标记为 cancelled。
