@@ -5,32 +5,47 @@
 
 ## 当前工作位置
 
-当前分析窗口尚未最终固定。先阅读并完善：
+第一执行子窗口的只读分析已完成，结论是：fsqlite session storage 是已有 SQLite session 后端的替换，不直接 merge；如需采用，应另立 SQLite 后端迁移波次。
 
-- `analysis-window.md`：确定 custom 对应的上游起点、宏观终点和当前执行子窗口。
-- `upstream-decisions.md`：了解已经确定的上游追踪原则和取舍边界。
+当前详细记录：
 
-当前还没有建立正式的波次文档。窗口边界固定后，先为第一个实际研究对象创建 `waves/<wave-name>.md`，再把它登记到本文。
+- `waves/01-fsqlite-session-storage.md`
+
+当前窗口边界：
+
+- 起点：`226a876425a856f657b2a5d7c7ac6f0ca1ad25f1`
+- 宏观终点：`v0.3.0` / `e23c4622f8bc4038a5e061ee3640a0e9206ec5cc`
+- 第一执行子窗口终点：`8f12352e174ea06c7d8d66cde15768cecfccccf3`
+- 窗口详情：`analysis-window.md`
 
 ## 波次文档索引
 
+### 已记录波次
+
+#### 01 — fsqlite session storage
+
+- 主题：上游把 `sqlmodel-*` SQLite session 后端替换为 `fsqlite 0.3.4`，并同步改变连接线程、错误、侧车和权限契约。
+- 结论：不直接 merge；暂时冻结为独立的 SQLite 后端迁移议题。
+- 详细文档：`waves/01-fsqlite-session-storage.md`
+- 当前处理：不修改源码，不执行 merge。
+
 ### 当前波次
 
-暂未建立。当前工作是固定分析窗口，而不是执行 merge 或移植。
+暂未开始新的实现波次。下一步不是继续扩大第一波，而是先决定是否要为 SQLite 后端迁移建立独立设计。
 
 ### 后续候选
 
-#### fsqlite session storage
+#### SQLite 后端迁移
 
-- 主题：上游 fsqlite session storage cutover 及其持久化影响。
+- 主题：评估从 `sqlmodel-*` 到 `fsqlite` 的完整迁移。
 - 详细文档：待创建。
-- 说明：这是候选的第一个小分析窗口；是否进入实际处理，需先完成与 custom 的语义和依赖对照。
+- 前置：确认是否愿意承担 fsqlite 依赖树、线程模型、错误类型、侧车文件、只读行为、并发验证和发布体积变化。
 
 #### FTUI foundation
 
 - 主题：FrankenTUI 初始迁移、启动路径和交互基础。
 - 详细文档：待创建。
-- 说明：属于结构性变化，不随 session storage 波次顺手处理。
+- 说明：属于结构性变化，不与 SQLite 后端迁移混合。
 
 #### MCP / RPC protocol
 
@@ -40,7 +55,7 @@
 
 #### 其他功能闭包
 
-- tools、providers、compaction、workspace、Hub 增量以及依赖迁移，待分析窗口固定后按语义拆分。
+- tools、providers、compaction、workspace、Hub 增量以及依赖迁移，待后续按语义拆分。
 - 每个真正开始分析的主题都建立独立波次文档，再在这里登记路径。
 
 ## 历史记录入口
@@ -53,7 +68,7 @@
 
 ## 波次切换规则
 
-完成一个波次后：
+完成一个波次的分析或处理后：
 
 1. 在对应的 `waves/<wave-name>.md` 中补充处理结论、实际结果和验证摘要。
 2. 将本文的“当前波次”改为下一个波次，并登记原波次的路径和一句话结论。

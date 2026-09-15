@@ -20,11 +20,10 @@ custom 上游起点 S ───────────────► upstream 
 
 ## 当前状态
 
-- 文档模型已从旧的 C1–C6 累计 checkpoint 改为“分析窗口 → 语义波次 → 证据”。
-- 当前分析窗口的起点和终点尚未最终确认。
-- 本次重建观察到的引用快照见 `analysis-window.md`；其中的 `upstream/main` SHA 只是候选观察值，不是已批准的终点。
-- 当前波次表见 `wave-plan.md`；上游追踪决策见 `upstream-decisions.md`。
-- 当前没有进行中的全量上游 merge。
+- 文档模型已从旧的 C1–C6 累计 checkpoint 改为“分析窗口 → 语义波次 → 文档档案”。
+- 当前分析窗口已固定：起点、宏观终点和第一执行子窗口见 `analysis-window.md`。
+- 第一执行子窗口已完成只读分析；详细结论见 `waves/01-fsqlite-session-storage.md`。
+- 当前没有进行中的源码迁移或全量上游 merge。
 
 ## 文档路由
 
@@ -34,7 +33,7 @@ custom 上游起点 S ───────────────► upstream 
 - `wave-plan.md`：只记录当前波次、后续候选波次和详细文档路径，不承载波次详情。
 - `upstream-decisions.md`：记录跨波次的上游追踪决策，不写入项目上下文决策文档。
 
-### 完成证据与基线
+### 历史记录与基线
 
 - `plan-hub-minimal.md`：Hub 最小闭包已完成的移植与验证记录。
 - `probe-report-2026-08-29.md`：全量 merge 探针的历史证据，记录依赖/API 漂移为何成为主要成本。
