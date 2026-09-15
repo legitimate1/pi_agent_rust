@@ -440,28 +440,6 @@
 
 **何时重新考虑**：若核心推出「事实注入 vs 业务注入」的提示词分层机制（事实类保留核心、业务类外放扩展），本条随之调整。
 
-## D46: 依赖升级冻结——快赢合并时回退上游依赖（2026-08-16）
-
-**决策**：合并上游时，Cargo.toml/Cargo.lock 的依赖升级（digest 0.11、swc 26、asupersync 0.4、rquickjs 0.12、base64 0.23 等）**整体回退到 custom 基线**，不随合并引入；build.rs 与引用新 API 的自动合入文件同样回退。升级留待与 extensions 架构迁移绑定做独立项目。
-
-**理由**：上游为升级依赖同步改了几百个 commit 的适配代码；custom 代码基于旧 API，直接升级 = 423 个编译错误（实测），等于重写适配层。快赢合并的目标是拿功能（ast 工具等），不是升级依赖；依赖升级是独立工程，应单独规划、单独验证。
-
-**不选 B 的原因**：逐个文件适配新 API（工作量 = 上游适配全量，且与 extensions 迁移重复）；部分升级（版本分裂，编译选一行为漂移）。
-
-**何时重新考虑**：做 extensions 架构迁移时（新架构依赖新依赖，强相关），连同依赖升级一起做。
-
-## D47: 上游追踪策略——固定分析窗口，按语义闭包选择性处理（2026-08-16，2026-09-15 重写）
-
-**决策**：改造式 fork 追上游不按提交数量机械追，也不直接把移动的 `upstream/main` 全量合入 `custom`。先固定 custom 对应的上游起点与一个可复核的终点（稳定 tag 或 SHA），分析整个窗口的最终净变化，再按语义依赖和功能闭包拆成独立波次。每个波次分别决定采纳、适配、冻结或排除，并独立验证。对于文件结构已分叉的区域，优先做功能闭包移植或按语义适配；只有仍能保持意图和归因的范围才使用选择性 merge。
-
-**理由**：上千个上游提交中包含重复修正、撤销实现、依赖升级、架构重构、生成物和上游内部治理，逐个处理会失去终点状态和功能因果。先定终点可以得到可复核的净变化；minor/tag 提供宏观时间锚点，但不是自动合并批次；按功能闭包处理可以同时保留类型、实现、调用方和测试，并在每个检查点归因失败。
-
-**不选 B 的原因**：不选择一次性 merge 最新 `upstream/main`，因为全量合流会把未评估的依赖/API 漂移和结构重构混入 custom，造成无法归因的编译与行为失败；不选择逐个 cherry-pick 上千个提交，因为改造式 fork 中上游提交的文件锚点可能已经不存在，无法表达 custom 当前结构中的真实语义。
-
-**何时重新考虑**：若 custom 完成对应结构迁移、主依赖已有完整适配且上游行为契约已固定，可重新评估更大范围的 merge；若某个冻结域能形成独立、低风险且可验证的功能闭包，则建立专门波次，不自动恢复全量同步。
-
----
-
 ## D48: Exec AMAC 阈值 — 通用 min_batch=4 前置为 Rule 0 直通
 
 **决策**：decide_toggle 将 Exec 分支提至最前（Rule 0），无视通用 min_batch_size=4 阈值（零新增配置/字段/env）；2 即 Interleave(width=2)，1 仍 Sequential(computed_width_too_low)，Http/Tool 等仍受 min_batch=4 守门。
@@ -546,18 +524,6 @@
 
 ---
 
-## D55: Hub 全闭包移植 — 单文件移植 hub 六件套而非全量 merge 上游
-
-**决策**：选单文件 `git show upstream/main:src/* > src/*` 移植 hub/jobs/agent_hub/subagents + secrets/worktree_iso 六件套 + Cargo 5 增量 (fs4 1.1/portable-pty/rustix/win32job/jsonschema) + tools 调度钩子，不选 `git merge --no-commit --no-ff upstream/main` 全量合流。
-
-**理由**：全量探针 121 冲突为纸老虎但 297 编译错为依赖漂移主成本，正面撞 hostcall/touched_files 重构区；单文件隔离 (hub-port) 44→0 可控，改动 14 文件 +11258 行。
-
-**不选 B 的原因**：不选全量合流，因 Cargo 自动合入 asupersync/rust/digest 大版本引 423 错，冻结面噪音需批量 --ours/rm，30k token 与定制区正面冲突。
-
-**何时重新考虑**：若需 hub Roster/Jobs UI 注入点 (app/cli/config/rpc) 或上游 0.2.x 发布需全特性同步时，再评估分阶段再移植或冻结面迁移项目。
-
----
-
 ## D57: 文件触达统计 — 收敛至 Agent 工具链 + 结构化快照
 
 **决策**：选 touched-files 仅统计 Agent 经 ToolRegistry 调度的结构化与 shell 触达并统一 shell 窗口快照，不计输入框本地 ! shell，不选全量求和或仅结构化或仅 shell。
@@ -628,7 +594,6 @@
 
 **何时重新考虑**：若需要真常驻 Idle 进程池或跨主会话 PID 恢复，且能承担显式泄漏防护与取消同步，则可在持久会话之上叠加 resident 复用，需扩展 hub 状态机与回收策略。
 
-
 ---
 
 ## D63: subagent 技能白名单 — 按代理 allowed-skills 在提示词阶段过滤
@@ -640,7 +605,6 @@
 **不选 B 的原因**：全局 --no-skills 为进程级开关无法按代理细分，追加 --skill 仅补充路径不约束可见性，二者均不支持 inherited 与 agent 的多层嵌套越往里越窄语义，且缺少大小写不敏感与 CSV 统一去重的契约。
 
 **何时重新考虑**：若需按任务动态覆盖或按调用链实时收敛白名单，可在 SubagentTask 上扩展 allowedSkills 覆盖 AgentDefinition，并在 effective_allowed_skills 中引入任务层交集策略。
-
 
 ---
 
@@ -662,7 +626,6 @@
 
 **何时重新考虑**：OpenCode 改头名/策略，或 opencode 与 opencode-go 行为分叉时重估
 
-
 ---
 
 ## D65: 新鲜 subagent hubId 全局唯一 — 防跨进程撞号误重放
@@ -674,7 +637,6 @@
 **不选 B 的原因**：旧 `<agent>-<seq>` 在每个新父进程都从 seq=1 重起，新鲜父进程第一次调用必撞上一个进程留下的 `<global>/sessions/subagents/<hubId>.jsonl`，--session 全量重放数十万 token 陈旧历史，效果等同默认续接；新鲜撞文件时静默复用或静默回 --no-session 则丢持久性且无迹可查。
 
 **何时重新考虑**：若未来引入跨主会话 PID 恢复/常驻进程池，或 hubId 需要人类可读短 id，可在保持跨进程唯一前缀的前提下重估编码格式；若 session 存储迁出文件系统，claim 兜底需同步迁移。
-
 
 ---
 
