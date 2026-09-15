@@ -1,20 +1,18 @@
 # LSP 独立移植实现契约
 
-> 状态：待确认。本文只定义 LSP 试点的实现边界，不表示 C1 已合入，也不接受 C1 全量 merge。
+> 状态：待确认。本文只定义 LSP 试点的实现边界，不表示 LSP 已合入，也不接受未经分析的上游全量 merge。
 
 ## 1. 实现边界
 
 Source:
 
-- `docs/upstream/c1/feature-matrix.md` 的 A1 LSP 条目
-- `docs/upstream/c1/dependency-matrix.md` 的低依赖候选结论
-- `docs/upstream/c1/overlap-risk-matrix.md` 的 LSP 风险条目
+- 上游 LSP 功能闭包的原始提交与接口资料（待在新的 `analysis-window.md` / `wave-plan.md` 中固定范围）
 - 上游首个功能提交 `912a4650e0ca39246114d3082ba92099d973f852`
 - 上游任务 `bd-cv653.1.1`
 
 Goal:
 
-- 在当前 `custom` 架构中，以独立功能闭包提供 LSP 代码智能工具，不接受上游 C1 的整体依赖升级和结构重构。
+- 在当前 `custom` 架构中，以独立功能闭包提供 LSP 代码智能工具，不接受未经分析的上游整体依赖升级和结构重构。
 
 In scope:
 
@@ -28,7 +26,7 @@ In scope:
 
 Out of scope:
 
-- C1 全量 merge 或继续解决 `integration/c1` 的 33 个源码冲突。
+- 未经分析的上游全量 merge，或继续解决旧 `integration/c1` 的历史冲突。
 - `src/tools.rs` 单文件到 `src/tools/` 的结构迁移。
 - extensions / extensions_js 重构、VFS 语义、Hub/Jobs/Subagents、FTUI、FrankenSQLite。
 - `asupersync`、`rquickjs`、SWC、`wasmtime`、Rust toolchain 等主依赖升级。
@@ -46,7 +44,7 @@ Design delta:
 
 - 不直接照搬上游修改 `src/tools.rs`、`src/xdev.rs` 和上游配置结构；先映射到 custom 当前目录化 tools 与配置模型。
 - 不把 LSP 默认暴露策略预先视为已决定：建议第一版先通过显式 `--tools lsp` 或等价配置启用，完成验证后再决定是否加入默认工具集合。
-- 不为适配 LSP 而升级主依赖；若编译暴露 custom 现有 API 缺口，先停止并记录，不扩大到 C1 依赖迁移。
+- 不为适配 LSP 而升级主依赖；若编译暴露 custom 现有 API 缺口，先停止并记录，不扩大到未经规划的依赖迁移。
 
 ## 2. 文件变更清单
 
@@ -105,7 +103,7 @@ Design delta:
 - 服务器缺失、协议错误、超时和取消均返回可诊断错误，不永久阻塞 Agent。
 - WorkspaceEdit 多文件应用满足全成全败；部分失败不会留下半写状态。
 - 路径访问不能绕过 custom workspace 约束。
-- LSP 工具可从 custom 的 ToolRegistry 构造并执行；不引入 C1 主依赖漂移。
+- LSP 工具可从 custom 的 ToolRegistry 构造并执行；不引入未经分析的主依赖漂移。
 - 在真实 rust-analyzer 可用时，至少完成 diagnostics 或 definition 一条真实链路；完整 14 操作作为后续验收目标，不因服务器缺失而伪造通过。
 
 人工检查：
@@ -121,6 +119,6 @@ Design delta:
 - 需要修改 extensions、Hub、session 或工具拆分结构才能继续，但尚未形成独立设计。
 - WorkspaceEdit 无法满足 custom 的路径约束或原子性要求。
 - 测试失败无法区分 LSP 引入问题与 custom 基线问题。
-- 需要读取整个仓库或 C1 全部提交才能继续判断。
+- 需要读取整个仓库或未经拆分的全部上游提交才能继续判断。
 
 > 本契约需要用户确认后才进入代码实现。
