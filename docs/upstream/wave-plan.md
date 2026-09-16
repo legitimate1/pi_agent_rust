@@ -1,13 +1,13 @@
 # 上游语义波次索引
 
 > 本文只负责导航：指出当前上游分析窗口、当前工作位置和波次文档路径。不在这里写波次的完整分析、冲突细节或验证过程。
-> 更新日期：2026-09-15
+> 更新日期：2026-09-16
 
 ## 当前工作位置
 
 第一执行子窗口的只读分析已完成，结论是：fsqlite session storage 是已有 SQLite session 后端的替换，不直接 merge；如需采用，应另立 SQLite 后端迁移波次。
 
-波次 02 已完成候选识别并建立只读分析记录，结论是：provider usage/quota 是独立的账户额度查询闭包，不直接 merge；如需采用，应按当前 custom 的认证、HTTP、CLI 和 interactive 边界适配。
+波次 02 的 provider usage/quota 已完成语义分析、隔离 cherry-pick 探针、基于 custom 的手动适配和局部回归验证；结论是：不原样 merge 上游提交，保留 custom 结构完成适配，当前实现和局部验证已完成。
 
 当前详细记录：
 
@@ -34,7 +34,7 @@
 
 ### 当前波次
 
-波次 02 的只读候选分析已完成，推荐主题是 provider usage/quota surface；结论是：它可形成独立的账户额度查询闭包，但不直接 merge，后续如采纳应按当前 custom 的认证、HTTP、CLI 和 interactive 边界适配。
+Wave 2 已完成 provider usage/quota 的手动适配和局部验证；当前没有正在执行的源码迁移波次。下一步应选择新的候选主题，或根据需要另立 SQLite 后端迁移设计。
 
 当前详细记录：
 
@@ -52,9 +52,9 @@
 #### 02 — provider usage/quota surface
 
 - 主题：上游新增 OpenRouter、Moonshot/Kimi、GitHub Copilot 等 provider 的账户额度/余额查询，并通过 `pi usage` 与 `/usage` 展示。
-- 结论：不直接 merge；如需采用，按当前 custom 的认证、HTTP、CLI 和 interactive 边界适配。
+- 结论：不原样 merge；已按当前 custom 的认证、HTTP、CLI 和 interactive 边界完成手动适配。
 - 详细文档：`waves/02-provider-usage-quota.md`
-- 当前处理：不修改源码，不执行 merge。
+- 当前处理：本地适配和局部验证已完成；真实 provider 网络验证及全量质量门禁尚未执行。
 
 ### 后续候选
 

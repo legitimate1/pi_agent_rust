@@ -4,7 +4,7 @@
 
 确认上游在 `S..v0.3.0` 中新增的 provider usage/quota 查询能力是否构成独立功能闭包，核对当前 `custom` 的接入基础，并判断后续应直接采纳、局部适配还是冻结。
 
-本波次只做语义分析，不执行 merge、不移植源码、不修改 Cargo 配置。
+本波次先完成只读语义分析，随后在用户确认后按当前 `custom` 结构完成手动适配；不执行整段上游 merge，也不修改 Cargo 配置。
 
 ## 分析边界
 
@@ -45,15 +45,15 @@ chore(beads): close bd-cv653.7.4; log gel2u class-1 addendum
 
 ## 一句话结论
 
-上游新增的是**provider 账户额度/余额查询闭包**：在已有认证和 HTTP 基础上，为 OpenRouter、Moonshot/Kimi、GitHub Copilot 等 provider 查询 credits、balance 或 entitlement/quota，并通过 `pi usage` 与 `/usage` 展示。当前 `custom` 已有 token 消耗统计和认证/HTTP 接入点，但没有同等的账户 quota 模块或命令；因此不应直接 merge，若用户决定落地，建议按当前 custom 的接口局部适配。
+上游新增的是**provider 账户额度/余额查询闭包**：在已有认证和 HTTP 基础上，为 OpenRouter、Moonshot/Kimi、GitHub Copilot 等 provider 查询 credits、balance 或 entitlement/quota，并通过 `pi usage` 与 `/usage` 展示。当前 `custom` 已通过手动适配获得这项能力，同时保留了 custom 的认证、HTTP、交互事件和依赖边界；Wave 2 不采用上游提交的直接 Git 合并。
 
-初步处理建议：
+处理建议：
 
 ```text
-适配
+已适配
 ```
 
-这里的“适配”只是上游追踪结论，不代表已经授权实现，也不代表 provider endpoint 契约已经在当前环境验证完成。
+这表示上游 usage/quota 语义已经以本地手动适配的方式进入 `custom`，不是对上游提交执行原样 merge。provider endpoint 的真实网络兼容性仍需单独验证。
 
 ## 上游最终变化
 
@@ -223,6 +223,35 @@ usage reader 和展示路径测试
 
 ## 当前 custom 的对应实现
 
+Wave 2 已按当前 `custom` 结构完成手动适配。实际实现位于：
+
+```text
+src/usage.rs
+src/lib.rs
+src/cli.rs
+src/main.rs
+src/interactive/commands.rs
+src/interactive/agent.rs
+```
+
+实现提交：
+
+```text
+32ca3f25d feat: adapt provider usage quota
+bc395caae fix: harden provider usage integration
+f8db80205 test: stabilize provider usage cache coverage
+```
+
+其中：
+
+- `src/usage.rs` 提供三个 provider reader、统一状态、超时、缓存、stale fallback 和 text/JSON renderer；
+- `src/cli.rs` 和 `src/main.rs` 提供 `pi usage [--format text|json] [--refresh]`；
+- `src/interactive/commands.rs` 提供 `/usage` 和 `/usage refresh`；
+- 交互结果使用 `PiMsg::SystemNote`，不会把异步 usage 结果当成 Agent 完成事件，也不会重置正在处理的 Agent 状态；
+- cache identity 使用 provider 与 credential 的不可逆 SHA-256 摘要，避免不同账号共享 fresh/stale quota；
+- CLI 和 interactive 的 auth 文件读取使用 `AuthStorage::load_async`，不在 runtime 中直接执行同步读取；
+- `src/interactive/agent.rs` 增加了 `SystemNote` 保持 Processing 状态的回归测试。
+
 ### 可复用的底层接入点
 
 当前 `custom` 已具备与 usage 闭包相邻的底层能力：
@@ -247,18 +276,13 @@ src/http/client.rs:245
   impl Client
 ```
 
-这些接入点覆盖认证文件读取、provider credential 查找、统一认证路径和异步 HTTP client。它们是适配时的候选接入点，不代表当前已有 provider quota 语义。
+这些接入点覆盖认证文件读取、provider credential 查找、统一认证路径和异步 HTTP client；本次适配已实际复用它们完成 usage/quota 接入。
 
-### 当前尚未具备的闭包
+### 已实现闭包
 
-已核对当前 `custom`：
+当前 `custom` 已具备 usage/quota 闭包。实现不等于上游提交原样合入，而是保留 custom 结构后完成的本地适配。
 
-```text
-src/usage.rs       不存在
-tests/usage.rs      不存在
-```
-
-当前也没有与上游相同的：
+已实现的接口包括：
 
 ```text
 Commands::Usage
@@ -267,7 +291,7 @@ handle_slash_usage(...)
 pub mod usage
 ```
 
-CLI 定义和分发入口仍分别位于：
+当前 CLI 定义和分发入口仍分别位于：
 
 ```text
 src/cli.rs:1889
@@ -295,7 +319,7 @@ src/interactive/commands.rs:1651-1652
   total token/cost 展示
 ```
 
-这类数据回答“本次请求消耗了多少 token/cost”，而上游 usage/quota 回答的是：
+这类数据回答“本次请求消耗了多少 token/cost”，而 usage/quota 模块回答的是：
 
 ```text
 账户 credits
@@ -304,31 +328,26 @@ entitlement
 remaining quota
 ```
 
-两者的来源、生命周期和失败语义不同。不能因为 custom 已有 `model::Usage` 就认定 usage/quota 闭包已迁移。
+两者的来源、生命周期和失败语义不同。当前 custom 同时保留原有的 `model::Usage` token 统计和新增的 usage/quota 账户查询，不能将二者混为一谈。
 
 ## 语义差异与适配边界
 
 ### 可以局部复用的部分
 
-以下部分预计可以在不升级主依赖的情况下复用或适配：
+以下部分已在本次适配中核对并完成：
 
 - `AuthStorage` 的 credential 读取；
-- 当前 HTTP client 的异步请求能力；
-- CLI 子命令注册和 `handle_subcommand` 分发结构；
+- 当前 HTTP client 的异步请求、headers、JSON body 和请求级 timeout；
+- CLI 子命令注册和 `handle_subcommand` 分发；
 - interactive slash command 的解析、帮助和展示结构；
-- serde/JSON 输出基础。
+- serde/JSON 输出基础；
+- usage cache 的 credential-scoped identity 与 stale fallback；
+- async runtime 中的 auth 文件读取。
 
-### 必须重新核对的部分
+仍需保留为外部或后续边界的核对项：
 
-正式实现前必须重新确认：
-
-- OpenRouter、Moonshot/Kimi、GitHub Copilot endpoint 和响应格式是否仍与上游快照一致；
-- 当前 `AuthStorage` 的 provider alias 是否覆盖 `readers_from_auth(...)` 的 key 形态；
-- 当前 HTTP client 是否直接支持所需的 GET、headers、JSON body 和每请求超时；
-- stale cache 的并发、生命周期和失败回退语义是否符合 custom runtime 约束；
-- 文本/JSON 输出是否符合 custom 现有 print/RPC/interactive 输出边界；
-- 没有公开 endpoint 的 provider 是否应保持 `Unavailable`，不能通过猜测实现“统一 quota”；
-- 是否需要未来单独暴露 RPC surface；上游本闭包没有 `src/rpc.rs` 变化，因此当前不纳入。
+- OpenRouter、Moonshot/Kimi、GitHub Copilot endpoint 和响应格式的真实线上可用性；
+- 是否需要未来单独暴露 RPC usage surface；上游本闭包没有 `src/rpc.rs` 变化，因此当前不纳入。
 
 ### 应明确排除
 
@@ -410,59 +429,82 @@ FTUI foundation 属于结构性 UI/runtime 迁移；MCP/RPC 属于协议、生�
 ## 处理结论
 
 ```text
-建议：适配
-当前动作：不 merge、不移植、不修改源码
+已适配
 ```
 
-如果用户后续决定进入实现，应先建立独立设计或实现任务，按以下顺序核对：
+Wave 2 已按当前 custom 的认证、HTTP、CLI 和 interactive 结构完成手动移植，并修复了两个适配阶段发现的边界问题：
 
-```text
-1. provider endpoint、认证头和响应 schema
-2. AuthStorage 到 provider reader 的映射
-3. HTTP client 的超时、错误和 JSON 读取能力
-4. ProviderUsage / UsageStatus 的最小数据模型
-5. 60 秒缓存和 stale fallback 的生命周期
-6. 文本/JSON 渲染契约
-7. CLI pi usage 接入
-8. interactive /usage 接入
-9. provider reader、缓存、错误和展示测试
-10. 是否需要另立 RPC usage 波次
-```
+- usage cache 改为按 provider + credential 的不可逆摘要隔离，避免账号之间复用 fresh/stale quota；
+- interactive usage 结果改用不改变 Agent 状态的 `PiMsg::SystemNote`，认证文件读取改用 `AuthStorage::load_async`。
 
-在用户明确同意实现之前，不执行上述源码迁移，也不把该功能直接 merge 到 `custom`。
+本次处理没有执行上游 `git merge` 或保留未解决的 cherry-pick；没有引入 Cargo 依赖变化，也没有纳入 Wave 1、beads 元数据或相邻功能。
+
+仍未完成的不是本地适配闭包，而是 provider endpoint 的真实网络验证和项目收尾阶段的全量质量门禁。
 
 ## 验证摘要
 
-本波次完成的是只读 Git 和 custom 对照分析，未运行 Cargo。
+本波次已完成上游 Git 分析、custom 结构对照、隔离 cherry-pick 探针、手动源码适配和局部回归验证。
+
+### Git 与适配证据
 
 已确认：
 
-- 工作区干净，当前分支为 `custom`；
-- `S`、`v0.3.0` 和当前 refs 可达；
+- 工作区当前分支为 `custom`，适配前后均未将上游整段历史 merge 进来；
 - `v0.3.0` 当前指向 `e23c4622f8bc4038a5e061ee3640a0e9206ec5cc`；
-- `S..v0.3.0` 为宏观窗口，不作为一次性 merge 范围；
-- usage 核心范围为 `f6be31da^..d7d1c311`，10 个文件、约 `+650 / -4`；
-- custom 没有 `src/usage.rs`、`tests/usage.rs`、`Commands::Usage`、`SlashCommand::Usage` 或 `pub mod usage`；
-- custom 已有认证、HTTP 和 token usage 基础，但没有账户 quota 闭包；
-- tokens-after 位于 T1 之前，turn-recovery/workspace trust 等属于其他独立闭包。
+- usage 上游功能核心范围为 `f6be31da^..d7d1c311`；
+- 直接 cherry-pick 上游功能提交在隔离 worktree 中对 `src/interactive/commands.rs`、`src/interactive/perf.rs`、`src/lib.rs` 产生内容冲突，因此改为手动适配；
+- 当前 custom 的本地适配提交为：
 
-未运行：
+```text
+32ca3f25d feat: adapt provider usage quota
+bc395caae fix: harden provider usage integration
+f8db80205 test: stabilize provider usage cache coverage
+```
 
-- Cargo 测试；
-- clippy、fmt；
-- provider 网络请求；
-- merge、checkout、reset、clean。
+- 实际变更未修改 `Cargo.toml`、`Cargo.lock`、session、RPC、extensions、FTUI 或 provider streaming 主流程；
+- `src/interactive/perf.rs` 未被修改，usage 展示复用了 custom 已有的 `PiMsg::SystemNote` 路径。
 
-## 未知事实
+### 已执行验证
 
-1. 当前各 provider quota endpoint 是否仍保持上游快照中的路径、认证头和响应格式。
-2. custom 的 HTTP client 是否能够无适配地表达各 reader 所需的 headers、JSON body 和 timeout。
-3. custom auth provider alias 与上游 `readers_from_auth(...)` 的映射是否一致。
-4. 60 秒内存缓存及 stale fallback 在 custom runtime 中的并发与生命周期行为。
-5. custom 是否需要 RPC usage 命令，以及该协议是否应另立波次。
-6. usage reader 失败时的错误输出是否需要接入 custom 现有 error/hint 分类。
+以下命令均通过，且均在 Windows `pwsh` 中执行：
 
-这些未知项不阻止把 usage 记录为独立候选，但阻止现在直接 merge 或声称可直接运行。
+```text
+cargo test --lib usage::tests
+  10 passed
+
+cargo test --lib parse_usage
+  3 passed
+
+cargo test --lib slash_usage
+  3 passed
+
+cargo test --lib system_note_does_not_change_processing_state
+  1 passed
+
+cargo check --lib
+  passed
+
+cargo clippy --lib -- -D warnings
+  passed
+
+cargo fmt --check
+  passed
+
+git diff --check
+  passed
+```
+
+测试覆盖 provider reader 解析、HTTP 错误脱敏、Unavailable/error 分类、credential-scoped cache、refresh、stale fallback、文本/JSON 渲染、CLI 参数和 interactive slash parser，以及 `SystemNote` 不改变 Processing 状态的回归。
+
+### 未执行验证
+
+- 未运行 provider 真实网络请求；
+- 未运行全量 `cargo test`；
+- 未运行 `cargo test --all-targets`；
+- 未运行 `cargo clippy --all-targets`；
+- 未运行 release-max 构建。
+
+因此“已适配”表示本地实现和局部验证完成，不表示 provider 线上 endpoint 或完整发布门禁已经认证通过。
 
 ## 证据入口
 
