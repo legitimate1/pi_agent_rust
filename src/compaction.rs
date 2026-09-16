@@ -833,83 +833,70 @@ fn should_compact(
 
 /// Estimate token count for a single session message using a chars/3 heuristic.
 pub fn estimate_tokens(message: &SessionMessage) -> u64 {
-    let mut chars: usize = 0;
-
-    match message {
+    let chars = match message {
         SessionMessage::User { content, .. } => match content {
-            UserContent::Text(text) => chars = text.len(),
-            UserContent::Blocks(blocks) => {
-                for block in blocks {
-                    match block {
-                        ContentBlock::Text(text) => {
-                            chars = chars.saturating_add(text.text.len());
-                        }
-                        ContentBlock::Image(_) => {
-                            chars = chars.saturating_add(IMAGE_CHAR_ESTIMATE);
-                        }
-                        ContentBlock::Thinking(thinking) => {
-                            chars = chars.saturating_add(thinking.thinking.len());
-                        }
-                        ContentBlock::ToolCall(call) => {
-                            chars = chars.saturating_add(call.name.len());
-                            chars = chars.saturating_add(json_byte_len(&call.arguments));
-                        }
-                        // Opaque marker — the data field is never replayed to a model
-                        // (see `convert_content_block_to_anthropic`), so it contributes
-                        // zero context tokens.
-                        ContentBlock::RedactedThinking(_) => {}
-                    }
-                }
-            }
+            UserContent::Text(text) => text.len(),
+            UserContent::Blocks(blocks) => estimate_content_blocks_chars(blocks),
         },
-        SessionMessage::Assistant { message } => {
-            for block in &message.content {
-                match block {
-                    ContentBlock::Text(text) => {
-                        chars = chars.saturating_add(text.text.len());
-                    }
-                    ContentBlock::Thinking(thinking) => {
-                        chars = chars.saturating_add(thinking.thinking.len());
-                    }
-                    ContentBlock::Image(_) => {
-                        chars = chars.saturating_add(IMAGE_CHAR_ESTIMATE);
-                    }
-                    ContentBlock::ToolCall(call) => {
-                        chars = chars.saturating_add(call.name.len());
-                        chars = chars.saturating_add(json_byte_len(&call.arguments));
-                    }
-                    ContentBlock::RedactedThinking(_) => {}
-                }
-            }
-        }
-        SessionMessage::ToolResult { content, .. } => {
-            for block in content {
-                match block {
-                    ContentBlock::Text(text) => {
-                        chars = chars.saturating_add(text.text.len());
-                    }
-                    ContentBlock::Thinking(thinking) => {
-                        chars = chars.saturating_add(thinking.thinking.len());
-                    }
-                    ContentBlock::Image(_) => {
-                        chars = chars.saturating_add(IMAGE_CHAR_ESTIMATE);
-                    }
-                    ContentBlock::ToolCall(call) => {
-                        chars = chars.saturating_add(call.name.len());
-                        chars = chars.saturating_add(json_byte_len(&call.arguments));
-                    }
-                    ContentBlock::RedactedThinking(_) => {}
-                }
-            }
-        }
-        SessionMessage::Custom { content, .. } => chars = content.len(),
+        SessionMessage::Assistant { message } => estimate_content_blocks_chars(&message.content),
+        SessionMessage::ToolResult { content, .. } => estimate_content_blocks_chars(content),
+        SessionMessage::Custom { content, .. } => content.len(),
         SessionMessage::BashExecution {
             command, output, ..
-        } => chars = command.len().saturating_add(output.len()),
+        } => command.len().saturating_add(output.len()),
         SessionMessage::BranchSummary { summary, .. }
-        | SessionMessage::CompactionSummary { summary, .. } => chars = summary.len(),
-    }
+        | SessionMessage::CompactionSummary { summary, .. } => summary.len(),
+    };
 
+    estimate_chars_as_tokens(chars)
+}
+
+/// Estimate token count for the provider message produced during session replay.
+///
+/// The replay conversion can replace a persisted message's content (for example,
+/// summaries and bash executions), so estimating the original session variant
+/// would not measure the context that is actually sent to the provider.
+fn estimate_model_message_tokens(message: &Message) -> u64 {
+    let chars = match message {
+        Message::User(message) => match &message.content {
+            UserContent::Text(text) => text.len(),
+            UserContent::Blocks(blocks) => estimate_content_blocks_chars(blocks),
+        },
+        Message::Assistant(message) => estimate_content_blocks_chars(&message.content),
+        Message::ToolResult(message) => estimate_content_blocks_chars(&message.content),
+        Message::Custom(message) => message.content.len(),
+    };
+
+    estimate_chars_as_tokens(chars)
+}
+
+fn estimate_content_blocks_chars(blocks: &[ContentBlock]) -> usize {
+    let mut chars: usize = 0;
+    for block in blocks {
+        match block {
+            ContentBlock::Text(text) => {
+                chars = chars.saturating_add(text.text.len());
+            }
+            ContentBlock::Image(_) => {
+                chars = chars.saturating_add(IMAGE_CHAR_ESTIMATE);
+            }
+            ContentBlock::Thinking(thinking) => {
+                chars = chars.saturating_add(thinking.thinking.len());
+            }
+            ContentBlock::ToolCall(call) => {
+                chars = chars.saturating_add(call.name.len());
+                chars = chars.saturating_add(json_byte_len(&call.arguments));
+            }
+            // Opaque marker — the data field is never replayed to a model
+            // (see `convert_content_block_to_anthropic`), so it contributes
+            // zero context tokens.
+            ContentBlock::RedactedThinking(_) => {}
+        }
+    }
+    chars
+}
+
+fn estimate_chars_as_tokens(chars: usize) -> u64 {
     u64::try_from(chars.div_ceil(CHARS_PER_TOKEN_ESTIMATE)).unwrap_or(u64::MAX)
 }
 
@@ -918,8 +905,7 @@ pub fn estimate_tokens(message: &SessionMessage) -> u64 {
 /// Useful for callers (e.g. RPC clients) that have raw text rather than
 /// structured [`SessionMessage`] values.
 pub fn estimate_text_tokens(text: &str) -> u64 {
-    let chars = text.len();
-    u64::try_from(chars.div_ceil(CHARS_PER_TOKEN_ESTIMATE)).unwrap_or(u64::MAX)
+    estimate_chars_as_tokens(text.len())
 }
 
 // =============================================================================
@@ -960,14 +946,13 @@ fn estimate_replayed_entry_tokens(entry: &SessionEntry) -> u64 {
         return 0;
     };
 
-    // Match the provider-context replay filter before estimating the original
-    // session message. In particular, BashExecution entries marked
-    // `excludeFromContext` must not contribute to the estimate.
-    if session_message_to_model(&message).is_none() {
+    // Estimate the converted provider message, not the persisted session
+    // variant. This preserves replay-specific formatting such as summary
+    // wrappers and the rendered bash execution text.
+    let Some(model_message) = session_message_to_model(&message) else {
         return 0;
-    }
-
-    estimate_tokens(&message)
+    };
+    estimate_model_message_tokens(&model_message)
 }
 
 /// Estimate the provider context after a compaction entry has been appended.
@@ -1002,7 +987,10 @@ pub(crate) fn estimate_post_compaction_context_tokens(entries: &[&SessionEntry])
         summary: compaction.summary.clone(),
         tokens_before: compaction.tokens_before,
     };
-    let summary_tokens = estimate_tokens(&summary_message);
+    let summary_tokens = estimate_model_message_tokens(
+        &session_message_to_model(&summary_message)
+            .expect("compaction summaries are always replayable provider messages"),
+    );
 
     let replay_start = entries
         .iter()
@@ -2680,10 +2668,39 @@ mod tests {
         ];
         let path_entries = entries.iter().collect::<Vec<_>>();
 
-        // Only the compaction summary (7 chars => 3 tokens), the kept user
-        // message (4 chars => 2 tokens), and the retained assistant message
-        // (2 chars => 1 token) are replayed.
-        assert_eq!(estimate_post_compaction_context_tokens(&path_entries), 6);
+        // The compaction summary is replayed as its provider-formatted text
+        // (114 chars => 38 tokens), followed by "keep" (2) and "go" (1).
+        assert_eq!(estimate_post_compaction_context_tokens(&path_entries), 41);
+    }
+
+    #[test]
+    fn estimate_post_compaction_uses_replayed_summary_branch_and_bash_text() {
+        let entries = [
+            compact_entry("compaction", "summary", 999),
+            branch_entry("kept", "branch summary text"),
+            bash_entry("bash"),
+        ];
+        let path_entries = entries.iter().collect::<Vec<_>>();
+
+        // Replay wraps summaries in provider-facing markers and renders bash
+        // execution as "Ran `ls`\\n```\\nok\\n```" before estimating:
+        // compaction (114 chars => 38), branch (118 => 40), bash (19 => 7).
+        assert_eq!(estimate_post_compaction_context_tokens(&path_entries), 85);
+    }
+
+    #[test]
+    fn estimate_post_compaction_excludes_bash_marked_exclude_from_context() {
+        let mut excluded_bash = bash_entry("excluded");
+        if let SessionEntry::Message(message_entry) = &mut excluded_bash {
+            if let SessionMessage::BashExecution { extra, .. } = &mut message_entry.message {
+                extra.insert("excludeFromContext".to_string(), Value::Bool(true));
+            }
+        }
+        let entries = [compact_entry("compaction", "s", 999), excluded_bash];
+        let path_entries = entries.iter().collect::<Vec<_>>();
+
+        // The excluded bash execution contributes no replayed provider text.
+        assert_eq!(estimate_post_compaction_context_tokens(&path_entries), 36);
     }
 
     #[test]
@@ -2694,9 +2711,9 @@ mod tests {
         ];
         let path_entries = entries.iter().collect::<Vec<_>>();
 
-        // The summary contributes 1 heuristic token and "hello" contributes
-        // 2; the stale provider usage must not replace that estimate.
-        assert_eq!(estimate_post_compaction_context_tokens(&path_entries), 3);
+        // The summary's provider wrapper contributes 36 heuristic tokens and
+        // "hello" contributes 2; stale provider usage is ignored.
+        assert_eq!(estimate_post_compaction_context_tokens(&path_entries), 38);
     }
 
     #[test]
@@ -2714,8 +2731,8 @@ mod tests {
         let path_entries = entries.iter().collect::<Vec<_>>();
 
         // The missing "kept" ID falls back to entries after the compaction:
-        // summary (3 chars => 1 token) plus "post" (4 chars => 2 tokens).
-        assert_eq!(estimate_post_compaction_context_tokens(&path_entries), 3);
+        // the wrapped summary (110 chars => 37 tokens) plus "post" (4 chars => 2 tokens).
+        assert_eq!(estimate_post_compaction_context_tokens(&path_entries), 39);
     }
 
     // ── extract_file_ops_from_message ────────────────────────────────
