@@ -9076,14 +9076,11 @@ impl AgentSession {
             }
 
             if let Some(compaction) = before_outcome.compaction {
-                let result_value = Some(Self::auto_compaction_result_payload(
-                    compaction.summary.clone(),
-                    compaction.first_kept_entry_id.clone(),
-                    compaction.tokens_before,
-                    compaction.details.clone(),
-                ));
                 self.extensions_is_compacting
                     .store(true, std::sync::atomic::Ordering::SeqCst);
+                let summary = compaction.summary.clone();
+                let first_kept_entry_id = compaction.first_kept_entry_id.clone();
+                let details = compaction.details.clone();
                 let apply_result = self
                     .apply_compaction_entry(
                         compaction.summary,
@@ -9095,7 +9092,14 @@ impl AgentSession {
                     .await;
                 self.extensions_is_compacting
                     .store(false, std::sync::atomic::Ordering::SeqCst);
-                apply_result?;
+                let tokens_after = apply_result?;
+                let result_value = Some(Self::auto_compaction_result_payload(
+                    summary,
+                    first_kept_entry_id,
+                    compaction.tokens_before,
+                    tokens_after,
+                    details,
+                ));
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: result_value,
                     aborted: false,
@@ -9153,6 +9157,7 @@ impl AgentSession {
         summary: String,
         first_kept_entry_id: String,
         tokens_before: u64,
+        tokens_after: u64,
         details: Option<Value>,
     ) -> Value {
         let mut payload = serde_json::Map::new();
@@ -9162,6 +9167,7 @@ impl AgentSession {
             Value::String(first_kept_entry_id),
         );
         payload.insert("tokensBefore".to_string(), Value::from(tokens_before));
+        payload.insert("tokensAfter".to_string(), Value::from(tokens_after));
         if let Some(details) = details {
             payload.insert("details".to_string(), details);
         }
@@ -9175,7 +9181,7 @@ impl AgentSession {
         tokens_before: u64,
         details: Option<Value>,
         from_extension: bool,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let cx = crate::agent_cx::AgentCx::for_request();
         let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
             .await
@@ -9189,6 +9195,10 @@ impl AgentSession {
             details,
             from_hook,
         );
+        let tokens_after = {
+            let entries = session.entries_for_current_path();
+            compaction::estimate_post_compaction_context_tokens(&entries)
+        };
 
         if self.save_enabled {
             session
@@ -9219,7 +9229,7 @@ impl AgentSession {
             }
         }
 
-        Ok(())
+        Ok(tokens_after)
     }
 
     /// Apply a completed compaction result to the session.
@@ -9229,21 +9239,26 @@ impl AgentSession {
         on_event: AgentEventHandler,
     ) -> Result<()> {
         let details = Some(compaction::compaction_details_to_value(&result.details)?);
-        let result_value = Some(Self::auto_compaction_result_payload(
-            result.summary.clone(),
-            result.first_kept_entry_id.clone(),
-            result.tokens_before,
-            details.clone(),
-        ));
+        let summary = result.summary.clone();
+        let first_kept_entry_id = result.first_kept_entry_id.clone();
+        let result_details = details.clone();
 
-        self.apply_compaction_entry(
-            result.summary,
-            result.first_kept_entry_id,
+        let tokens_after = self
+            .apply_compaction_entry(
+                result.summary,
+                result.first_kept_entry_id,
+                result.tokens_before,
+                details,
+                false,
+            )
+            .await?;
+        let result_value = Some(Self::auto_compaction_result_payload(
+            summary,
+            first_kept_entry_id,
             result.tokens_before,
-            details,
-            false,
-        )
-        .await?;
+            tokens_after,
+            result_details,
+        ));
 
         on_event(AgentEvent::AutoCompactionEnd {
             result: result_value,
@@ -9295,14 +9310,11 @@ impl AgentSession {
             }
 
             if let Some(compaction) = before_outcome.compaction {
-                let result_value = Some(Self::auto_compaction_result_payload(
-                    compaction.summary.clone(),
-                    compaction.first_kept_entry_id.clone(),
-                    compaction.tokens_before,
-                    compaction.details.clone(),
-                ));
                 self.extensions_is_compacting
                     .store(true, std::sync::atomic::Ordering::SeqCst);
+                let summary = compaction.summary.clone();
+                let first_kept_entry_id = compaction.first_kept_entry_id.clone();
+                let details = compaction.details.clone();
                 let apply_result = self
                     .apply_compaction_entry(
                         compaction.summary,
@@ -9314,7 +9326,14 @@ impl AgentSession {
                     .await;
                 self.extensions_is_compacting
                     .store(false, std::sync::atomic::Ordering::SeqCst);
-                apply_result?;
+                let tokens_after = apply_result?;
+                let result_value = Some(Self::auto_compaction_result_payload(
+                    summary,
+                    first_kept_entry_id,
+                    compaction.tokens_before,
+                    tokens_after,
+                    details,
+                ));
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: result_value,
                     aborted: false,
@@ -12873,6 +12892,8 @@ mod tests {
             assert_eq!(payload["summary"], "Compacted 10 messages into 2");
             assert_eq!(payload["firstKeptEntryId"], "entry-5");
             assert_eq!(payload["tokensBefore"], 12_000);
+            assert_eq!(payload["tokensAfter"], 45);
+            assert!(payload.get("tokens_after").is_none());
             assert_eq!(payload["details"]["readFiles"], json!(["src/main.rs"]));
             assert_eq!(payload["details"]["modifiedFiles"], json!(["src/agent.rs"]));
         });
