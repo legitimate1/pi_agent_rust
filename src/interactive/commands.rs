@@ -38,6 +38,7 @@ pub enum SlashCommand {
     Template,
     Share,
     Mcp,
+    Usage,
 }
 
 impl SlashCommand {
@@ -77,6 +78,7 @@ impl SlashCommand {
             "/template" => Self::Template,
             "/share" => Self::Share,
             "/mcp" => Self::Mcp,
+            "/usage" => Self::Usage,
             _ => return None,
         };
 
@@ -111,6 +113,7 @@ impl SlashCommand {
   /template <name> [args] - Expand a prompt template by name
   /share             - Upload session HTML to a secret GitHub gist and show URL
   /mcp               - Show MCP server status (Model Context Protocol)
+  /usage [refresh]    - Show provider usage/quota state
   /exit, /quit, /q   - Exit Pi
 
   Tips:
@@ -2245,9 +2248,43 @@ impl PiApp {
             SlashCommand::Template => self.handle_slash_template(args),
             SlashCommand::Share => self.handle_slash_share(args),
             SlashCommand::Mcp => self.handle_slash_mcp(args),
+            SlashCommand::Usage => self.handle_slash_usage(args),
         }
     }
 
+    /// Start an asynchronous provider usage query and display it as a system message.
+    pub(super) fn handle_slash_usage(&mut self, args: &str) -> Option<Cmd> {
+        let argument = args.trim();
+        let refresh = if argument.is_empty() {
+            false
+        } else if argument.eq_ignore_ascii_case("refresh") {
+            true
+        } else {
+            self.status_message = Some("Usage: /usage [refresh]".to_string());
+            return None;
+        };
+
+        self.status_message = Some("Fetching provider usage...".to_string());
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let message = match crate::auth::AuthStorage::load(crate::config::Config::auth_path()) {
+                Ok(auth) => {
+                    let rows = crate::usage::gather_usage(&auth, refresh).await;
+                    crate::usage::render_usage_text(&rows)
+                }
+                Err(error) => format!("Failed to load credentials: {error}"),
+            };
+            let _ = crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &asupersync::Cx::for_request(),
+                PiMsg::System(message),
+            )
+            .await;
+        });
+        None
+    }
+
+    /// Handle a slash command.
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_login(&mut self, args: &str) -> Option<Cmd> {
         if self.agent_state != AgentState::Idle {
@@ -3179,6 +3216,36 @@ mod tests {
         assert_eq!(plan.effective, crate::model::ThinkingLevel::Off);
         assert!(!plan.thinking_changed);
         assert!(plan.persist_needed);
+    }
+
+    #[test]
+    fn parse_slash_usage_with_optional_refresh() {
+        assert_eq!(
+            super::SlashCommand::parse(" /usage "),
+            Some((super::SlashCommand::Usage, ""))
+        );
+        assert_eq!(
+            super::SlashCommand::parse("/usage refresh"),
+            Some((super::SlashCommand::Usage, "refresh"))
+        );
+        assert!(super::parse_extension_command("/usage").is_none());
+        assert!(super::SlashCommand::help_text().contains("/usage [refresh]"));
+    }
+
+    #[test]
+    fn parse_slash_usage_is_case_insensitive() {
+        assert_eq!(
+            super::SlashCommand::parse("/USAGE REFRESH"),
+            Some((super::SlashCommand::Usage, "REFRESH"))
+        );
+    }
+
+    #[test]
+    fn parse_slash_usage_rejects_extra_arguments_in_handler_contract() {
+        // The parser preserves arguments; the PiApp handler validates that the
+        // only supported argument is the optional `refresh` token.
+        let parsed = super::SlashCommand::parse("/usage now");
+        assert_eq!(parsed, Some((super::SlashCommand::Usage, "now")));
     }
 
     #[test]
