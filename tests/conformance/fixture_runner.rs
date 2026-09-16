@@ -392,6 +392,11 @@ fn command_value(command: Option<&Commands>) -> Value {
             "path": path,
             "dry_run": dry_run,
         }),
+        Some(Commands::Usage { format, refresh }) => json!({
+            "name": "usage",
+            "format": format,
+            "refresh": refresh,
+        }),
         None => Value::Null,
     }
 }

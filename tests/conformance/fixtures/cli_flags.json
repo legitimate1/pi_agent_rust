@@ -308,6 +308,19 @@
       }
     },
     {
+      "name": "subcommand_usage",
+      "input": { "args": ["usage", "--format", "json", "--refresh"] },
+      "expected": {
+        "details_exact": {
+          "command": {
+            "name": "usage",
+            "format": "json",
+            "refresh": true
+          }
+        }
+      }
+    },
+    {
       "name": "file_message_args",
       "input": { "args": ["@a.txt", "hello", "@b.md", "world"] },
       "expected": {
