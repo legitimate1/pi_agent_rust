@@ -948,6 +948,78 @@ fn message_from_entry(entry: &SessionEntry) -> Option<SessionMessage> {
     }
 }
 
+fn estimate_replayed_entry_tokens(entry: &SessionEntry) -> u64 {
+    if !matches!(
+        entry,
+        SessionEntry::Message(_) | SessionEntry::BranchSummary(_)
+    ) {
+        return 0;
+    }
+
+    let Some(message) = message_from_entry(entry) else {
+        return 0;
+    };
+
+    // Match the provider-context replay filter before estimating the original
+    // session message. In particular, BashExecution entries marked
+    // `excludeFromContext` must not contribute to the estimate.
+    if session_message_to_model(&message).is_none() {
+        return 0;
+    }
+
+    estimate_tokens(&message)
+}
+
+/// Estimate the provider context after a compaction entry has been appended.
+///
+/// The input must be the chronological current-path entries, such as the
+/// result of [`Session::entries_for_current_path`](crate::session::Session::entries_for_current_path).
+/// This mirrors [`Session::to_messages_for_current_path`](crate::session::Session::to_messages_for_current_path):
+/// the latest compaction contributes one summary, then replay starts at its
+/// `first_kept_entry_id`, or at the first entry after that compaction when the
+/// referenced entry is missing.
+///
+/// Provider-reported usage on retained assistant messages is intentionally
+/// ignored; every replayed session message uses the local heuristic instead.
+pub(crate) fn estimate_post_compaction_context_tokens(entries: &[&SessionEntry]) -> u64 {
+    let latest_compaction =
+        entries
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, entry)| match *entry {
+                SessionEntry::Compaction(compaction) => Some((index, compaction)),
+                _ => None,
+            });
+
+    let Some((compaction_index, compaction)) = latest_compaction else {
+        return entries.iter().fold(0u64, |total, entry| {
+            total.saturating_add(estimate_replayed_entry_tokens(entry))
+        });
+    };
+
+    let summary_message = SessionMessage::CompactionSummary {
+        summary: compaction.summary.clone(),
+        tokens_before: compaction.tokens_before,
+    };
+    let summary_tokens = estimate_tokens(&summary_message);
+
+    let replay_start = entries
+        .iter()
+        .position(|entry| {
+            entry
+                .base_id()
+                .is_some_and(|id| id == &compaction.first_kept_entry_id)
+        })
+        .unwrap_or(compaction_index + 1);
+
+    entries[replay_start..]
+        .iter()
+        .fold(summary_tokens, |total, entry| {
+            total.saturating_add(estimate_replayed_entry_tokens(entry))
+        })
+}
+
 const fn entry_is_message_like(entry: &SessionEntry) -> bool {
     matches!(
         entry,
@@ -2595,6 +2667,55 @@ mod tests {
         // "hi" => 1, "hello" => 2, "bye" => 1.
         assert_eq!(estimate.tokens, 4);
         assert!(estimate.last_usage_index.is_none());
+    }
+
+    #[test]
+    fn estimate_post_compaction_excludes_old_history() {
+        let entries = [
+            user_entry("old", "old history that was compacted"),
+            assistant_entry("old-assistant", "old assistant response", 1, 1),
+            compact_entry("compaction", "summary", 999),
+            user_entry("kept", "keep"),
+            assistant_entry("after", "go", u64::MAX, 0),
+        ];
+        let path_entries = entries.iter().collect::<Vec<_>>();
+
+        // Only the compaction summary (7 chars => 3 tokens), the kept user
+        // message (4 chars => 2 tokens), and the retained assistant message
+        // (2 chars => 1 token) are replayed.
+        assert_eq!(estimate_post_compaction_context_tokens(&path_entries), 6);
+    }
+
+    #[test]
+    fn estimate_post_compaction_ignores_retained_assistant_usage() {
+        let entries = [
+            compact_entry("compaction", "s", 999),
+            assistant_entry("kept", "hello", u64::MAX, 0),
+        ];
+        let path_entries = entries.iter().collect::<Vec<_>>();
+
+        // The summary contributes 1 heuristic token and "hello" contributes
+        // 2; the stale provider usage must not replace that estimate.
+        assert_eq!(estimate_post_compaction_context_tokens(&path_entries), 3);
+    }
+
+    #[test]
+    fn estimate_post_compaction_missing_first_kept_uses_post_compaction_fallback() {
+        let entries = [
+            user_entry("old", "old history"),
+            compact_entry("compaction", "sum", 999),
+            SessionEntry::ModelChange(ModelChangeEntry {
+                base: test_base("metadata"),
+                provider: "provider".to_string(),
+                model_id: "model".to_string(),
+            }),
+            user_entry("post-compaction", "post"),
+        ];
+        let path_entries = entries.iter().collect::<Vec<_>>();
+
+        // The missing "kept" ID falls back to entries after the compaction:
+        // summary (3 chars => 1 token) plus "post" (4 chars => 2 tokens).
+        assert_eq!(estimate_post_compaction_context_tokens(&path_entries), 3);
     }
 
     // ── extract_file_ops_from_message ────────────────────────────────
