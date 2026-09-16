@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 
 use crate::auth::AuthStorage;
 use crate::error::{Error, Result};
@@ -88,8 +89,28 @@ pub trait UsageReader: Send + Sync {
     /// Return the canonical provider identifier.
     fn provider(&self) -> &'static str;
 
+    /// Return the private cache identity for this credential/account.
+    ///
+    /// Built-in readers override this with a one-way identity. The provider-only
+    /// default keeps existing external reader implementations source-compatible;
+    /// such readers should override this method before enabling account-scoped
+    /// caching.
+    fn cache_identity(&self) -> String {
+        self.provider().to_string()
+    }
+
     /// Fetch and normalize one provider reading.
     async fn fetch(&self, client: &Client) -> Result<ProviderUsage>;
+}
+
+fn credential_cache_identity(provider: &str, credential: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"pi-usage-cache-v1");
+    digest.update([0]);
+    digest.update(provider.as_bytes());
+    digest.update([0]);
+    digest.update(credential.as_bytes());
+    format!("{provider}:{:x}", digest.finalize())
 }
 
 /// Reads OpenRouter purchased and consumed credits from `/api/v1/credits`.
@@ -116,6 +137,10 @@ impl OpenRouterUsageReader {
 impl UsageReader for OpenRouterUsageReader {
     fn provider(&self) -> &'static str {
         "openrouter"
+    }
+
+    fn cache_identity(&self) -> String {
+        credential_cache_identity(self.provider(), &self.api_key)
     }
 
     async fn fetch(&self, client: &Client) -> Result<ProviderUsage> {
@@ -169,6 +194,10 @@ impl MoonshotUsageReader {
 impl UsageReader for MoonshotUsageReader {
     fn provider(&self) -> &'static str {
         "moonshotai"
+    }
+
+    fn cache_identity(&self) -> String {
+        credential_cache_identity(self.provider(), &self.api_key)
     }
 
     async fn fetch(&self, client: &Client) -> Result<ProviderUsage> {
@@ -234,6 +263,10 @@ impl CopilotUsageReader {
 impl UsageReader for CopilotUsageReader {
     fn provider(&self) -> &'static str {
         "github-copilot"
+    }
+
+    fn cache_identity(&self) -> String {
+        credential_cache_identity(self.provider(), &self.github_token)
     }
 
     async fn fetch(&self, client: &Client) -> Result<ProviderUsage> {
@@ -333,25 +366,25 @@ pub fn readers_from_auth(auth: &AuthStorage) -> ConfiguredReaders {
 type CachedUsage = (Instant, ProviderUsage);
 static USAGE_CACHE: Mutex<Option<HashMap<String, CachedUsage>>> = Mutex::new(None);
 
-fn cache_get(provider: &str, max_age: Duration) -> Option<(Duration, ProviderUsage)> {
+fn cache_get(cache_identity: &str, max_age: Duration) -> Option<(Duration, ProviderUsage)> {
     let guard = match USAGE_CACHE.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
     let cache = guard.as_ref()?;
-    let (stored_at, usage) = cache.get(provider)?;
+    let (stored_at, usage) = cache.get(cache_identity)?;
     let age = stored_at.elapsed();
     (age <= max_age).then(|| (age, usage.clone()))
 }
 
-fn cache_put(provider: &str, usage: &ProviderUsage) {
+fn cache_put(cache_identity: &str, usage: &ProviderUsage) {
     let mut guard = match USAGE_CACHE.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
     guard
         .get_or_insert_with(HashMap::new)
-        .insert(provider.to_string(), (Instant::now(), usage.clone()));
+        .insert(cache_identity.to_string(), (Instant::now(), usage.clone()));
 }
 
 /// Gather usage for every provider with a supported or documented endpoint.
@@ -374,7 +407,8 @@ async fn gather_usage_from_readers(
 
     for reader in readers {
         let provider = reader.provider().to_string();
-        if !refresh && let Some((age, mut usage)) = cache_get(&provider, USAGE_CACHE_TTL) {
+        let cache_identity = reader.cache_identity();
+        if !refresh && let Some((age, mut usage)) = cache_get(&cache_identity, USAGE_CACHE_TTL) {
             usage.cache_age_secs = Some(age.as_secs());
             rows.push(UsageStatus::Ready(usage));
             continue;
@@ -388,12 +422,17 @@ async fn gather_usage_from_readers(
         .await;
         match fetched {
             Ok(Ok(usage)) => {
-                cache_put(&provider, &usage);
+                cache_put(&cache_identity, &usage);
                 rows.push(UsageStatus::Ready(usage));
             }
-            Ok(Err(error)) => rows.push(stale_or_error(&provider, &error.to_string())),
+            Ok(Err(error)) => rows.push(stale_or_error(
+                &provider,
+                &cache_identity,
+                &error.to_string(),
+            )),
             Err(_) => rows.push(stale_or_error(
                 &provider,
+                &cache_identity,
                 &format!("timed out after {}s", USAGE_FETCH_TIMEOUT.as_secs()),
             )),
         }
@@ -407,8 +446,8 @@ async fn gather_usage_from_readers(
     rows
 }
 
-fn stale_or_error(provider: &str, error: &str) -> UsageStatus {
-    cache_get(provider, Duration::MAX).map_or_else(
+fn stale_or_error(provider: &str, cache_identity: &str, error: &str) -> UsageStatus {
+    cache_get(cache_identity, Duration::MAX).map_or_else(
         || UsageStatus::Error {
             provider: provider.to_string(),
             error: error.to_string(),
@@ -575,6 +614,8 @@ mod tests {
 
     struct TestReader {
         provider: &'static str,
+        identity: String,
+        value: f64,
         calls: Arc<AtomicUsize>,
         should_fail: Arc<AtomicBool>,
     }
@@ -585,6 +626,10 @@ mod tests {
             self.provider
         }
 
+        fn cache_identity(&self) -> String {
+            self.identity.clone()
+        }
+
         async fn fetch(&self, _client: &Client) -> Result<ProviderUsage> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.should_fail.load(Ordering::SeqCst) {
@@ -593,9 +638,9 @@ mod tests {
             Ok(ProviderUsage {
                 provider: self.provider.to_string(),
                 plan: None,
-                used: Some(1.0),
-                limit: Some(2.0),
-                remaining: Some(1.0),
+                used: Some(self.value),
+                limit: Some(100.0),
+                remaining: Some(100.0 - self.value),
                 unit: Some("test units".to_string()),
                 resets_at: None,
                 detail: None,
@@ -606,12 +651,18 @@ mod tests {
         }
     }
 
-    fn test_reader(provider: &'static str) -> (TestReader, Arc<AtomicUsize>, Arc<AtomicBool>) {
+    fn test_reader(
+        provider: &'static str,
+        identity: &str,
+        value: f64,
+    ) -> (TestReader, Arc<AtomicUsize>, Arc<AtomicBool>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let should_fail = Arc::new(AtomicBool::new(false));
         (
             TestReader {
                 provider,
+                identity: identity.to_string(),
+                value,
                 calls: Arc::clone(&calls),
                 should_fail: Arc::clone(&should_fail),
             },
@@ -647,8 +698,20 @@ mod tests {
     }
 
     #[test]
+    fn built_in_cache_identity_is_one_way_and_account_scoped() {
+        let first = OpenRouterUsageReader::new("first-secret".to_string());
+        let second = OpenRouterUsageReader::new("second-secret".to_string());
+        let first_identity = first.cache_identity();
+        let second_identity = second.cache_identity();
+        assert_ne!(first_identity, second_identity);
+        assert!(first_identity.starts_with("openrouter:"));
+        assert!(!first_identity.contains("first-secret"));
+        assert!(!second_identity.contains("second-secret"));
+    }
+
+    #[test]
     fn gather_uses_cache_refresh_and_stale_fallback() {
-        let (reader, calls, should_fail) = test_reader("test-cache-refresh");
+        let (reader, calls, _) = test_reader("test-cache-refresh", "account-a", 1.0);
         let first = run_async(gather_usage_from_readers(
             vec![Box::new(reader)],
             Vec::new(),
@@ -657,7 +720,7 @@ mod tests {
         assert!(matches!(first.as_slice(), [UsageStatus::Ready(_)]));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        let (reader, _, _) = test_reader("test-cache-refresh");
+        let (reader, _, _) = test_reader("test-cache-refresh", "account-a", 1.0);
         let cached = run_async(gather_usage_from_readers(
             vec![Box::new(reader)],
             Vec::new(),
@@ -672,21 +735,24 @@ mod tests {
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        let (reader, _, _) = test_reader("test-cache-refresh");
+        let (reader, refresh_calls, should_fail) =
+            test_reader("test-cache-refresh", "account-a", 2.0);
         let refreshed = run_async(gather_usage_from_readers(
             vec![Box::new(reader)],
             Vec::new(),
             true,
         ));
         assert!(matches!(refreshed.as_slice(), [UsageStatus::Ready(_)]));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
 
         should_fail.store(true, Ordering::SeqCst);
         // The shared failure switch belongs to the first reader; use it in a
         // reader instance so the live failure can exercise the cached row.
         let stale_reader = TestReader {
             provider: "test-cache-refresh",
-            calls: Arc::clone(&calls),
+            identity: "account-a".to_string(),
+            value: 2.0,
+            calls: Arc::clone(&refresh_calls),
             should_fail: Arc::clone(&should_fail),
         };
         let stale = run_async(gather_usage_from_readers(
@@ -702,12 +768,97 @@ mod tests {
                 ..
             })] if detail.contains("live read failed")
         ));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(refresh_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn different_credentials_do_not_share_fresh_or_stale_cache() {
+        let (reader_a, calls_a, _) = test_reader("test-account-isolation", "account-a", 11.0);
+        let rows_a = run_async(gather_usage_from_readers(
+            vec![Box::new(reader_a)],
+            Vec::new(),
+            true,
+        ));
+        assert!(matches!(
+            rows_a.as_slice(),
+            [UsageStatus::Ready(ProviderUsage {
+                used: Some(11.0),
+                ..
+            })]
+        ));
+        assert_eq!(calls_a.load(Ordering::SeqCst), 1);
+
+        let (reader_b, calls_b, should_fail_b) =
+            test_reader("test-account-isolation", "account-b", 22.0);
+        should_fail_b.store(true, Ordering::SeqCst);
+        let rows_b_failed = run_async(gather_usage_from_readers(
+            vec![Box::new(reader_b)],
+            Vec::new(),
+            true,
+        ));
+        assert!(matches!(
+            rows_b_failed.as_slice(),
+            [UsageStatus::Error { provider, .. }]
+                if provider == "test-account-isolation"
+        ));
+        assert_eq!(calls_b.load(Ordering::SeqCst), 1);
+
+        should_fail_b.store(false, Ordering::SeqCst);
+        let reader_b_live = TestReader {
+            provider: "test-account-isolation",
+            identity: "account-b".to_string(),
+            value: 22.0,
+            calls: Arc::clone(&calls_b),
+            should_fail: Arc::clone(&should_fail_b),
+        };
+        let rows_b = run_async(gather_usage_from_readers(
+            vec![Box::new(reader_b_live)],
+            Vec::new(),
+            true,
+        ));
+        assert!(matches!(
+            rows_b.as_slice(),
+            [UsageStatus::Ready(ProviderUsage {
+                used: Some(22.0),
+                ..
+            })]
+        ));
+        assert_eq!(calls_b.load(Ordering::SeqCst), 2);
+
+        should_fail_b.store(true, Ordering::SeqCst);
+        let reader_b_failed = TestReader {
+            provider: "test-account-isolation",
+            identity: "account-b".to_string(),
+            value: 22.0,
+            calls: Arc::clone(&calls_b),
+            should_fail: Arc::clone(&should_fail_b),
+        };
+        let failed_b = run_async(gather_usage_from_readers(
+            vec![Box::new(reader_b_failed)],
+            Vec::new(),
+            true,
+        ));
+        assert!(matches!(
+            failed_b.as_slice(),
+            [UsageStatus::Ready(ProviderUsage {
+                used: Some(22.0),
+                detail: Some(detail),
+                ..
+            })] if detail.contains("live read failed")
+        ));
+        assert!(!matches!(
+            failed_b.as_slice(),
+            [UsageStatus::Ready(ProviderUsage {
+                used: Some(11.0),
+                ..
+            })]
+        ));
+        assert_eq!(calls_b.load(Ordering::SeqCst), 3);
     }
 
     #[test]
     fn gather_reports_error_without_cached_row() {
-        let (reader, _, should_fail) = test_reader("test-no-cache-error");
+        let (reader, _, should_fail) = test_reader("test-no-cache-error", "account-error", 1.0);
         should_fail.store(true, Ordering::SeqCst);
         let rows = run_async(gather_usage_from_readers(
             vec![Box::new(reader)],

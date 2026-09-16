@@ -2351,6 +2351,23 @@ mod stream_delta_batcher_tests {
         app
     }
 
+    #[test]
+    fn system_note_does_not_change_processing_state() {
+        let mut app = build_test_app();
+        app.agent_state = AgentState::Processing;
+        let message_count = app.messages.len();
+
+        let result = app.handle_pi_message(PiMsg::SystemNote("usage result".to_string()));
+
+        assert!(result.is_none());
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert_eq!(app.messages.len(), message_count + 1);
+        assert_eq!(
+            app.messages.last().map(|message| message.content.as_str()),
+            Some("usage result")
+        );
+    }
+
     fn build_test_extension_manager_with_command_output(
         output: &Value,
     ) -> crate::extensions::ExtensionManager {
