@@ -2267,7 +2267,11 @@ impl PiApp {
         self.status_message = Some("Fetching provider usage...".to_string());
         let event_tx = self.event_tx.clone();
         self.runtime_handle.spawn(async move {
-            let message = match crate::auth::AuthStorage::load(crate::config::Config::auth_path()) {
+            let message = match crate::auth::AuthStorage::load_async(
+                crate::config::Config::auth_path(),
+            )
+            .await
+            {
                 Ok(auth) => {
                     let rows = crate::usage::gather_usage(&auth, refresh).await;
                     crate::usage::render_usage_text(&rows)
@@ -2277,7 +2281,7 @@ impl PiApp {
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
                 &asupersync::Cx::for_request(),
-                PiMsg::System(message),
+                PiMsg::SystemNote(message),
             )
             .await;
         });
