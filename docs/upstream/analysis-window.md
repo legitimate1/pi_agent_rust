@@ -92,7 +92,7 @@ waves/01-fsqlite-session-storage.md
 ```text
 Wave 3：tokensAfter compaction result contract
 固定范围：129cf9fe88598439b4717b17002d6110266c03b3^..129cf9fe88598439b4717b17002d6110266c03b3
-状态：已完成只读分析，等待用户决定是否进入实现设计
+状态：已按 custom 结构实现并完成验证
 ```
 
-Wave 3 仍不改变宏观窗口终点，也不自动吸收当前 `upstream/main` 在 `v0.3.0` 之后的变化。
+Wave 3 未改变宏观窗口终点，也未自动吸收当前 `upstream/main` 在 `v0.3.0` 之后的变化。下一波次需要重新固定上游终点并选择新的独立功能闭包。

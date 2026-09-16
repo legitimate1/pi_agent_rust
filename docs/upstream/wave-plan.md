@@ -9,7 +9,7 @@
 
 波次 02 的 provider usage/quota 已完成语义分析、隔离 cherry-pick 探针、基于 custom 的手动适配和局部回归验证；结论是：不原样 merge 上游提交，保留 custom 结构完成适配，当前实现和局部验证已完成。
 
-波次 03 已完成 `tokensAfter` compaction result contract 的只读分析；结论是：上游新增 compaction 后上下文规模估算并传播到 RPC/SDK，当前 custom 有对应 compaction/RPC/SDK 接入点但缺少 `tokens_after`，推荐进入后续实现决策；同提交中的 grep/search 依赖仍需单独核对，不直接 cherry-pick。
+波次 03 已完成 `tokensAfter` compaction result contract 的分析、custom 手动适配和验证；结论是：不原样 merge 上游提交，保留 custom 依赖与 session schema，按当前 replay/Agent/RPC/SDK 结构实现。相关全量测试中仅有已复跑确认的 Windows PTY/进程终止基线失败，未发现 Wave 3 相关失败。
 
 当前详细记录：
 
@@ -35,29 +35,23 @@
 - 详细文档：`waves/01-fsqlite-session-storage.md`
 - 当前处理：不修改源码，不执行 merge。
 
-### 当前波次
-
-Wave 3 已完成 `tokensAfter` compaction result contract 的只读语义分析；当前未开始源码迁移。推荐先由用户决定是否进入实现设计，再核对同一上游提交中混入的 grep/search 依赖。
-
-当前详细记录：
-
-- `waves/03-compaction-tokens-after.md`
-
-### 已记录波次
-
-#### 01 — fsqlite session storage
-
-- 主题：上游把 `sqlmodel-*` SQLite session 后端替换为 `fsqlite 0.3.4`，并同步改变连接线程、错误、侧车和权限契约。
-- 结论：不直接 merge；暂时冻结为独立的 SQLite 后端迁移议题。
-- 详细文档：`waves/01-fsqlite-session-storage.md`
-- 当前处理：不修改源码，不执行 merge。
-
 #### 02 — provider usage/quota surface
 
 - 主题：上游新增 OpenRouter、Moonshot/Kimi、GitHub Copilot 等 provider 的账户额度/余额查询，并通过 `pi usage` 与 `/usage` 展示。
 - 结论：不原样 merge；已按当前 custom 的认证、HTTP、CLI 和 interactive 边界完成手动适配。
 - 详细文档：`waves/02-provider-usage-quota.md`
-- 当前处理：本地适配和局部验证已完成；真实 provider 网络验证及全量质量门禁尚未执行。
+- 当前处理：本地适配、局部回归和云端 my-check 验证已完成；真实 provider 网络验证仍未执行。
+
+#### 03 — compaction tokensAfter result contract
+
+- 主题：compaction 完成后估算下一次 provider request 的上下文规模，并通过 Agent/RPC/SDK 结果暴露 `tokensAfter`。
+- 结论：不原样 merge；已按 custom 的 replay、Agent、RPC 和 SDK 结构完成手动适配，保留依赖和 session schema 基线。
+- 详细文档：`waves/03-compaction-tokens-after.md`
+- 当前处理：focused 验证通过；全量测试仅有已复跑确认的 Windows PTY/进程终止基线失败。
+
+### 当前波次
+
+当前没有正在执行的源码迁移波次。下一波次需要重新固定上游终点并选择新的独立功能闭包。
 
 ### 后续候选
 

@@ -4,7 +4,7 @@
 
 确认上游 `S..v0.3.0` 中 `tokensAfter` compaction 结果变化是否构成可以独立解释和验证的功能闭包，并核对当前 `custom` 的对应接入点。
 
-本波次完成只读语义分析，不执行源码移植、merge 或 cherry-pick。是否进入实现，等待用户决定。
+本波次已完成只读语义分析，并在用户确认后按当前 `custom` 结构完成手动适配和验证。未执行整段上游 merge 或 cherry-pick。
 
 ## 分析边界
 
@@ -36,7 +36,7 @@ Wave 1 的 fsqlite session storage 和 Wave 2 的 provider usage/quota 已排除
 
 ## 一句话结论
 
-上游新增的是**compaction 完成后下一次上下文规模的结果契约**：在 compaction 后估算 `tokensAfter`，并将其传播到 RPC/SDK 的 compaction result payload。当前 `custom` 已有 compaction 结果、RPC compact 路径和 SDK 结果类型，但只保留 `tokens_before`；因此该主题具备独立的低风险候选闭包，推荐作为 Wave 3 继续进行实现决策。不过，上游提交同时带入了若干 grep/search 依赖，是否属于该功能仍未确认，不能原样 cherry-pick。
+上游新增的是**compaction 完成后下一次上下文规模的结果契约**：在 compaction 后估算 `tokensAfter`，并将其传播到 Agent/RPC/SDK 的 compaction result payload。当前 `custom` 已按自身 session replay、Agent、RPC 和 SDK 边界完成手动适配；保留当前依赖基线和 session 持久化 schema，不原样 cherry-pick 上游提交。
 
 ## 上游最终变化
 
@@ -85,42 +85,48 @@ grep-searcher
 ```text
 compaction 后上下文估算
     ↓
-CompactionResult 增加 tokens_after
-    ↓
-RPC compact result 传播
+Agent/RPC 成功结果传播
     ↓
 SDK RpcCompactionResult 序列化/反序列化
     ↓
 旧 payload 默认值兼容
     ↓
-focused compaction / SDK 单元测试
+focused compaction / Agent / RPC / SDK 测试
 ```
 
-该闭包不要求同时迁移 provider streaming、session backend、interactive UI、Agent turn recovery 或完整 RPC 协议。
+本波次采用 wire-only 方案，不把 `tokens_after` 加入 `CompactionResult` 或 session entry。该闭包可以单独解释为“报告 compaction 后下一次 provider request 的上下文规模”，不要求同时迁移 provider streaming、session backend、interactive UI、Agent turn recovery 或完整 RPC 协议。
 
 ## 当前 custom 的对应实现
 
-当前 `custom` 已有可直接对照的 compaction 结构：
+Wave 3 已按当前 `custom` 结构完成实现，核心提交为：
+
+```text
+c73154c0d feat: add post-compaction token estimator
+53753e629 fix: align post-compaction token estimation
+93bc41e14 feat: expose tokensAfter in RPC compaction results
+a0ff33cd3 feat: add tokensAfter to SDK compaction result
+1fcca8dfa test: cover Agent tokensAfter payload
+5fffd7162 test: cover RPC tokensAfter payload
+```
+
+实际实现文件：
 
 ```text
 src/compaction.rs
-  CompactionResult 当前包含 tokens_before，但没有 tokens_after
-
+src/agent.rs
 src/rpc.rs
-  compact result 当前主要传播 tokensBefore
-
 src/sdk.rs
-  RpcCompactionResult 当前没有 tokens_after
+tests/sdk_unit.rs
 ```
 
-依据当前 `custom` 工作树的定位：
+实现边界：
 
-- `src/compaction.rs:100-106`：`CompactionResult` 的现有字段；
-- `src/compaction.rs:774-817`：当前上下文估算路径；
-- `src/rpc.rs:1985-1990`、`src/rpc.rs:4676-4680`：RPC compact result 的现有输出路径；
-- `src/sdk.rs:589-597`：`RpcCompactionResult` 的现有 SDK 类型。
-
-这些位置说明当前不是完全没有 compaction result，而是缺少 post-compaction estimate 的结果字段和跨边界传播。
+- `src/compaction.rs` 按实际 provider replay 后的消息内容估算 tokensAfter，复用现有 chars/3 heuristic；summary、branch summary、bash execution 使用 replay 转换后的文本，`excludeFromContext` 和 stale assistant usage 按既有语义处理；
+- Agent normal、synchronous 和 extension hook compaction 成功结果均在 append 后生成 `tokensAfter`；
+- RPC 手动 `compact` 和 auto-compaction 成功结果均输出 `tokensAfter`；
+- SDK `RpcCompactionResult` 增加 `tokens_after`，通过 camelCase 映射为 `tokensAfter`，旧 payload 缺失字段时默认 `0`；
+- 不修改 `CompactionResult` 的 pre-apply 生命周期，不修改 `CompactionEntry`、session JSONL schema、`Cargo.toml` 或 `Cargo.lock`；
+- 未引入上游同提交中与搜索后端相关的 `globset`、`grep-regex`、`grep-searcher` 依赖。
 
 ## 语义差异与适配边界
 
@@ -170,12 +176,21 @@ src/sdk.rs
 ## 处理结论
 
 ```text
-Wave 3 只读分析完成。
-推荐：进入 tokensAfter 的实现设计/实现决策。
-当前：未移植、未 merge、未 cherry-pick，等待用户确认。
+Wave 3 已实现并完成验证。
+处理方式：按 custom 结构手动适配，不执行整段上游 merge 或 cherry-pick。
+依赖：保留 custom Cargo.toml/Cargo.lock 基线，未引入搜索依赖。
 ```
 
-如果用户确认实现，下一阶段应先处理依赖因果和 custom 协议差异，再建立最小实现计划；不应直接执行：
+本波次实际落地：
+
+- 新增与 `Session::to_messages_for_current_path()` 转换结果一致的 post-compaction token estimator；
+- Agent normal、synchronous 和 extension hook compaction 成功结果增加 `tokensAfter`；
+- RPC 手动 `compact` 和 auto-compaction 成功结果增加 `tokensAfter`；
+- SDK `RpcCompactionResult` 增加 `tokens_after`，旧 payload 缺失字段时默认 `0`；
+- 保持 `CompactionResult` 的 pre-apply 生命周期、`CompactionEntry` 和 session JSONL schema 不变；
+- 未采纳上游同提交中与 in-process grep/find 相关的依赖变化。
+
+不执行：
 
 ```text
 git cherry-pick 129cf9fe...
@@ -207,15 +222,59 @@ compaction estimate
 - 固定 `S..v0.3.0` 对象复核；
 - 宏观净变化和 first-parent 里程碑调查；
 - Wave 1/2 排除；
-- tokensAfter 候选范围、路径和 custom 接入点调查。
+- tokensAfter 候选范围、路径和 custom 接入点调查；
+- custom 结构手动实现；
+- estimator、Agent、RPC、SDK 的 focused 测试；
+- 收尾质量门禁。
 
-本波次未执行：
+### 已通过验证
 
-- 源码修改；
-- merge 或 cherry-pick；
+以下命令均通过，并通过 Windows `pwsh` 执行：
+
+```text
+cargo check --lib
+cargo clippy --lib -- -D warnings
+cargo fmt --check
+cargo test --lib compaction::tests
+  97 passed
+cargo test --lib apply_compaction_result_emits_structured_result_payload
+  1 passed
+cargo test --lib rpc_compact_success_payload_contains_tokens_after
+  1 passed
+cargo test --lib rpc_auto_compaction_success_event_contains_tokens_after
+  1 passed
+cargo test --test sdk_unit rpc_compaction_result_serde
+  1 passed
+cargo test --test compaction
+  139 passed
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
+
+### 全量测试结果
+
+全量 `cargo test` 共通过 6475 个测试，1 个 ignored，另有 5 个失败。5 个失败随后逐个以 `cargo test --lib <name> -- --exact` 复跑，均稳定复现，且与本波次修改文件无交集：
+
+```text
+jobs::tests::cancel_kills_running_job
+  Windows 进程终止升级测试未观察到 KILL escalation
+
+hub::tests::logs_cursor_advances_incrementally
+hub::tests::send_text_drives_repl
+hub::tests::status_stays_running_for_live_repl
+  Windows PTY readiness 失败，日志尾部为 ESC [6n 终端探测序列
+
+hub::tests::restart_after_completion_works
+  Windows PTY 子进程状态/退出码观察失败
+```
+
+这些失败属于当前 Windows 环境或既有基线行为，不是本波次新增失败；本波次未修改 `src/jobs.rs` 或 `src/hub.rs`，也未为此扩大处理范围。
+
+### 未执行
+
 - provider/compaction 真实网络验证；
-- cargo 测试、clippy、fmt；
-- release 构建或部署。
+- release 构建或部署；
+- `release-max` 构建。
 
 ## 证据入口
 
@@ -232,7 +291,15 @@ compaction estimate
 ## 状态
 
 ```text
-status: analysis-complete
-requires_user_decision: true
-implementation_started: false
+status: implemented
+requires_user_decision: false
+implementation_started: true
+implementation_commits:
+  - c73154c0d
+  - 53753e629
+  - 93bc41e14
+  - a0ff33cd3
+  - 1fcca8dfa
+  - 5fffd7162
+closeout: focused-pass-full-test-baseline-failures
 ```

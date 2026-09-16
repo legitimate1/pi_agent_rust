@@ -152,6 +152,8 @@ CLI --tools read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit,s
 - 触发：每 agent turn 后，估算 token 超 `context_window - reserve_tokens`
 - Cut point：优先完整 user-assistant turn 边界；被迫中途切时包含前缀消息保上下文连贯
 - 手动触发：`/compact`（交互）或 RPC `compact`
+- 结果传播：compaction 写入 session 后，Agent 和 RPC 结果携带下一次 provider request 的上下文 token 预估；SDK 将该字段映射为 `tokens_after`
+- 边界：该预估沿用本地启发式，不写入 Compaction entry，不替代 provider usage 或账户 quota
 
 ## 会话索引 + Sidecar 存储
 
