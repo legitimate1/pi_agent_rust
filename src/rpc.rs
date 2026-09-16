@@ -1966,7 +1966,7 @@ pub async fn run(
 
                     let details_value = compaction_details_to_value(&result_data.details)?;
 
-                    let messages = {
+                    let (messages, tokens_after) = {
                         let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
                             Error::session(format!("inner session lock failed: {err}"))
                         })?;
@@ -1977,7 +1977,11 @@ pub async fn run(
                             Some(details_value.clone()),
                             None,
                         );
-                        inner_session.to_messages_for_current_path()
+                        let tokens_after =
+                            crate::compaction::estimate_post_compaction_context_tokens(
+                                &inner_session.entries_for_current_path(),
+                            );
+                        (inner_session.to_messages_for_current_path(), tokens_after)
                     };
                     guard.persist_session().await?;
                     guard.agent.replace_messages(messages);
@@ -1986,6 +1990,7 @@ pub async fn run(
                         "summary": result_data.summary,
                         "firstKeptEntryId": result_data.first_kept_entry_id,
                         "tokensBefore": result_data.tokens_before,
+                        "tokensAfter": tokens_after,
                         "details": details_value,
                     }))
                 }
@@ -4655,7 +4660,7 @@ async fn maybe_auto_compact(
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), cx.cx()).await else {
                 return;
             };
-            let messages = {
+            let (messages, tokens_after) = {
                 let Ok(mut inner_session) = guard.session.lock(cx.cx()).await else {
                     return;
                 };
@@ -4666,7 +4671,10 @@ async fn maybe_auto_compact(
                     Some(details_value.clone()),
                     None,
                 );
-                inner_session.to_messages_for_current_path()
+                let tokens_after = crate::compaction::estimate_post_compaction_context_tokens(
+                    &inner_session.entries_for_current_path(),
+                );
+                (inner_session.to_messages_for_current_path(), tokens_after)
             };
             let _ = guard.persist_session().await;
             guard.agent.replace_messages(messages);
@@ -4677,6 +4685,7 @@ async fn maybe_auto_compact(
                     "summary": result.summary,
                     "firstKeptEntryId": result.first_kept_entry_id,
                     "tokensBefore": result.tokens_before,
+                    "tokensAfter": tokens_after,
                     "details": details_value,
                 })),
                 aborted: false,
