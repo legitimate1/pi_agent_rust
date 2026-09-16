@@ -70,6 +70,7 @@ const ROOT_SUBCOMMANDS: &[&str] = &[
     "config",
     "doctor",
     "migrate",
+    "usage",
 ];
 
 fn known_long_option(name: &str) -> Option<LongOptionSpec> {
@@ -818,6 +819,32 @@ mod tests {
     }
 
     // ── 4. Subcommand parsing ────────────────────────────────────────
+
+    #[test]
+    fn parse_usage_subcommand_defaults_to_text_without_refresh() {
+        let cli = Cli::parse_from(["pi", "usage"]);
+        let Some(Commands::Usage { format, refresh }) = cli.command else {
+            panic!("expected usage command");
+        };
+        assert_eq!(format, "text");
+        assert!(!refresh);
+    }
+
+    #[test]
+    fn parse_usage_subcommand_accepts_json_and_refresh() {
+        let cli = Cli::parse_from(["pi", "usage", "--format", "json", "--refresh"]);
+        let Some(Commands::Usage { format, refresh }) = cli.command else {
+            panic!("expected usage command");
+        };
+        assert_eq!(format, "json");
+        assert!(refresh);
+    }
+
+    #[test]
+    fn parse_usage_subcommand_rejects_unknown_format() {
+        let result = Cli::try_parse_from(["pi", "usage", "--format", "yaml"]);
+        assert!(result.is_err());
+    }
 
     #[test]
     fn parse_install_subcommand() -> Result<(), String> {
@@ -2044,6 +2071,16 @@ pub enum Commands {
         /// Run specific categories: config,dirs,auth,shell,sessions,swarm,extensions
         #[arg(long)]
         only: Option<String>,
+    },
+
+    /// Show provider usage/quota state
+    Usage {
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+        /// Force live reads and skip the 60-second cache
+        #[arg(long)]
+        refresh: bool,
     },
 
     /// Migrate session files from JSONL v1 to v2 segment format
