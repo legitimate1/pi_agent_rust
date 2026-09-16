@@ -9,10 +9,13 @@
 
 波次 02 的 provider usage/quota 已完成语义分析、隔离 cherry-pick 探针、基于 custom 的手动适配和局部回归验证；结论是：不原样 merge 上游提交，保留 custom 结构完成适配，当前实现和局部验证已完成。
 
+波次 03 已完成 `tokensAfter` compaction result contract 的只读分析；结论是：上游新增 compaction 后上下文规模估算并传播到 RPC/SDK，当前 custom 有对应 compaction/RPC/SDK 接入点但缺少 `tokens_after`，推荐进入后续实现决策；同提交中的 grep/search 依赖仍需单独核对，不直接 cherry-pick。
+
 当前详细记录：
 
 - `waves/01-fsqlite-session-storage.md`
 - `waves/02-provider-usage-quota.md`
+- `waves/03-compaction-tokens-after.md`
 
 当前窗口边界：
 
@@ -34,11 +37,11 @@
 
 ### 当前波次
 
-Wave 2 已完成 provider usage/quota 的手动适配和局部验证；当前没有正在执行的源码迁移波次。下一步应选择新的候选主题，或根据需要另立 SQLite 后端迁移设计。
+Wave 3 已完成 `tokensAfter` compaction result contract 的只读语义分析；当前未开始源码迁移。推荐先由用户决定是否进入实现设计，再核对同一上游提交中混入的 grep/search 依赖。
 
 当前详细记录：
 
-- `waves/02-provider-usage-quota.md`
+- `waves/03-compaction-tokens-after.md`
 
 ### 已记录波次
 

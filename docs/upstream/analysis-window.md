@@ -1,7 +1,7 @@
 # 上游分析窗口
 
 > 本文定义当前上游研究窗口的边界，不表示已经把分析终点合入 `custom`。
-> 更新日期：2026-09-15
+> 更新日期：2026-09-16
 
 ## 当前窗口
 
@@ -36,14 +36,20 @@ T1 用途：分析 fsqlite session storage 后端替换闭包
 
 ## 当前引用快照
 
-本次波次分析使用的本地引用快照：
+本次 Wave 3 候选分析在刷新远程引用后的本地快照：
 
 - 当前工作分支：`custom`
-- 当前 `custom`：`c31b09abc1b7a085315ca29999646452672ba3a1`
+- 当前 `custom`：`6d65193a628dabe1f3136bd76bc4a9e998f302db`
 - `main`：`195ca9464101c4862607c909951bf9467baf245c`
-- 本地 `upstream/main`：`e403485b3116e6c97e9af7026ec9445f30312c7d`
+- `origin/main`：`fffc80db497ddb755c7af23052c6c553ab598ac4`
+- `origin/custom`：`6d65193a628dabe1f3136bd76bc4a9e998f302db`
+- 刷新后的本地 `upstream/main`：`c32541d0bdf431f7fdfe5a7b628662b05b4b7ab1`
+- 本地 `v0.3.0` annotated tag：`ecdb899c573bce7a0cd3e2168d2d33e07e865998`
+- `v0.3.0^{}`：`e23c4622f8bc4038a5e061ee3640a0e9206ec5cc`
 
-这些 SHA 只说明本次分析使用的 Git 对象。上游分支会移动，下一轮研究前必须重新读取并重新固定终点；历史文档中的旧 SHA 不得直接当作当前状态。
+本次执行了 `git fetch --prune upstream main`、`git fetch --prune origin main custom` 和 `git fetch --prune --tags upstream`。`upstream/main` 相对文档原快照 `e403485b3116e6c97e9af7026ec9445f30312c7d` 已前进；固定的 `S`、`T1` 和 `v0.3.0` 对象仍存在，`S..v0.3.0` 仍可复核。刷新只移动远程跟踪引用，没有切换分支或合并上游。
+
+这些 SHA 只说明本次分析使用的 Git 对象。上游分支会移动，后续研究前仍需重新读取并重新固定终点；本次 Wave 3 仍以固定 `v0.3.0` 为边界，不自动扩展到当前 `upstream/main`。
 
 ## 为什么先用 T1，而不是直接分析 v0.3.0
 
@@ -80,3 +86,13 @@ waves/01-fsqlite-session-storage.md
 ```
 
 结论不是直接 merge，而是将 fsqlite 后端替换记录为独立迁移议题。后续若继续处理，应先创建独立的 SQLite 后端迁移波次；在此之前不把 `S..T1` 或 `S..v0.3.0` 作为全量 merge 范围。
+
+当前后续执行边界：
+
+```text
+Wave 3：tokensAfter compaction result contract
+固定范围：129cf9fe88598439b4717b17002d6110266c03b3^..129cf9fe88598439b4717b17002d6110266c03b3
+状态：已完成只读分析，等待用户决定是否进入实现设计
+```
+
+Wave 3 仍不改变宏观窗口终点，也不自动吸收当前 `upstream/main` 在 `v0.3.0` 之后的变化。
