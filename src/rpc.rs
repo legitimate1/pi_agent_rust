@@ -6153,6 +6153,106 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct SuccessfulCompactionProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for SuccessfulCompactionProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("summary"))],
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(crate::model::StreamEvent::Start {
+                    partial: message.clone(),
+                }),
+                Ok(crate::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                }),
+            ])))
+        }
+    }
+
+    fn successful_compaction_session() -> (AgentSession, ModelEntry) {
+        let provider: Arc<dyn Provider> = Arc::new(SuccessfulCompactionProvider);
+        let mut session = Session::in_memory();
+        session.header.provider = Some("test-provider".to_string());
+        session.header.model_id = Some("test-model".to_string());
+        session.append_message(crate::session::SessionMessage::User {
+            content: UserContent::Text("history".to_string()),
+            timestamp: Some(0),
+        });
+        session.append_message(crate::session::SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("response"))],
+                api: "test-api".to_string(),
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                usage: Usage {
+                    total_tokens: 200_000,
+                    ..Usage::default()
+                },
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            },
+        });
+        session.append_message(crate::session::SessionMessage::User {
+            content: UserContent::Text("keep".to_string()),
+            timestamp: Some(0),
+        });
+
+        let mut agent_session = build_test_agent_session_with_provider(session, provider);
+        agent_session.agent.stream_options_mut().api_key = Some("test-api-key".to_string());
+
+        let mut model = dummy_entry("test-model", false);
+        model.model.provider = "test-provider".to_string();
+        model.model.api = "test-api".to_string();
+        model.model.context_window = 10;
+        model.api_key = Some("test-api-key".to_string());
+        (agent_session, model)
+    }
+
+    fn configure_compaction_for_test(config: &mut Config) {
+        config.compaction = Some(crate::config::CompactionSettings {
+            enabled: Some(true),
+            reserve_tokens: Some(2),
+            keep_recent_tokens: Some(1),
+        });
+    }
+
     #[derive(Default)]
     struct RpcDeadlineProbeState {
         calls: std::sync::atomic::AtomicUsize,
@@ -8236,6 +8336,92 @@ export default function init(pi) {
                 end.get("result").is_none(),
                 "failed auto_compaction_end must omit absent result: {end}"
             );
+        });
+    }
+
+    #[test]
+    fn rpc_compact_success_payload_contains_tokens_after() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let (agent_session, model) = successful_compaction_session();
+            let auth_dir = tempfile::tempdir().expect("tempdir");
+            let mut options = build_test_rpc_options(&handle, auth_dir.path().join("auth.json"));
+            configure_compaction_for_test(&mut options.config);
+            options.available_models = vec![model];
+
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let server =
+                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+            let response = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"1","type":"compact"}"#,
+                "compact(tokensAfter)",
+            )
+            .await;
+            assert_ok(&response, "compact");
+
+            let data = &response["data"];
+            assert_eq!(data["summary"], "summary");
+            assert_eq!(data["tokensAfter"].as_u64(), Some(40));
+            assert!(data.get("tokensAfter").is_some());
+            assert!(data.get("tokens_after").is_none());
+
+            drop(in_tx);
+            let result = server.await;
+            assert!(result.is_ok(), "rpc server error: {result:?}");
+        });
+    }
+
+    #[test]
+    fn rpc_auto_compaction_success_event_contains_tokens_after() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let (agent_session, model) = successful_compaction_session();
+            let auth_dir = tempfile::tempdir().expect("tempdir");
+            let mut options = build_test_rpc_options(&handle, auth_dir.path().join("auth.json"));
+            configure_compaction_for_test(&mut options.config);
+            options.available_models = vec![model];
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);
+
+            maybe_auto_compact(
+                Arc::new(asupersync::sync::Mutex::new(agent_session)),
+                options,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                out_tx,
+            )
+            .await;
+
+            let events = out_rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).expect("event json"))
+                .collect::<Vec<_>>();
+            let start_idx = events
+                .iter()
+                .position(|event| event["type"] == "auto_compaction_start")
+                .expect("auto_compaction_start");
+            let end_idx = events
+                .iter()
+                .position(|event| event["type"] == "auto_compaction_end")
+                .expect("auto_compaction_end");
+            assert!(start_idx < end_idx, "unexpected event order: {events:?}");
+
+            let result = &events[end_idx]["result"];
+            assert_eq!(result["summary"], "summary");
+            assert_eq!(result["tokensAfter"].as_u64(), Some(40));
+            assert!(result.get("tokensAfter").is_some());
+            assert!(result.get("tokens_after").is_none());
         });
     }
 
