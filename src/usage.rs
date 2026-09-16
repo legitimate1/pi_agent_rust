@@ -711,46 +711,75 @@ mod tests {
 
     #[test]
     fn gather_uses_cache_refresh_and_stale_fallback() {
-        let (reader, calls, _) = test_reader("test-cache-refresh", "account-a", 1.0);
+        const TEST_PROVIDER: &str = "test-cache-refresh-unique-account-a-v2";
+        const ACCOUNT_A_IDENTITY: &str = "account-a-unique-cache-refresh-v2";
+
+        let (reader, calls, should_fail) = test_reader(TEST_PROVIDER, ACCOUNT_A_IDENTITY, 1.0);
         let first = run_async(gather_usage_from_readers(
             vec![Box::new(reader)],
             Vec::new(),
             false,
         ));
-        assert!(matches!(first.as_slice(), [UsageStatus::Ready(_)]));
+        assert!(matches!(
+            first.as_slice(),
+            [UsageStatus::Ready(ProviderUsage {
+                used: Some(1.0),
+                cache_age_secs: None,
+                ..
+            })]
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        let (reader, _, _) = test_reader("test-cache-refresh", "account-a", 1.0);
+        let cache_calls = Arc::new(AtomicUsize::new(0));
+        let cache_reader = TestReader {
+            provider: TEST_PROVIDER,
+            identity: ACCOUNT_A_IDENTITY.to_string(),
+            value: 1.0,
+            calls: Arc::clone(&cache_calls),
+            should_fail: Arc::clone(&should_fail),
+        };
         let cached = run_async(gather_usage_from_readers(
-            vec![Box::new(reader)],
+            vec![Box::new(cache_reader)],
             Vec::new(),
             false,
         ));
         assert!(matches!(
             cached.as_slice(),
             [UsageStatus::Ready(ProviderUsage {
+                used: Some(1.0),
                 cache_age_secs: Some(_),
                 ..
             })]
         ));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache_calls.load(Ordering::SeqCst), 0);
 
-        let (reader, refresh_calls, should_fail) =
-            test_reader("test-cache-refresh", "account-a", 2.0);
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let refresh_reader = TestReader {
+            provider: TEST_PROVIDER,
+            identity: ACCOUNT_A_IDENTITY.to_string(),
+            value: 2.0,
+            calls: Arc::clone(&refresh_calls),
+            should_fail: Arc::clone(&should_fail),
+        };
         let refreshed = run_async(gather_usage_from_readers(
-            vec![Box::new(reader)],
+            vec![Box::new(refresh_reader)],
             Vec::new(),
             true,
         ));
-        assert!(matches!(refreshed.as_slice(), [UsageStatus::Ready(_)]));
+        assert!(matches!(
+            refreshed.as_slice(),
+            [UsageStatus::Ready(ProviderUsage {
+                used: Some(2.0),
+                cache_age_secs: None,
+                ..
+            })]
+        ));
         assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
 
         should_fail.store(true, Ordering::SeqCst);
-        // The shared failure switch belongs to the first reader; use it in a
-        // reader instance so the live failure can exercise the cached row.
         let stale_reader = TestReader {
-            provider: "test-cache-refresh",
-            identity: "account-a".to_string(),
+            provider: TEST_PROVIDER,
+            identity: ACCOUNT_A_IDENTITY.to_string(),
             value: 2.0,
             calls: Arc::clone(&refresh_calls),
             should_fail: Arc::clone(&should_fail),
@@ -763,6 +792,7 @@ mod tests {
         assert!(matches!(
             stale.as_slice(),
             [UsageStatus::Ready(ProviderUsage {
+                used: Some(2.0),
                 cache_age_secs: Some(_),
                 detail: Some(detail),
                 ..
