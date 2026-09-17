@@ -124,6 +124,7 @@ fn format_event(event: &AgentEvent) -> serde_json::Value {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn agent_loop_openai_vcr_basic() {
     let test_name = "agent_loop_openai_basic";
     let harness = TestHarness::new(test_name);
