@@ -92,6 +92,7 @@ CLI --tools read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit,s
 - **`tools/verify.rs`** → 编辑后轻量验证引擎：文件类型检测→检查器映射（.rs/.json/.toml/.ts/.js/.py/.go/.md）→进程内/外部进程执行，支持 Format+Lint 并行（oxfmt+oxlint/ruff），诊断直写 content 正文
 - **`tools/touched_files.rs`** → 文件触达追踪：三级快照（gix 0.77 status → git status --porcelain=v1 -z --find-renames → walk）+ 结构化写入与 shell 触达过滤 + TurnEnd 聚合（R>D>A>M，firstOldPath 重命名链）+ per-cwd asupersync::sync::Mutex 窗口锁 + capture_snapshot_async 经 asupersync::runtime::spawn_blocking 卸载阻塞
 - **`agent.rs`** → Agent 循环（工具迭代、扩展合并、ToolDef 构建）
+- **`turn_recovery.rs`** → 正常 assistant turn 的未完成分类、logical-run recovery budget 与普通 user nudge 决策；不处理 provider 错误重试
 - **`extensions.rs`** → 扩展管理器、能力策略、生命周期
 - **`extensions_js.rs`** → QuickJS 运行时、虚拟模块、HostcallKind
 - **`hostcall_amac.rs`** → AMAC 批量调度器：hostcall 按类型分组，遥测驱动并发/串行决策
@@ -118,8 +119,8 @@ CLI --tools read,shell,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit,s
 
 1. **Turn 作用域的 agent 生命周期** — 主循环按稳定顺序发 `AgentStart → TurnStart → TurnEnd → AgentEnd`；工具递归由 `max_tool_iterations`（默认 50）封顶
 2. **Abort/超时行为显式化** — abort 检查在 turn 边界与工具执行处；bash 超时走升级路径（终止进程树 → 宽限期 → 硬杀）；`Aborted` 统一 `success:false + final_error=Some("Aborted")`，`AutoRetryEnd` 仅 `has_retried()` 时发射（`rpc.rs`/`main.rs`，D61）；未重试的中断不误发重试结束
-3. **重试双计数器与进展语义** — `RetryCounters{consecutive,total,max_total=max*3}`：`consecutive` 在 `TextDelta|ThinkingDelta|ToolCallDelta` 非空 `delta`（`is_progress_event`）时先重置为 0 再递增，`total` 单调递增并以 `max_total` 封顶防无限循环；退避统一 `Config::retry_delay_ms(consecutive)`，无本地 `retry_delay_ms`（`retry_state.rs`，D61）
-4. **会话写入 crash-resilient 且单写入者** — 所有入口由 `Session` autosave 统一写入 JSONL；用户消息在 turn 开始阶段保存，assistant/tool 消息在 turn 边界保存；写入经 sidecar 锁、临时文件 + 原子 persist/追加、Windows 瞬态占锁重试；RPC 事件 handler 不直接写会话文件
+3. **重试双计数器与进展语义** — `RetryCounters{consecutive,total,max_total=max*3}`：`consecutive` 在 `TextDelta|ThinkingDelta|ToolCallDelta` 非空 `delta`（`is_progress_event`）时先重置为 0 再递增，`total` 单调递增并以 `max_total` 封顶防无限循环；退避统一 `Config::retry_delay_ms(consecutive)`，无本地 `retry_delay_ms`（`retry_state.rs`，D61）；turn recovery 使用独立 `LogicalRunScope` 与最多两条 continuation nudge，provider retry/resume 复用同一 scope，不重置 recovery budget
+4. **会话写入 crash-resilient 且单写入者** — 所有入口由 `Session` autosave 统一写入 JSONL；用户消息在 turn 开始阶段保存，assistant/tool 消息在 turn 边界保存；写入经 sidecar 锁、临时文件 + 原子 persist/追加、Windows 瞬态占锁重试；RPC 事件 handler 不直接写会话文件；recovery nudge 沿既有批量持久化路径写入，不单独 flush
 5. **Compaction 阈值驱动、边界感知** — 触发条件为估算 token 超 `context_window - reserve_tokens`；cut-point 优先 user turn 边界，保留近期上下文预算
 6. **能力策略 fail-closed、优先级明确** — 解析顺序：per-extension deny → 全局 deny → per-extension allow → 默认 caps → 模式回退
 7. **流式解析器容忍真实网络分块** — CR/LF 变体、多行 `data:`、UTF-8 部分尾部、EOF flush

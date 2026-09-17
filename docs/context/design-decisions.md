@@ -651,3 +651,27 @@
 **何时重新考虑**：如果产品明确要求强杀前的部分回合恢复，再重新评估独立增量日志协议；不得直接恢复同文件双写。
 
 **替代**：已由 D66 替代 D16。
+
+---
+
+## D67: Turn recovery 触发边界 — 正常 Stop/Length → 独立 logical-run budget
+
+**决策**：仅对正常 Stop/Length 的 assistant turn 做有限 recovery；provider/network Error、Aborted、tool call 和 abort 继续走既有 retry/failover/取消路径。recovery budget 由一次高层 logical prompt/continue 的 scope 所有，provider retry/resume 复用 scope，独立调用创建新 scope。
+
+**理由**：这样能区分未完成工作与失败请求，避免重复执行工具、错误重置 recovery cap 或把 transport retry 当成模型续写。
+
+**不选 B 的原因**：不把 recovery 放进 provider error 分支，不把 state 放进长期 Agent 字段，也不复用 retry counter；这些方案会混淆失败恢复与正常续写并造成跨调用预算泄漏。
+
+**何时重新考虑**：如果未来 provider stop reason、重试协议或 Agent 生命周期改变，使两类恢复无法保持独立，再重新评估 scope 和触发边界。
+
+---
+
+## D68: Recovery nudge 持久化 — 普通 user message → 既有 event/transcript/autosave
+
+**决策**：自动续跑提示使用普通 Message::User(UserMessage)，沿既有 MessageStart/MessageEnd、turn event、transcript 和 Session autosave 路径处理；不新增 recovery 专属事件、session entry 或 wire 字段。
+
+**理由**：复用现有消息链路可以让所有入口获得一致行为，并保持 RPC/SDK/ACP 协议与 session schema 稳定。
+
+**不选 B 的原因**：不采用隐藏 retry 或独立 recovery flush；隐藏消息无法形成一致上下文，独立 flush 会绕过 custom 的单写入者和 eventual persistence 边界。
+
+**何时重新考虑**：如果产品未来需要独立展示 recovery 生命周期或更强的崩溃前持久化保证，再单独设计 observability/protocol 或 durability 变更。

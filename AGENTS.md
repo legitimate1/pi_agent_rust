@@ -160,6 +160,8 @@ cargo test -- --nocapture                # 带输出
   - 做架构级改动、理解决策背景时读；过时决策在 `docs/context/design-decisions-archive.md`
 - **verify 验证引擎** — `docs/context/verify-tool.md`
   - 新增静态检查工具 / 优化 verify 检查逻辑时读
+- **Turn recovery 子系统** — `docs/context/turn-recovery.md`
+  - 修改正常 assistant turn 的未完成分类、自动续跑预算、scope、nudge、事件或持久化边界时读取；负责 turn recovery 的架构、行为契约和已知陷阱
 - **Subagent 工具** — `docs/context/subagent.md`
   - 调度单任务/并行/chain、续跑 `continue` 会话、worktree 隔离合入、schema 校验或排查子 Agent API/stderr 错误时读
 - **症状排查手册** — `docs/context/debugging.md`
