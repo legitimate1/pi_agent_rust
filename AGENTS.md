@@ -110,6 +110,10 @@ cargo test -- --nocapture                # 带输出
   gh run watch <run-id>                               # 跟踪进度
   gh workflow run my-build-windows.yml --ref custom  # 仅 Windows 快速构建（原生 MSVC，约 10~12 分钟）
   ```
+- **CI 日志处理**：
+  - 本项目 `my-check.yml` 会运行数千个 Rust 测试并输出大量 `PASS` 进度；CI 失败时优先采用通知摘要，必要时只保留失败测试名、`FAILED` / `panicked` / `panic` / `assertion` / `error:` / `stack backtrace` / `test result` 及其前后有限上下文。
+  - soak 测试额外保留 `Latency drift`、`soak_`、`e2e_soak_stability.rs`、`SLOW`；编译、Clippy、fmt 失败保留对应编译器诊断块（`error[E...]`、`error:`、`warning:`、`--> path:line:column`）。
+  - 默认丢弃通过测试列表、完整测试编号、失败后的无关并行测试、sccache 统计、artifact 上传和 job cleanup 日志；只有调查并发、超时、资源、缓存、artifact 或 job 生命周期问题时，才扩大日志范围。原始日志可保存到临时文件，但不得未经筛选直接输出到会话。
 - **Agent 约束**：日常开发不准在本地跑 `cargo test --all-targets` / `cargo clippy --all-targets`（产物 ~30GB）及 `cargo build --profile release-max`（~15 分钟），改完推 `custom` 后 `gh workflow run my-check.yml` 让云端去验，`git tag my-v*` 让 `my-build` 去压性能；急需本地验证单模块用 `cargo test --test <stem>` 针对性跑
 
 ## 第三方库使用

@@ -61,11 +61,19 @@ const SOAK_TURN_COUNT: usize = 20;
 /// Number of tool-use iterations for repeated tool tests.
 const TOOL_ITERATION_COUNT: usize = 10;
 
-/// Maximum acceptable latency drift ratio (latest turn / baseline turn).
-/// A value of 10.0 means the last turn can be at most 10x the baseline.
-/// Baseline is clamped to at least 10ms to avoid inflating the ratio when
-/// the second turn is pathologically fast on shared CI runners.
+/// Maximum acceptable latency drift ratio (recent median / baseline median).
+///
+/// A value of 10.0 means the recent window can be at most 10x the baseline
+/// window. Window medians make the check tolerant of one scheduler outlier on
+/// a shared CI runner while still detecting sustained growth.
 const MAX_LATENCY_DRIFT_RATIO: f64 = 10.0;
+
+/// Number of post-warm-up samples used for each latency window.
+const LATENCY_DRIFT_WINDOW_SIZE: usize = 5;
+
+/// Minimum latency used for either median to avoid amplifying sub-millisecond
+/// measurements into an unstable ratio.
+const MIN_LATENCY_BASELINE_MS: u128 = 10;
 
 // ─── Shared helpers ─────────────────────────────────────────────────────────
 
@@ -294,6 +302,31 @@ fn compute_latency_stats(durations: &[u128]) -> (f64, f64, f64, f64, f64) {
     let min = durations.iter().copied().min().unwrap_or(0) as f64;
     let max = durations.iter().copied().max().unwrap_or(0) as f64;
     (mean, stddev, min, max, sum)
+}
+
+fn median_latency_ms(durations: &[u128]) -> u128 {
+    if durations.is_empty() {
+        return 0;
+    }
+
+    let mut sorted = durations.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
+}
+
+fn latency_drift_ratio(durations: &[u128]) -> Option<(u128, u128, f64)> {
+    let samples = durations.get(1..)?;
+    if samples.len() < LATENCY_DRIFT_WINDOW_SIZE * 2 {
+        return None;
+    }
+
+    let baseline_end = LATENCY_DRIFT_WINDOW_SIZE;
+    let recent_start = samples.len() - LATENCY_DRIFT_WINDOW_SIZE;
+    let baseline = median_latency_ms(&samples[..baseline_end]).max(MIN_LATENCY_BASELINE_MS);
+    let recent = median_latency_ms(&samples[recent_start..]).max(MIN_LATENCY_BASELINE_MS);
+    let drift_ratio = recent as f64 / baseline as f64;
+
+    Some((baseline, recent, drift_ratio))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -945,27 +978,25 @@ fn soak_latency_stability_bounded_drift() {
     let metrics = metrics_store.lock().expect("final metrics");
     let durations: Vec<u128> = metrics.iter().map(|m| m.duration_ms).collect();
 
-    // Skip first turn (warm-up) for drift analysis
-    if durations.len() > 2 {
-        let baseline = durations[1].max(10); // second turn as baseline (first may be warm-up), clamped
-        let last = durations[durations.len() - 1].max(10);
-        let drift_ratio = last as f64 / baseline as f64;
-
+    // Skip the first turn (warm-up) and compare median windows so a single
+    // scheduler outlier cannot fail the long-run stability check.
+    if let Some((baseline, recent, drift_ratio)) = latency_drift_ratio(&durations) {
         assert!(
             drift_ratio < MAX_LATENCY_DRIFT_RATIO,
-            "Latency drift too high: last={last}ms, baseline={baseline}ms, ratio={drift_ratio:.2}, max={MAX_LATENCY_DRIFT_RATIO}"
+            "Latency drift too high: recent_median={recent}ms, baseline_median={baseline}ms, ratio={drift_ratio:.2}, max={MAX_LATENCY_DRIFT_RATIO}"
         );
 
         harness
             .log()
             .info_ctx("soak", "latency drift check passed", |ctx| {
-                ctx.push(("baseline_ms".into(), baseline.to_string()));
-                ctx.push(("last_ms".into(), last.to_string()));
+                ctx.push(("baseline_median_ms".into(), baseline.to_string()));
+                ctx.push(("recent_median_ms".into(), recent.to_string()));
                 ctx.push(("drift_ratio".into(), format!("{drift_ratio:.2}")));
             });
     }
 
     let (mean, stddev, min, max, _) = compute_latency_stats(&durations);
+    let drift_ratio = latency_drift_ratio(&durations).map_or(0.0, |(_, _, ratio)| ratio);
     write_summary_artifact(
         &harness,
         test_name,
@@ -977,9 +1008,7 @@ fn soak_latency_stability_bounded_drift() {
                 "stddev_ms": stddev,
                 "min_ms": min,
                 "max_ms": max,
-                "drift_ratio": if durations.len() > 2 {
-                    durations[durations.len() - 1] as f64 / durations[1].max(10) as f64
-                } else { 0.0 },
+                "drift_ratio": drift_ratio,
             },
         }),
     );
@@ -1641,6 +1670,8 @@ fn soak_stability_report_generation() {
     let final_tokens = metrics.last().map_or(0, |m| m.cumulative_tokens);
     let final_messages = metrics.last().map_or(0, |m| m.session_message_count);
 
+    let drift_ratio = latency_drift_ratio(&durations).map_or(0.0, |(_, _, ratio)| ratio);
+
     // Generate stability report
     let report = json!({
         "test": test_name,
@@ -1663,14 +1694,14 @@ fn soak_stability_report_generation() {
             "min_ms": min,
             "max_ms": max,
             "cv_pct": if mean > 0.0 { (stddev / mean) * 100.0 } else { 0.0 },
+            "drift_ratio": drift_ratio,
         },
         "stability_checks": {
             "no_errors": error_count == 0,
             "monotonic_tokens": metrics.windows(2).all(|w| w[1].cumulative_tokens >= w[0].cumulative_tokens),
             "monotonic_messages": metrics.windows(2).all(|w| w[1].session_message_count >= w[0].session_message_count),
-            "latency_bounded": if durations.len() > 2 {
-                (durations[durations.len() - 1] as f64 / durations[1].max(10) as f64) < MAX_LATENCY_DRIFT_RATIO
-            } else { true },
+            "latency_bounded": latency_drift_ratio(&durations)
+                .is_none_or(|(_, _, ratio)| ratio < MAX_LATENCY_DRIFT_RATIO),
         },
     });
 
