@@ -242,6 +242,8 @@ pub mod tools;
 #[doc(hidden)]
 pub mod tui;
 #[doc(hidden)]
+pub mod turn_recovery;
+#[doc(hidden)]
 pub mod usage;
 #[doc(hidden)]
 pub mod validation_broker;
