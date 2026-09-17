@@ -2,6 +2,7 @@
 
 use crate::agent::QueueMode;
 use crate::error::{Error, Result};
+use crate::turn_recovery::TurnRecoveryMode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -65,6 +66,9 @@ pub struct Config {
     pub steering_mode: Option<String>,
     #[serde(alias = "followUpMode")]
     pub follow_up_mode: Option<String>,
+
+    // Turn Recovery
+    pub turn_recovery: Option<TurnRecoveryMode>,
 
     // Version check
     #[serde(alias = "checkForUpdates")]
@@ -520,6 +524,7 @@ impl Config {
             // Message Handling
             steering_mode: other.steering_mode.or(base.steering_mode),
             follow_up_mode: other.follow_up_mode.or(base.follow_up_mode),
+            turn_recovery: other.turn_recovery.or(base.turn_recovery),
 
             // Version check
             check_for_updates: other.check_for_updates.or(base.check_for_updates),
@@ -602,6 +607,12 @@ impl Config {
 
     pub fn follow_up_queue_mode(&self) -> QueueMode {
         parse_queue_mode_or_default(self.follow_up_mode.as_deref())
+    }
+
+    /// Resolve the configured turn-recovery mode, defaulting conservatively.
+    #[must_use]
+    pub fn turn_recovery_mode(&self) -> TurnRecoveryMode {
+        self.turn_recovery.unwrap_or_default()
     }
 
     pub fn compaction_reserve_tokens(&self) -> u32 {
@@ -1452,7 +1463,7 @@ mod tests {
     use super::{
         BranchSummarySettings, CompactionSettings, Config, ExtensionPolicyConfig,
         ExtensionRiskConfig, ImageSettings, RepairPolicyConfig, RetrySettings, SettingsScope,
-        TerminalSettings, ThinkingBudgets, deep_merge_settings_value,
+        TerminalSettings, ThinkingBudgets, TurnRecoveryMode, deep_merge_settings_value,
         extension_index_path_from_env, global_dir_from_env, merge_branch_summary, merge_compaction,
         merge_extension_policy, merge_extension_risk, merge_images, merge_repair_policy,
         merge_retry, merge_terminal, merge_thinking_budgets, package_dir_from_env,
@@ -1861,6 +1872,68 @@ mod tests {
         assert!(config.default_model.is_none());
     }
 
+    #[test]
+    fn turn_recovery_mode_defaults_to_conservative_when_missing() {
+        let config: Config = serde_json::from_str("{}").expect("default config");
+        assert_eq!(config.turn_recovery, None);
+        assert_eq!(config.turn_recovery_mode(), TurnRecoveryMode::Conservative);
+    }
+
+    #[test]
+    fn turn_recovery_mode_deserializes_all_supported_values() {
+        for (json_value, expected) in [
+            ("off", TurnRecoveryMode::Off),
+            ("conservative", TurnRecoveryMode::Conservative),
+            ("aggressive", TurnRecoveryMode::Aggressive),
+        ] {
+            let config: Config =
+                serde_json::from_str(&format!("{{\"turn_recovery\":\"{json_value}\"}}"))
+                    .expect("supported turn recovery mode");
+            assert_eq!(config.turn_recovery, Some(expected));
+            assert_eq!(config.turn_recovery_mode(), expected);
+        }
+    }
+
+    #[test]
+    fn unknown_turn_recovery_mode_follows_config_parse_error_path() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{"turn_recovery":"unknown"}"#,
+        );
+
+        let result = Config::load_with_roots(None, &global_dir, &cwd);
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("unknown mode must fail")
+                .to_string()
+                .contains("Failed to parse settings file")
+        );
+    }
+
+    #[test]
+    fn merge_turn_recovery_uses_project_value_without_changing_other_settings() {
+        let base = Config {
+            theme: Some("global-theme".to_string()),
+            default_provider: Some("global-provider".to_string()),
+            turn_recovery: Some(TurnRecoveryMode::Conservative),
+            ..Config::default()
+        };
+        let project = Config {
+            default_provider: Some("project-provider".to_string()),
+            turn_recovery: Some(TurnRecoveryMode::Aggressive),
+            ..Config::default()
+        };
+
+        let merged = Config::merge(base, project);
+        assert_eq!(merged.theme.as_deref(), Some("global-theme"));
+        assert_eq!(merged.default_provider.as_deref(), Some("project-provider"));
+        assert_eq!(merged.turn_recovery, Some(TurnRecoveryMode::Aggressive));
+        assert_eq!(merged.turn_recovery_mode(), TurnRecoveryMode::Aggressive);
+    }
     #[test]
     fn queue_mode_accessors_parse_values_and_aliases() {
         let temp = TempDir::new().expect("create tempdir");
