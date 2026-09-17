@@ -153,7 +153,7 @@ jobs:
                   | Where-Object { $_ -match "(?i)(error\[|error:|FAILED|failures:|panicked|assertion failed|test result:|thread .* panicked|warning:|Diff |  left:| right:|expected|found)" } `
                   | Select-Object -Last 50
                 if (-not $filtered -or $filtered.Count -eq 0) {
-                  $filtered = $rawLines | Where-Object { $_ -notmatch "^\s*(Downloading|Downloaded|Compiling)" -and $_.Trim() -ne "" } | Select-Object -Last 40
+                  $filtered = @("(未捕获到精简日志，详见 Run 链接)")
                 }
                 $all += $filtered
                 $all += ""
