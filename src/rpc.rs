@@ -11,7 +11,9 @@
 #![allow(clippy::ignored_unit_patterns)]
 #![allow(clippy::needless_pass_by_value)]
 
-use crate::agent::{AbortHandle, AgentEvent, AgentSession, InputSource, QueueMode};
+use crate::agent::{
+    AbortHandle, AgentEvent, AgentSession, InputSource, LogicalRunScope, QueueMode,
+};
 use crate::agent_cx::AgentCx;
 use crate::auth::AuthStorage;
 use crate::compaction::{
@@ -2589,6 +2591,7 @@ async fn run_prompt_with_retry(
     let mut success = false;
     let mut final_error: Option<String> = None;
     let mut final_error_hints: Option<Value> = None;
+    let mut scope = LogicalRunScope::new(options.config.turn_recovery_mode());
 
     loop {
         has_progress.clear();
@@ -2627,12 +2630,22 @@ async fn run_prompt_with_retry(
                 // First attempt: add the user message and run the turn.
                 if images.is_empty() {
                     guard
-                        .run_text_with_abort(message.clone(), Some(abort_signal), event_handler)
+                        .run_text_with_abort_and_scope(
+                            message.clone(),
+                            Some(abort_signal),
+                            event_handler,
+                            &mut scope,
+                        )
                         .await
                 } else {
                     let blocks = build_prompt_content_blocks(&message, &images);
                     guard
-                        .run_with_content_with_abort(blocks, Some(abort_signal), event_handler)
+                        .run_with_content_with_abort_and_scope(
+                            blocks,
+                            Some(abort_signal),
+                            event_handler,
+                            &mut scope,
+                        )
                         .await
                 }
             } else {
@@ -2643,7 +2656,11 @@ async fn run_prompt_with_retry(
                 // retry re-issues only the failed provider request — no tool
                 // re-execution, no re-billing of prior work (pi_agent_rust#125).
                 guard
-                    .run_continue_with_abort(Some(abort_signal), event_handler)
+                    .run_continue_with_abort_and_scope(
+                        Some(abort_signal),
+                        event_handler,
+                        &mut scope,
+                    )
                     .await
             }
         };

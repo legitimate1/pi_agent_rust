@@ -24,7 +24,8 @@ use asupersync::sync::Mutex;
 use bubbletea::{Cmd, KeyMsg, KeyType, Message as BubbleMessage, Program, quit};
 use clap::error::ErrorKind;
 use pi::agent::{
-    AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession, PreWarmedExtensionRuntime,
+    AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession, LogicalRunScope,
+    PreWarmedExtensionRuntime,
 };
 use pi::app::StartupError;
 use pi::auth::{AuthCredential, AuthStorage};
@@ -1468,7 +1469,7 @@ async fn run(
         block_images: config.image_block_images(),
         fail_closed_hooks: config.fail_closed_hooks(),
         tool_approval: None,
-        turn_recovery: pi::turn_recovery::TurnRecoveryMode::default(),
+        turn_recovery: config.turn_recovery_mode(),
     };
 
     let tools = ToolRegistry::new(
@@ -6914,22 +6915,25 @@ where
             }
         }
     };
+    let mut scope = LogicalRunScope::new(config.turn_recovery_mode());
     let first_result = match &input {
         PromptInput::Text(text) => {
             session
-                .run_text_with_abort(
+                .run_text_with_abort_and_scope(
                     text.clone(),
                     Some(abort_signal.clone()),
                     make_event_handler_wrapped(),
+                    &mut scope,
                 )
                 .await
         }
         PromptInput::Content(content) => {
             session
-                .run_with_content_with_abort(
+                .run_with_content_with_abort_and_scope(
                     content.clone(),
                     Some(abort_signal.clone()),
                     make_event_handler_wrapped(),
+                    &mut scope,
                 )
                 .await
         }
@@ -6987,9 +6991,10 @@ where
                 let _ = session.revert_incomplete_response().await;
                 has_progress.clear();
                 current_result = session
-                    .run_continue_with_abort(
+                    .run_continue_with_abort_and_scope(
                         Some(abort_signal.clone()),
                         make_event_handler_wrapped(),
+                        &mut scope,
                     )
                     .await;
             }
@@ -7041,9 +7046,10 @@ where
                     let _ = session.revert_incomplete_response().await;
                     has_progress.clear();
                     current_result = session
-                        .run_continue_with_abort(
+                        .run_continue_with_abort_and_scope(
                             Some(abort_signal.clone()),
                             make_event_handler_wrapped(),
+                            &mut scope,
                         )
                         .await;
                 } else {

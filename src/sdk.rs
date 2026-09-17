@@ -37,7 +37,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use crate::agent::{
-    AbortHandle, AbortSignal, Agent, AgentConfig, AgentEvent, AgentSession, QueueMode,
+    AbortHandle, AbortSignal, Agent, AgentConfig, AgentEvent, AgentSession, LogicalRunScope,
+    QueueMode,
 };
 pub use crate::config::Config;
 pub use crate::error::{Error, Result};
@@ -1278,9 +1279,10 @@ impl AgentSessionHandle {
         self.session
             .sync_runtime_selection_from_session_header()
             .await?;
+        let mut scope = LogicalRunScope::new(self.session.agent.turn_recovery_mode());
         self.session
             .agent
-            .run_continue_with_abort(None, combined)
+            .run_continue_with_scope(None, combined, &mut scope)
             .await
     }
 
@@ -1294,9 +1296,10 @@ impl AgentSessionHandle {
         self.session
             .sync_runtime_selection_from_session_header()
             .await?;
+        let mut scope = LogicalRunScope::new(self.session.agent.turn_recovery_mode());
         self.session
             .agent
-            .run_continue_with_abort(Some(abort_signal), combined)
+            .run_continue_with_scope(Some(abort_signal), combined, &mut scope)
             .await
     }
 
@@ -1805,7 +1808,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         block_images: config.image_block_images(),
         fail_closed_hooks: config.fail_closed_hooks(),
         tool_approval: None,
-        turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
+        turn_recovery: config.turn_recovery_mode(),
     };
 
     let tools = options.tool_factory.as_ref().map_or_else(

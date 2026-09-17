@@ -712,14 +712,15 @@ impl Default for AgentConfig {
 /// The scope is deliberately owned by the caller rather than by [`Agent`], so
 /// an independent public run cannot inherit a previous recovery budget.
 #[derive(Debug)]
-pub(crate) struct LogicalRunScope {
+pub struct LogicalRunScope {
     mode: TurnRecoveryMode,
     recovery: TurnRecoveryState,
 }
 
 impl LogicalRunScope {
-    /// Create a fresh logical-run scope with the configured recovery mode.
-    pub(crate) const fn new(mode: TurnRecoveryMode) -> Self {
+    /// Create a fresh recovery scope for one logical prompt or continue.
+    #[must_use]
+    pub const fn new(mode: TurnRecoveryMode) -> Self {
         Self {
             mode,
             recovery: TurnRecoveryState::new(),
@@ -1415,7 +1416,7 @@ impl Agent {
     }
 
     /// Run a pre-constructed message using an explicitly owned logical scope.
-    pub(crate) async fn run_with_message_with_scope(
+    pub async fn run_with_message_with_scope(
         &mut self,
         message: Message,
         abort: Option<AbortSignal>,
@@ -1427,7 +1428,7 @@ impl Agent {
     }
 
     /// Run a prompt list using an explicitly owned logical scope.
-    pub(crate) async fn run_with_messages_with_scope(
+    pub async fn run_with_messages_with_scope(
         &mut self,
         messages: Vec<Message>,
         abort: Option<AbortSignal>,
@@ -1451,7 +1452,7 @@ impl Agent {
     }
 
     /// Continue with an explicitly shared logical scope.
-    pub(crate) async fn run_continue_with_scope(
+    pub async fn run_continue_with_scope(
         &mut self,
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
@@ -1478,6 +1479,12 @@ impl Agent {
 
     fn new_logical_run_scope(&self) -> LogicalRunScope {
         LogicalRunScope::new(self.config.turn_recovery)
+    }
+
+    /// Return the configured recovery mode used by fresh logical runs.
+    #[must_use]
+    pub const fn turn_recovery_mode(&self) -> TurnRecoveryMode {
+        self.config.turn_recovery
     }
 
     fn build_abort_message(&self, partial: Option<&AssistantMessage>) -> AssistantMessage {
@@ -10264,6 +10271,22 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        let mut scope = LogicalRunScope::new(self.agent.config.turn_recovery);
+        self.run_text_with_abort_and_scope(input, abort, on_event, &mut scope)
+            .await
+    }
+
+    /// Run text input with an explicitly shared logical-run recovery scope.
+    ///
+    /// The scope must be reused by an outer retry wrapper when provider
+    /// attempts belong to the same logical prompt.
+    pub async fn run_text_with_abort_and_scope(
+        &mut self,
+        input: String,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+        scope: &mut LogicalRunScope,
+    ) -> Result<AssistantMessage> {
         self.extensions_turn_active.store(true, Ordering::SeqCst);
         let result = async {
             let outcome = self.dispatch_input_event(input, Vec::new()).await?;
@@ -10293,11 +10316,11 @@ impl AgentSession {
             }
 
             let result = if images.is_empty() {
-                self.run_agent_with_text(text, abort, on_event, custom_messages)
+                self.run_agent_with_text(text, abort, on_event, custom_messages, scope)
                     .await
             } else {
                 let content = Self::build_content_blocks_for_input(&text, &images);
-                self.run_agent_with_content(content, abort, on_event, custom_messages)
+                self.run_agent_with_content(content, abort, on_event, custom_messages, scope)
                     .await
             };
 
@@ -10323,6 +10346,19 @@ impl AgentSession {
         content: Vec<ContentBlock>,
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        let mut scope = LogicalRunScope::new(self.agent.config.turn_recovery);
+        self.run_with_content_with_abort_and_scope(content, abort, on_event, &mut scope)
+            .await
+    }
+
+    /// Run structured content with an explicitly shared logical-run scope.
+    pub async fn run_with_content_with_abort_and_scope(
+        &mut self,
+        content: Vec<ContentBlock>,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+        scope: &mut LogicalRunScope,
     ) -> Result<AssistantMessage> {
         self.extensions_turn_active.store(true, Ordering::SeqCst);
         let result = async {
@@ -10355,7 +10391,7 @@ impl AgentSession {
 
             let content_for_agent = Self::build_content_blocks_for_input(&text, &images);
             let result = self
-                .run_agent_with_content(content_for_agent, abort, on_event, custom_messages)
+                .run_agent_with_content(content_for_agent, abort, on_event, custom_messages, scope)
                 .await;
 
             self.agent.set_system_prompt(base_system_prompt);
@@ -10844,6 +10880,7 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
         custom_messages: Vec<CustomMessage>,
+        scope: &mut LogicalRunScope,
     ) -> Result<AssistantMessage> {
         let on_event: AgentEventHandler = Arc::new(on_event);
         self.sync_runtime_selection_from_session_header().await?;
@@ -10903,9 +10940,14 @@ impl AgentSession {
         let on_event_for_run = Arc::clone(&on_event);
         let result = self
             .agent
-            .run_with_messages_with_abort(prompts, abort, move |event| {
-                on_event_for_run(event);
-            })
+            .run_with_messages_with_scope(
+                prompts,
+                abort,
+                move |event| {
+                    on_event_for_run(event);
+                },
+                scope,
+            )
             .await;
         drop(streaming_guard);
         self.agent.set_system_prompt(base_system_prompt);
@@ -10927,6 +10969,7 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
         custom_messages: Vec<CustomMessage>,
+        scope: &mut LogicalRunScope,
     ) -> Result<AssistantMessage> {
         let on_event: AgentEventHandler = Arc::new(on_event);
         self.sync_runtime_selection_from_session_header().await?;
@@ -10986,9 +11029,14 @@ impl AgentSession {
         let on_event_for_run = Arc::clone(&on_event);
         let result = self
             .agent
-            .run_with_messages_with_abort(prompts, abort, move |event| {
-                on_event_for_run(event);
-            })
+            .run_with_messages_with_scope(
+                prompts,
+                abort,
+                move |event| {
+                    on_event_for_run(event);
+                },
+                scope,
+            )
             .await;
         drop(streaming_guard);
         self.agent.set_system_prompt(base_system_prompt);
@@ -11020,7 +11068,18 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        let on_event: AgentEventHandler = Arc::new(on_event);
+        let mut scope = LogicalRunScope::new(self.agent.config.turn_recovery);
+        self.run_continue_with_abort_and_scope(abort, on_event, &mut scope)
+            .await
+    }
+
+    /// Resume a provider attempt using an explicitly shared logical-run scope.
+    pub async fn run_continue_with_abort_and_scope(
+        &mut self,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+        scope: &mut LogicalRunScope,
+    ) -> Result<AssistantMessage> {
         self.sync_runtime_selection_from_session_header().await?;
 
         // Rehydrate the agent transcript from the (already reverted) session
@@ -11038,12 +11097,17 @@ impl AgentSession {
         let start_len = self.agent.messages().len();
 
         let streaming_guard = AtomicBoolGuard::activate(&self.extensions_is_streaming);
+        let on_event: AgentEventHandler = Arc::new(on_event);
         let on_event_for_run = Arc::clone(&on_event);
         let result = self
             .agent
-            .run_continue_with_abort(abort, move |event| {
-                on_event_for_run(event);
-            })
+            .run_continue_with_scope(
+                abort,
+                move |event| {
+                    on_event_for_run(event);
+                },
+                scope,
+            )
             .await;
         drop(streaming_guard);
 

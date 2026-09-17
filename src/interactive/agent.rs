@@ -1526,20 +1526,25 @@ After approving access in the browser, press Enter in Pi to complete login."
                     Arc::clone(&tui_pressure_frame_p99_us),
                 )));
             let ui_stream_batcher_for_events = Arc::clone(&ui_stream_batcher);
+            let mut scope = crate::agent::LogicalRunScope::new(agent_guard.turn_recovery_mode());
             let result = agent_guard
-                .run_continue_with_abort(Some(abort_signal), move |event| {
-                    {
-                        let mut batcher = match ui_stream_batcher_for_events.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        dispatch_agent_event_to_ui(&event, &mut batcher);
-                    }
+                .run_continue_with_scope(
+                    Some(abort_signal),
+                    move |event| {
+                        {
+                            let mut batcher = match ui_stream_batcher_for_events.lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            dispatch_agent_event_to_ui(&event, &mut batcher);
+                        }
 
-                    if let Some(coal) = &coalescer {
-                        coal.dispatch_agent_event_lazy(&event, &runtime_handle);
-                    }
-                })
+                        if let Some(coal) = &coalescer {
+                            coal.dispatch_agent_event_lazy(&event, &runtime_handle);
+                        }
+                    },
+                    &mut scope,
+                )
                 .await;
             flush_ui_stream_batcher_with_backpressure(&ui_stream_batcher).await;
 
