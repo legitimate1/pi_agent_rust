@@ -307,6 +307,7 @@ async fn run_flight_session(
         },
         block_images: false,
         fail_closed_hooks: true,
+        turn_recovery: pi::turn_recovery::TurnRecoveryMode::Off,
         tool_approval: None,
     };
     let agent = Agent::new(provider, tools, config);
@@ -431,6 +432,7 @@ async fn run_cancelled_pressure_session(
         },
         block_images: false,
         fail_closed_hooks: true,
+        turn_recovery: pi::turn_recovery::TurnRecoveryMode::Off,
         tool_approval: None,
     };
     let agent = Agent::new(provider, tools, config);

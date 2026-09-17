@@ -1410,6 +1410,7 @@ fn handle_session_new(
         fail_closed_hooks: options.config.fail_closed_hooks(),
         tool_approval: permission_client
             .map(|client| client.handler_for_session(session_id.clone())),
+        turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
     };
 
     let agent = crate::agent::Agent::new(provider, tools, agent_config);
@@ -2479,6 +2480,7 @@ mod tests {
                 block_images: false,
                 fail_closed_hooks: false,
                 tool_approval: None,
+                turn_recovery: crate::turn_recovery::TurnRecoveryMode::Off,
             },
         );
 

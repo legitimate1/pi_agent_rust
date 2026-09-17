@@ -46,6 +46,9 @@ use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::semantic_workspace_graph::{ContextBundleItem, SemanticContextBundle};
 use crate::session::{AutosaveFlushTrigger, Session, SessionHandle};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolRegistry, ToolUpdate};
+#[cfg(test)]
+use crate::turn_recovery::RecoveryClass;
+use crate::turn_recovery::{TurnRecoveryMode, TurnRecoveryState};
 use asupersync::runtime::{Runtime, RuntimeBuilder, RuntimeHandle};
 #[allow(unused_imports)]
 use asupersync::sync::{Mutex, Notify, OwnedMutexGuard};
@@ -644,6 +647,9 @@ pub struct AgentConfig {
 
     /// Optional approval gate invoked before a tool executes.
     pub tool_approval: Option<ToolApprovalHandler>,
+
+    /// Automatic continuation policy for unexpectedly incomplete turns.
+    pub turn_recovery: TurnRecoveryMode,
 }
 
 impl fmt::Debug for AgentConfig {
@@ -655,6 +661,7 @@ impl fmt::Debug for AgentConfig {
             .field("block_images", &self.block_images)
             .field("fail_closed_hooks", &self.fail_closed_hooks)
             .field("tool_approval", &self.tool_approval.is_some())
+            .field("turn_recovery", &self.turn_recovery)
             .finish()
     }
 }
@@ -695,7 +702,34 @@ impl Default for AgentConfig {
             block_images: false,
             fail_closed_hooks: false,
             tool_approval: None,
+            turn_recovery: TurnRecoveryMode::default(),
         }
+    }
+}
+
+/// State shared by all provider attempts in one logical prompt or continue.
+///
+/// The scope is deliberately owned by the caller rather than by [`Agent`], so
+/// an independent public run cannot inherit a previous recovery budget.
+#[derive(Debug)]
+pub(crate) struct LogicalRunScope {
+    mode: TurnRecoveryMode,
+    recovery: TurnRecoveryState,
+}
+
+impl LogicalRunScope {
+    /// Create a fresh logical-run scope with the configured recovery mode.
+    pub(crate) const fn new(mode: TurnRecoveryMode) -> Self {
+        Self {
+            mode,
+            recovery: TurnRecoveryState::new(),
+        }
+    }
+
+    /// Number of recovery continuations issued by this logical run.
+    #[cfg(test)]
+    const fn recovery_continuations(&self) -> u8 {
+        self.recovery.continuations()
     }
 }
 
@@ -1316,7 +1350,8 @@ impl Agent {
 
     /// Run the agent with a user message.
     ///
-    /// Returns a stream of events and the final assistant message.
+    /// Returns a stream of events and the final assistant message. Each call
+    /// creates an independent logical-run recovery scope.
     pub async fn run(
         &mut self,
         user_input: impl Into<String>,
@@ -1332,14 +1367,12 @@ impl Agent {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        // Add user message
         let user_message = Message::User(UserMessage {
             content: UserContent::Text(user_input.into()),
             timestamp: Utc::now().timestamp_millis(),
         });
-
-        // Run the agent loop
-        self.run_loop(vec![user_message], Arc::new(on_event), abort)
+        let mut scope = self.new_logical_run_scope();
+        self.run_with_messages_with_scope(vec![user_message], abort, on_event, &mut scope)
             .await
     }
 
@@ -1360,14 +1393,12 @@ impl Agent {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        // Add user message
         let user_message = Message::User(UserMessage {
             content: UserContent::Blocks(content),
             timestamp: Utc::now().timestamp_millis(),
         });
-
-        // Run the agent loop
-        self.run_loop(vec![user_message], Arc::new(on_event), abort)
+        let mut scope = self.new_logical_run_scope();
+        self.run_with_messages_with_scope(vec![user_message], abort, on_event, &mut scope)
             .await
     }
 
@@ -1378,27 +1409,75 @@ impl Agent {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        self.run_loop(vec![message], Arc::new(on_event), abort)
+        let mut scope = self.new_logical_run_scope();
+        self.run_with_message_with_scope(message, abort, on_event, &mut scope)
             .await
     }
 
-    /// Run the agent with a pre-constructed prompt list and abort support.
+    /// Run a pre-constructed message using an explicitly owned logical scope.
+    pub(crate) async fn run_with_message_with_scope(
+        &mut self,
+        message: Message,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+        scope: &mut LogicalRunScope,
+    ) -> Result<AssistantMessage> {
+        self.run_with_messages_with_scope(vec![message], abort, on_event, scope)
+            .await
+    }
+
+    /// Run a prompt list using an explicitly owned logical scope.
+    pub(crate) async fn run_with_messages_with_scope(
+        &mut self,
+        messages: Vec<Message>,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+        scope: &mut LogicalRunScope,
+    ) -> Result<AssistantMessage> {
+        self.run_loop(messages, Arc::new(on_event), abort, scope)
+            .await
+    }
+
+    /// Run a prompt list with a fresh logical scope.
     pub async fn run_with_messages_with_abort(
         &mut self,
         messages: Vec<Message>,
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        self.run_loop(messages, Arc::new(on_event), abort).await
+        let mut scope = self.new_logical_run_scope();
+        self.run_with_messages_with_scope(messages, abort, on_event, &mut scope)
+            .await
     }
 
-    /// Continue the agent loop without adding a new prompt message (used for retries).
+    /// Continue with an explicitly shared logical scope.
+    pub(crate) async fn run_continue_with_scope(
+        &mut self,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+        scope: &mut LogicalRunScope,
+    ) -> Result<AssistantMessage> {
+        self.run_loop(Vec::new(), Arc::new(on_event), abort, scope)
+            .await
+    }
+
+    /// Continue the agent loop without adding a new prompt message.
+    ///
+    /// This compatibility wrapper starts a new logical run. Callers handling
+    /// provider retry/resume within an existing run must use
+    /// [`Self::run_continue_with_scope`] instead.
     pub async fn run_continue_with_abort(
         &mut self,
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        self.run_loop(Vec::new(), Arc::new(on_event), abort).await
+        let mut scope = self.new_logical_run_scope();
+        self.run_continue_with_scope(abort, on_event, &mut scope)
+            .await
+    }
+
+    fn new_logical_run_scope(&self) -> LogicalRunScope {
+        LogicalRunScope::new(self.config.turn_recovery)
     }
 
     fn build_abort_message(&self, partial: Option<&AssistantMessage>) -> AssistantMessage {
@@ -1461,6 +1540,7 @@ impl Agent {
         prompts: Vec<Message>,
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
+        scope: &mut LogicalRunScope,
     ) -> Result<AssistantMessage> {
         let loop_cx = crate::agent_cx::AgentCx::for_current_or_request();
         let session_id: Arc<str> = self
@@ -1885,6 +1965,18 @@ impl Agent {
                 } else {
                     // Delivery boundary: after assistant completion (no tool calls).
                     pending_messages = self.drain_steering_messages().await;
+                    if pending_messages.is_empty() && !has_more_tool_calls {
+                        if let Some(action) = scope.recovery.evaluate_turn(
+                            scope.mode,
+                            assistant_arc.stop_reason,
+                            &assistant_text_content(&assistant_arc.content),
+                        ) {
+                            pending_messages.push(Message::User(UserMessage {
+                                content: UserContent::Text(action.nudge_text),
+                                timestamp: Utc::now().timestamp_millis(),
+                            }));
+                        }
+                    }
                 }
             }
 
@@ -6008,6 +6100,8 @@ mod extensions_integration_tests {
                 tools,
                 AgentConfig {
                     fail_closed_hooks: true,
+                    tool_approval: None,
+                    turn_recovery: TurnRecoveryMode::Off,
                     ..AgentConfig::default()
                 },
             );
@@ -7726,6 +7820,88 @@ mod turn_event_tests {
 
     struct StreamSetupErrorProvider;
 
+    #[derive(Debug)]
+    struct RecoveryProvider {
+        responses: Vec<(StopReason, String)>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl RecoveryProvider {
+        fn new(responses: Vec<(StopReason, &str)>) -> Self {
+            Self {
+                responses: responses
+                    .into_iter()
+                    .map(|(reason, text)| (reason, text.to_string()))
+                    .collect(),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn assistant_message(&self, stop_reason: StopReason, text: &str) -> AssistantMessage {
+            AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(text))],
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason,
+                error_message: None,
+                timestamp: 0,
+            }
+        }
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for RecoveryProvider {
+        fn name(&self) -> &str {
+            "recovery-provider"
+        }
+
+        fn api(&self) -> &str {
+            "recovery-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "recovery-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let (reason, text) = self
+                .responses
+                .get(call)
+                .cloned()
+                .unwrap_or((StopReason::Stop, "fallback response".to_string()));
+            let partial = self.assistant_message(StopReason::Stop, "");
+            let done = self.assistant_message(reason, &text);
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamEvent::Start { partial }),
+                Ok(StreamEvent::Done {
+                    reason,
+                    message: done,
+                }),
+            ])))
+        }
+    }
+
+    fn recovery_agent(provider: Arc<RecoveryProvider>, mode: TurnRecoveryMode) -> Agent {
+        Agent::new(
+            provider,
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig {
+                turn_recovery: mode,
+                ..AgentConfig::default()
+            },
+        )
+    }
+
     #[async_trait]
     #[allow(clippy::unnecessary_literal_bound)]
     impl Provider for StreamSetupErrorProvider {
@@ -7871,6 +8047,343 @@ mod turn_event_tests {
         }
     }
 
+    #[test]
+    fn recovery_length_then_stop_injects_one_nudge() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let provider = Arc::new(RecoveryProvider::new(vec![
+            (StopReason::Length, "partial answer"),
+            (StopReason::Stop, "completed answer"),
+        ]));
+        let calls = Arc::clone(&provider.calls);
+        let mut agent = recovery_agent(provider, TurnRecoveryMode::Conservative);
+
+        runtime.block_on(async {
+            let result = agent.run("finish this".to_string(), |_| {}).await;
+            assert_eq!(result.expect("recovery run").stop_reason, StopReason::Stop);
+        });
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let messages = agent.messages();
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(messages[0], Message::User(_)));
+        assert!(
+            matches!(&messages[1], Message::Assistant(message) if message.stop_reason == StopReason::Length)
+        );
+        assert!(matches!(
+            &messages[2],
+            Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text == "[auto-continue 1/2: response truncated by token budget] Continue from exactly where you stopped. Do not repeat content you already produced; finish the remaining work."
+        ));
+        assert!(
+            matches!(&messages[3], Message::Assistant(message) if message.stop_reason == StopReason::Stop)
+        );
+    }
+
+    #[test]
+    fn recovery_finishes_before_idle_follow_up_is_drained() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let provider = Arc::new(RecoveryProvider::new(vec![
+            (StopReason::Length, "partial answer"),
+            (StopReason::Stop, "completed answer"),
+            (StopReason::Stop, "follow-up answer"),
+        ]));
+        let calls = Arc::clone(&provider.calls);
+        let mut agent = recovery_agent(provider, TurnRecoveryMode::Conservative);
+        agent.queue_follow_up(Message::User(UserMessage {
+            content: UserContent::Text("follow-up prompt".to_string()),
+            timestamp: 0,
+        }));
+
+        runtime.block_on(async {
+            let result = agent.run("finish this".to_string(), |_| {}).await;
+            assert_eq!(
+                result.expect("recovery plus follow-up").stop_reason,
+                StopReason::Stop
+            );
+        });
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let user_texts = agent
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(user_texts.len(), 3);
+        assert_eq!(user_texts[0], "finish this");
+        assert!(user_texts[1].starts_with("[auto-continue 1/2:"));
+        assert_eq!(user_texts[2], "follow-up prompt");
+    }
+    #[test]
+    fn recovery_length_is_capped_at_two_nudges() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let provider = Arc::new(RecoveryProvider::new(vec![
+            (StopReason::Length, "first"),
+            (StopReason::Length, "second"),
+            (StopReason::Length, "third"),
+        ]));
+        let calls = Arc::clone(&provider.calls);
+        let mut agent = recovery_agent(provider, TurnRecoveryMode::Conservative);
+
+        runtime.block_on(async {
+            let result = agent.run("finish this".to_string(), |_| {}).await;
+            assert_eq!(
+                result.expect("capped recovery run").stop_reason,
+                StopReason::Length
+            );
+        });
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let nudge_count = agent
+            .messages()
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    Message::User(UserMessage {
+                        content: UserContent::Text(text),
+                        ..
+                    }) if text.starts_with("[auto-continue ")
+                )
+            })
+            .count();
+        assert_eq!(nudge_count, 2);
+    }
+
+    #[test]
+    fn tool_turn_does_not_recover_and_follow_up_waits_until_idle() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let provider = Arc::new(ToolTurnProvider::new());
+        let tools = ToolRegistry::from_tools(vec![Box::new(EchoTool)]);
+        let mut agent = Agent::new(
+            provider,
+            tools,
+            AgentConfig {
+                turn_recovery: TurnRecoveryMode::Conservative,
+                ..AgentConfig::default()
+            },
+        );
+        agent.queue_follow_up(Message::User(UserMessage {
+            content: UserContent::Text("follow-up".to_string()),
+            timestamp: 0,
+        }));
+
+        runtime.block_on(async {
+            let result = agent.run("use the tool".to_string(), |_| {}).await;
+            assert_eq!(result.expect("tool run").stop_reason, StopReason::Stop);
+        });
+
+        let user_texts = agent
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(user_texts, ["use the tool", "follow-up"]);
+    }
+
+    #[test]
+    fn steering_has_priority_over_recovery_nudge() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let provider = Arc::new(RecoveryProvider::new(vec![
+            (StopReason::Length, "partial"),
+            (StopReason::Stop, "steered completion"),
+        ]));
+        let calls = Arc::clone(&provider.calls);
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let fetch_count_for_fetcher = Arc::clone(&fetch_count);
+        let mut agent = recovery_agent(provider, TurnRecoveryMode::Conservative);
+        agent.register_message_fetchers(
+            Some(Arc::new(move || {
+                let fetch_count = Arc::clone(&fetch_count_for_fetcher);
+                Box::pin(async move {
+                    if fetch_count.fetch_add(1, Ordering::SeqCst) == 1 {
+                        vec![Message::User(UserMessage {
+                            content: UserContent::Text("steer now".to_string()),
+                            timestamp: 0,
+                        })]
+                    } else {
+                        Vec::new()
+                    }
+                })
+            })),
+            None,
+        );
+
+        runtime.block_on(async {
+            let result = agent.run("start".to_string(), |_| {}).await;
+            assert_eq!(result.expect("steering run").stop_reason, StopReason::Stop);
+        });
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(agent.messages().iter().all(|message| {
+            !matches!(
+                message,
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) if text.starts_with("[auto-continue ")
+            )
+        }));
+        assert!(agent.messages().iter().any(|message| {
+            matches!(
+                message,
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) if text == "steer now"
+            )
+        }));
+    }
+
+    #[test]
+    fn error_and_abort_paths_do_not_recover() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let mut error_agent = Agent::new(
+            Arc::new(StreamSetupErrorProvider),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig {
+                turn_recovery: TurnRecoveryMode::Aggressive,
+                ..AgentConfig::default()
+            },
+        );
+        runtime.block_on(async {
+            assert!(error_agent.run("error".to_string(), |_| {}).await.is_err());
+        });
+        assert!(error_agent.messages().iter().all(|message| {
+            !matches!(
+                message,
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) if text.starts_with("[auto-continue ")
+            )
+        }));
+
+        let provider = Arc::new(RecoveryProvider::new(vec![(
+            StopReason::Length,
+            "must not stream",
+        )]));
+        let calls = Arc::clone(&provider.calls);
+        let mut abort_agent = recovery_agent(provider, TurnRecoveryMode::Conservative);
+        let (abort_handle, abort_signal) = AbortHandle::new();
+        abort_handle.abort();
+        runtime.block_on(async {
+            let result = abort_agent
+                .run_with_abort("aborted".to_string(), Some(abort_signal), |_| {})
+                .await
+                .expect("abort result");
+            assert_eq!(result.stop_reason, StopReason::Aborted);
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(abort_agent.messages().iter().all(|message| {
+            !matches!(
+                message,
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) if text.starts_with("[auto-continue ")
+            )
+        }));
+    }
+
+    #[test]
+    fn independent_public_runs_start_with_fresh_recovery_scope() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let provider = Arc::new(RecoveryProvider::new(vec![
+            (StopReason::Length, "first run partial"),
+            (StopReason::Length, "first run continuation"),
+            (StopReason::Length, "first run capped"),
+            (StopReason::Stop, "second run clean"),
+        ]));
+        let calls = Arc::clone(&provider.calls);
+        let mut agent = recovery_agent(provider, TurnRecoveryMode::Conservative);
+
+        runtime.block_on(async {
+            let first = agent.run("first".to_string(), |_| {}).await;
+            assert_eq!(first.expect("first run").stop_reason, StopReason::Length);
+            let second = agent.run("second".to_string(), |_| {}).await;
+            assert_eq!(second.expect("second run").stop_reason, StopReason::Stop);
+        });
+
+        let nudges = agent
+            .messages()
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    Message::User(UserMessage {
+                        content: UserContent::Text(text),
+                        ..
+                    }) if text.starts_with("[auto-continue ")
+                )
+            })
+            .count();
+        assert_eq!(nudges, 2);
+    }
+
+    #[test]
+    fn logical_scope_reuses_budget_only_when_explicitly_reused() {
+        let mut scope = LogicalRunScope::new(TurnRecoveryMode::Conservative);
+        assert!(
+            scope
+                .recovery
+                .evaluate(
+                    TurnRecoveryMode::Conservative,
+                    RecoveryClass::BudgetTruncated
+                )
+                .is_some()
+        );
+        assert!(
+            scope
+                .recovery
+                .evaluate(
+                    TurnRecoveryMode::Conservative,
+                    RecoveryClass::BudgetTruncated
+                )
+                .is_some()
+        );
+        assert!(
+            scope
+                .recovery
+                .evaluate(
+                    TurnRecoveryMode::Conservative,
+                    RecoveryClass::BudgetTruncated
+                )
+                .is_none()
+        );
+        assert_eq!(scope.recovery_continuations(), 2);
+
+        let fresh_scope = LogicalRunScope::new(TurnRecoveryMode::Conservative);
+        assert_eq!(fresh_scope.recovery_continuations(), 0);
+        assert_eq!(fresh_scope.mode, TurnRecoveryMode::Conservative);
+    }
     #[test]
     fn turn_events_wrap_assistant_response() {
         let runtime = RuntimeBuilder::current_thread()
@@ -11014,6 +11527,21 @@ fn filter_image_blocks(blocks: &mut Vec<ContentBlock>) -> usize {
     removed
 }
 
+/// Extract only user-visible assistant text for turn-recovery heuristics.
+fn assistant_text_content(content: &[ContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
+            ContentBlock::Thinking(_)
+            | ContentBlock::RedactedThinking(_)
+            | ContentBlock::Image(_)
+            | ContentBlock::ToolCall(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Extract tool calls from content blocks.
 fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolCall> {
     content
@@ -11896,6 +12424,7 @@ mod tests {
                 block_images: true,
                 fail_closed_hooks: false,
                 tool_approval: None,
+                turn_recovery: TurnRecoveryMode::Off,
             },
         );
         agent.add_message(Message::User(UserMessage {
@@ -11929,6 +12458,7 @@ mod tests {
                 block_images: false,
                 fail_closed_hooks: false,
                 tool_approval: None,
+                turn_recovery: TurnRecoveryMode::Off,
             },
         );
         agent.add_message(Message::User(UserMessage {
@@ -12123,6 +12653,7 @@ mod tests {
                 block_images: false,
                 fail_closed_hooks: false,
                 tool_approval: None,
+                turn_recovery: TurnRecoveryMode::Off,
             },
         );
 

@@ -118,6 +118,7 @@ fn make_agent_session(
                 api_key: Some("test-key".to_string()),
                 ..StreamOptions::default()
             },
+            turn_recovery: pi::turn_recovery::TurnRecoveryMode::Off,
             ..AgentConfig::default()
         },
     );

@@ -1468,6 +1468,7 @@ async fn run(
         block_images: config.image_block_images(),
         fail_closed_hooks: config.fail_closed_hooks(),
         tool_approval: None,
+        turn_recovery: pi::turn_recovery::TurnRecoveryMode::default(),
     };
 
     let tools = ToolRegistry::new(

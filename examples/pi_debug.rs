@@ -222,6 +222,7 @@ async fn run_debug(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<(
         stream_options,
         block_images: config.image_block_images(),
         fail_closed_hooks: config.fail_closed_hooks(),
+        turn_recovery: pi::turn_recovery::TurnRecoveryMode::default(),
         tool_approval: None,
     };
     let tools = ToolRegistry::new(
