@@ -111,21 +111,17 @@ impl RecoveryAction {
     }
 }
 
-/// Per-logical-run recovery budget and structure-repeat guard.
+/// Per-logical-run recovery budget.
 #[derive(Debug, Default)]
 pub struct TurnRecoveryState {
     continuations: u8,
-    structure_recovery_issued: bool,
 }
 
 impl TurnRecoveryState {
     /// Create an unused recovery state for a new logical run.
     #[must_use]
     pub const fn new() -> Self {
-        Self {
-            continuations: 0,
-            structure_recovery_issued: false,
-        }
+        Self { continuations: 0 }
     }
 
     /// Return the number of nudges already issued in this logical run.
@@ -136,9 +132,9 @@ impl TurnRecoveryState {
 
     /// Evaluate a classified stop and consume one nudge slot when actionable.
     ///
-    /// `mode` is supplied by the owning Agent configuration so the state stays
-    /// scoped only to the logical run. Clean stops, disabled modes, repeated
-    /// structure heuristics, and exhausted budgets do not consume a slot.
+    /// Once a logical run has issued any recovery nudge, only the provider's
+    /// explicit budget-truncation signal can consume the remaining budget.
+    /// Structure and semantic heuristics are intentionally one-shot per run.
     pub fn evaluate(
         &mut self,
         mode: TurnRecoveryMode,
@@ -147,7 +143,7 @@ impl TurnRecoveryState {
         if !class.is_actionable(mode) {
             return None;
         }
-        if matches!(class, RecoveryClass::UnclosedStructure) && self.structure_recovery_issued {
+        if self.continuations > 0 && !matches!(class, RecoveryClass::BudgetTruncated) {
             return None;
         }
         if self.continuations >= MAX_AUTO_CONTINUATIONS {
@@ -155,9 +151,6 @@ impl TurnRecoveryState {
         }
 
         self.continuations += 1;
-        if matches!(class, RecoveryClass::UnclosedStructure) {
-            self.structure_recovery_issued = true;
-        }
         let reason = class.reason();
         let attempt = self.continuations;
         Some(RecoveryAction {
@@ -492,13 +485,13 @@ mod tests {
     }
 
     #[test]
-    fn structure_recovery_does_not_repeat_but_length_uses_remaining_budget() {
+    fn structure_recovery_does_not_repeat_after_any_recovery_but_length_remains_available() {
         let mut state = TurnRecoveryState::new();
         assert!(
             state
                 .evaluate(
                     TurnRecoveryMode::Conservative,
-                    RecoveryClass::UnclosedStructure
+                    RecoveryClass::BudgetTruncated
                 )
                 .is_some()
         );
