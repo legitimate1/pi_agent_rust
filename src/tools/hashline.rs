@@ -346,7 +346,7 @@ impl Tool for HashlineEditTool {
                 },
                 "verify": {
                     "type": "boolean",
-                    "description": "若为 true，编辑后自动运行语法检查（.rs → rustfmt --check, .json/.toml → 进程内解析, .ts/.md → prettier --check）。依赖工具需在 PATH 中可用。默认 true。",
+                    "description": "若为 true，编辑后自动运行适用的轻量检查（.rs → rustfmt --check, .json/.toml → 进程内解析, .ts/.js → oxfmt + oxlint, .md/.markdown → 默认跳过并输出 SKIPPED）。依赖工具需在 PATH 中可用。默认 true。",
                     "default": true
                 }
             },
@@ -679,21 +679,22 @@ impl Tool for HashlineEditTool {
 
         let mut output_text = format!("Successfully applied hashline edits to {}.", input.path);
 
-        // Optional: run file verification after successful edit.
-        // Verification only applies to known syntax/format-checkable types;
-        // plain files (`.txt`, no extension, …) are skipped so the output
-        // stays free of spurious "unsupported type" errors.
-        // Verify diagnostics are appended to `output_text` (content), not `details`.
-        if input.verify && crate::tools::verify::is_supported_file_type(&absolute_path) {
-            let verify_path = absolute_path.clone();
-            match crate::tools::verify::verify_file(verify_path, abort).await {
-                Ok(result) => {
-                    crate::tools::verify::append_verify_to_output(&mut output_text, &result);
-                }
-                Err(e) => {
-                    crate::tools::verify::append_verify_error_to_output(&mut output_text, &e);
+        match crate::tools::verify::automatic_verify_action(&absolute_path, input.verify) {
+            crate::tools::verify::AutomaticVerifyAction::SkipMarkdown => {
+                crate::tools::verify::append_markdown_verify_skipped(&mut output_text);
+            }
+            crate::tools::verify::AutomaticVerifyAction::RunVerify => {
+                let verify_path = absolute_path.clone();
+                match crate::tools::verify::verify_file(verify_path, abort).await {
+                    Ok(result) => {
+                        crate::tools::verify::append_verify_to_output(&mut output_text, &result);
+                    }
+                    Err(e) => {
+                        crate::tools::verify::append_verify_error_to_output(&mut output_text, &e);
+                    }
                 }
             }
+            crate::tools::verify::AutomaticVerifyAction::NoVerify => {}
         }
 
         Ok(ToolOutput {

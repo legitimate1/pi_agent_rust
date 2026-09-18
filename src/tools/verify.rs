@@ -15,7 +15,7 @@
 //! | `.js` `.jsx` `.mjs` `.cjs` | `oxfmt --check` + `oxlint --deny-warnings` (parallel) | external processes | ≤1MB |
 //! | `.py` `.pyi` | `ruff format --check` + `ruff check` (parallel) | external processes | ≤1MB |
 //! | `.go`     | `gofmt -l` (diff via `gofmt`) | external process | ≤1MB |
-//! | `.md`     | `prettier --check` (global install; `npx --no-install` fallback) | external process | ≤1MB |
+//! | `.md`     | `prettier --check` checker retained for explicit future use; automatic edit/write verify reports `SKIPPED` | external process | ≤1MB |
 //!
 //! # Architecture
 //!
@@ -26,6 +26,9 @@
 //!   runner ([`run_external_checker`]). Adding a checker means adding a
 //!   `FileType` variant + extension mapping + one table entry — no new
 //!   boilerplate.
+//! - Markdown's `FileType` and Prettier checker remain available for future
+//!   explicit verification, but `edit`, `hashline_edit`, and `write` report
+//!   `SKIPPED` and do not invoke them automatically.
 //!
 //! Failure messages are normalized: ANSI codes stripped, an optional unified
 //! diff appended (via `similar`, when the checker can emit normalized text),
@@ -109,6 +112,34 @@ pub fn is_supported_file_type(path: &Path) -> bool {
     detect_file_type(path).is_some()
 }
 
+/// Whether a file is eligible for automatic verification after a file tool
+/// operation. Markdown is intentionally reported as skipped: its full-file
+/// Prettier output is not useful feedback for local document edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutomaticVerifyAction {
+    NoVerify,
+    SkipMarkdown,
+    RunVerify,
+}
+
+/// Select the shared automatic verification behavior for edit-like tools.
+pub(crate) fn automatic_verify_action(path: &Path, enabled: bool) -> AutomaticVerifyAction {
+    if !enabled {
+        return AutomaticVerifyAction::NoVerify;
+    }
+
+    match detect_file_type(path) {
+        Some(FileType::Markdown) => AutomaticVerifyAction::SkipMarkdown,
+        Some(_) => AutomaticVerifyAction::RunVerify,
+        None => AutomaticVerifyAction::NoVerify,
+    }
+}
+
+/// Append the explicit notification used when Markdown automatic verification is skipped.
+pub(crate) fn append_markdown_verify_skipped(output_text: &mut String) {
+    output_text.push_str("\n[verify:SKIPPED|markdown] Markdown 默认跳过自动验证。");
+}
+
 /// Resolve a bare program name to a spawnable command on this platform.
 ///
 /// Windows `CreateProcess` cannot spawn extension-less shims or `.cmd`/`.bat`
@@ -184,6 +215,9 @@ struct ExternalChecker {
     /// or spawned (e.g. no global prettier → npx wrapper). `None` = report
     /// not-found. Chains are at most one level deep in practice.
     fallback: Option<&'static Self>,
+    /// Optional checker-specific predicate for suppressing informational output
+    /// lines before stdout/stderr are merged into the failure message.
+    suppress_output_line: Option<fn(&str) -> bool>,
 }
 
 /// rustfmt --check. Its stderr already contains the diff (with ANSI codes),
@@ -199,6 +233,7 @@ static RUSTFMT_CHECKER: ExternalChecker = ExternalChecker {
     in_place_format_args: None,
     classify_failure: None,
     fallback: None,
+    suppress_output_line: None,
 };
 
 /// oxfmt --check (Rust-native formatter, replaces prettier for JS/TS).
@@ -215,6 +250,7 @@ static OXFMT_CHECKER: ExternalChecker = ExternalChecker {
     in_place_format_args: Some(&[]),
     classify_failure: None,
     fallback: Some(&NPX_OXFMT_CHECKER),
+    suppress_output_line: Some(is_oxfmt_informational_line),
 };
 
 static NPX_OXFMT_CHECKER: ExternalChecker = ExternalChecker {
@@ -228,6 +264,7 @@ static NPX_OXFMT_CHECKER: ExternalChecker = ExternalChecker {
     in_place_format_args: Some(&["--yes", "oxfmt"]),
     classify_failure: None,
     fallback: None,
+    suppress_output_line: Some(is_oxfmt_informational_line),
 };
 
 /// oxlint --deny-warnings (Rust-native linter). Warnings become errors so
@@ -243,6 +280,7 @@ static OXLINT_CHECKER: ExternalChecker = ExternalChecker {
     in_place_format_args: None,
     classify_failure: None,
     fallback: Some(&NPX_OXLINT_CHECKER),
+    suppress_output_line: None,
 };
 
 static NPX_OXLINT_CHECKER: ExternalChecker = ExternalChecker {
@@ -256,6 +294,7 @@ static NPX_OXLINT_CHECKER: ExternalChecker = ExternalChecker {
     in_place_format_args: None,
     classify_failure: None,
     fallback: None,
+    suppress_output_line: None,
 };
 
 /// ruff format --check --diff (Python formatter, Rust-native, standalone exe).
@@ -272,6 +311,7 @@ static RUFF_FORMAT_CHECKER: ExternalChecker = ExternalChecker {
     in_place_format_args: None,
     classify_failure: None,
     fallback: None,
+    suppress_output_line: None,
 };
 
 /// ruff check (Python linter, Rust-native).
@@ -286,6 +326,7 @@ static RUFF_CHECKER: ExternalChecker = ExternalChecker {
     in_place_format_args: None,
     classify_failure: None,
     fallback: None,
+    suppress_output_line: None,
 };
 
 /// gofmt -l (Go formatter, standalone exe from Go toolchain).
@@ -302,6 +343,7 @@ static GOFMT_CHECKER: ExternalChecker = ExternalChecker {
     in_place_format_args: None,
     classify_failure: None,
     fallback: None,
+    suppress_output_line: None,
 };
 
 /// prettier --check via the global install (resolved to `prettier.cmd` on
@@ -323,6 +365,7 @@ static PRETTIER_CHECKER: ExternalChecker = ExternalChecker {
     in_place_format_args: None,
     classify_failure: Some(prettier_classify_failure),
     fallback: Some(&NPX_PRETTIER_CHECKER),
+    suppress_output_line: None,
 };
 
 /// npx --no-install prettier --check — fallback when no global prettier is
@@ -342,6 +385,7 @@ static NPX_PRETTIER_CHECKER: ExternalChecker = ExternalChecker {
     in_place_format_args: None,
     classify_failure: Some(prettier_classify_failure),
     fallback: None,
+    suppress_output_line: None,
 };
 
 /// prettier failure classification: exit code 2 with a module-not-found
@@ -379,6 +423,31 @@ fn strip_ansi(text: &str) -> String {
         .get_or_init(|| Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").expect("ansi regex"))
         .replace_all(text, "")
         .into_owned()
+}
+
+/// Suppress oxfmt's default-config notice and run summary from automatic verify
+/// output. Both are informational and do not help the agent repair the file.
+fn is_oxfmt_informational_line(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("No config found, using defaults.")
+        || (line.starts_with("Finished in ")
+            && line.contains(" on ")
+            && line.contains(" files using ")
+            && line.ends_with(" threads."))
+}
+
+/// Filter checker output while preserving every non-suppressed byte, including
+/// LF/CRLF separators and whether the input ended with a newline.
+fn filter_output_preserving_newlines(text: &str, suppress: fn(&str) -> bool) -> String {
+    let mut output = String::with_capacity(text.len());
+    for chunk in text.split_inclusive('\n') {
+        let body = chunk.strip_suffix('\n').unwrap_or(chunk);
+        let line = body.strip_suffix('\r').unwrap_or(body);
+        if !suppress(line) {
+            output.push_str(chunk);
+        }
+    }
+    output
 }
 
 /// Generate a unified diff between original and formatted text, capped at
@@ -725,18 +794,27 @@ fn run_external_checker_resolved(
         // Goal: self-contained diagnosis without a second bash call. Preserve both streams.
         let stderr_stripped = strip_ansi(&stderr);
         let stdout_stripped = strip_ansi(&stdout);
+        let suppress = checker.suppress_output_line;
+        let stderr_filtered = suppress.map_or_else(
+            || stderr_stripped.clone(),
+            |predicate| filter_output_preserving_newlines(&stderr_stripped, predicate),
+        );
+        let stdout_filtered = suppress.map_or_else(
+            || stdout_stripped.clone(),
+            |predicate| filter_output_preserving_newlines(&stdout_stripped, predicate),
+        );
         let mut message = String::new();
-        let stderr_trimmed = stderr_stripped.trim();
-        let stdout_trimmed = stdout_stripped.trim();
+        let stderr_trimmed = stderr_filtered.trim();
+        let stdout_trimmed = stdout_filtered.trim();
         if !stderr_trimmed.is_empty() {
-            message.push_str(&stderr_stripped);
+            message.push_str(&stderr_filtered);
         }
         if !stdout_trimmed.is_empty() && stdout_trimmed != stderr_trimmed {
             // Always surface stdout when it carries diagnostics (diff, stats, lint).
             // `looks_like_diff` is retained as a strong signal, but we also surface
             // plain stats like "Format issues found" / "would be reformatted" which
             // were previously swallowed.
-            let should_include_stdout = looks_like_diff(&stdout_stripped)
+            let should_include_stdout = looks_like_diff(&stdout_filtered)
                 || stdout_trimmed.contains("would be reformatted")
                 || stdout_trimmed.contains("Format issues")
                 || stdout_trimmed.contains("Checking formatting")
@@ -745,13 +823,13 @@ fn run_external_checker_resolved(
                 if !message.is_empty() && !message.ends_with('\n') {
                     message.push('\n');
                 }
-                message.push_str(&stdout_stripped);
+                message.push_str(&stdout_filtered);
             } else if !message.contains(stdout_trimmed) {
                 // Fallback: include any non-duplicate stdout that isn't empty.
                 if !message.is_empty() && !message.ends_with('\n') {
                     message.push('\n');
                 }
-                message.push_str(&stdout_stripped);
+                message.push_str(&stdout_filtered);
             }
         }
         if message.trim().is_empty() {
@@ -1042,6 +1120,99 @@ mod tests {
         assert_eq!(detect_file_type(Path::new("foo.go")), Some(FileType::Go));
         assert_eq!(detect_file_type(Path::new("foo.unknown")), None);
         assert_eq!(detect_file_type(Path::new("foo")), None);
+    }
+
+    #[test]
+    fn test_automatic_verify_action() {
+        assert_eq!(
+            automatic_verify_action(Path::new("note.md"), true),
+            AutomaticVerifyAction::SkipMarkdown
+        );
+        assert_eq!(
+            automatic_verify_action(Path::new("note.markdown"), true),
+            AutomaticVerifyAction::SkipMarkdown
+        );
+        assert_eq!(
+            automatic_verify_action(Path::new("main.rs"), true),
+            AutomaticVerifyAction::RunVerify
+        );
+        assert_eq!(
+            automatic_verify_action(Path::new("note.md"), false),
+            AutomaticVerifyAction::NoVerify
+        );
+        assert_eq!(
+            automatic_verify_action(Path::new("notes.txt"), true),
+            AutomaticVerifyAction::NoVerify
+        );
+    }
+
+    #[test]
+    fn test_append_markdown_verify_skipped() {
+        let mut output = String::from("Successfully wrote file");
+        append_markdown_verify_skipped(&mut output);
+        assert_eq!(
+            output,
+            "Successfully wrote file\n[verify:SKIPPED|markdown] Markdown 默认跳过自动验证。"
+        );
+    }
+
+    #[test]
+    fn test_oxfmt_informational_lines_are_suppressed() {
+        assert!(is_oxfmt_informational_line(
+            "No config found, using defaults. Please add `.oxfmtrc.json` if needed."
+        ));
+        assert!(is_oxfmt_informational_line(
+            "Finished in 1ms on 1 files using 24 threads."
+        ));
+        assert!(!is_oxfmt_informational_line(
+            "No config found: actual formatter error"
+        ));
+        assert!(!is_oxfmt_informational_line("Checking formatting..."));
+    }
+
+    #[test]
+    fn test_filter_output_preserves_line_endings_and_keeps_diagnostics() {
+        let input = concat!(
+            "No config found, using defaults. Please add `.oxfmtrc.json` if needed.\r\n",
+            "Checking formatting...\r\n",
+            "Finished in 1ms on 1 files using 24 threads.\r\n",
+            "@@ -1 +1 @@\r\n",
+            "-bad\r\n",
+            "+good\r\n",
+        );
+        let filtered = filter_output_preserving_newlines(input, is_oxfmt_informational_line);
+        assert_eq!(
+            filtered,
+            "Checking formatting...\r\n@@ -1 +1 @@\r\n-bad\r\n+good\r\n"
+        );
+    }
+
+    #[test]
+    fn test_filter_output_preserves_missing_final_newline() {
+        let input = "Finished in 1ms on 1 files using 24 threads.";
+        assert_eq!(
+            filter_output_preserving_newlines(input, is_oxfmt_informational_line),
+            ""
+        );
+
+        let input = "Checking formatting...";
+        assert_eq!(
+            filter_output_preserving_newlines(input, is_oxfmt_informational_line),
+            input
+        );
+    }
+
+    #[test]
+    fn test_oxfmt_only_checkers_enable_output_filter() {
+        assert!(OXFMT_CHECKER.suppress_output_line.is_some());
+        assert!(NPX_OXFMT_CHECKER.suppress_output_line.is_some());
+        assert!(OXLINT_CHECKER.suppress_output_line.is_none());
+        assert!(RUSTFMT_CHECKER.suppress_output_line.is_none());
+        assert!(RUFF_FORMAT_CHECKER.suppress_output_line.is_none());
+        assert!(RUFF_CHECKER.suppress_output_line.is_none());
+        assert!(PRETTIER_CHECKER.suppress_output_line.is_none());
+        assert!(NPX_PRETTIER_CHECKER.suppress_output_line.is_none());
+        assert!(GOFMT_CHECKER.suppress_output_line.is_none());
     }
 
     #[test]
@@ -1483,6 +1654,16 @@ mod tests {
         assert!(
             msg_str.contains("oxfmt") && msg_str.contains("to fix"),
             "fix hint missing (oxfmt fix hint): {}",
+            msg_str
+        );
+        assert!(
+            !msg_str.contains("No config found, using defaults."),
+            "oxfmt config notice should be filtered: {}",
+            msg_str
+        );
+        assert!(
+            !msg_str.contains("Finished in ") || !msg_str.contains(" files using "),
+            "oxfmt run summary should be filtered: {}",
             msg_str
         );
     }

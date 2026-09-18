@@ -1779,6 +1779,117 @@ fn test_edit_exact_match_replace() {
 }
 
 #[test]
+fn test_edit_markdown_skips_automatic_verify() {
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("note.md");
+        std::fs::write(&path, "before\n").unwrap();
+
+        let tool = EditTool::new(tmp.path());
+        let out = tool
+            .execute(
+                "t",
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "oldText": "before",
+                    "newText": "after"
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!out.is_error);
+        assert!(first_text(&out).contains("[verify:SKIPPED|markdown] Markdown 默认跳过自动验证。"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "after\n");
+    });
+}
+
+#[test]
+fn test_edit_markdown_verify_false_has_no_skip_notice() {
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("note.md");
+        std::fs::write(&path, "before\n").unwrap();
+
+        let tool = EditTool::new(tmp.path());
+        let out = tool
+            .execute(
+                "t",
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "oldText": "before",
+                    "newText": "after",
+                    "verify": false
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!out.is_error);
+        assert!(!first_text(&out).contains("[verify:SKIPPED|markdown]"));
+    });
+}
+
+#[test]
+fn test_edit_markdown_extension_skips_automatic_verify() {
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("note.markdown");
+        std::fs::write(&path, "before\n").unwrap();
+
+        let tool = EditTool::new(tmp.path());
+        let out = tool
+            .execute(
+                "t",
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "oldText": "before",
+                    "newText": "after"
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(first_text(&out).contains("[verify:SKIPPED|markdown]"));
+    });
+}
+
+#[test]
+fn test_write_markdown_skips_automatic_verify_and_reports_bytes() {
+    asupersync::test_utils::run_test(|| async {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("note.markdown");
+        let content = "# Note\n";
+
+        let tool = WriteTool::new(tmp.path());
+        let out = tool
+            .execute(
+                "t",
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "content": content
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!out.is_error);
+        let text = first_text(&out);
+        assert!(text.contains("Successfully wrote 7 bytes"));
+        assert!(text.contains("[verify:SKIPPED|markdown] Markdown 默认跳过自动验证。"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), content);
+    });
+}
+
+#[test]
 fn test_edit_no_match_error() {
     asupersync::test_utils::run_test(|| async {
         let tmp = tempfile::tempdir().unwrap();
@@ -4505,6 +4616,99 @@ fn test_hashline_edit_single_replace() {
 
         let content = std::fs::read_to_string(&file).unwrap();
         assert_eq!(content, "line1\nchanged\nline3\n");
+    });
+}
+
+#[test]
+fn test_hashline_edit_markdown_skips_automatic_verify() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.md");
+        std::fs::write(&file, "line1\nline2\n").unwrap();
+
+        let tool = HashlineEditTool::new(dir.path());
+        let tag = format_hashline_tag(1, "line2");
+        let out = tool
+            .execute(
+                "test",
+                serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "edits": [{
+                        "op": "replace",
+                        "pos": tag,
+                        "lines": ["changed"]
+                    }]
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!out.is_error);
+        assert!(first_text(&out).contains("[verify:SKIPPED|markdown] Markdown 默认跳过自动验证。"));
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "line1\nchanged\n");
+    });
+}
+
+#[test]
+fn test_hashline_edit_markdown_verify_false_has_no_skip_notice() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.md");
+        std::fs::write(&file, "line1\nline2\n").unwrap();
+
+        let tool = HashlineEditTool::new(dir.path());
+        let tag = format_hashline_tag(1, "line2");
+        let out = tool
+            .execute(
+                "test",
+                serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "edits": [{
+                        "op": "replace",
+                        "pos": tag,
+                        "lines": ["changed"]
+                    }],
+                    "verify": false
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!first_text(&out).contains("[verify:SKIPPED|markdown]"));
+    });
+}
+
+#[test]
+fn test_hashline_edit_markdown_extension_skips_automatic_verify() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.markdown");
+        std::fs::write(&file, "line1\nline2\n").unwrap();
+
+        let tool = HashlineEditTool::new(dir.path());
+        let tag = format_hashline_tag(1, "line2");
+        let out = tool
+            .execute(
+                "test",
+                serde_json::json!({
+                    "path": file.to_string_lossy(),
+                    "edits": [{
+                        "op": "replace",
+                        "pos": tag,
+                        "lines": ["changed"]
+                    }]
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(first_text(&out).contains("[verify:SKIPPED|markdown]"));
     });
 }
 
