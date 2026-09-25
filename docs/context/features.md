@@ -6,6 +6,7 @@
 - **非交互式 Print 模式** — 单次响应输出，无交互界面 | `src/main.rs`
 - **RPC/stdin 服务器模式** — 客户端经 stdin 发送请求、接收流式事件 | `src/rpc.rs`
 - **Turn recovery 自动续跑** — 正常响应疑似未完成时有限次数继续完成工作 | 详见 `turn-recovery.md`
+- **上下文压缩** — 按 context window 阈值将旧历史摘要为 compaction entry，并在后续 provider replay 中使用摘要与近期消息 | 详见 `context-compaction.md`
 - **会话 token 用量估算** — 提供当前上下文占用预估，并在压缩完成后报告后续请求的预估占用 | `src/rpc.rs` + `src/compaction.rs` + `src/agent.rs` + `src/sdk.rs`
 - **斜杠命令查询** — 返回可用命令，含扩展注册的命令 | `src/rpc.rs` + `src/extensions.rs`
 - **会话树查询** — 返回会话的分支/叶子结构 | `src/rpc.rs`

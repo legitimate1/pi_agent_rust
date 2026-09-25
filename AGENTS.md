@@ -162,9 +162,11 @@ cargo test -- --nocapture                # 带输出
   - 新增静态检查工具 / 优化 verify 检查逻辑时读
 - **Turn recovery 子系统** — `docs/context/turn-recovery.md`
   - 修改正常 assistant turn 的未完成分类、自动续跑预算、scope、nudge、事件或持久化边界时读取；负责 turn recovery 的架构、行为契约和已知陷阱
+- **上下文压缩子系统** — `docs/context/context-compaction.md`
+  - 修改 compaction 触发阈值、token 估算、cut point、摘要、session replay、后台 worker、`/compact`、RPC compact 或 compaction 生命周期事件时读取；负责上下文压缩的架构、行为契约、持久化边界和排错路由
 - **Subagent 工具** — `docs/context/subagent.md`
   - 调度单任务/并行/chain、续跑 `continue` 会话、worktree 隔离合入、schema 校验或排查子 Agent API/stderr 错误时读
-- **症状排查手册** — `docs/context/debugging.md`
+- **症状排查手册** — `docs/context/debug.md`
   - 症状已知但根因不明时读：症状路由表、调试 playbook、安装器补丁模式
 - **追上游 / 合并上游** — `docs/upstream/`
   - 追上游时读 `fork-merge-sop.md`(SOP)+ `known-test-failures.md`(对照基准)+ `upstream-qa-bead-swarm-guide.md`(体系理解);全量测试跑完对照已知失败清单
