@@ -37,12 +37,13 @@ impl EventCoalescer {
         data: CoalescedPayload,
         runtime_handle: &asupersync::runtime::RuntimeHandle,
     ) {
-        let event_name_str = event.to_string();
-
-        // Fast path: skip entirely if no hooks registered.
-        if !self.manager.has_hook_for(&event_name_str) {
+        // Fast path: skip entirely if no hooks registered. Asked through
+        // `as_str`, before the owned name exists, so an event nothing
+        // subscribes to costs no allocation at all (bd-82331).
+        if !self.manager.has_hook_for(event.as_str()) {
             return;
         }
+        let event_name_str = event.to_string();
 
         if !is_coalescable_event(&event) {
             // Non-coalescable: buffer for batch dispatch.
@@ -201,13 +202,149 @@ impl EventCoalescer {
         if is_lifecycle_event(&event_name) {
             return;
         }
-        let event_name_str = event_name.to_string();
-        if !self.manager.has_hook_for(&event_name_str) {
+        if !self.manager.has_hook_for(event_name.as_str()) {
             return;
         }
         // Hook exists — defer serialization to the async task.
         let event_clone = event.clone();
         let lazy = Box::new(move || serde_json::to_value(&event_clone).ok());
         self.dispatch_fire_and_forget(event_name, CoalescedPayload::Lazy(lazy), runtime_handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AgentEvent, ExtensionEventName, extension_event_name_from_agent, is_lifecycle_event,
+    };
+    use crate::model::{
+        AssistantMessage, AssistantMessageEvent, Message, UserContent, UserMessage,
+    };
+    use crate::tools::ToolOutput;
+    use std::sync::Arc;
+
+    /// The two-route split this file depends on, pinned (bd-82331).
+    ///
+    /// Lifecycle events are dispatched to extensions from inside the agent
+    /// loop, so the coalescer must skip them or every surface that installs
+    /// one would deliver them twice. Observation events are the coalescer's
+    /// job, and a surface that does not install one delivers none of them —
+    /// which is the whole of bd-82331. If this classification ever changes,
+    /// both halves change with it and this test is where that shows up.
+    #[test]
+    fn lifecycle_events_are_skipped_and_observation_events_are_not() {
+        let lifecycle = [
+            ExtensionEventName::AgentStart,
+            ExtensionEventName::AgentEnd,
+            ExtensionEventName::TurnStart,
+            ExtensionEventName::TurnEnd,
+        ];
+        for name in lifecycle {
+            assert!(
+                is_lifecycle_event(&name),
+                "{name:?} must stay a lifecycle event: it is dispatched in-loop, and treating it \
+                 as an observation event would double-deliver it on every surface that installs a \
+                 coalescer"
+            );
+        }
+        let observation = [
+            ExtensionEventName::MessageStart,
+            ExtensionEventName::MessageUpdate,
+            ExtensionEventName::MessageEnd,
+            ExtensionEventName::ToolExecutionStart,
+            ExtensionEventName::ToolExecutionUpdate,
+            ExtensionEventName::ToolExecutionEnd,
+        ];
+        for name in observation {
+            assert!(
+                !is_lifecycle_event(&name),
+                "{name:?} must stay an observation event: it reaches extensions only through a \
+                 surface-installed coalescer (bd-82331)"
+            );
+        }
+    }
+
+    /// Every observation event an agent can emit maps to the extension event
+    /// name extensions subscribe to (bd-82331).
+    ///
+    /// `dispatch_agent_event_lazy` returns early when
+    /// `extension_event_name_from_agent` yields `None`, which is correct for
+    /// the events extensions have no concept of (`auto_retry_*`,
+    /// `failover_*`, `provider_error`, …). The match in that function is
+    /// exhaustive, so a *new* `AgentEvent` variant cannot be forgotten — the
+    /// compiler demands an arm. What the compiler cannot catch is an existing
+    /// observation variant being folded into the trailing `=> None` group, or
+    /// wired to the wrong name: both compile, both are silent, and both stop
+    /// extensions receiving an event they are registered for with no error
+    /// anywhere. So assert the exact name, for all six, rather than merely
+    /// `is_some()`.
+    #[test]
+    fn every_observation_event_maps_to_an_extension_event_name() {
+        let message = || {
+            Message::User(UserMessage {
+                content: UserContent::Text("probe".to_string()),
+                timestamp: 1_700_000_000,
+            })
+        };
+        let tool_output = || ToolOutput {
+            content: Vec::new(),
+            details: None,
+            is_error: false,
+        };
+        let events = [
+            (
+                AgentEvent::MessageStart { message: message() },
+                ExtensionEventName::MessageStart,
+            ),
+            (
+                AgentEvent::MessageUpdate {
+                    message: message(),
+                    assistant_message_event: AssistantMessageEvent::Start {
+                        partial: Arc::new(AssistantMessage::default()),
+                    },
+                },
+                ExtensionEventName::MessageUpdate,
+            ),
+            (
+                AgentEvent::MessageEnd { message: message() },
+                ExtensionEventName::MessageEnd,
+            ),
+            (
+                AgentEvent::ToolExecutionStart {
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "probe".to_string(),
+                    args: serde_json::Value::Null,
+                },
+                ExtensionEventName::ToolExecutionStart,
+            ),
+            (
+                AgentEvent::ToolExecutionUpdate {
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "probe".to_string(),
+                    args: serde_json::Value::Null,
+                    partial_result: tool_output(),
+                },
+                ExtensionEventName::ToolExecutionUpdate,
+            ),
+            (
+                AgentEvent::ToolExecutionEnd {
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "probe".to_string(),
+                    result: tool_output(),
+                    is_error: false,
+                },
+                ExtensionEventName::ToolExecutionEnd,
+            ),
+        ];
+        for (event, expected) in events {
+            let actual = extension_event_name_from_agent(&event);
+            assert_eq!(
+                actual,
+                Some(expected),
+                "this observation event must map to {expected:?}; a None means extensions \
+                 silently stop seeing it and a different name means it is delivered to the \
+                 wrong subscribers — neither reports the loss (bd-82331)"
+            );
+        }
     }
 }

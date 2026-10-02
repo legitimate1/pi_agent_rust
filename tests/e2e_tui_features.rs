@@ -15,6 +15,13 @@
 
 mod common;
 
+// The mock `gh` script used to be duplicated in this file, byte for byte,
+// alongside the copy in tests/common/mocks.rs. Both the classic and ftui
+// `/share` scenarios drive the same `run_share` implementation (bd-ydz1t.1), so
+// the comparison between them only means something if they drive the same mock
+// — which the shared copy's own doc comment claimed while this duplicate
+// quietly existed.
+use common::mocks::write_mock_gh_script;
 use common::tmux::TuiSession;
 use serde_json::json;
 use std::fs::{self, OpenOptions};
@@ -22,11 +29,26 @@ use std::time::Duration;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-const SHARE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Patience budgets for this tmux-driven lane.
+///
+/// Every wait here polls a real tmux pane until the expected text appears, so
+/// it is bounded by how fast the machine can start a process, render a frame,
+/// and let tmux report it. The previous values were comfortable on an idle
+/// worker and not in a full lane: an equivalent case in tests/e2e_ftui.rs
+/// failed on a run that took roughly ten times as long as the runs that passed,
+/// on the same commit. A ten second budget on a worker running an order of
+/// magnitude slow is about one second of effective time.
+///
+/// Raising them costs nothing when things are healthy, because every wait
+/// returns as soon as its pane matches; the budget is only ever spent on the
+/// way to a failure. See tests/e2e_ftui.rs for the measurements.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+/// `/share` shells out to `gh`, so it carries the same budget as any other
+/// command rather than the tighter one it had.
+const SHARE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Overall budget for resending `/share` while the session reports busy.
-const SHARE_RETRY_BUDGET: Duration = Duration::from_secs(30);
+const SHARE_RETRY_BUDGET: Duration = Duration::from_secs(120);
 
 /// Standard CLI args for interactive mode with minimal features (no API calls).
 fn minimal_interactive_args() -> Vec<&'static str> {
@@ -125,51 +147,6 @@ fn log_test_event(test_name: &str, event: &str, data: &serde_json::Value) {
     eprintln!("JSONL: {}", serde_json::to_string(&entry).unwrap());
 }
 
-/// Create a mock `gh` script that records args and emits a gist URL.
-fn write_mock_gh_script(dir: &std::path::Path, gist_url: &str) -> std::path::PathBuf {
-    let gh_path = dir.join("gh");
-    let args_path = dir.join("gh_args.log");
-    let uploaded_path = dir.join("uploaded.html");
-    let script = format!(
-        r#"#!/bin/sh
-set -e
-
-# Record all invocations
-echo "$@" >> "{args_log}"
-
-if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
-  exit 0
-fi
-
-if [ "$1" = "gist" ] && [ "$2" = "create" ]; then
-  upload_path=""
-  for arg in "$@"; do
-    upload_path="$arg"
-  done
-  cp "$upload_path" "{uploaded}"
-  echo "{gist_url}"
-  exit 0
-fi
-
-echo "unexpected gh args: $@" >&2
-exit 2
-"#,
-        args_log = args_path.display(),
-        uploaded = uploaded_path.display(),
-        gist_url = gist_url,
-    );
-    fs::write(&gh_path, script).expect("write mock gh");
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod mock gh");
-    }
-
-    gh_path
-}
-
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 /// E2E: `/share` creates a secret, unlisted gist and shows viewer URL.
@@ -188,13 +165,13 @@ fn e2e_tui_share_creates_secret_gist_with_visibility_warning() {
     let mock_bin = session.harness.temp_path("mock_bin");
     fs::create_dir_all(&mock_bin).expect("create mock_bin");
     let gist_url = "https://gist.github.com/testuser/e2e_share_id_123";
-    write_mock_gh_script(&mock_bin, gist_url);
+    let gh_path = write_mock_gh_script(&mock_bin, gist_url);
 
     // Write project settings with gh_path pointing to our mock.
     let pi_dir = session.harness.temp_path(".pi");
     fs::create_dir_all(&pi_dir).expect("create .pi");
     let settings = json!({
-        "ghPath": mock_bin.join("gh").display().to_string()
+        "ghPath": gh_path.display().to_string()
     });
     fs::write(
         pi_dir.join("settings.json"),
@@ -313,12 +290,12 @@ fn e2e_tui_share_rejects_public_argument_without_invoking_gh() {
     let mock_bin = session.harness.temp_path("mock_bin");
     fs::create_dir_all(&mock_bin).expect("create mock_bin");
     let gist_url = "https://gist.github.com/testuser/e2e_public_456";
-    write_mock_gh_script(&mock_bin, gist_url);
+    let gh_path = write_mock_gh_script(&mock_bin, gist_url);
 
     let pi_dir = session.harness.temp_path(".pi");
     fs::create_dir_all(&pi_dir).expect("create .pi");
     let settings = json!({
-        "ghPath": mock_bin.join("gh").display().to_string()
+        "ghPath": gh_path.display().to_string()
     });
     fs::write(
         pi_dir.join("settings.json"),

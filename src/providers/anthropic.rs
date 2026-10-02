@@ -15,12 +15,14 @@ use crate::provider::{CacheRetention, Context, Provider, StreamOptions, ToolDef}
 use crate::provider_metadata::canonical_provider_id;
 use crate::sse::SseStream;
 use async_trait::async_trait;
-use futures::StreamExt;
-use futures::stream::{self, Stream};
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::pin::Pin;
+
+mod transport;
 
 // ============================================================================
 // Constants
@@ -40,6 +42,8 @@ const ANTHROPIC_CACHE_BETA_FLAG: &str = "prompt-caching-2024-07-31";
 /// actually carries a `ttl: "1h"` cache breakpoint (first-party API + `Long`
 /// retention); relays commonly reject both the flag and the `ttl` field.
 const ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG: &str = "extended-cache-ttl-2025-04-11";
+/// Beta flag that accompanies `speed: "fast"` (fast mode, `/fast`).
+const ANTHROPIC_FAST_MODE_BETA_FLAG: &str = "fast-mode-2026-02-01";
 const KIMI_SHARE_DIR_ENV_KEY: &str = "KIMI_SHARE_DIR";
 
 fn anthropic_oauth_beta_flags() -> String {
@@ -216,9 +220,13 @@ where
             if path.starts_with('\\') || path.starts_with('/') {
                 Some(std::path::PathBuf::from(format!("{drive}{path}")))
             } else {
-                let mut combined = std::path::PathBuf::from(drive);
-                combined.push(path);
-                Some(combined)
+                // Write the separator out: `PathBuf::push` suppresses it after
+                // a bare drive prefix, leaving the drive-RELATIVE `C:Users\me`
+                // instead of a rooted home. See `auth::home_dir_with_env_lookup`.
+                Some(std::path::PathBuf::from(format!(
+                    "{drive}{}{path}",
+                    std::path::MAIN_SEPARATOR
+                )))
             }
         })
 }
@@ -339,6 +347,21 @@ pub struct AnthropicProvider {
     base_url: String,
     provider: String,
     compat: Option<CompatConfig>,
+    /// Set once the API rejects fast mode for this model or account, so later
+    /// turns stop asking for it instead of paying a failed request each time.
+    fast_mode_rejected: std::sync::atomic::AtomicBool,
+}
+
+/// Whether an error response means the model or account can't use fast mode:
+/// a 400 saying `speed` is not supported, or a 429 because the account lacks
+/// the fast-mode entitlement (same rule as OMP's `FastModeUnsupported`).
+fn fast_mode_unsupported(status: u16, body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    match status {
+        400 => body.contains("speed") && body.contains("not support"),
+        429 => body.contains("rate_limit_error") && body.contains("fast mode"),
+        _ => false,
+    }
 }
 
 /// Whether an Anthropic(-compatible) model on the `anthropic-messages`
@@ -441,7 +464,20 @@ impl AnthropicProvider {
             base_url: ANTHROPIC_API_URL.to_string(),
             provider: "anthropic".to_string(),
             compat: None,
+            fast_mode_rejected: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Whether this request asks for fast mode (`speed: "fast"`): a
+    /// `priority` service tier on the first-party Anthropic provider that
+    /// hasn't already been rejected. Relays and Anthropic-compatible
+    /// backends never get it.
+    fn fast_mode(&self, options: &StreamOptions) -> bool {
+        self.provider == "anthropic"
+            && options.service_tier.as_deref() == Some("priority")
+            && !self
+                .fast_mode_rejected
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Override the provider name reported in streamed events.
@@ -609,6 +645,7 @@ impl AnthropicProvider {
             stream: true,
             thinking,
             output_config,
+            speed: self.fast_mode(options).then_some("fast"),
         }
     }
 }
@@ -725,6 +762,9 @@ impl Provider for AnthropicProvider {
                 beta_flags.push(ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG.to_string());
             }
         }
+        if request_body.speed.is_some() {
+            beta_flags.push(ANTHROPIC_FAST_MODE_BETA_FLAG.to_string());
+        }
         if !beta_flags.is_empty() {
             request = request.header("anthropic-beta", beta_flags.join(","));
         }
@@ -776,99 +816,30 @@ impl Provider for AnthropicProvider {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
+            // Fast mode exists only on some models and accounts. When the API
+            // refuses it, run the turn at standard speed rather than failing
+            // it, and stop asking for the rest of this model's use.
+            if request_body.speed.is_some() && fast_mode_unsupported(status, &body) {
+                self.fast_mode_rejected
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    model = %self.model,
+                    "Anthropic rejected fast mode; continuing at standard speed: {body}"
+                );
+                return self.stream(context, options).await;
+            }
             return Err(Error::provider(
                 self.name(),
                 format!("Anthropic API error (HTTP {status}): {body}"),
             ));
         }
 
-        // Create SSE stream for streaming responses.
-        let event_source = SseStream::new(response.bytes_stream());
-
-        // Create stream state
-        let model = self.model.clone();
-        let api = self.api().to_string();
-        let provider = self.name().to_string();
-
-        let stream = stream::unfold(
-            StreamState::new(event_source, model, api, provider),
-            |mut state| async move {
-                if state.done {
-                    return None;
-                }
-                loop {
-                    match state.event_source.next().await {
-                        Some(Ok(msg)) => {
-                            state.transient_error_count = 0;
-                            if msg.event == "ping" {
-                                // Skip ping events
-                            } else {
-                                match state.process_event(&msg.data) {
-                                    Ok(Some(event)) => {
-                                        if matches!(
-                                            &event,
-                                            StreamEvent::Done { .. } | StreamEvent::Error { .. }
-                                        ) {
-                                            state.done = true;
-                                        }
-                                        return Some((Ok(event), state));
-                                    }
-                                    Ok(None) => {}
-                                    Err(e) => {
-                                        state.done = true;
-                                        return Some((Err(e), state));
-                                    }
-                                }
-                            }
-                        }
-                        Some(Err(e)) => {
-                            // WriteZero, WouldBlock, and TimedOut errors are transient (e.g. empty SSE
-                            // frames when TLS buffers are full). Skip them and
-                            // keep reading, but cap consecutive occurrences to
-                            // avoid infinite loops.
-                            const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 5;
-                            if e.kind() == std::io::ErrorKind::WriteZero
-                                || e.kind() == std::io::ErrorKind::WouldBlock
-                                || e.kind() == std::io::ErrorKind::TimedOut
-                            {
-                                state.transient_error_count += 1;
-                                if state.transient_error_count <= MAX_CONSECUTIVE_TRANSIENT_ERRORS {
-                                    tracing::warn!(
-                                        kind = ?e.kind(),
-                                        count = state.transient_error_count,
-                                        "Transient error in SSE stream, continuing"
-                                    );
-                                    continue;
-                                }
-                                tracing::warn!(
-                                    kind = ?e.kind(),
-                                    "Error persisted after {MAX_CONSECUTIVE_TRANSIENT_ERRORS} \
-                                     consecutive attempts, treating as fatal"
-                                );
-                            }
-                            state.done = true;
-                            let err = Error::sse(&e);
-                            return Some((Err(err), state));
-                        }
-                        // A clean transport EOF is not a successful Anthropic
-                        // completion unless message_stop was observed. Return a
-                        // retry-classifiable error; the agent loop retains the
-                        // partial message while marking the turn as failed.
-                        None => {
-                            state.done = true;
-                            return Some((
-                                Err(Error::api(
-                                    "Anthropic stream ended before message_stop (unexpected EOF)",
-                                )),
-                                state,
-                            ));
-                        }
-                    }
-                }
-            },
-        );
-
-        Ok(Box::pin(stream))
+        Ok(transport::response_stream(
+            response,
+            self.model.clone(),
+            self.api().to_string(),
+            self.name().to_string(),
+        ))
     }
 }
 
@@ -1218,6 +1189,9 @@ pub struct AnthropicRequest<'a> {
     thinking: Option<AnthropicThinking>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_config: Option<AnthropicOutputConfig>,
+    /// `"fast"` requests fast mode (`/fast`); sent with the fast-mode beta.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed: Option<&'static str>,
 }
 
 /// Thinking configuration. Two shapes share this struct:
@@ -1254,7 +1228,7 @@ struct AnthropicMessage<'a> {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicContent<'a> {
     Text {
-        text: &'a str,
+        text: Cow<'a, str>,
         /// Prompt-cache breakpoint for incremental conversation caching.
         /// Set only on the final block of the last user-role message.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1294,7 +1268,7 @@ struct AnthropicImageSource<'a> {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicToolResultContent<'a> {
-    Text { text: &'a str },
+    Text { text: Cow<'a, str> },
     Image { source: AnthropicImageSource<'a> },
 }
 
@@ -1466,7 +1440,7 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
         Message::Custom(custom) => AnthropicMessage {
             role: "user",
             content: vec![AnthropicContent::Text {
-                text: &custom.content,
+                text: Cow::Borrowed(&custom.content),
                 cache_control: None,
             }],
         },
@@ -1486,15 +1460,20 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
                     .content
                     .iter()
                     .filter_map(|block| match block {
-                        ContentBlock::Text(t) => {
-                            Some(AnthropicToolResultContent::Text { text: &t.text })
-                        }
+                        ContentBlock::Text(t) => Some(AnthropicToolResultContent::Text {
+                            text: Cow::Borrowed(&t.text),
+                        }),
                         ContentBlock::Image(img) => Some(AnthropicToolResultContent::Image {
                             source: AnthropicImageSource {
                                 r#type: "base64",
                                 media_type: &img.mime_type,
                                 data: &img.data,
                             },
+                        }),
+                        // Messages API has no video/audio block; degrade to
+                        // the text placeholder (gh #212).
+                        ContentBlock::Media(media) => Some(AnthropicToolResultContent::Text {
+                            text: Cow::Owned(media.placeholder()),
                         }),
                         _ => None,
                     })
@@ -1509,14 +1488,14 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
 fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent<'_>> {
     match content {
         UserContent::Text(text) => vec![AnthropicContent::Text {
-            text,
+            text: Cow::Borrowed(text),
             cache_control: None,
         }],
         UserContent::Blocks(blocks) => blocks
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::Text(t) => Some(AnthropicContent::Text {
-                    text: &t.text,
+                    text: Cow::Borrowed(&t.text),
                     cache_control: None,
                 }),
                 ContentBlock::Image(img) => Some(AnthropicContent::Image {
@@ -1525,6 +1504,10 @@ fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent<'_>> {
                         media_type: &img.mime_type,
                         data: &img.data,
                     },
+                    cache_control: None,
+                }),
+                ContentBlock::Media(media) => Some(AnthropicContent::Text {
+                    text: Cow::Owned(media.placeholder()),
                     cache_control: None,
                 }),
                 _ => None,
@@ -1536,7 +1519,7 @@ fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent<'_>> {
 fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicContent<'_>> {
     match block {
         ContentBlock::Text(t) => Some(AnthropicContent::Text {
-            text: &t.text,
+            text: Cow::Borrowed(&t.text),
             cache_control: None,
         }),
         ContentBlock::ToolCall(tc) => Some(AnthropicContent::ToolUse {
@@ -1567,7 +1550,7 @@ fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicC
         // Images and redacted-thinking markers don't round-trip back to the
         // Anthropic input surface — Anthropic discards redacted-thinking on
         // subsequent turns, so we do the same.
-        ContentBlock::Image(_) | ContentBlock::RedactedThinking(_) => None,
+        ContentBlock::Image(_) | ContentBlock::Media(_) | ContentBlock::RedactedThinking(_) => None,
     }
 }
 
@@ -1602,10 +1585,10 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn thinking_block_drops_foreign_reasoning_signature() {
@@ -1657,6 +1640,63 @@ mod tests {
         });
 
         assert_eq!(home, Some(PathBuf::from("D:\\Users\\Grace")));
+    }
+
+    /// A `HOMEPATH` with no leading separator must still root against the
+    /// drive; joining it with `PathBuf::push` would leave the drive-relative
+    /// `D:Users\Grace`, which resolves against the current directory on D:.
+    #[test]
+    fn home_dir_lookup_roots_homepath_without_leading_separator() {
+        let home = home_dir_with_env_lookup(|key| match key {
+            "HOMEDRIVE" => Some("D:".to_string()),
+            "HOMEPATH" => Some("Users\\Grace".to_string()),
+            _ => None,
+        })
+        .expect("HOMEDRIVE/HOMEPATH home");
+
+        assert_eq!(home, PathBuf::from("D:/Users\\Grace"));
+        #[cfg(windows)]
+        assert!(home.has_root(), "home must be rooted on the drive");
+    }
+
+    /// gh #212: the Messages API has text/image/document blocks only, so a
+    /// media block degrades to a text placeholder in user content and tool
+    /// results and the payload never reaches the wire.
+    #[test]
+    fn test_convert_media_block_degrades_to_placeholder() {
+        let media = crate::model::MediaContent {
+            data: "AAAA".to_string(),
+            mime_type: "audio/wav".to_string(),
+            name: Some("voice.wav".to_string()),
+        };
+        let content = UserContent::Blocks(vec![
+            ContentBlock::Text(TextContent::new("listen")),
+            ContentBlock::Media(media.clone()),
+        ]);
+        let wire = serde_json::to_value(convert_user_content(&content)).expect("serialize");
+        assert_eq!(
+            wire,
+            json!([
+                { "type": "text", "text": "listen" },
+                { "type": "text", "text": "[media omitted: voice.wav, audio/wav, 3 B]" },
+            ])
+        );
+
+        let result = Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: "call_media".to_string(),
+            tool_name: "read_media".to_string(),
+            content: vec![ContentBlock::Media(media)],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        });
+        let wire = serde_json::to_value(convert_message_to_anthropic(&result)).expect("serialize");
+        assert_eq!(wire["content"][0]["type"], "tool_result");
+        assert_eq!(
+            wire["content"][0]["content"],
+            json!([{ "type": "text", "text": "[media omitted: voice.wav, audio/wav, 3 B]" }])
+        );
+        assert!(!wire.to_string().contains("AAAA"));
     }
 
     #[test]
@@ -1740,7 +1780,7 @@ mod tests {
         assert_eq!(request.messages[0].role, "user");
         assert_eq!(request.messages[0].content.len(), 1);
         match &request.messages[0].content[0] {
-            AnthropicContent::Text { text, .. } => assert_eq!(*text, "Ping"),
+            AnthropicContent::Text { text, .. } => assert_eq!(text.as_ref(), "Ping"),
             other => panic!(),
         }
 
@@ -2936,6 +2976,120 @@ mod tests {
         assert_eq!(provider.name(), "kimi-for-coding");
     }
 
+    fn fast_stream_setup(base_url: String) -> (AnthropicProvider, Context<'static>, StreamOptions) {
+        let provider = AnthropicProvider::new("claude-test").with_base_url(base_url);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions {
+            api_key: Some("sk-ant-test-key".to_string()),
+            service_tier: Some("priority".to_string()),
+            ..Default::default()
+        };
+        (provider, context, options)
+    }
+
+    fn drain_stream(provider: &AnthropicProvider, context: &Context<'_>, options: &StreamOptions) {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(context, options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn fast_mode_sends_speed_and_beta_to_first_party_anthropic_only() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let (provider, context, options) = fast_stream_setup(base_url);
+        drain_stream(&provider, &context, &options);
+        let captured = rx.recv_timeout(Duration::from_secs(2)).expect("request");
+        let body: Value = serde_json::from_str(&captured.body).expect("request json");
+        assert_eq!(body["speed"], "fast");
+        let betas = captured.headers.get("anthropic-beta").expect("beta header");
+        assert!(
+            betas
+                .split(',')
+                .any(|flag| flag == ANTHROPIC_FAST_MODE_BETA_FLAG),
+            "{betas}"
+        );
+
+        // Anthropic-compatible relays and a request without the tier get
+        // neither the field nor (via speed) the beta.
+        let relay = AnthropicProvider::new("m").with_provider_name("minimax");
+        let request = serde_json::to_value(relay.build_request(&context, &options)).unwrap();
+        assert!(request.get("speed").is_none());
+        let plain = StreamOptions {
+            service_tier: None,
+            ..options
+        };
+        let request = serde_json::to_value(provider.build_request(&context, &plain)).unwrap();
+        assert!(request.get("speed").is_none());
+    }
+
+    #[test]
+    fn rejected_fast_mode_retries_at_standard_speed_and_stops_asking() {
+        let rejection = r#"{"type":"error","error":{"type":"invalid_request_error","message":"speed: fast mode is not supported for this model"}}"#;
+        let ok = success_sse_body();
+        let (base_url, rx) = spawn_test_server_sequence(vec![
+            (400, "application/json", rejection),
+            (200, "text/event-stream", &ok),
+            (200, "text/event-stream", &ok),
+        ]);
+        let (provider, context, options) = fast_stream_setup(base_url);
+
+        // The turn succeeds: the rejected request is retried without speed.
+        drain_stream(&provider, &context, &options);
+        let first = rx.recv_timeout(Duration::from_secs(2)).expect("first");
+        let retry = rx.recv_timeout(Duration::from_secs(2)).expect("retry");
+        assert!(first.body.contains(r#""speed":"fast""#), "{}", first.body);
+        assert!(!retry.body.contains("speed"), "{}", retry.body);
+        assert!(
+            !retry
+                .headers
+                .get("anthropic-beta")
+                .is_some_and(|betas| betas.contains(ANTHROPIC_FAST_MODE_BETA_FLAG))
+        );
+
+        // The next turn doesn't ask again.
+        drain_stream(&provider, &context, &options);
+        let next = rx.recv_timeout(Duration::from_secs(2)).expect("next");
+        assert!(!next.body.contains("speed"), "{}", next.body);
+    }
+
+    #[test]
+    fn fast_mode_rejection_is_recognized_narrowly() {
+        assert!(fast_mode_unsupported(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"`speed` is not supported on this model"}}"#
+        ));
+        assert!(fast_mode_unsupported(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"Fast mode requires extra usage"}}"#
+        ));
+        // Unrelated 400s and ordinary rate limits stay errors.
+        assert!(!fast_mode_unsupported(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"max_tokens: 99999999 is too large"}}"#
+        ));
+        assert!(!fast_mode_unsupported(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your rate limit"}}"#
+        ));
+        assert!(!fast_mode_unsupported(500, "speed not supported"));
+    }
+
     #[derive(Debug)]
     struct CapturedRequest {
         headers: HashMap<String, String>,
@@ -2944,6 +3098,78 @@ mod tests {
 
     fn run_stream_and_capture_headers(cache_retention: CacheRetention) -> Option<CapturedRequest> {
         run_stream_and_capture_headers_with_api_key(cache_retention, "sk-ant-test-key")
+    }
+
+    /// bd-n0hjg: the regression test for the whole fixture class (bd-eg6ng).
+    ///
+    /// Eleven provider fixtures used to treat a socket read timeout as fatal or
+    /// as end-of-request. That only breaks under contention — when the client
+    /// has not been scheduled before the fixture's first read — so on an idle
+    /// machine the timeout arm is never even reached and a mutation probe
+    /// cannot fail. I could not prove those conversions any other way: with the
+    /// deadline forced into the past AND a 1ms poll, all 68 tests still passed,
+    /// because the request was already buffered.
+    ///
+    /// This reproduces the condition deliberately instead of waiting for load:
+    /// the CLIENT connects and then says nothing for longer than the two
+    /// seconds the old code allowed. Against the old fixture the read returned
+    /// `WouldBlock` and the header scan then failed as
+    /// `expect("request header boundary")` — a SLOW request misreported as a
+    /// MALFORMED one. Against the current fixture the read waits and the
+    /// request parses.
+    ///
+    /// One provider is enough: the eleven conversions are textually identical,
+    /// so a second copy of this would be ceremony. It lives beside the fixture
+    /// it drives rather than in tests/common, because each provider owns its
+    /// own in-module fixture and there is no shared mock to put it next to.
+    #[test]
+    fn a_fixture_waits_out_a_client_slower_than_the_old_read_timeout() {
+        // Comfortably past the 2s the old code allowed, well inside the 30s
+        // budget the current code gives the whole exchange.
+        const CLIENT_SILENCE: Duration = Duration::from_millis(2_500);
+
+        let (url, rx) = spawn_test_server(200, "text/event-stream", "data: [DONE]\n\n");
+        let authority = url
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .expect("fixture URL has an authority")
+            .to_string();
+
+        let started = Instant::now();
+        let client = std::thread::spawn(move || {
+            let mut socket = TcpStream::connect(&authority).expect("connect to fixture");
+            // The point of the test: connected, then silent past the old window.
+            std::thread::sleep(CLIENT_SILENCE);
+            let body = r#"{"model":"claude-test"}"#;
+            let request = format!(
+                "POST /v1/messages HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(request.as_bytes())
+                .expect("write the delayed request");
+            socket.flush().expect("flush the delayed request");
+        });
+
+        let captured = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the fixture must still capture a request from a slow client");
+        client.join().expect("client thread");
+
+        assert!(
+            started.elapsed() >= CLIENT_SILENCE,
+            "the client did not actually stay silent, so this proves nothing"
+        );
+        assert_eq!(
+            captured.body, r#"{"model":"claude-test"}"#,
+            "the body must arrive whole, not truncated at the read timeout"
+        );
+        assert_eq!(
+            captured.headers.get("content-type").map(String::as_str),
+            Some("application/json"),
+            "headers must parse; truncation shows up here first"
+        );
     }
 
     fn run_stream_and_capture_headers_with_api_key(
@@ -3043,84 +3269,110 @@ mod tests {
         content_type: &str,
         body: &str,
     ) -> (String, mpsc::Receiver<CapturedRequest>) {
+        spawn_test_server_sequence(vec![(status_code, content_type, body)])
+    }
+
+    /// Serve one response per connection, in order, then stop accepting.
+    fn spawn_test_server_sequence(
+        responses: Vec<(u16, &str, &str)>,
+    ) -> (String, mpsc::Receiver<CapturedRequest>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().expect("local addr");
         let (tx, rx) = mpsc::channel();
-        let body = body.to_string();
-        let content_type = content_type.to_string();
+        let responses: Vec<(u16, String, String)> = responses
+            .into_iter()
+            .map(|(status, content_type, body)| {
+                (status, content_type.to_string(), body.to_string())
+            })
+            .collect();
 
         std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().expect("accept");
-            socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("set read timeout");
+            for (status_code, content_type, body) in responses {
+                let (mut socket, _) = listener.accept().expect("accept");
+                // 250ms is the POLLING interval; the deadline below is the budget.
+                // Treating a timed-out read as end-of-request truncated `bytes` and
+                // the header scan then failed as "request header boundary", which
+                // reads as a malformed request rather than a slow one — the reason
+                // this shape is worse than an outright panic (bd-eg6ng).
+                socket
+                    .set_read_timeout(Some(Duration::from_millis(250)))
+                    .expect("set read timeout");
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
 
-            let mut bytes = Vec::new();
-            let mut chunk = [0_u8; 4096];
-            loop {
-                match socket.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        bytes.extend_from_slice(&chunk[..n]);
-                        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                            break;
+                let mut bytes = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    match socket.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            bytes.extend_from_slice(&chunk[..n]);
+                            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
                         }
+                        Err(err)
+                            if err.kind() == std::io::ErrorKind::WouldBlock
+                                || err.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "fixture timed out waiting for request headers"
+                            );
+                        }
+                        Err(err) => panic!(),
                     }
-                    Err(err)
-                        if err.kind() == std::io::ErrorKind::WouldBlock
-                            || err.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        break;
-                    }
-                    Err(err) => panic!(),
                 }
-            }
 
-            let header_end = bytes
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .expect("request header boundary");
-            let header_text = String::from_utf8_lossy(&bytes[..header_end]).to_string();
-            let headers = parse_headers(&header_text);
-            let mut request_body = bytes[header_end + 4..].to_vec();
+                let header_end = bytes
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .expect("request header boundary");
+                let header_text = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+                let headers = parse_headers(&header_text);
+                let mut request_body = bytes[header_end + 4..].to_vec();
 
-            let content_length = headers
-                .get("content-length")
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(0);
-            while request_body.len() < content_length {
-                match socket.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => request_body.extend_from_slice(&chunk[..n]),
-                    Err(err)
-                        if err.kind() == std::io::ErrorKind::WouldBlock
-                            || err.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        break;
+                let content_length = headers
+                    .get("content-length")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                while request_body.len() < content_length {
+                    match socket.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => request_body.extend_from_slice(&chunk[..n]),
+                        Err(err)
+                            if err.kind() == std::io::ErrorKind::WouldBlock
+                                || err.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "fixture timed out waiting for the request body"
+                            );
+                        }
+                        Err(err) => panic!(),
                     }
-                    Err(err) => panic!(),
                 }
+
+                let captured = CapturedRequest {
+                    headers,
+                    body: String::from_utf8_lossy(&request_body).to_string(),
+                };
+                tx.send(captured).expect("send captured request");
+
+                let reason = match status_code {
+                    400 => "Bad Request",
+                    401 => "Unauthorized",
+                    500 => "Internal Server Error",
+                    _ => "OK",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status_code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+                socket.flush().expect("flush response");
             }
-
-            let captured = CapturedRequest {
-                headers,
-                body: String::from_utf8_lossy(&request_body).to_string(),
-            };
-            tx.send(captured).expect("send captured request");
-
-            let reason = match status_code {
-                401 => "Unauthorized",
-                500 => "Internal Server Error",
-                _ => "OK",
-            };
-            let response = format!(
-                "HTTP/1.1 {status_code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket
-                .write_all(response.as_bytes())
-                .expect("write response");
-            socket.flush().expect("flush response");
         });
 
         (format!("http://{addr}/messages"), rx)

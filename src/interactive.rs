@@ -75,18 +75,27 @@ mod conversation;
 mod ext_session;
 mod file_refs;
 mod keybindings;
+/// Crate-visible because the ftui stack drives the same `/share` implementation
+/// rather than growing a second copy of it (bd-ydz1t.1). Only `run_share` and
+/// `ShareOutcome` are exported; everything else stays private to this stack.
+pub(crate) mod login_flow;
 mod model_selector_ui;
 mod perf;
-mod share;
+pub(crate) mod share;
 mod state;
 mod text_utils;
 mod tool_render;
 mod tree;
 mod tree_ui;
 mod view;
+pub(crate) mod workspace_reports;
 
 use self::agent::build_user_message;
 pub(crate) use self::agent::extension_commands_for_catalog;
+/// Shared with the ftui stack so `/copy` behaves and reports identically on
+/// both; see the function's own note.
+pub(crate) use self::commands::copy_text_to_clipboard;
+pub(crate) use self::commands::running_under_wsl;
 pub use self::commands::{
     SlashCommand, model_entry_matches, parse_scoped_model_patterns, resolve_scoped_model_entries,
     strip_thinking_level_suffix,
@@ -98,11 +107,44 @@ use self::commands::{
 // Session→conversation snapshot; re-exported for the ftui migration stack
 // (bd-cv653.9.1) to rebuild its transcript after /resume.
 pub use self::conversation::conversation_from_session;
+pub(crate) use self::tree::{fork_candidates, format_fork_candidates, select_fork_candidate};
+
+/// Where `/export` writes when it is given no argument.
+///
+/// Free rather than a `PiApp` method because the ftui stack runs the same
+/// `/export` (bd-cv653) and must not name its files differently: an exported
+/// conversation should land in the same place whichever stack wrote it.
+pub(crate) fn default_export_path(cwd: &Path, session: &Session) -> PathBuf {
+    if let Some(path) = session.path.as_ref() {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("session");
+        return cwd.join(format!("pi-session-{stem}.html"));
+    }
+    let id = crate::session_picker::truncate_session_id(&session.header.id, 8);
+    cwd.join(format!("pi-session-unsaved-{id}.html"))
+}
+
+/// Resolve an explicit `/export <path>` argument against the working
+/// directory. A relative path is joined; an absolute one is taken as given.
+pub(crate) fn resolve_output_path(cwd: &Path, raw: &str) -> PathBuf {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return cwd.join("pi-session.html");
+    }
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
 use self::ext_session::{InteractiveExtensionHostActions, InteractiveExtensionSession};
 pub use self::ext_session::{format_extension_ui_prompt, parse_extension_ui_response};
+pub(crate) use self::file_refs::extract_file_references;
 use self::file_refs::{
-    file_url_to_path, format_file_ref, is_file_ref_boundary, next_non_whitespace_token,
-    parse_quoted_file_ref, path_for_display, split_trailing_punct, strip_wrapping_quotes,
+    file_url_to_path, format_file_ref, path_for_display, strip_wrapping_quotes,
     unescape_dragged_path,
 };
 use self::perf::{
@@ -1010,7 +1052,7 @@ impl PiApp {
             "  theme: {} (config: {})",
             self.theme.name, theme_setting
         );
-        let _ = writeln!(output, "  model: {}", self.model);
+        let _ = writeln!(output, "  model: {}", session_model_line(&self.model_entry));
         let _ = writeln!(
             output,
             "  compaction: {compaction_enabled} (reserve={reserve_tokens}, keepRecent={keep_recent})"
@@ -1079,28 +1121,11 @@ impl PiApp {
     }
 
     fn default_export_path(&self, session: &Session) -> PathBuf {
-        if let Some(path) = session.path.as_ref() {
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("session");
-            return self.cwd.join(format!("pi-session-{stem}.html"));
-        }
-        let id = crate::session_picker::truncate_session_id(&session.header.id, 8);
-        self.cwd.join(format!("pi-session-unsaved-{id}.html"))
+        default_export_path(&self.cwd, session)
     }
 
     fn resolve_output_path(&self, raw: &str) -> PathBuf {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            return self.cwd.join("pi-session.html");
-        }
-        let path = PathBuf::from(raw);
-        if path.is_absolute() {
-            path
-        } else {
-            self.cwd.join(path)
-        }
+        resolve_output_path(&self.cwd, raw)
     }
 
     fn spawn_save_session(&self) {
@@ -1112,6 +1137,20 @@ impl PiApp {
         let event_tx = self.event_tx.clone();
         let runtime_handle = self.runtime_handle.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
+
+        // Nothing spawned into a cancelled region can report: the runtime
+        // cancels the task at its first await, so neither the lock failure nor
+        // an enqueue ahead of it ever runs. Say so here, where a line of output
+        // still reaches somewhere, instead of spawning a task that vanishes.
+        // See the fuller note in `submit_continue` (bd-k01i6).
+        if task_cx.is_cancel_requested() {
+            tracing::warn!(
+                event = "pi.interactive.save_skipped_cancelled_region",
+                "session save skipped: the request was already cancelled"
+            );
+            return;
+        }
+
         runtime_handle.spawn(async move {
             // Owned guard: `MutexGuard` is `!Send` (asupersync 0.3.9), and
             // `RuntimeHandle::spawn` requires the future to be `Send`.
@@ -1208,8 +1247,14 @@ impl PiApp {
     ///
     /// Keeping this in one place prevents overlay/input drift between
     /// rendering, viewport sizing, and keyboard dispatch.
+    ///
+    /// The editor is normally hidden while a turn is running, but an ask or
+    /// approval card only ever arrives mid-turn (the tool that raised it is
+    /// still executing) and is answered through this same editor. Hiding it
+    /// then left the card's "enter a number" instruction pointing at nothing
+    /// (gh #198): keystrokes were accepted invisibly and the card timed out.
     const fn editor_input_is_available(&self) -> bool {
-        matches!(self.agent_state, AgentState::Idle)
+        (matches!(self.agent_state, AgentState::Idle) || self.has_pending_input_card())
             && self.tree_ui.is_none()
             && self.session_picker.is_none()
             && self.settings_ui.is_none()
@@ -1459,121 +1504,15 @@ impl PiApp {
     }
 
     fn extract_file_references(&mut self, message: &str) -> (String, Vec<String>) {
-        let mut cleaned = String::with_capacity(message.len());
-        let mut file_args = Vec::new();
-        let mut idx = 0usize;
-
-        while idx < message.len() {
-            let ch = message[idx..].chars().next().unwrap_or(' ');
-            if ch == '@' && is_file_ref_boundary(message, idx) {
-                let token_start = idx + ch.len_utf8();
-                let parsed = parse_quoted_file_ref(message, token_start);
-                let (path, trailing, token_end) = parsed.unwrap_or_else(|| {
-                    let (token, token_end) = next_non_whitespace_token(message, token_start);
-                    let (path, trailing) = split_trailing_punct(token);
-                    (path.to_string(), trailing.to_string(), token_end)
-                });
-
-                if !path.is_empty() {
-                    let resolved =
-                        self.autocomplete
-                            .provider
-                            .resolve_file_ref(&path)
-                            .or_else(|| {
-                                let resolved_path = resolve_read_path(&path, &self.cwd);
-                                resolved_path.exists().then(|| path.clone())
-                            });
-
-                    if let Some(resolved) = resolved {
-                        file_args.push(resolved);
-                        let mut next_idx = token_end;
-                        if !trailing.is_empty() {
-                            Self::trim_trailing_horizontal_whitespace(&mut cleaned);
-                        } else if message[next_idx..]
-                            .chars()
-                            .next()
-                            .is_some_and(Self::is_horizontal_whitespace)
-                        {
-                            while message[next_idx..]
-                                .chars()
-                                .next()
-                                .is_some_and(Self::is_horizontal_whitespace)
-                            {
-                                next_idx +=
-                                    message[next_idx..].chars().next().map_or(0, char::len_utf8);
-                            }
-                        } else if Self::trailing_line_is_blank(&cleaned)
-                            && message[next_idx..]
-                                .chars()
-                                .next()
-                                .is_some_and(Self::is_linebreak)
-                        {
-                            Self::trim_trailing_horizontal_whitespace(&mut cleaned);
-                            next_idx += Self::consume_single_linebreak(message, next_idx);
-                        }
-                        cleaned.push_str(&trailing);
-                        idx = next_idx;
-                        continue;
-                    }
-                }
-            }
-
-            cleaned.push(ch);
-            idx += ch.len_utf8();
-        }
-
-        (cleaned, file_args)
-    }
-
-    const fn is_linebreak(ch: char) -> bool {
-        matches!(ch, '\n' | '\r')
-    }
-
-    const fn is_horizontal_whitespace(ch: char) -> bool {
-        matches!(ch, ' ' | '\t')
-    }
-
-    fn trim_trailing_horizontal_whitespace(text: &mut String) {
-        while text
-            .chars()
-            .last()
-            .is_some_and(Self::is_horizontal_whitespace)
-        {
-            text.pop();
-        }
-    }
-
-    fn trailing_line_is_blank(text: &str) -> bool {
-        if let Some((line_start, linebreak)) = text
-            .char_indices()
-            .rev()
-            .find(|(_, ch)| Self::is_linebreak(*ch))
-        {
-            let start = line_start + linebreak.len_utf8();
-            return text[start..].chars().all(Self::is_horizontal_whitespace);
-        }
-
-        text.chars().all(Self::is_horizontal_whitespace)
-    }
-
-    fn consume_single_linebreak(text: &str, start: usize) -> usize {
-        if start >= text.len() {
-            return 0;
-        }
-
-        let Some(first) = text[start..].chars().next() else {
-            return 0;
-        };
-        if !Self::is_linebreak(first) {
-            return 0;
-        }
-
-        let first_len = first.len_utf8();
-        if first == '\r' && text[start + first_len..].starts_with('\n') {
-            return first_len + '\n'.len_utf8();
-        }
-
-        first_len
+        let cwd = &self.cwd;
+        let provider = &mut self.autocomplete.provider;
+        file_refs::extract_file_references(message, |path| {
+            provider.resolve_file_ref(path).or_else(|| {
+                resolve_read_path(path, cwd)
+                    .exists()
+                    .then(|| path.to_string())
+            })
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1936,6 +1875,24 @@ pub(crate) enum InputCardKind {
 }
 
 /// Custom message types for async agent events.
+/// What the FTUI powerline status line shows (OMP-style: display name, not
+/// the provider/id identity), captured by the driver after every command.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FtuiStatusSnapshot {
+    /// The model's display label: catalog/`models.json` name, else the id.
+    pub model: String,
+    pub thinking: Option<String>,
+    /// Plan mode (`act` when off).
+    pub mode: String,
+    pub cwd: String,
+    pub vcs: Option<String>,
+    /// Last prompt's context use as a percentage of the model's window.
+    pub context_pct: u8,
+    pub cost_usd: f64,
+    pub tokens: u64,
+    pub session_name: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum PiMsg {
     /// Agent started processing.
@@ -1955,6 +1912,27 @@ pub enum PiMsg {
     /// charmed stack ignores it because its header re-emits the title every
     /// frame.
     TerminalTitle(String),
+    /// FTUI `/login` state (the charmed stack keeps its own pending login and
+    /// ignores this). `Some(provider)` routes the next submitted line to the
+    /// login as a code or key, never echoed into the transcript; `None` ends
+    /// that. `accepts_empty_input` is true for device flows, where a bare
+    /// Enter polls.
+    LoginPending {
+        provider: Option<String>,
+        accepts_empty_input: bool,
+    },
+    /// FTUI status-line snapshot from the driver, which owns the session
+    /// state the line shows. The charmed stack renders its own and ignores
+    /// this.
+    StatusSnapshot(FtuiStatusSnapshot),
+    /// The user messages on the current path, oldest first, as
+    /// `(summary, entry id)`, for the FTUI's `/branch` and double-Esc picker.
+    /// `fork` means the pick forks a new session instead of rewinding in
+    /// place. The charmed stack ignores it.
+    MessagePicker {
+        fork: bool,
+        messages: Vec<(String, String)>,
+    },
     /// Periodic autocomplete refresh tick (background file index).
     AutocompleteRefresh,
     /// Replacement completion catalog (issue #208). The ftui driver sends it
@@ -2186,12 +2164,45 @@ fn read_jj_change(cwd: &Path) -> Option<String> {
     Some(format!("jj:{line}"))
 }
 
+/// Save the clipboard's image as a temporary PNG and return an `@file`
+/// reference to it for the editor, as ctrl+v does on the classic stack.
+/// `None` when the clipboard holds no image (or clipboard support is off).
+pub(crate) fn paste_clipboard_image_ref() -> Option<String> {
+    let path = PiApp::paste_image_from_clipboard()?;
+    Some(format_file_ref(&path.display().to_string()))
+}
+
+/// What to show for a model (gh #214): its models.json `name` when one is set
+/// and differs from the id, else `provider/id`. Display only: selection,
+/// cycling, and lookups keep using `provider/id`.
+pub(crate) fn model_display_label(entry: &ModelEntry) -> String {
+    let name = entry.model.name.trim();
+    if name.is_empty() || name == entry.model.id {
+        format!("{}/{}", entry.model.provider, entry.model.id)
+    } else {
+        name.to_string()
+    }
+}
+
+/// A model for `/session`-style listings: the display name with the
+/// `provider/id` it resolves to, or just `provider/id` when there is no
+/// distinct name.
+pub(crate) fn session_model_line(entry: &ModelEntry) -> String {
+    let identity = format!("{}/{}", entry.model.provider, entry.model.id);
+    let display = model_display_label(entry);
+    if display == identity {
+        identity
+    } else {
+        format!("{display} ({identity})")
+    }
+}
+
 /// Read VCS info for the interactive status bar: prefers jj in colocated
 /// repos (where both `.jj` and `.git` exist) so the status bar reflects
 /// the VCS the user is actually driving, and falls back to the git
 /// branch name in pure-git repos. Returns `None` when neither is
 /// detectable.
-fn read_vcs_info(cwd: &Path) -> Option<String> {
+pub(crate) fn read_vcs_info(cwd: &Path) -> Option<String> {
     read_jj_change(cwd).or_else(|| read_git_branch(cwd))
 }
 
@@ -2500,6 +2511,143 @@ mod startup_changelog_tests {
 
         assert!(result.is_none());
         assert!(!read.get(), "current changelog should stay compressed");
+    }
+}
+
+#[cfg(test)]
+mod editor_keybinding_tests {
+    use super::{AppAction, KeyBindings, TextArea, apply_editor_keybinding_overrides};
+
+    fn keys_of(binding: &bubbles::key::Binding) -> Vec<String> {
+        binding.get_keys().to_vec()
+    }
+
+    #[test]
+    fn a_rebound_editor_action_reaches_the_editor() {
+        // The failure this replaces: pi parsed the override, stored it,
+        // matched it against the pressed key, and then handed the raw key to
+        // a TextArea that had never heard of it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keybindings.json");
+        std::fs::write(&path, r#"{ "deleteWordBackward": ["ctrl+q"] }"#).expect("write config");
+        let keybindings = KeyBindings::load(&path).expect("load keybindings");
+
+        let mut input = TextArea::new();
+        let before = keys_of(&input.key_map.delete_word_backward);
+        apply_editor_keybinding_overrides(&keybindings, &mut input);
+
+        assert_eq!(
+            keys_of(&input.key_map.delete_word_backward),
+            vec!["ctrl+q".to_string()],
+            "the override did not reach the editor (was {before:?})"
+        );
+    }
+
+    #[test]
+    fn an_untouched_action_keeps_every_key_the_editor_shipped() {
+        // pi's catalog mirrors this widget's defaults but is not identical to
+        // them — the widget also answers ctrl+h here — so overwriting entries
+        // nobody asked about would silently remove working keys.
+        let mut input = TextArea::new();
+        let shipped = keys_of(&input.key_map.delete_character_backward);
+        assert!(
+            shipped.iter().any(|key| key == "ctrl+h"),
+            "test premise changed: the widget no longer ships ctrl+h ({shipped:?})"
+        );
+
+        apply_editor_keybinding_overrides(&KeyBindings::new(), &mut input);
+        assert_eq!(
+            keys_of(&input.key_map.delete_character_backward),
+            shipped,
+            "defaults must pass through untouched"
+        );
+    }
+
+    #[test]
+    fn application_actions_are_not_pushed_into_the_editor() {
+        // Submit belongs to pi's dispatcher; handing it to the editor would
+        // make enter insert a newline instead of sending the message.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keybindings.json");
+        std::fs::write(&path, r#"{ "submit": ["ctrl+j"] }"#).expect("write config");
+        let keybindings = KeyBindings::load(&path).expect("load keybindings");
+        assert_eq!(
+            keybindings.get_bindings(AppAction::Submit),
+            KeyBindings::load(&path)
+                .expect("reload")
+                .get_bindings(AppAction::Submit),
+            "premise: the override loaded"
+        );
+
+        let mut input = TextArea::new();
+        let shipped = keys_of(&input.key_map.insert_newline);
+        apply_editor_keybinding_overrides(&keybindings, &mut input);
+        assert_eq!(
+            keys_of(&input.key_map.insert_newline),
+            shipped,
+            "Submit must not reach the editor's newline entry"
+        );
+    }
+}
+
+/// The `TextArea` keymap entry an editor action drives, if it drives one.
+///
+/// `None` for everything pi's own dispatcher owns (Submit, Interrupt, the
+/// pickers) and for the editor actions the widget has no entry for: `Yank`,
+/// `YankPop` and `Undo`.
+const fn editor_keymap_entry(
+    key_map: &mut bubbles::textarea::KeyMap,
+    action: AppAction,
+) -> Option<&mut bubbles::key::Binding> {
+    Some(match action {
+        AppAction::CursorLeft => &mut key_map.character_backward,
+        AppAction::CursorRight => &mut key_map.character_forward,
+        AppAction::CursorWordLeft => &mut key_map.word_backward,
+        AppAction::CursorWordRight => &mut key_map.word_forward,
+        AppAction::CursorLineStart => &mut key_map.line_start,
+        AppAction::CursorLineEnd => &mut key_map.line_end,
+        AppAction::CursorUp => &mut key_map.line_previous,
+        AppAction::CursorDown => &mut key_map.line_next,
+        AppAction::JumpBackward => &mut key_map.input_begin,
+        AppAction::JumpForward => &mut key_map.input_end,
+        AppAction::DeleteCharBackward => &mut key_map.delete_character_backward,
+        AppAction::DeleteCharForward => &mut key_map.delete_character_forward,
+        AppAction::DeleteWordBackward => &mut key_map.delete_word_backward,
+        AppAction::DeleteWordForward => &mut key_map.delete_word_forward,
+        AppAction::DeleteToLineStart => &mut key_map.delete_before_cursor,
+        AppAction::DeleteToLineEnd => &mut key_map.delete_after_cursor,
+        AppAction::NewLine => &mut key_map.insert_newline,
+        _ => return None,
+    })
+}
+
+/// Teach the editor the editor keys the user rebound.
+///
+/// `keybindings.json` accepts all 59 actions, and for the editor-native ones
+/// pi stored the override, matched it against the pressed key, and then
+/// forwarded the raw key to a `TextArea` that had never heard of it. So
+/// rebinding `deleteWordBackward` — the example in `load_from_user_config`'s
+/// own documentation — did nothing at all.
+///
+/// Only overridden actions are pushed. pi's defaults were written to mirror
+/// this widget's, but not exactly: the widget also answers `ctrl+h` for
+/// delete-character-backward and `ctrl+home`/`ctrl+end` for the document
+/// jumps, which pi's catalog does not list. Replacing untouched entries would
+/// quietly take those away, so untouched entries are left alone and only a
+/// deliberate override moves anything.
+fn apply_editor_keybinding_overrides(keybindings: &KeyBindings, input: &mut TextArea) {
+    let defaults = KeyBindings::new();
+    for &action in AppAction::all() {
+        let bound = keybindings.get_bindings(action);
+        if bound.is_empty() || bound == defaults.get_bindings(action) {
+            continue;
+        }
+        let Some(entry) = editor_keymap_entry(&mut input.key_map, action) else {
+            continue;
+        };
+        let rendered: Vec<String> = bound.iter().map(ToString::to_string).collect();
+        let keys: Vec<&str> = rendered.iter().map(String::as_str).collect();
+        entry.set_keys(&keys);
     }
 }
 
@@ -2930,12 +3078,16 @@ impl PiApp {
             let keybindings_result = KeyBindings::load_from_user_config();
             if keybindings_result.has_warnings() {
                 tracing::warn!(
+                    target: crate::config::USER_DIAGNOSTIC_TARGET,
                     "Keybindings warnings: {}",
                     keybindings_result.format_warnings()
                 );
             }
             keybindings_result.bindings
         });
+        // The editor owns its own key handling, so an override of an
+        // editor-native action only takes effect if it is handed over.
+        apply_editor_keybinding_overrides(&keybindings, &mut input);
 
         // Initialize autocomplete with catalog from resources
         let mut autocomplete_catalog = AutocompleteCatalog::from_resources(&resources);
@@ -3669,8 +3821,16 @@ impl PiApp {
             // (e.g., text input handled by TextArea)
         }
 
-        // Forward to appropriate component based on state
-        if matches!(self.agent_state, AgentState::Idle) {
+        // Forward to appropriate component based on state. The editor owns
+        // keystrokes while idle and, because an ask/approval card is answered
+        // through this same editor, while such a card is pending mid-turn
+        // (gh #229: the card rendered but every typed character went to the
+        // spinner). Spinner ticks keep flowing to the spinner regardless: a
+        // pending card never hides the tool-progress row.
+        let editor_owns_input = (matches!(self.agent_state, AgentState::Idle)
+            || self.has_pending_input_card())
+            && msg.downcast_ref::<SpinnerTickMsg>().is_none();
+        if editor_owns_input {
             let old_height = self.input.height();
 
             if let Some(key) = msg.downcast_ref::<KeyMsg>()

@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 use ftui::core::geometry::Rect;
 use ftui::render::sanitize::sanitize;
 use ftui::runtime::subscription::{StopSignal, SubId, Subscription};
-use ftui::text::Text;
+use ftui::text::{Text, WrapMode, display_width};
 use ftui::widgets::Widget;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::spinner::{DOTS, SpinnerState};
@@ -60,7 +60,12 @@ use crate::extensions::{ExtensionUiRequest, ExtensionUiResponse};
 use crate::interactive::{AutocompleteState, PiMsg, extension_commands_for_catalog};
 use crate::interactive::{format_extension_ui_prompt, parse_extension_ui_response};
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+
+mod info_commands;
+mod plan_commands;
+pub mod session_pins;
+mod workspace_commands;
 
 /// Typed message for the ftui model: terminal events plus bridged agent events.
 ///
@@ -77,6 +82,16 @@ pub enum PiFtuiMsg {
     /// The process came back from a SIGTSTP suspension: the terminal has
     /// been re-acquired and the next frame must repaint everything.
     Resumed,
+    /// The external editor (ctrl+g) closed and the terminal is back: the
+    /// saved draft (or why there is none) and the size for a full repaint.
+    Edited {
+        text: std::result::Result<String, String>,
+        width: u16,
+        height: u16,
+    },
+    /// A clipboard image paste finished off the loop thread (WSL): the
+    /// `@file` reference to insert, or `None` when there was no image.
+    PastedImage(Option<String>),
 }
 
 impl From<Event> for PiFtuiMsg {
@@ -124,7 +139,7 @@ const AGENT_EVENT_POLL: Duration = Duration::from_millis(50);
 const SPINNER_INTERVAL: Duration = Duration::from_millis(120);
 
 /// Key hint shown in the footer while a picker overlay is open.
-const PICKER_HINT: &str = "↑/↓ j/k navigate · Enter apply · Esc close";
+const PICKER_HINT: &str = "type to filter · ↑/↓ navigate · Enter apply · Esc close";
 
 /// Loop-lag budget. A single `update()` or `view()` call that holds the event
 /// loop this long has stalled it: input sits unread, agent deltas queue, and
@@ -386,49 +401,124 @@ fn drain_agent_events(
 /// the model freezes spinner ticks while suspending so pending frames stay
 /// byte-identical and the diff engine emits nothing.
 #[cfg(unix)]
-fn perform_terminal_suspend(alt_screen: bool) -> std::io::Result<(u16, u16)> {
-    use std::io::{Write, stdout};
-
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
-
-    // Cooked mode first: the shell must own echo/signal handling while we
-    // are stopped. Raw mode is process-global termios state, safe to toggle
-    // from a task thread.
-    disable_raw_mode()?;
-    {
-        let mut out = stdout();
-        out.write_all(b"\x1b[?2004l")?; // bracketed paste off
-        out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l")?; // SGR mouse off
-        if alt_screen {
-            out.write_all(b"\x1b[?1049l")?; // leave alternate screen
-        }
-        out.write_all(b"\x1b[?25h")?; // show cursor
-        out.flush()?;
-    };
+fn perform_terminal_suspend(alt_screen: bool, mouse: bool) -> std::io::Result<(u16, u16)> {
+    release_terminal(alt_screen)?;
     // Stops the process here; resumes after `fg`.
     signal_hook::low_level::raise(signal_hook::consts::signal::SIGTSTP)?;
-
     // --- continued ---
-    enable_raw_mode()?;
+    reacquire_terminal(alt_screen, mouse)
+}
+
+/// Hand the terminal back in shell-safe cooked state (suspend, external
+/// editor). Undone by [`reacquire_terminal`].
+fn release_terminal(alt_screen: bool) -> std::io::Result<()> {
+    use std::io::{Write, stdout};
+
+    // Cooked mode first: the shell (or editor) must own echo/signal handling.
+    // Raw mode is process-global termios state, safe to toggle from a task
+    // thread.
+    crossterm::terminal::disable_raw_mode()?;
+    let mut out = stdout();
+    out.write_all(b"\x1b[?2004l")?; // bracketed paste off
+    out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l")?; // SGR mouse off
+    if alt_screen {
+        out.write_all(b"\x1b[?1049l")?; // leave alternate screen
+    }
+    out.write_all(b"\x1b[?25h")?; // show cursor
+    out.flush()
+}
+
+/// Take the terminal back after [`release_terminal`]; returns its size so the
+/// caller can feed a full repaint.
+fn reacquire_terminal(alt_screen: bool, mouse: bool) -> std::io::Result<(u16, u16)> {
+    use std::io::{Write, stdout};
+
+    crossterm::terminal::enable_raw_mode()?;
     {
         let mut out = stdout();
         if alt_screen {
             out.write_all(b"\x1b[?1049h")?; // re-enter alternate screen
         }
         out.write_all(b"\x1b[?2004h")?; // bracketed paste on
-        out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")?; // mouse on (SGR)
+        if mouse {
+            out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")?; // mouse on (SGR)
+        }
         out.write_all(b"\x1b[?25l")?; // hide cursor
         out.flush()?;
     }
-    size()
+    crossterm::terminal::size()
+}
+
+/// The editor ctrl+g opens: `$VISUAL`, else `$EDITOR`, else `vi`.
+fn external_editor_command() -> String {
+    std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| String::from("vi"))
+}
+
+/// Edit `draft` in `editor` (a shell command, so `code --wait` works) and
+/// return the saved text.
+fn run_external_editor(editor: &str, draft: &str) -> std::io::Result<String> {
+    use std::io::Write;
+
+    let mut file = tempfile::Builder::new().suffix(".md").tempfile()?;
+    file.write_all(draft.as_bytes())?;
+    file.flush()?;
+    let path = file.path().to_path_buf();
+    #[cfg(unix)]
+    let status = std::process::Command::new("sh")
+        .args(["-c", &format!("{editor} \"$1\""), "--"])
+        .arg(&path)
+        .status()?;
+    #[cfg(not(unix))]
+    let status = std::process::Command::new("cmd")
+        .args(["/c", &format!("{editor} \"{}\"", path.display())])
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "{editor} exited with {status}; the draft is unchanged"
+        )));
+    }
+    std::fs::read_to_string(&path)
+}
+
+/// Build the blocking task behind [`AppAction::ExternalEditor`]: release the
+/// terminal, edit the draft, take the terminal back, and report the result.
+fn external_editor_task(
+    draft: String,
+    alt_screen: bool,
+    mouse: bool,
+) -> impl FnOnce() -> PiFtuiMsg + Send + 'static {
+    move || {
+        // Always answer with `Edited` (errors in `text`): it is the message
+        // that clears `suspending` and repaints, whatever went wrong.
+        let text = release_terminal(alt_screen)
+            .map_err(|err| format!("external editor: {err}"))
+            .and_then(|()| {
+                run_external_editor(&external_editor_command(), &draft)
+                    .map_err(|err| format!("external editor: {err}"))
+            });
+        let (text, (width, height)) = match reacquire_terminal(alt_screen, mouse) {
+            Ok(size) => (text, size),
+            Err(err) => (
+                Err(format!("external editor: terminal not restored: {err}")),
+                crossterm::terminal::size().unwrap_or((80, 24)),
+            ),
+        };
+        PiFtuiMsg::Edited {
+            text,
+            width,
+            height,
+        }
+    }
 }
 
 /// Build the blocking task behind [`AppAction::Suspend`]: park the terminal,
 /// stop until continued, then hand back a message that clears the suspend
 /// state and triggers a full repaint.
 #[cfg(unix)]
-fn suspend_task(alt_screen: bool) -> impl FnOnce() -> PiFtuiMsg + Send + 'static {
-    move || match perform_terminal_suspend(alt_screen) {
+fn suspend_task(alt_screen: bool, mouse: bool) -> impl FnOnce() -> PiFtuiMsg + Send + 'static {
+    move || match perform_terminal_suspend(alt_screen, mouse) {
         Ok((width, height)) => PiFtuiMsg::Term(Event::Resize { width, height }),
         Err(err) => PiFtuiMsg::Agent(PiMsg::AgentError(format!("suspend/resume: {err}"))),
     }
@@ -498,6 +588,9 @@ impl FtuiPalette {
 enum EntryRole {
     User,
     Assistant,
+    /// The model's reasoning before an answer or tool call; collapsed to one
+    /// line unless ctrl+t shows it.
+    Thinking,
     System,
     Error,
     Ask,
@@ -509,6 +602,7 @@ impl EntryRole {
         match self {
             Self::User => "› ",
             Self::System => "· ",
+            Self::Thinking => "∴ ",
             Self::Error => "✗ ",
             Self::Assistant | Self::Ask => "",
         }
@@ -518,10 +612,207 @@ impl EntryRole {
         match self {
             Self::User => ftui::Style::new().bold().fg(palette.accent),
             Self::Assistant => ftui::Style::new(),
-            Self::System | Self::Ask => ftui::Style::new().dim().fg(palette.muted),
+            Self::System | Self::Ask | Self::Thinking => ftui::Style::new().dim().fg(palette.muted),
             Self::Error => ftui::Style::new().bold().fg(palette.error),
         }
     }
+}
+
+/// The newest http(s) link in the transcript (OMP `/open`), without the
+/// sentence punctuation or closing bracket that tends to follow one.
+fn last_url(transcript: &[TranscriptEntry]) -> Option<String> {
+    transcript.iter().rev().find_map(|entry| {
+        [entry.detail.as_deref(), Some(entry.text.as_str())]
+            .into_iter()
+            .flatten()
+            .find_map(|text| {
+                text.split(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '`'))
+                    .rev()
+                    .map(|word| word.trim_start_matches(['(', '[', '\'']))
+                    .find(|word| word.starts_with("https://") || word.starts_with("http://"))
+                    .map(|word| {
+                        word.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '\''])
+                            .to_string()
+                    })
+            })
+    })
+}
+
+/// Resolve a `/model` or `/switch` selector (OMP) against the available
+/// `provider/id` list: an optional `:level` suffix sets thinking; then an
+/// exact `provider/id`, an exact id, or a unique substring match. A
+/// `provider/id` not in the list passes through, as `/model` always allowed
+/// (the driver reports an unknown model). Ambiguity lists the candidates.
+fn resolve_model_selector(
+    available: &[String],
+    selector: &str,
+) -> Result<(String, String, Option<crate::model::ThinkingLevel>), String> {
+    let selector = selector.trim();
+    let id_of = |full: &str| {
+        full.split_once('/')
+            .map_or(full, |(_, id)| id)
+            .to_ascii_lowercase()
+    };
+    let names_available_model = |candidate: &str| {
+        let lower = candidate.to_ascii_lowercase();
+        available
+            .iter()
+            .any(|full| full.to_ascii_lowercase() == lower || id_of(full) == lower)
+    };
+    // `spec:level` selects a thinking level by name only. Model ids can end in
+    // `:<digit>` (Bedrock's `...-v1:0`), and a selector that names an available
+    // model exactly is never split.
+    let (spec, level) = match selector.rsplit_once(':') {
+        Some((spec, level))
+            if !spec.is_empty()
+                && !level.bytes().all(|byte| byte.is_ascii_digit())
+                && !names_available_model(selector) =>
+        {
+            level
+                .parse::<crate::model::ThinkingLevel>()
+                .map_or((selector, None), |level| (spec, Some(level)))
+        }
+        _ => (selector, None),
+    };
+    let lower = spec.to_ascii_lowercase();
+    let mut matches: Vec<&String> = available
+        .iter()
+        .filter(|full| full.to_ascii_lowercase() == lower || id_of(full) == lower)
+        .collect();
+    if matches.is_empty() {
+        matches = available
+            .iter()
+            .filter(|full| full.to_ascii_lowercase().contains(&lower))
+            .collect();
+    }
+    let split = |full: &str| {
+        full.split_once('/')
+            .map(|(provider, id)| (provider.to_string(), id.to_string()))
+    };
+    match matches.as_slice() {
+        [one] => split(one)
+            .map(|(provider, id)| (provider, id, level))
+            .ok_or_else(|| format!("malformed model entry: {one}")),
+        [] => match split(spec) {
+            Some((provider, id)) if !provider.is_empty() && !id.is_empty() => {
+                Ok((provider, id, level))
+            }
+            _ => Err(format!("Model not found: {spec}")),
+        },
+        many => {
+            let preview = many
+                .iter()
+                .take(8)
+                .map(|m| format!("  - {m}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(format!(
+                "Ambiguous model \"{spec}\". Matches:\n{preview}\nUse provider/id for an exact match."
+            ))
+        }
+    }
+}
+
+/// The fenced code blocks in markdown `text`, in order, as `(language,
+/// code)`. An unterminated fence runs to the end, as a streaming renderer
+/// would show it.
+fn fenced_code_blocks(text: &str) -> Vec<(String, String)> {
+    let mut blocks = Vec::new();
+    let mut open: Option<(String, String, Vec<&str>)> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        match open.take() {
+            None => {
+                if let Some(rest) = trimmed.strip_prefix("```") {
+                    open = Some(("```".to_string(), rest.trim().to_string(), Vec::new()));
+                } else if let Some(rest) = trimmed.strip_prefix("~~~") {
+                    open = Some(("~~~".to_string(), rest.trim().to_string(), Vec::new()));
+                }
+            }
+            Some((fence, lang, mut lines)) => {
+                if trimmed.starts_with(fence.as_str())
+                    && trimmed.trim_start_matches(['`', '~']).trim().is_empty()
+                {
+                    blocks.push((lang, lines.join("\n")));
+                } else {
+                    lines.push(line);
+                    open = Some((fence, lang, lines));
+                }
+            }
+        }
+    }
+    if let Some((_, lang, lines)) = open
+        && !lines.is_empty()
+    {
+        blocks.push((lang, lines.join("\n")));
+    }
+    blocks
+}
+
+/// What `/copy` offers, newest first: each reply, and each code block in
+/// it, as `(picker row, text to copy)` (OMP's copy selector).
+fn copy_choices(transcript: &[TranscriptEntry]) -> Vec<(String, String)> {
+    fn first_line(text: &str) -> String {
+        let line = text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        let clipped: String = line.chars().take(70).collect();
+        if clipped.len() < line.len() {
+            format!("{clipped}…")
+        } else {
+            clipped
+        }
+    }
+    let mut choices = Vec::new();
+    for entry in transcript.iter().rev() {
+        if entry.role != EntryRole::Assistant || entry.text.trim().is_empty() {
+            continue;
+        }
+        for (lang, code) in fenced_code_blocks(&entry.text).into_iter().rev() {
+            let label = if lang.is_empty() {
+                String::from("code")
+            } else {
+                format!("code ({lang})")
+            };
+            choices.push((format!("{label}: {}", first_line(&code)), code));
+        }
+        choices.push((
+            format!("reply: {}", first_line(&entry.text)),
+            entry.text.clone(),
+        ));
+    }
+    choices
+}
+
+/// Hand a URL to the platform's opener, detached.
+fn open_in_browser(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    // Not `cmd /c start`: cmd re-parses the URL, so `&`, `|` or `^` in a link
+    // taken from model or tool output would run as commands.
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler");
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = std::process::Command::new("xdg-open");
+    command
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(drop)
+}
+
+/// A thinking entry while thinking is hidden: one line saying how much.
+fn collapsed_thinking(text: &str) -> String {
+    let lines = text.lines().count();
+    format!("thinking · {lines} lines (ctrl+t to show)")
 }
 
 /// Word-level pairing for one removed/added line couplet: returns the
@@ -573,6 +864,35 @@ fn word_diff_parts(removed: &str, added: &str) -> Option<(String, String, String
 /// result detail. Diff cards pair consecutive -/+ lines and emphasize the
 /// changed words; everything else renders dim indented lines.
 #[allow(clippy::too_many_arguments)]
+/// Lines of a card's detail shown while tool output is collapsed (ctrl+o
+/// expands it to everything the card kept).
+const COLLAPSED_DETAIL_LINES: usize = 8;
+/// Lines of tool output a card keeps at all; beyond this an elision line
+/// (`… +N more lines`) stands in for the rest.
+const KEPT_DETAIL_LINES: usize = 200;
+
+/// A detail body cut to [`COLLAPSED_DETAIL_LINES`], plus how many lines the
+/// cut hides (counting those a trailing `… +N more lines` already elided).
+fn collapse_detail<'a>(body: &[&'a str]) -> (Vec<&'a str>, usize) {
+    if body.len() <= COLLAPSED_DETAIL_LINES {
+        return (body.to_vec(), 0);
+    }
+    let (content, already_elided) = body
+        .last()
+        .and_then(|last| {
+            last.strip_prefix("… +")
+                .and_then(|rest| rest.strip_suffix(" more lines"))
+                .and_then(|n| n.parse::<usize>().ok())
+        })
+        .map_or((body, 0), |n| (&body[..body.len() - 1], n));
+    let shown = content.len().min(COLLAPSED_DETAIL_LINES);
+    (
+        content[..shown].to_vec(),
+        content.len() - shown + already_elided,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn push_card_block(
     lines: &mut Vec<ftui::text::Line<'static>>,
     state: CardState,
@@ -582,6 +902,7 @@ fn push_card_block(
     group_count: u32,
     palette: &FtuiPalette,
     spinner_frame: usize,
+    expanded: bool,
 ) {
     let (glyph, style) = match state {
         CardState::Pending => (
@@ -604,7 +925,12 @@ fn push_card_block(
     let added_span = |s: String| ftui::text::Span::styled(s, ftui::Style::new().fg(palette.accent));
     let removed_span =
         |s: String| ftui::text::Span::styled(s, ftui::Style::new().fg(palette.error));
-    let body = detail.lines().collect::<Vec<_>>();
+    let all = detail.lines().collect::<Vec<_>>();
+    let (body, hidden) = if expanded {
+        (all, 0)
+    } else {
+        collapse_detail(&all)
+    };
     let mut i = 0;
     while i < body.len() {
         let line = body[i];
@@ -637,6 +963,11 @@ fn push_card_block(
         };
         lines.push(ftui::text::Line::from_spans(vec![span]));
         i += 1;
+    }
+    if hidden > 0 {
+        lines.push(ftui::text::Line::from_spans(vec![dim(format!(
+            "  … +{hidden} more lines (ctrl+o to expand)"
+        ))]));
     }
 }
 
@@ -742,6 +1073,153 @@ fn apply_compact_spacing(
     out
 }
 
+/// Cell width of a rendered line's leading whitespace.
+///
+/// Walks spans rather than materializing the plain text: the markdown
+/// renderer emits list and code-block indentation as its own span, so the
+/// answer is usually the first span's width.
+fn leading_indent_cells(line: &ftui::text::Line<'_>) -> usize {
+    let mut cells = 0;
+    for span in line.spans() {
+        let content = span.as_str();
+        let trimmed = content.trim_start();
+        if trimmed.is_empty() {
+            // Empty or whitespace-only span: all of it is indent.
+            cells += display_width(content);
+            continue;
+        }
+        cells += display_width(&content[..content.len() - trimmed.len()]);
+        break;
+    }
+    cells
+}
+
+/// Split the first `indent_cells` cells off `line`, returning the indent
+/// spans and the remainder. Styles and OSC-8 links survive the split because
+/// [`ftui::text::Span::split_at_cell`] carries them onto both halves.
+fn split_leading_indent(
+    line: &ftui::text::Line<'static>,
+    indent_cells: usize,
+) -> (Vec<ftui::text::Span<'static>>, ftui::text::Line<'static>) {
+    let mut indent: Vec<ftui::text::Span<'static>> = Vec::new();
+    let mut rest: Vec<ftui::text::Span<'static>> = Vec::new();
+    let mut consumed = 0_usize;
+    for span in line.spans() {
+        if consumed >= indent_cells {
+            rest.push(span.clone());
+            continue;
+        }
+        let span_width = span.width();
+        if consumed + span_width <= indent_cells {
+            consumed += span_width;
+            indent.push(span.clone());
+            continue;
+        }
+        let (left, right) = span.split_at_cell(indent_cells - consumed);
+        consumed = indent_cells;
+        if !left.is_empty() {
+            indent.push(left);
+        }
+        if !right.is_empty() {
+            rest.push(right);
+        }
+    }
+    (indent, ftui::text::Line::from_spans(rest))
+}
+
+/// The hanging indent for a wrapped line: how many cells its continuations
+/// move in by, and the spans that fill them.
+///
+/// A list bullet or task checkbox is emitted as its own span carrying the
+/// nesting indent plus the marker, and is identified by the theme style
+/// stamped on it (the same technique [`compact_line_is_boundary`] uses).
+/// Continuations of a list item align under its text with blanks — repeating
+/// the glyph would read as a new item. Everything else hangs on its literal
+/// leading whitespace, and those spans are cloned so a fenced code block
+/// keeps its background tint all the way to the margin.
+fn hanging_indent(
+    line: &ftui::text::Line<'static>,
+    theme: &ftui_extras::markdown::MarkdownTheme,
+) -> (usize, Vec<ftui::text::Span<'static>>) {
+    let marker_styles = [theme.list_bullet, theme.task_done, theme.task_todo];
+    if let Some(first) = line.spans().first()
+        && !first.is_empty()
+        && first
+            .style
+            .is_some_and(|style| marker_styles.contains(&style))
+    {
+        let cells = first.width();
+        return (cells, vec![ftui::text::Span::raw(" ".repeat(cells))]);
+    }
+    let cells = leading_indent_cells(line);
+    if cells == 0 {
+        return (0, Vec::new());
+    }
+    (cells, split_leading_indent(line, cells).0)
+}
+
+/// Wrap one rendered conversation line to `width` cells (issue #227).
+///
+/// [`WrapMode::WordChar`] breaks at word boundaries and falls back to
+/// grapheme boundaries for a token longer than the row, so an unbroken URL
+/// hard-breaks instead of overflowing; splits are measured in display cells,
+/// so CJK and emoji never straddle the edge. ftui's word wrap left-trims
+/// wrapped rows, so the hanging indent is re-applied here — otherwise list
+/// items and fenced code slide back to the margin on every continuation.
+fn wrap_body_line(
+    line: &ftui::text::Line<'static>,
+    width: usize,
+    theme: &ftui_extras::markdown::MarkdownTheme,
+) -> Vec<ftui::text::Line<'static>> {
+    if width == 0 || line.width() <= width {
+        return vec![line.clone()];
+    }
+    let (indent_cells, continuation) = hanging_indent(line, theme);
+    // A hanging indent is only worth it while it leaves most of the row for
+    // text; deep indents (and whitespace-only lines, whose indent is the
+    // whole line) wrap flush instead of squeezing text into a sliver.
+    if indent_cells == 0 || indent_cells.saturating_mul(2) >= width {
+        return line.wrap(width, WrapMode::WordChar);
+    }
+    let (own_prefix, rest) = split_leading_indent(line, indent_cells);
+    rest.wrap(width - indent_cells, WrapMode::WordChar)
+        .into_iter()
+        .enumerate()
+        .map(|(row, piece)| {
+            // Row 0 keeps the line's real prefix (the bullet, the tinted
+            // code indent); the rest get the continuation fill.
+            let prefix = if row == 0 { &own_prefix } else { &continuation };
+            let mut out = ftui::text::Line::from_spans(prefix.iter().cloned());
+            for span in piece {
+                out.push_span(span);
+            }
+            out
+        })
+        .collect()
+}
+
+/// Wrap a block of rendered lines to `width` in place (issue #227).
+///
+/// The whole conversation body is one [`Paragraph`], and ftui's paragraph
+/// defaults to `WrapMode::None` — long lines are *clipped* at the right edge,
+/// silently losing everything past it. Wrapping here rather than through
+/// `Paragraph::wrap` keeps one source of truth for the visual line count,
+/// which the tail-follow scroll math in `render_frame` depends on.
+fn wrap_body_block(
+    lines: &mut Vec<ftui::text::Line<'static>>,
+    width: usize,
+    theme: &ftui_extras::markdown::MarkdownTheme,
+) {
+    if width == 0 || lines.iter().all(|line| line.width() <= width) {
+        return;
+    }
+    let mut out: Vec<ftui::text::Line<'static>> = Vec::with_capacity(lines.len() + 8);
+    for line in lines.iter() {
+        out.extend(wrap_body_line(line, width, theme));
+    }
+    *lines = out;
+}
+
 /// Live state of a tool-execution card (bd-cv653.9.2): a pending card
 /// flips to its terminal state IN PLACE when the tool ends, mirroring
 /// omp's state-tinted tool boxes. Bordered widget chrome lands with the
@@ -804,8 +1282,9 @@ pub struct AskUiReply {
 
 /// Modal list picker rendered over the conversation body. All pickers of the
 /// bubbletea stack (theme, model, session, branch) share this shape; while
-/// open it captures every key (Up/Down/j/k navigate, Enter confirms, Esc
-/// closes), matching the modal-capture chain in `update_inner`.
+/// open it captures every key (Up/Down navigate, Enter confirms, Esc
+/// closes, typing filters; j/k navigate until a filter is typed), matching
+/// the modal-capture chain in `update_inner`.
 struct PickerOverlay {
     title: String,
     items: Vec<String>,
@@ -813,8 +1292,98 @@ struct PickerOverlay {
     /// session picker shows names but selects paths). Empty → items are the
     /// values.
     values: Vec<String>,
+    /// Typed filter (gh #244). Empty shows every item.
+    query: String,
+    /// Indices into `items` that match `query`, in list order.
+    shown: Vec<usize>,
+    /// Position within `shown`, not within `items`.
     selected: usize,
     kind: PickerKind,
+}
+
+impl PickerOverlay {
+    fn new(
+        title: impl Into<String>,
+        items: Vec<String>,
+        values: Vec<String>,
+        kind: PickerKind,
+    ) -> Self {
+        let shown = (0..items.len()).collect();
+        Self {
+            title: title.into(),
+            items,
+            values,
+            query: String::new(),
+            shown,
+            selected: 0,
+            kind,
+        }
+    }
+
+    fn matches(&self, index: usize) -> bool {
+        let query = self.query.trim();
+        if query.is_empty() {
+            return true;
+        }
+        let item = &self.items[index];
+        match self.kind {
+            // Same matching as the classic stack's model selector, provider
+            // aliases included ("grok" finds xai models), on the identity;
+            // a display name shown beside it (GH #214) also finds the row.
+            PickerKind::Model => {
+                let id = self.values.get(index).unwrap_or(item);
+                crate::model_selector::full_id_matches_query(query, id)
+                    || (item != id && crate::model_selector::fuzzy_match(query, item))
+            }
+            PickerKind::Theme
+            | PickerKind::Session
+            | PickerKind::Rewind
+            | PickerKind::ForkFrom
+            | PickerKind::Copy => crate::model_selector::fuzzy_match(query, item),
+        }
+    }
+
+    /// Recompute `shown` after `query` changed; the selection returns to the
+    /// first match, as on the classic stack.
+    fn refilter(&mut self) {
+        self.shown = (0..self.items.len()).filter(|&i| self.matches(i)).collect();
+        self.selected = 0;
+    }
+
+    fn push_query_char(&mut self, ch: char) {
+        if ch.is_control() {
+            return;
+        }
+        self.query.push(ch);
+        self.refilter();
+    }
+
+    /// Pasted text joins the filter (the classic selector takes pastes the
+    /// same way). Line breaks and other control characters are dropped.
+    fn push_query_str(&mut self, text: &str) {
+        let before = self.query.len();
+        self.query
+            .extend(text.chars().filter(|ch| !ch.is_control()));
+        if self.query.len() != before {
+            self.refilter();
+        }
+    }
+
+    fn pop_query_char(&mut self) {
+        if self.query.pop().is_some() {
+            self.refilter();
+        }
+    }
+
+    /// The selection value of the highlighted row, if any row is shown.
+    fn take_choice(mut self) -> Option<String> {
+        let index = *self.shown.get(self.selected)?;
+        if self.values.is_empty() {
+            (index < self.items.len()).then(|| self.items.swap_remove(index))
+        } else {
+            (index < self.values.len()).then(|| self.values.swap_remove(index))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -827,6 +1396,51 @@ enum PickerKind {
     /// Session picker (`/resume`): items are display labels, values are
     /// session file paths; selection routes `UiCommand::ResumeSession`.
     Session,
+    /// A user message to rewind to (`/branch`, double-Esc): values are
+    /// entry ids; selection routes `UiCommand::Rewind`.
+    Rewind,
+    /// A user message to fork a new session from (`doubleEscapeAction:
+    /// fork`); selection routes `UiCommand::Fork` with the entry id.
+    ForkFrom,
+    /// A reply or code block to copy (`/copy`): values are the text.
+    Copy,
+}
+
+/// What double-Esc on an idle, empty editor does (`doubleEscapeAction`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoubleEscapeAction {
+    /// OMP's default: pick an earlier message to rewind to.
+    Rewind,
+    /// Pick an earlier message to fork a new session from.
+    Fork,
+    /// Show the session tree summary.
+    Tree,
+    /// Do nothing.
+    None,
+}
+
+impl DoubleEscapeAction {
+    /// Parse the setting. Unset or unrecognized means OMP's `rewind`;
+    /// OMP's legacy `branch` is its old name.
+    pub fn from_setting(value: Option<&str>) -> Self {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("fork") => Self::Fork,
+            Some("tree") => Self::Tree,
+            Some("none") => Self::None,
+            _ => Self::Rewind,
+        }
+    }
+}
+
+/// Text the user typed in answer to a `/login` prompt. It may be an API key
+/// or an OAuth code, so `Debug` never shows it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LoginInput(pub String);
+
+impl std::fmt::Debug for LoginInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LoginInput(<redacted>)")
+    }
 }
 
 /// Command from the UI to the agent driver.
@@ -850,6 +1464,12 @@ pub enum UiCommand {
     /// Compact the conversation (`/compact`): the driver runs compaction and
     /// replays the rewritten history into the transcript.
     Compact,
+    /// OMP `/shake` (also `/compact shake`): compact by dropping bulky tool
+    /// output from the older span, with no model summary.
+    Shake,
+    /// Control read-only planning and session-bound review (`/plan`).
+    /// The driver retains the exact displayed proposal, not the UI command.
+    Plan { action: String },
     /// Roll back (`/undo`) or re-apply (`/redo`) recorded agent file edits
     /// (bd-cv653.3.13).
     Undo {
@@ -871,9 +1491,59 @@ pub enum UiCommand {
     /// the launch template with the current provider/model selection and a
     /// reset thinking level, swaps it in, and replays the (empty) history.
     NewSession,
+    /// `/delete yes` (OMP `/delete`): start a new session, then delete the
+    /// previous session's file.
+    DeleteSession,
+    /// `/login [provider]`: list providers, or start that provider's flow.
+    Login { args: String },
+    /// The user's answer to a pending `/login`: an authorization code,
+    /// callback URL, API key, or (device flow) a bare confirmation.
+    LoginSubmit(LoginInput),
+    /// `/logout [provider]`: remove stored credentials (default: active
+    /// provider).
+    Logout { args: String },
+    /// `/fork [list|index|id]`: branch a new session from a user message.
+    Fork { args: String },
+    /// `/reload`: rebuild the session from its file with resources re-read.
+    Reload,
+    /// `/btw <question>`: an ephemeral side question to the smol role model
+    /// with a compact, vault-transformed summary of the conversation. The
+    /// answer is display-only and never enters the session.
+    Btw(String),
+    /// `/fresh`: reset provider stream state (new stream session id and
+    /// prompt cache key) without changing the transcript.
+    Fresh,
+    /// `/retry`: re-send the last user turn as a sibling branch of the
+    /// abandoned one; the driver replays the history before the turn runs.
+    Retry,
+    /// `/scoped-models [patterns|clear]`: show or set the models ctrl+p
+    /// cycles through.
+    ScopedModels { args: String },
+    /// `/checkpoint [name] [note]`: mark the active context.
+    Checkpoint { args: String },
+    /// `/rewind [name]`: collapse the context since a checkpoint into a
+    /// summarized report.
+    Rewind { name: String },
+    /// An OMP workspace command (`/rules`, `/omfg`, `/commit`, `/review`,
+    /// `/handoff`, `/approval`, `/advisor`) with its arguments.
+    Workspace {
+        command: workspace_commands::WorkspaceCommand,
+        args: String,
+    },
+    /// A read-only OMP info command (`/tools`, `/extensions`, `/skills`,
+    /// `/dirs`, `/context`, `/todo`, `/jobs`, `/stats`).
+    Info(info_commands::InfoCommand),
     /// Show session info (`/session`): file, id, name, model, thinking
     /// level, and message count — a read-only snapshot of the live session.
     SessionInfo,
+    /// Export the session to a secret gist through `gh` (`/share`,
+    /// bd-ydz1t.1). Takes no arguments: the UI rejects `/share public`
+    /// before this is ever sent, and the gist is always `--public=false`.
+    Share,
+    /// Run `work` in a background child agent and deliver its answer at the
+    /// next turn boundary (`/tan`, bd-ydz1t.2). The UI rejects an empty
+    /// argument; the driver enforces that the opt-in `subagent` tool is on.
+    Tan(String),
     /// Print a textual branch-tree summary (`/tree`). The interactive tree
     /// selector overlay arrives with bd-cv653.9.8; until then /tree reports
     /// branches/entries instead of falling through to extension dispatch.
@@ -882,6 +1552,30 @@ pub enum UiCommand {
     /// The UI validates the level against `ThinkingLevel::from_str` before
     /// sending; invalid levels never reach the driver.
     SetThinking(Option<crate::model::ThinkingLevel>),
+    /// `/fast [on|off|status]`: toggle, set or report fast mode (the
+    /// `priority` service tier; OMP `/fast`).
+    Fast(FastRequest),
+    /// List the user messages on the current path for the rewind (or, with
+    /// `fork`, fork) picker; the driver answers `PiMsg::MessagePicker`.
+    MessagePicker { fork: bool },
+    /// `/dump`: copy the session as plain text and write the next request's
+    /// context as JSON (OMP `/dump`).
+    Dump,
+    /// `/copy cmd`: copy the newest shell command, the agent's (bash tool) or
+    /// the user's (`!cmd`), in full.
+    CopyLastCommand,
+    /// Rewind the session to just before this user message (OMP `/branch`);
+    /// unrelated to the checkpoint `/rewind`.
+    RewindTo { entry_id: String },
+    /// Step the thinking level to the next one this model offers
+    /// (`AppAction::CycleThinkingLevel`, shift+tab by default). The driver
+    /// owns the decision because only it can see the model's catalog entry;
+    /// the UI has no model state to cycle through.
+    CycleThinking,
+    /// Switch to the next (`forward`) or previous model in the cycle list
+    /// (`AppAction::CycleModelForward`/`Backward`, ctrl+p / shift+ctrl+p by
+    /// default). The driver owns it: only it knows the running model.
+    CycleModel { forward: bool },
     /// Set the session display name (`/name <name>`).
     SetName(String),
     /// Grant access to an additional workspace root
@@ -891,6 +1585,77 @@ pub enum UiCommand {
     RemoveDir { dir: String },
     /// Crash bundle management (`/crash list|show|delete`, bd-cv653.7.12).
     Crash { action: String },
+    /// Write the conversation to an HTML file (`/export [path]`). The driver
+    /// owns it because the rendering is `Session::to_html` and only the driver
+    /// holds the session; `path` is the raw argument, resolved against the
+    /// working directory by the shared helpers the charmed stack uses.
+    Export { path: String },
+}
+
+/// Does this action edit the input, rather than drive the application?
+///
+/// Exactly the set [`apply_editor_action`] can carry out, so the two cannot
+/// disagree: a `true` here without an arm there would swallow the key and do
+/// nothing, which is the failure this whole routing exists to remove.
+const fn is_editor_action(action: AppAction) -> bool {
+    matches!(
+        action,
+        AppAction::CursorLeft
+            | AppAction::CursorRight
+            | AppAction::CursorWordLeft
+            | AppAction::CursorWordRight
+            | AppAction::CursorLineStart
+            | AppAction::JumpBackward
+            | AppAction::JumpForward
+            | AppAction::DeleteCharBackward
+            | AppAction::DeleteCharForward
+            | AppAction::DeleteWordBackward
+            | AppAction::DeleteWordForward
+            | AppAction::DeleteToLineStart
+            | AppAction::DeleteToLineEnd
+            | AppAction::Undo
+    )
+}
+
+/// Carry out an editor action on the input.
+///
+/// pi ships a 59-action keymap and the ftui editor recognises ctrl+a, ctrl+k,
+/// ctrl+z, ctrl+y, the arrows, Home/End, Backspace, Delete and PageUp/Down —
+/// ignoring Alt completely. Everything pi promised beyond that reached the
+/// editor as a key it had never heard of and was dropped. Routing through the
+/// catalog is also what makes `keybindings.json` mean anything for editing:
+/// before this, an override of `deleteWordBackward` was parsed, stored,
+/// matched, and then discarded.
+///
+/// `Yank` and `YankPop` are deliberately absent: there is no kill ring to
+/// paste from, and building one is a feature rather than a wiring fix.
+/// `ctrl+y` reaches the editor and redoes instead.
+fn apply_editor_action(input: &mut TextArea, action: AppAction) {
+    match action {
+        AppAction::CursorLeft => input.move_left(),
+        AppAction::CursorRight => input.move_right(),
+        AppAction::CursorWordLeft => input.move_word_left(),
+        AppAction::CursorWordRight => input.move_word_right(),
+        AppAction::CursorLineStart => input.move_to_line_start(),
+        AppAction::JumpBackward => input.move_to_document_start(),
+        AppAction::JumpForward => input.move_to_document_end(),
+        AppAction::DeleteCharBackward => input.delete_backward(),
+        AppAction::DeleteCharForward => input.delete_forward(),
+        AppAction::DeleteWordBackward => input.delete_word_backward(),
+        AppAction::DeleteWordForward => input.delete_word_forward(),
+        AppAction::DeleteToLineStart => {
+            // The editor has no kill-to-start, but it has both halves of one:
+            // the cursor's grapheme offset within its line, and a backward
+            // delete. The count stops at column 0, so this cannot run on and
+            // join the previous line.
+            for _ in 0..input.cursor().grapheme {
+                input.delete_backward();
+            }
+        }
+        AppAction::DeleteToLineEnd => input.delete_to_end_of_line(),
+        AppAction::Undo => input.undo(),
+        _ => {}
+    }
 }
 
 /// Match `input` against a slash command name: returns the argument tail for
@@ -938,6 +1703,10 @@ impl AgentUiState {
 /// Covers init/update/view/subscriptions end to end but holds only what its
 /// tests assert on; the real conversation state migrates here from
 /// `interactive::state` as the view port proceeds.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "quit, terminal capabilities, and suspension are independent state flags"
+)]
 pub struct PiFtuiModel {
     /// What the agent is doing right now (drives header + input routing).
     state: AgentUiState,
@@ -946,6 +1715,8 @@ pub struct PiFtuiModel {
     /// Session identity represented by the transcript. Owner-tagged async
     /// notes are accepted only when they match this reset-installed value.
     displayed_session_id: Option<String>,
+    /// Where `/pin` keeps pinned session ids (the agent dir).
+    pins_dir: std::path::PathBuf,
     /// Sanitized in-flight assistant text (streaming deltas accumulate here).
     streaming: String,
     /// Running tool (name shown in the status region while active).
@@ -955,6 +1726,13 @@ pub struct PiFtuiModel {
     /// Pinned error banner above the editor (bd-cv653.9.2): set by
     /// AgentError, dismissed on the next sent input.
     error_banner: Option<String>,
+    /// A `/login` waiting for the user's code or key: `(provider,
+    /// accepts_empty_input)`. The next submitted line goes to the driver as
+    /// login input and is never echoed into the transcript.
+    login_pending: Option<(String, bool)>,
+    /// What the powerline status line shows; sent by the driver after every
+    /// command. `None` until the session exists.
+    status_snapshot: Option<crate::interactive::FtuiStatusSnapshot>,
     /// Sanitized in-flight thinking text (drives the `thinking…` status).
     thinking: String,
     /// Spinner animation state; advanced by `Event::Tick` while working.
@@ -968,14 +1746,27 @@ pub struct PiFtuiModel {
     /// `provider/model-id` entries for the `/model` picker (from the launch
     /// path's model registry; empty when unset).
     available_models: Vec<String>,
+    /// Display names (`models.json`/catalog `name`) by `provider/model-id`,
+    /// shown beside the identity in the `/model` picker (GH #214).
+    model_names: HashMap<String, String>,
     /// Set by `/exit`//`/quit`; the update loop turns it into `Cmd::quit()`.
     pending_quit: bool,
+    /// Raised by `/restart` before quitting; `run` relaunches once the
+    /// session is saved. `None` in tests and embedders without the hook.
+    restart_request: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// `(display label, session path)` entries for the `/resume` picker.
     available_sessions: Vec<(String, String)>,
-    /// Keybinding catalog (defaults now; user config once the launch path
-    /// wires `KeyBindings::load_from_user_config`). Shared naming with the
-    /// bubbletea stack via `KeyBinding::from_ftui_key`.
+    /// The session-index cwd `/resume` re-reads (`None`: keep the launch list).
+    resume_cwd: Option<String>,
+    /// Keybinding catalog, loaded from the user's config by the launch path
+    /// via [`Self::with_keybindings`] and defaulting to the shipped bindings
+    /// otherwise. Shared naming with the bubbletea stack via
+    /// `KeyBinding::from_ftui_key`.
     keybindings: KeyBindings,
+    /// Status text an extension set via `ui.setStatus` / `ui.setWorkingMessage`.
+    /// Shown on the idle status line, ahead of the todo summary; cleared by an
+    /// empty status.
+    ext_status: Option<String>,
     /// Ask-tool card currently collecting answers via the editor.
     active_ask: Option<ActiveAsk>,
     /// Extension UI prompt currently collecting a reply (bd-1eoh4); extras
@@ -995,6 +1786,21 @@ pub struct PiFtuiModel {
     /// `run_prompt_turn` installs a fresh handle per turn; Ctrl-C fires it so
     /// exit doesn't block on the provider stream and remaining tool calls.
     turn_abort: Option<TurnAbortSlot>,
+    /// Live control lane of the driver's running prompt turn
+    /// (`session_control`): Enter steers it, alt+enter queues a follow-up,
+    /// Escape aborts it. Empty between turns.
+    turn_control: Option<TurnControlSlot>,
+    /// `/btw` client, for side questions asked while the driver is busy
+    /// with a turn (answered without conversation context).
+    btw_client: Option<Arc<crate::btw::BtwClient>>,
+    /// Background answers that arrived mid-turn, rendered at the turn boundary.
+    ///
+    /// `/tan` runs a child agent while the user keeps working, so its answer
+    /// can land at any moment (bd-ydz1t.2). Splicing it into a streaming reply
+    /// would show an answer to an earlier question in the middle of the current
+    /// one, so it waits for `AgentDone`/`AgentError` and is drained in arrival
+    /// order.
+    deferred_notes: Vec<String>,
     /// Terminal size, tracked from `Event::Resize` (cols, rows).
     term: (u16, u16),
     /// Conversation scroll, measured in lines UP from the tail. 0 means
@@ -1030,6 +1836,10 @@ pub struct PiFtuiModel {
     /// Whether the program owns the alternate screen (fullscreen launch).
     /// The suspend path mirrors only the features actually enabled.
     alt_screen: bool,
+    /// Whether mouse capture is on. Off when the user asked for native
+    /// terminal selection, and then the suspend/resume mirror must not turn
+    /// tracking back on behind their back (pi_agent_rust#78).
+    mouse: bool,
     /// Set while a ctrl+z suspension is in flight: freezes spinner ticks so
     /// the pre-stop frames stay byte-identical (the diff engine then emits
     /// nothing into the restored cooked terminal). Cleared by
@@ -1039,6 +1849,31 @@ pub struct PiFtuiModel {
     /// on a headless test host). `None` in production.
     #[cfg(test)]
     suspend_task_override: Option<Box<dyn FnOnce() -> PiFtuiMsg + Send>>,
+    /// Blocking work an input handler queued for the runtime (a mid-turn
+    /// `/btw`); the key handler returns it as a `Cmd::task`.
+    pending_task: Option<Box<dyn FnOnce() -> PiFtuiMsg + Send>>,
+    /// When ctrl+c last cleared the editor: a second press within
+    /// [`CTRL_C_EXIT_WINDOW`] quits (OMP's double-tap exit).
+    last_ctrl_c: Option<std::time::Instant>,
+    /// Tool cards show all their kept output (ctrl+o toggles).
+    tools_expanded: bool,
+    /// Thinking entries show in full rather than as one line (ctrl+t).
+    show_thinking: bool,
+    /// What double-Esc on an idle, empty editor does.
+    double_escape_action: DoubleEscapeAction,
+    /// When Esc last hit an idle, empty editor (the first of a double-Esc).
+    last_idle_escape: Option<Instant>,
+    /// Prompts sent this session, oldest first (up/down recall; `/history`).
+    input_history: Vec<String>,
+    /// Which history entry the editor shows while recalling; `None` when
+    /// the editor holds the user's own draft.
+    history_cursor: Option<usize>,
+    /// The draft set aside when recall began, restored past the newest entry.
+    history_draft: String,
+    /// Where `@file` references in mid-turn messages resolve, and the loader
+    /// that expands them (the driver does this for idle prompts).
+    file_ref_cwd: std::path::PathBuf,
+    steer_resources: Option<crate::resources::ResourceLoader>,
     /// Loop-lag probe with render/input/agent-event attribution. Inert unless
     /// `PI_PERF_TELEMETRY=1`.
     watchdog: LoopWatchdog,
@@ -1052,9 +1887,14 @@ pub struct PiFtuiModel {
     /// matches, so a frame re-renders only changed entries plus the
     /// in-flight streaming tail instead of the whole transcript. Interior
     /// mutability because `view()` builds frames through `&self`. Cleared
-    /// whenever the styling inputs change (theme picker) — the markdown
-    /// renderer itself is width-independent, so resizes need no flush.
+    /// whenever the styling inputs change (theme picker) and whenever the
+    /// body width changes: cached lines are wrapped (issue #227) and tables
+    /// fitted (gh #195) for one width only.
     render_cache: std::cell::RefCell<Vec<Option<CachedBlock>>>,
+    /// Body width the blocks in `render_cache` were rendered for. A frame at
+    /// a different width drops the cache before reusing anything; see
+    /// [`PiFtuiModel::conversation_text`].
+    render_cache_width: std::cell::Cell<u16>,
     /// `(rendered, reused)` block counts from the most recent
     /// `conversation_text()` pass — the observable that keeps the cache
     /// honest in tests (O(changed) per frame, not O(transcript)).
@@ -1115,6 +1955,53 @@ pub struct AutocompleteLaunch {
     pub cwd: std::path::PathBuf,
     /// Maximum suggestion rows shown at once (`autocompleteMaxVisible`).
     pub max_visible: usize,
+    /// The loader the catalog came from: the driver expands `/template` and
+    /// `/skill:name` input with it before a turn, as the classic stack does.
+    pub resources: Option<crate::resources::ResourceLoader>,
+    /// What the loader was built from, so `/reload` can build it again.
+    pub resource_source: Option<ResourceSource>,
+}
+
+/// The inputs of [`crate::resources::ResourceLoader::load`] at launch.
+#[derive(Debug, Clone)]
+pub struct ResourceSource {
+    pub package_manager: crate::package_manager::PackageManager,
+    pub config: crate::config::Config,
+    pub cli: crate::resources::ResourceCliOptions,
+}
+
+/// After `/reload`: read skills and prompt templates again, then refresh the
+/// completion catalog (with the reloaded session's extension commands) and
+/// the resources the driver expands input with.
+async fn reload_driver_resources(
+    source: &ResourceSource,
+    cwd: &std::path::Path,
+    extension_commands: Vec<crate::autocomplete::NamedEntry>,
+    resources: &mut Option<crate::resources::ResourceLoader>,
+    catalog: &mut AutocompleteCatalog,
+    agent_tx: &Sender<PiMsg>,
+) {
+    match crate::resources::ResourceLoader::load(
+        &source.package_manager,
+        cwd,
+        &source.config,
+        &source.cli,
+    )
+    .await
+    {
+        Ok(loader) => {
+            *catalog = AutocompleteCatalog::from_resources(&loader);
+            *resources = Some(loader);
+            let mut completion = catalog.clone();
+            completion.extension_commands = extension_commands;
+            let _ = agent_tx.send(PiMsg::AutocompleteCatalog(completion));
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::System(format!(
+                "reload: skills and prompt templates were not re-read: {err}"
+            )));
+        }
+    }
 }
 
 /// Default popup height when settings don't override it (matches the
@@ -1131,6 +2018,24 @@ const FIXED_CHROME_ROWS: u16 = 3;
 
 /// The input editor grows with its content up to this many rows.
 const MAX_INPUT_ROWS: u16 = 5;
+
+/// The `[start, end)` slice of a `len`-item picker list that fits in
+/// `visible` rows while keeping `selected` on screen.
+///
+/// The window is anchored to the top until the selection would fall off the
+/// bottom, then slides one row at a time so the selection stays on the last
+/// visible row; paging up slides it back the same way. The window never
+/// starts past the point where it could show `visible` items, so the last
+/// page is always full.
+fn picker_window(selected: usize, len: usize, visible: usize) -> std::ops::Range<usize> {
+    if visible == 0 || len == 0 {
+        return 0..0;
+    }
+    let selected = selected.min(len - 1);
+    let max_start = len.saturating_sub(visible);
+    let start = selected.saturating_sub(visible - 1).min(max_start);
+    start..(start + visible).min(len)
+}
 
 fn layout_regions(area: Rect, input_rows: u16, banner_rows: u16, completion_rows: u16) -> Regions {
     use ftui::layout::{Constraint, Flex};
@@ -1162,19 +2067,27 @@ impl PiFtuiModel {
             state: AgentUiState::Ready,
             transcript: Vec::new(),
             displayed_session_id: None,
+            pins_dir: crate::config::Config::global_dir(),
+            deferred_notes: Vec::new(),
             streaming: String::new(),
             current_tool: None,
             todo_summary: None,
             error_banner: None,
+            login_pending: None,
+            status_snapshot: None,
             thinking: String::new(),
             spinner: SpinnerState::default(),
             usage_line: None,
             palette: FtuiPalette::default(),
             picker: None,
             available_models: Vec::new(),
+            model_names: HashMap::new(),
             pending_quit: false,
+            restart_request: None,
             available_sessions: Vec::new(),
+            resume_cwd: None,
             keybindings: KeyBindings::default(),
+            ext_status: None,
             active_ask: None,
             active_ext: None,
             ext_queue: VecDeque::new(),
@@ -1182,21 +2095,36 @@ impl PiFtuiModel {
             ext_reply_tx: None,
             ask_reply_tx: None,
             turn_abort: None,
+            turn_control: None,
+            btw_client: None,
             term: (80, 24),
             scroll_from_tail: 0,
             rendered_total_lines: std::cell::Cell::new(0),
             agent_rx: Arc::new(Mutex::new(Some(agent_rx))),
 
             alt_screen: false,
+            mouse: true,
             suspending: false,
             watchdog: LoopWatchdog::new(),
             transcript_revision: 0,
             render_cache: std::cell::RefCell::new(Vec::new()),
+            render_cache_width: std::cell::Cell::new(0),
             render_stats: std::cell::Cell::new((0, 0)),
             busy: None,
             markdown_spacing: crate::config::MarkdownSpacing::Comfortable,
             #[cfg(test)]
             suspend_task_override: None,
+            pending_task: None,
+            last_ctrl_c: None,
+            tools_expanded: false,
+            show_thinking: false,
+            double_escape_action: DoubleEscapeAction::Rewind,
+            last_idle_escape: None,
+            input_history: Vec::new(),
+            history_cursor: None,
+            history_draft: String::new(),
+            file_ref_cwd: std::path::PathBuf::from("."),
+            steer_resources: None,
             input: TextArea::new()
                 .with_placeholder("Type a message (Enter to send, Alt+Enter for newline)")
                 .with_focus(true)
@@ -1219,6 +2147,8 @@ impl PiFtuiModel {
     /// driver's session exists.
     #[must_use]
     pub fn with_autocomplete(mut self, launch: AutocompleteLaunch) -> Self {
+        self.file_ref_cwd.clone_from(&launch.cwd);
+        self.steer_resources = launch.resources;
         self.autocomplete.provider.set_cwd(launch.cwd);
         self.autocomplete.provider.set_catalog(launch.catalog);
         self.autocomplete.max_visible = launch.max_visible.clamp(1, 20);
@@ -1231,6 +2161,21 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_submit_channel(mut self, tx: Sender<UiCommand>) -> Self {
         self.submit_tx = Some(tx);
+        self
+    }
+
+    /// Whether thinking starts shown in full (`hideThinkingBlock` off) or
+    /// collapsed to one line. ctrl+t flips it either way.
+    #[must_use]
+    pub const fn with_thinking_visible(mut self, visible: bool) -> Self {
+        self.show_thinking = visible;
+        self
+    }
+
+    /// What double-Esc on an idle, empty editor does (`doubleEscapeAction`).
+    #[must_use]
+    pub const fn with_double_escape_action(mut self, action: DoubleEscapeAction) -> Self {
+        self.double_escape_action = action;
         self
     }
 
@@ -1247,6 +2192,30 @@ impl PiFtuiModel {
     pub fn with_turn_abort(mut self, slot: TurnAbortSlot) -> Self {
         self.turn_abort = Some(slot);
         self
+    }
+
+    /// Share the driver's running-turn control lane so the user can steer,
+    /// queue a follow-up, or abort while the agent works.
+    #[must_use]
+    pub fn with_turn_control(mut self, slot: TurnControlSlot) -> Self {
+        self.turn_control = Some(slot);
+        self
+    }
+
+    /// The `/btw` client for mid-turn side questions.
+    #[must_use]
+    pub fn with_btw_client(mut self, client: Option<Arc<crate::btw::BtwClient>>) -> Self {
+        self.btw_client = client;
+        self
+    }
+
+    /// The running turn's control handle, if a controlled turn is live.
+    fn live_turn_control(&self) -> Option<crate::session_control::SessionControlHandle> {
+        self.turn_control.as_ref().and_then(|slot| {
+            slot.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
     }
 
     /// Route completed ask-tool interactions to the launch path, which pairs
@@ -1278,10 +2247,52 @@ impl PiFtuiModel {
         self
     }
 
+    /// Where `/pin` keeps pinned session ids (default: the agent dir).
+    #[must_use]
+    pub fn with_pins_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.pins_dir = dir;
+        self
+    }
+
+    /// The flag `/restart` raises before quitting (see `run`).
+    #[must_use]
+    pub fn with_restart_request(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.restart_request = Some(flag);
+        self
+    }
+
+    /// Display names by `provider/model-id` for the `/model` picker rows.
+    /// Selection still routes the identity.
+    #[must_use]
+    pub fn with_model_names(mut self, names: HashMap<String, String>) -> Self {
+        self.model_names = names;
+        self
+    }
+
     /// Provide `(display label, session path)` entries for `/resume`.
     #[must_use]
     pub fn with_available_sessions(mut self, sessions: Vec<(String, String)>) -> Self {
         self.available_sessions = sessions;
+        self
+    }
+
+    /// Refresh the `/resume` list from the session index for `cwd` each
+    /// time the picker opens (otherwise the launch list is used as is).
+    #[must_use]
+    pub fn with_resume_cwd(mut self, cwd: String) -> Self {
+        self.resume_cwd = Some(cwd);
+        self
+    }
+
+    /// Install the keybinding catalog this session resolves keys against.
+    ///
+    /// Without it the model holds `KeyBindings::default()`, which is what the
+    /// launch path used to hand it — so `keybindings.json` was read by nobody
+    /// on this stack and every override in it, editor or application, was
+    /// inert.
+    #[must_use]
+    pub fn with_keybindings(mut self, keybindings: KeyBindings) -> Self {
+        self.keybindings = keybindings;
         self
     }
 
@@ -1291,6 +2302,14 @@ impl PiFtuiModel {
     #[must_use]
     pub const fn with_alt_screen(mut self, alt_screen: bool) -> Self {
         self.alt_screen = alt_screen;
+        self
+    }
+
+    /// Record whether mouse capture is enabled, so the suspend/resume mirror
+    /// restores exactly the features that were on.
+    #[must_use]
+    pub const fn with_mouse_enabled(mut self, mouse: bool) -> Self {
+        self.mouse = mouse;
         self
     }
 
@@ -1490,6 +2509,102 @@ impl PiFtuiModel {
         });
     }
 
+    /// Put a pasted image's `@file` reference in the draft, or say there was
+    /// no image.
+    fn insert_pasted_image(&mut self, reference: Option<String>) {
+        match reference {
+            Some(reference) => self.input.insert_text(&format!("{reference} ")),
+            None => {
+                self.error_banner = Some(String::from("No image on the clipboard to paste."));
+            }
+        }
+    }
+
+    /// Remember a sent prompt for recall (consecutive repeats collapse) and
+    /// leave recall mode.
+    fn record_history(&mut self, text: &str) {
+        const MAX_INPUT_HISTORY: usize = 500;
+        self.history_cursor = None;
+        self.history_draft.clear();
+        let text = text.trim();
+        if text.is_empty() || self.input_history.last().is_some_and(|last| last == text) {
+            return;
+        }
+        self.input_history.push(text.to_string());
+        if self.input_history.len() > MAX_INPUT_HISTORY {
+            self.input_history.remove(0);
+        }
+    }
+
+    /// Up/down recall applies to the plain editor with a one-line draft, and
+    /// keeps applying once recall has begun (a recalled entry may itself be
+    /// multi-line; stopping there would strand the user mid-history).
+    fn history_navigable(&self) -> bool {
+        self.input_active()
+            && self.active_ask.is_none()
+            && self.active_ext.is_none()
+            && (self.history_cursor.is_some() || !self.input.text().contains('\n'))
+    }
+
+    /// Show the next-older prompt (staying on the oldest).
+    fn history_back(&mut self) {
+        let Some(newest) = self.input_history.len().checked_sub(1) else {
+            return;
+        };
+        let index = match self.history_cursor {
+            None => {
+                self.history_draft = self.input.text();
+                newest
+            }
+            Some(index) => index.saturating_sub(1),
+        };
+        self.history_cursor = Some(index);
+        self.input.set_text(&self.input_history[index]);
+    }
+
+    /// Show the next-newer prompt; past the newest, the set-aside draft.
+    fn history_forward(&mut self) {
+        let Some(index) = self.history_cursor else {
+            return;
+        };
+        if index + 1 < self.input_history.len() {
+            self.history_cursor = Some(index + 1);
+            self.input.set_text(&self.input_history[index + 1]);
+        } else {
+            self.history_cursor = None;
+            let draft = std::mem::take(&mut self.history_draft);
+            self.input.set_text(&draft);
+        }
+    }
+
+    /// `/history`: the prompts sent this session, most recent first.
+    fn format_input_history(&self) -> String {
+        if self.input_history.is_empty() {
+            return String::from("No input history yet.");
+        }
+        let mut out = String::from("Input history (most recent first):");
+        for (n, entry) in self.input_history.iter().rev().take(50).enumerate() {
+            let preview: String = entry.replace('\n', "\\n").chars().take(120).collect();
+            let _ = write!(out, "\n  {}. {preview}", n + 1);
+        }
+        out
+    }
+
+    /// Move in-flight thinking, then text, into transcript entries (OMP
+    /// order: thinking, answer, tool). Called before a tool card and when
+    /// the turn ends, so each lands where it happened in the turn.
+    fn flush_stream(&mut self) {
+        let thinking = std::mem::take(&mut self.thinking);
+        let thinking = thinking.trim();
+        if !thinking.is_empty() {
+            self.push_entry(EntryRole::Thinking, thinking.to_string());
+        }
+        if !self.streaming.is_empty() {
+            let text = std::mem::take(&mut self.streaming);
+            self.push_entry(EntryRole::Assistant, text);
+        }
+    }
+
     /// Push a pending tool-execution card keyed by the sanitized tool_id
     /// (stable across head-text replacement by invocation summaries);
     /// `display` is the sanitized initial head (the tool name).
@@ -1574,7 +2689,7 @@ impl PiFtuiModel {
     /// preview at 8 lines with an elision counter. Returns false when no
     /// open bash card exists (caller falls back to a plain block).
     fn fold_bash_detail(&mut self, sanitized_display: &str) -> bool {
-        const MAX_DETAIL_LINES: usize = 8;
+        const MAX_DETAIL_LINES: usize = KEPT_DETAIL_LINES;
         let revision = self.next_revision();
         let Some(entry) =
             self.transcript.iter_mut().rev().find(|e| {
@@ -1660,6 +2775,9 @@ impl PiFtuiModel {
                 self.thinking.push_str(&sanitize(&delta));
             }
             PiMsg::ToolStart { name, tool_id, .. } => {
+                // What the model thought and said before calling the tool
+                // comes before the tool's card, not after the whole turn.
+                self.flush_stream();
                 let name = sanitize(&name).into_owned();
                 // The card pairs on the sanitized tool_id; the head starts
                 // as the tool name and is later replaced by the invocation
@@ -1709,10 +2827,7 @@ impl PiFtuiModel {
                 ..
             } => {
                 self.dismiss_pending_interactions();
-                if !self.streaming.is_empty() {
-                    let text = std::mem::take(&mut self.streaming);
-                    self.push_entry(EntryRole::Assistant, text);
-                }
+                self.flush_stream();
                 if let Some(err) = error_message {
                     let text = sanitize(&err).into_owned();
                     self.push_entry(EntryRole::Error, text);
@@ -1726,6 +2841,7 @@ impl PiFtuiModel {
                 self.state = AgentUiState::Ready;
                 self.current_tool = None;
                 self.thinking.clear();
+                self.drain_deferred_notes();
                 self.settle_pending_cards();
             }
             PiMsg::AgentError(err) => {
@@ -1733,14 +2849,15 @@ impl PiFtuiModel {
                 // Pinned above the editor (bd-cv653.9.2), dismiss-on-send —
                 // not duplicated into the transcript. Partial streamed text
                 // is still flushed so it isn't merged into the next turn.
-                if !self.streaming.is_empty() {
-                    let text = std::mem::take(&mut self.streaming);
-                    self.push_entry(EntryRole::Assistant, text);
-                }
+                self.flush_stream();
                 self.error_banner = Some(sanitize(&err).into_owned());
                 self.state = AgentUiState::Ready;
                 self.current_tool = None;
                 self.thinking.clear();
+                // A failed turn still ends the turn, so a held note is owed to
+                // the user either way — dropping it on error would lose a
+                // completed background answer to an unrelated failure.
+                self.drain_deferred_notes();
                 self.settle_pending_cards();
             }
             PiMsg::System(text) | PiMsg::SystemNote(text) => {
@@ -1753,16 +2870,22 @@ impl PiFtuiModel {
             } => {
                 if self.displayed_session_id.as_deref() == Some(owner_session_id.as_str()) {
                     let text = sanitize(&message).into_owned();
-                    self.push_entry(EntryRole::System, text);
+                    // Held until the turn ends rather than rendered now: a
+                    // background answer arriving mid-stream would interleave
+                    // with the assistant text still accumulating in
+                    // `self.streaming`, and the user would see a reply to a
+                    // question they asked minutes ago spliced into the middle
+                    // of the current one (bd-ydz1t.2). The classic stack gets
+                    // the same effect a different way, by treating a busy
+                    // session as a reason to retry delivery later.
+                    if self.state == AgentUiState::Working {
+                        self.deferred_notes.push(text);
+                    } else {
+                        self.push_entry(EntryRole::System, text);
+                    }
                 }
             }
             PiMsg::ConversationReset {
-                session_id,
-                messages,
-                status,
-                ..
-            }
-            | PiMsg::RetryCommitted {
                 session_id,
                 messages,
                 status,
@@ -1771,6 +2894,20 @@ impl PiFtuiModel {
                 self.dismiss_pending_interactions();
                 self.displayed_session_id = Some(session_id);
                 self.apply_conversation_reset(messages, status);
+            }
+            PiMsg::RetryCommitted {
+                session_id,
+                messages,
+                status,
+                text,
+                ..
+            } => {
+                self.dismiss_pending_interactions();
+                self.displayed_session_id = Some(session_id);
+                self.apply_conversation_reset(messages, status);
+                // The driver re-sends this text next; show it as the turn's
+                // user message, as a typed prompt would be.
+                self.push_entry(EntryRole::User, sanitize(&text).into_owned());
             }
             PiMsg::BashResult { display, .. } => {
                 let text = sanitize(&display).into_owned();
@@ -1803,9 +2940,17 @@ impl PiFtuiModel {
             }
             PiMsg::ExtensionUiRequest(request) => {
                 if !request.expects_response() {
+                    // Effects this stack can carry out are applied; the rest
+                    // still fall through to a transcript line, which is the
+                    // only thing that used to happen to any of them.
+                    if self.apply_extension_ui_effect(&request) {
+                        return Cmd::none();
+                    }
                     let text =
                         sanitize(format_extension_ui_prompt(&request).trim_end()).into_owned();
                     self.push_entry(EntryRole::System, text);
+                } else if self.answer_extension_ui_query(&request) {
+                    return Cmd::none();
                 } else if self.active_ext.is_none() && self.active_ask.is_none() {
                     self.activate_ext_request(request);
                 } else {
@@ -1832,6 +2977,58 @@ impl PiFtuiModel {
                 let mut out = std::io::stdout().lock();
                 let _ = out.write_all(sequence.as_bytes());
                 let _ = out.flush();
+            }
+            PiMsg::LoginPending {
+                provider,
+                accepts_empty_input,
+            } => {
+                self.login_pending = provider.map(|provider| (provider, accepts_empty_input));
+            }
+            PiMsg::StatusSnapshot(snapshot) => {
+                self.status_snapshot = Some(snapshot);
+            }
+            PiMsg::MessagePicker { fork, messages } => {
+                if messages.is_empty() {
+                    self.push_entry(
+                        EntryRole::System,
+                        String::from("No messages to branch from"),
+                    );
+                } else {
+                    // Newest first, so Enter right away takes the last turn;
+                    // numbered as `/fork list` numbers them.
+                    let (items, values) = messages
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .map(|(n, (summary, id))| {
+                            (format!("{}. {}", n + 1, sanitize(summary)), id.clone())
+                        })
+                        .unzip();
+                    let (title, kind) = if fork {
+                        (
+                            "Fork a new session from (Enter to fork, Esc to close)",
+                            PickerKind::ForkFrom,
+                        )
+                    } else {
+                        (
+                            "Rewind to before (Enter: edit and resend it; the old path stays as a branch)",
+                            PickerKind::Rewind,
+                        )
+                    };
+                    self.picker = Some(PickerOverlay::new(title, items, values, kind));
+                }
+            }
+            // `/fork` hands the selected message back for rewording; a stale
+            // reply for a session no longer shown is dropped.
+            PiMsg::SetEditorText {
+                owner_session_id,
+                text,
+            } if self
+                .displayed_session_id
+                .as_deref()
+                .is_none_or(|shown| shown == owner_session_id) =>
+            {
+                self.input.set_text(&text);
             }
             // Remaining variants are wired up as their owning surfaces are
             // ported (tools panel, ask cards, OAuth flows, pickers, ...).
@@ -1914,12 +3111,200 @@ impl PiFtuiModel {
         }
     }
 
+    /// Enter (steer) or alt+enter (`follow_up`) while the agent works: hand the
+    /// editor text to the running turn's control lane (`session_control`).
+    /// Steering lands at the next steering boundary without restarting
+    /// completed tools; a follow-up runs after the current model turn.
+    /// Commands wait for the turn to end; text the lane cannot take yet (the
+    /// turn is starting or ending) becomes the next prompt instead.
+    fn submit_mid_turn(&mut self, follow_up: bool) {
+        let text = self.input.text();
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let clean = sanitize(trimmed).into_owned();
+        // /btw is the one command meant for mid-turn use.
+        if let Some(question) = strip_command(&clean, "/btw") {
+            let question = question.trim().to_string();
+            self.queue_btw_mid_turn(&question);
+            return;
+        }
+        // OMP /queue <message>: a follow-up for after the agent yields, the
+        // command form of Alt+Enter.
+        if let Some(message) = strip_command(&clean, "/queue") {
+            let message = message.trim().to_string();
+            if message.is_empty() {
+                self.push_entry(EntryRole::Error, String::from("Usage: /queue <message>"));
+                return;
+            }
+            self.input.set_text(&message);
+            self.submit_mid_turn(true);
+            return;
+        }
+        if clean.starts_with('/') || clean.starts_with('!') {
+            // The text stays in the editor for after the turn.
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Commands wait until the agent finishes; press Escape to abort it."),
+            );
+            return;
+        }
+        // `@file` references are read in here, as the driver does for idle
+        // prompts; they used to reach the model as literal `@path` text.
+        let steer_text = match prepare_prompt(
+            &clean,
+            self.steer_resources.as_ref(),
+            &self.file_ref_cwd,
+            None,
+            true,
+        ) {
+            Ok((_, images)) if !images.is_empty() => {
+                // The text stays in the editor for after the turn.
+                self.push_entry(
+                    EntryRole::Error,
+                    String::from(
+                        "Images attach once the agent finishes; the message is kept in the editor.",
+                    ),
+                );
+                return;
+            }
+            Ok((text, _)) => text,
+            Err(err) => {
+                self.push_entry(EntryRole::Error, format!("Not sent: {err}"));
+                return;
+            }
+        };
+        self.record_history(&clean);
+        self.input.set_text("");
+        self.autocomplete.close();
+        self.scroll_from_tail = 0;
+        let Some(control) = self.live_turn_control() else {
+            self.push_entry(EntryRole::User, clean.clone());
+            self.send_command(UiCommand::Prompt(clean));
+            return;
+        };
+        let queued = if follow_up {
+            control.follow_up(&steer_text)
+        } else {
+            control.steer(&steer_text)
+        };
+        match queued {
+            Ok(_) => {
+                let label = if follow_up { "follow-up" } else { "steer" };
+                self.push_entry(EntryRole::User, format!("({label}) {clean}"));
+            }
+            Err(err) => {
+                // Put the text back; nothing was queued.
+                self.input.set_text(&clean);
+                self.push_entry(EntryRole::Error, err.to_string());
+            }
+        }
+    }
+
+    /// `/btw` while the agent works: the driver is inside the turn and cannot
+    /// build (or vault-transform) a conversation summary, so the question goes
+    /// out alone, as the classic stack does when its agent is busy, and says
+    /// so. The answer shows as soon as it arrives.
+    fn queue_btw_mid_turn(&mut self, question: &str) {
+        if question.is_empty() {
+            self.push_entry(EntryRole::Error, String::from(BTW_USAGE));
+            return;
+        }
+        let Some(client) = self.btw_client.clone() else {
+            self.push_entry(EntryRole::Error, String::from(BTW_UNAVAILABLE));
+            return;
+        };
+        self.input.set_text("");
+        self.push_entry(
+            EntryRole::System,
+            format!("(/btw) {question} — agent busy, answering without conversation context"),
+        );
+        let question = question.to_string();
+        self.pending_task = Some(Box::new(move || {
+            let answer = asupersync::runtime::RuntimeBuilder::new()
+                .build()
+                .map_err(|err| err.to_string())
+                .and_then(|runtime| {
+                    runtime
+                        .block_on(client.ask("", &question))
+                        .map_err(|err| err.to_string())
+                });
+            PiFtuiMsg::Agent(PiMsg::System(match answer {
+                Ok(answer) => format!("(/btw) {answer}"),
+                Err(err) => format!("(/btw) failed: {err}"),
+            }))
+        }));
+    }
+
+    /// alt+up: pull steering and follow-up messages the running turn has not
+    /// picked up yet back into the editor, in the order they were sent, ahead
+    /// of anything already typed. Messages the agent already received cannot
+    /// be recalled; the lane guarantees each one is either here or there.
+    fn restore_queued_input(&mut self) {
+        let Some(control) = self.live_turn_control() else {
+            return;
+        };
+        let pending = control.take_pending();
+        if pending.is_empty() {
+            self.push_entry(
+                EntryRole::System,
+                String::from("No queued messages to restore."),
+            );
+            return;
+        }
+        let count = pending.len();
+        let mut text = pending
+            .into_iter()
+            .map(|input| input.text)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let typed = self.input.text();
+        if !typed.trim().is_empty() {
+            text.push_str("\n\n");
+            text.push_str(&typed);
+        }
+        self.input.set_text(&text);
+        self.push_entry(
+            EntryRole::System,
+            format!("Restored {count} queued message(s) to the editor."),
+        );
+    }
+
     /// Submit the editor content: echo into the transcript, hand it to the
     /// agent loop (when wired), clear the editor, resume tail follow.
     fn submit_input(&mut self) {
         let text = self.input.text();
         let trimmed = text.trim();
+        if let Some((provider, accepts_empty_input)) = self.login_pending.clone() {
+            if trimmed.starts_with('/') {
+                // A slash command abandons the login prompt and runs as usual.
+                self.login_pending = None;
+                self.push_entry(EntryRole::System, format!("{provider} login cancelled."));
+            } else {
+                if trimmed.is_empty() && !accepts_empty_input {
+                    return;
+                }
+                // Never echoed: the line may be an API key or an OAuth code.
+                let secret = trimmed.to_string();
+                self.input.set_text("");
+                self.autocomplete.close();
+                self.error_banner = None;
+                self.scroll_from_tail = 0;
+                self.push_entry(
+                    EntryRole::System,
+                    format!("(login input for {provider} submitted)"),
+                );
+                self.begin_busy(format!("completing {provider} login ..."));
+                self.send_command(UiCommand::LoginSubmit(LoginInput(secret)));
+                return;
+            }
+        }
         if trimmed.is_empty() {
+            return;
+        }
+        if self.state == AgentUiState::Working {
+            self.submit_mid_turn(false);
             return;
         }
         // Sending anything dismisses the pinned error banner
@@ -1928,6 +3313,7 @@ impl PiFtuiModel {
         // User input is the one text source the user typed themself, but it
         // still goes through sanitize: paste can smuggle control sequences.
         let clean = sanitize(trimmed).into_owned();
+        self.record_history(&clean);
         self.input.set_text("");
         self.autocomplete.close();
         self.scroll_from_tail = 0;
@@ -1966,7 +3352,11 @@ impl PiFtuiModel {
         // Token-exact: /model and /m route here; /mode or /modelx fall
         // through to the tail (extension dispatch), matching bubbletea.
         let (token, rest) = clean.split_once(char::is_whitespace).unwrap_or((clean, ""));
-        if token.eq_ignore_ascii_case("/model") || token.eq_ignore_ascii_case("/m") {
+        // OMP `/switch` is `/model` with a selector.
+        if token.eq_ignore_ascii_case("/model")
+            || token.eq_ignore_ascii_case("/m")
+            || token.eq_ignore_ascii_case("/switch")
+        {
             self.route_model_command(rest.trim());
             return true;
         }
@@ -1984,29 +3374,44 @@ impl PiFtuiModel {
                         String::from("no models available; use /model <provider>/<model>"),
                     );
                 } else {
-                    self.picker = Some(PickerOverlay {
-                        title: String::from("Model (Enter to switch, Esc to close)"),
-                        items: self.available_models.clone(),
-                        values: Vec::new(),
-                        selected: 0,
-                        kind: PickerKind::Model,
-                    });
+                    // Rows show the display name beside the identity (GH
+                    // #214); the value, which is what switching parses,
+                    // stays `provider/model-id`.
+                    let rows = self
+                        .available_models
+                        .iter()
+                        .map(|id| match self.model_names.get(id) {
+                            Some(name) if !name.trim().is_empty() && name != id => {
+                                format!("{id} · {}", sanitize(name.trim()))
+                            }
+                            _ => id.clone(),
+                        })
+                        .collect();
+                    self.picker = Some(PickerOverlay::new(
+                        "Model (Enter to switch, Esc to close)",
+                        rows,
+                        self.available_models.clone(),
+                        PickerKind::Model,
+                    ));
                 }
-            } else if let Some((provider, model)) = spec.split_once('/')
-                && !provider.is_empty()
-                && !model.is_empty()
-            {
-                self.push_entry(EntryRole::System, format!("switching model to {spec} ..."));
-                self.begin_busy(format!("switching model to {spec} ..."));
-                self.send_command(UiCommand::SetModel {
-                    provider: provider.to_string(),
-                    model: model.to_string(),
-                });
             } else {
-                self.push_entry(
-                    EntryRole::Error,
-                    String::from("usage: /model <provider>/<model>"),
-                );
+                match resolve_model_selector(&self.available_models, spec) {
+                    Ok((provider, model, level)) => {
+                        let target = format!("{provider}/{model}");
+                        self.push_entry(
+                            EntryRole::System,
+                            format!("switching model to {target} ..."),
+                        );
+                        self.begin_busy(format!("switching model to {target} ..."));
+                        self.send_command(UiCommand::SetModel { provider, model });
+                        // The driver runs commands in order: the level
+                        // applies to the model just selected.
+                        if let Some(level) = level {
+                            self.send_command(UiCommand::SetThinking(Some(level)));
+                        }
+                    }
+                    Err(message) => self.push_entry(EntryRole::Error, message),
+                }
             }
         }
     }
@@ -2036,8 +3441,66 @@ impl PiFtuiModel {
         // Case-insensitive tokens (SlashCommand::parse parity): compare on
         // an ASCII-lowercased copy; args keep their original case.
         let canon = clean.to_ascii_lowercase();
+        // OMP /restart: relaunch with the same flags, reopening this session
+        // (`run` does it once the session is saved and the terminal restored).
+        if canon == "/restart" {
+            if self.state == AgentUiState::Working {
+                self.push_entry(
+                    EntryRole::Error,
+                    String::from(
+                        "Wait for the turn to finish (or Esc to stop it) before restarting",
+                    ),
+                );
+            } else if let Some(flag) = &self.restart_request {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.pending_quit = true;
+            } else {
+                self.push_entry(
+                    EntryRole::Error,
+                    String::from("/restart is not available here"),
+                );
+            }
+            return true;
+        }
         if canon == "/exit" || canon == "/quit" || canon == "/q" {
             self.pending_quit = true;
+            return true;
+        }
+        // OMP's /plan-review re-opens the review of the latest plan.
+        if canon == "/plan-review" {
+            self.begin_busy("updating plan ...");
+            self.send_command(UiCommand::Plan {
+                action: String::from("review"),
+            });
+            return true;
+        }
+        // Read-only OMP info commands answer from state the session has.
+        if let Some(command) = canon
+            .split_whitespace()
+            .next()
+            .and_then(info_commands::InfoCommand::parse)
+        {
+            self.send_command(UiCommand::Info(command));
+            return true;
+        }
+        let (token, rest) = clean.split_once(char::is_whitespace).unwrap_or((clean, ""));
+        if let Some(command) = workspace_commands::WorkspaceCommand::parse(token) {
+            self.begin_busy(format!("{} ...", token.to_ascii_lowercase()));
+            self.send_command(UiCommand::Workspace {
+                command,
+                args: rest.trim().to_string(),
+            });
+            return true;
+        }
+        if let Some(rest) = strip_command(clean, "/plan") {
+            if plan_commands::parse(rest).is_ok() {
+                self.begin_busy("updating plan ...");
+                self.send_command(UiCommand::Plan {
+                    action: rest.trim().to_string(),
+                });
+            } else {
+                self.push_entry(EntryRole::Error, plan_commands::USAGE.to_string());
+            }
             return true;
         }
         if let Some(rest) = strip_command(clean, "/add-dir") {
@@ -2060,6 +3523,74 @@ impl PiFtuiModel {
             });
             return true;
         }
+        if canon == "/changelog" {
+            self.push_entry(
+                EntryRole::System,
+                crate::embedded_assets::changelog().to_string(),
+            );
+            self.scroll_from_tail = 0;
+            return true;
+        }
+        if let Some(arg) = strip_command(clean, "/copy") {
+            // OMP `/copy [code|cmd|link]`: bare opens a picker of replies and
+            // their code blocks; the subcommands take the newest one.
+            self.scroll_from_tail = 0;
+            let copy = |this: &mut Self, text: Option<String>, missing: &str| match text {
+                Some(text) => {
+                    let outcome = crate::interactive::copy_text_to_clipboard(&text);
+                    this.push_entry(EntryRole::System, outcome);
+                }
+                None => this.push_entry(EntryRole::Error, missing.to_string()),
+            };
+            match arg.trim().to_ascii_lowercase().as_str() {
+                "" => {
+                    let (items, values): (Vec<_>, Vec<_>) =
+                        copy_choices(&self.transcript).into_iter().take(100).unzip();
+                    if items.is_empty() {
+                        self.push_entry(
+                            EntryRole::Error,
+                            String::from("No agent messages to copy yet."),
+                        );
+                    } else {
+                        self.picker = Some(PickerOverlay::new(
+                            "Copy (Enter to copy, Esc to close)",
+                            items,
+                            values,
+                            PickerKind::Copy,
+                        ));
+                    }
+                }
+                "code" => {
+                    let code = self
+                        .transcript
+                        .iter()
+                        .rev()
+                        .filter(|entry| entry.role == EntryRole::Assistant)
+                        .find_map(|entry| fenced_code_blocks(&entry.text).pop())
+                        .map(|(_, code)| code);
+                    copy(self, code, "No code block to copy.");
+                }
+                "link" | "url" => {
+                    let link = last_url(&self.transcript);
+                    copy(self, link, "No link to copy.");
+                }
+                // The full command lives in the session (tool cards show a
+                // clipped first line), so the driver finds and copies it.
+                "cmd" | "command" => self.send_command(UiCommand::CopyLastCommand),
+                _ => self.push_entry(
+                    EntryRole::Error,
+                    String::from("Usage: /copy [code|cmd|link]"),
+                ),
+            }
+            return true;
+        }
+        if let Some(rest) = strip_command(clean, "/export") {
+            self.begin_busy(String::from("exporting ..."));
+            self.send_command(UiCommand::Export {
+                path: rest.trim().to_string(),
+            });
+            return true;
+        }
         if let Some(rest) = strip_command(clean, "/crash") {
             self.send_command(UiCommand::Crash {
                 action: rest.trim().to_ascii_lowercase(),
@@ -2074,6 +3605,11 @@ impl PiFtuiModel {
             );
             self.begin_busy("compacting conversation ...");
             self.send_command(UiCommand::Compact);
+            return true;
+        }
+        if canon == "/shake" || canon == "/compact shake" {
+            self.begin_busy("shaking conversation ...");
+            self.send_command(UiCommand::Shake);
             return true;
         }
         if let Some(rest) = strip_command(clean, "/undo") {
@@ -2112,16 +3648,20 @@ impl PiFtuiModel {
             return true;
         }
         if canon == "/theme" {
-            self.picker = Some(PickerOverlay {
-                title: String::from("Theme (Enter to apply, Esc to close)"),
-                items: vec![String::from("dark"), String::from("light")],
-                values: Vec::new(),
-                selected: 0,
-                kind: PickerKind::Theme,
-            });
+            self.picker = Some(PickerOverlay::new(
+                "Theme (Enter to apply, Esc to close)",
+                vec![String::from("dark"), String::from("light")],
+                Vec::new(),
+                PickerKind::Theme,
+            ));
             return true;
         }
         if canon == "/resume" || canon == "/r" {
+            // Re-read the index: sessions saved (and pins set) since launch
+            // belong in the list, as in OMP's picker.
+            if let Some(cwd) = &self.resume_cwd {
+                self.available_sessions = session_pins::resume_entries(cwd, &self.pins_dir);
+            }
             if self.available_sessions.is_empty() {
                 self.push_entry(EntryRole::Error, String::from("no saved sessions found"));
             } else {
@@ -2130,24 +3670,43 @@ impl PiFtuiModel {
                     .iter()
                     .map(|(label, path)| (label.clone(), path.clone()))
                     .unzip();
-                self.picker = Some(PickerOverlay {
-                    title: String::from("Resume session (Enter to load, Esc to close)"),
+                self.picker = Some(PickerOverlay::new(
+                    "Resume session (Enter to load, Esc to close)",
                     items,
                     values,
-                    selected: 0,
-                    kind: PickerKind::Session,
-                });
+                    PickerKind::Session,
+                ));
             }
+            return true;
+        }
+        if canon == "/hotkeys" || canon == "/keys" || canon == "/keybindings" {
+            // The key map formatted specifically for the FTUI stack from the user's
+            // keybindings catalog, omitting chords that are unrouted/inert on FTUI.
+            self.push_entry(
+                EntryRole::System,
+                crate::keybindings::format_hotkeys_for_ftui(&self.keybindings),
+            );
             return true;
         }
         if canon == "/help" || canon == "/h" || canon == "/?" {
             self.push_entry(
                 EntryRole::System,
                 String::from(
-                    "ftui preview commands: /model [provider/model], /resume, /compact, \
-                     /theme, /new, /clear, /session, /tree, /mcp, /thinking [level], \
-                     /name <name>, /exit, /help, !<cmd> (runs + sends output to the \
-                     agent), !!<cmd> (display-only)",
+                    "pi commands: /model or /switch [model[:level]], /queue <message>, /resume, /new, \
+                     /session, /name <name>, /plan, /compact, /tree, /undo [n], /redo [n], \
+                     /export [path], /copy [code|cmd|link], /dump, /pin, /delete, /share, /tan <task>, /usage, /mcp, \
+                     /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
+                     /thinking [level], /fast [on|off|status], /branch (or Esc Esc), /theme, /changelog, /clear, /hotkeys, \
+                     /login [provider], /logout [provider], /fork [n|id|list], /reload, \
+                     /rename <name>, /plan-review, /btw <question>, /tools, /extensions, \
+                     /skills, /dirs, /history, /fresh, /retry, /shake, /checkpoint [name], /rewind [name], /rules, /omfg <complaint>, \
+                     /commit [--dry-run], /review [target], /handoff, /approval [mode], \
+                     /advisor [on|off|status], /memory [view|list|search|forget], /hub [id], \
+                     /security [paths], /plugins, /open, /reload-plugins, \
+                     /scoped-models [patterns|clear], /template [name args], /templates, /ssh, \
+                     /context, /todo, /jobs, /stats, /help, \
+                     /restart, /exit, !<cmd> (runs + sends output to the agent), !!<cmd> \
+                     (display-only)",
                 ),
             );
             return true;
@@ -2177,8 +3736,217 @@ impl PiFtuiModel {
                 self.send_command(UiCommand::SessionInfo);
                 return true;
             }
+            "/history" | "/hist" => {
+                let listing = self.format_input_history();
+                self.push_entry(EntryRole::System, listing);
+                return true;
+            }
+            "/fresh" => {
+                self.send_command(UiCommand::Fresh);
+                return true;
+            }
+            "/retry" => {
+                self.begin_busy("retrying last turn ...");
+                self.send_command(UiCommand::Retry);
+                return true;
+            }
+            "/template" => {
+                // Bare: list them. With a name: run it, as `/<name> [args]`.
+                let rest = cmd_args.trim();
+                if rest.is_empty() {
+                    self.send_command(UiCommand::Info(info_commands::InfoCommand::Templates));
+                } else {
+                    let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                    let name = name.trim_start_matches('/');
+                    self.begin_busy(format!("running /{name} ..."));
+                    self.send_command(UiCommand::ExtensionCommand {
+                        name: name.to_string(),
+                        args: args.trim().to_string(),
+                    });
+                }
+                return true;
+            }
+            "/scoped-models" => {
+                self.send_command(UiCommand::ScopedModels {
+                    args: cmd_args.trim().to_string(),
+                });
+                return true;
+            }
+            "/checkpoint" => {
+                self.send_command(UiCommand::Checkpoint {
+                    args: cmd_args.trim().to_string(),
+                });
+                return true;
+            }
+            "/rewind" => {
+                self.begin_busy("rewinding ...");
+                self.send_command(UiCommand::Rewind {
+                    name: cmd_args.trim().to_string(),
+                });
+                return true;
+            }
+            "/btw" => {
+                let question = cmd_args.trim();
+                if question.is_empty() {
+                    self.push_entry(EntryRole::Error, String::from(BTW_USAGE));
+                } else if self.btw_client.is_none() {
+                    self.push_entry(EntryRole::Error, String::from(BTW_UNAVAILABLE));
+                } else {
+                    self.push_entry(EntryRole::System, format!("(/btw) {question}"));
+                    self.send_command(UiCommand::Btw(question.to_string()));
+                }
+                return true;
+            }
+            "/tan" => {
+                let work = cmd_args.trim();
+                if work.is_empty() {
+                    self.push_entry(EntryRole::Error, String::from("Usage: /tan <work>"));
+                    return true;
+                }
+                // Deliberately NOT `begin_busy`: the whole point is that the
+                // user keeps working while the child agent runs. The answer
+                // arrives as a system entry at the next turn boundary.
+                self.push_entry(EntryRole::System, format!("(/tan started) {work}"));
+                self.send_command(UiCommand::Tan(work.to_string()));
+                return true;
+            }
+            "/login" => {
+                self.begin_busy("starting login ...");
+                self.send_command(UiCommand::Login {
+                    args: cmd_args.trim().to_string(),
+                });
+                return true;
+            }
+            "/logout" => {
+                self.send_command(UiCommand::Logout {
+                    args: cmd_args.trim().to_string(),
+                });
+                return true;
+            }
+            "/reload" | "/reload-plugins" => {
+                self.begin_busy("reloading resources ...");
+                self.send_command(UiCommand::Reload);
+                return true;
+            }
+            "/open" => {
+                match last_url(&self.transcript) {
+                    Some(url) => match open_in_browser(&url) {
+                        Ok(()) => self.push_entry(EntryRole::System, format!("Opening {url}")),
+                        Err(err) => {
+                            self.push_entry(EntryRole::Error, format!("open {url}: {err}"));
+                        }
+                    },
+                    None => self.push_entry(
+                        EntryRole::System,
+                        String::from("No link in the conversation yet."),
+                    ),
+                }
+                return true;
+            }
+            "/fork" => {
+                let args = cmd_args.trim();
+                if !(args.eq_ignore_ascii_case("list") || args.eq_ignore_ascii_case("ls")) {
+                    self.begin_busy("forking session ...");
+                }
+                self.send_command(UiCommand::Fork {
+                    args: args.to_string(),
+                });
+                return true;
+            }
+            "/share" => {
+                // Refused HERE, before `gh` is ever invoked: a user who typed
+                // `/share public` is asking for the opposite of what this does,
+                // and the safe answer must not depend on the driver, the
+                // subprocess, or the network (bd-ydz1t.1).
+                if !cmd_args.trim().is_empty() {
+                    self.push_entry(
+                        EntryRole::Error,
+                        String::from(
+                            "Usage: /share (uploads a secret, unlisted gist; anyone with its URL can view it; public sharing is disabled)",
+                        ),
+                    );
+                    return true;
+                }
+                self.push_entry(
+                    EntryRole::System,
+                    String::from(
+                        "Sharing session... (secret gist, not private; transcript may still contain sensitive local context; Ctrl-C to cancel)",
+                    ),
+                );
+                self.begin_busy(String::from("sharing session ..."));
+                self.send_command(UiCommand::Share);
+                return true;
+            }
             "/tree" => {
                 self.send_command(UiCommand::TreeSummary);
+                return true;
+            }
+            "/branch" => {
+                self.request_message_picker(false);
+                return true;
+            }
+            "/dump" => {
+                self.send_command(UiCommand::Dump);
+                return true;
+            }
+            // OMP /delete asks before destroying anything; here the second
+            // step is typing `yes`.
+            "/delete" => {
+                if cmd_args.trim().eq_ignore_ascii_case("yes") {
+                    self.begin_busy("deleting session ...");
+                    self.send_command(UiCommand::DeleteSession);
+                } else {
+                    self.push_entry(
+                        EntryRole::System,
+                        String::from(
+                            "This deletes this session's file (to the trash when one is \
+                             available) and starts a new session. Type /delete yes to confirm.",
+                        ),
+                    );
+                }
+                return true;
+            }
+            // Idle, a queued message has nothing to wait for: it is a prompt.
+            "/queue" => {
+                let message = cmd_args.trim();
+                if message.is_empty() {
+                    self.push_entry(EntryRole::Error, String::from("Usage: /queue <message>"));
+                } else {
+                    self.send_command(UiCommand::Prompt(message.to_string()));
+                }
+                return true;
+            }
+            // OMP /pin: pin or unpin this session at the top of /resume.
+            "/pin" => {
+                let Some(id) = self.displayed_session_id.clone() else {
+                    self.push_entry(EntryRole::Error, String::from("No active session to pin."));
+                    return true;
+                };
+                match session_pins::toggle_pin(&self.pins_dir, &id) {
+                    Ok(true) => self.push_entry(
+                        EntryRole::System,
+                        String::from("Pinned: /resume lists this session first."),
+                    ),
+                    Ok(false) => self.push_entry(EntryRole::System, String::from("Unpinned.")),
+                    Err(err) => self.push_entry(EntryRole::Error, format!("pin: {err}")),
+                }
+                return true;
+            }
+            "/fast" => {
+                let request = match cmd_args.trim().to_ascii_lowercase().as_str() {
+                    "" | "toggle" => FastRequest::Toggle,
+                    "on" => FastRequest::On,
+                    "off" => FastRequest::Off,
+                    "status" => FastRequest::Status,
+                    _ => {
+                        self.push_entry(
+                            EntryRole::Error,
+                            String::from("Usage: /fast [on|off|status]"),
+                        );
+                        return true;
+                    }
+                };
+                self.send_command(UiCommand::Fast(request));
                 return true;
             }
             "/thinking" | "/think" | "/t" => {
@@ -2193,10 +3961,10 @@ impl PiFtuiModel {
                 }
                 return true;
             }
-            "/name" => {
+            "/name" | "/rename" => {
                 let name = cmd_args.trim();
                 if name.is_empty() {
-                    self.push_entry(EntryRole::Error, String::from("Usage: /name <name>"));
+                    self.push_entry(EntryRole::Error, String::from("Usage: /rename <name>"));
                 } else {
                     self.send_command(UiCommand::SetName(name.to_string()));
                 }
@@ -2225,32 +3993,96 @@ impl PiFtuiModel {
     }
 
     fn handle_picker_key(&mut self, key: &ftui::KeyEvent) {
-        let Some(picker) = self.picker.as_mut() else {
+        if self.picker.is_none() {
+            return;
+        }
+        let Some(action) = self.picker_action(key) else {
+            // gh #244: anything that is not a picker action edits the
+            // filter. Shift is allowed so capitals and symbols type.
+            if let Some(picker) = self.picker.as_mut() {
+                match key.code {
+                    KeyCode::Backspace if key.modifiers.is_empty() => picker.pop_query_char(),
+                    KeyCode::Char(ch) if (key.modifiers - Modifiers::SHIFT).is_empty() => {
+                        picker.push_query_char(ch);
+                    }
+                    _ => {}
+                }
+            }
             return;
         };
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                picker.selected = picker.selected.saturating_sub(1);
+        let page = self.body_height().saturating_sub(1).max(1);
+        match action {
+            AppAction::SelectUp => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                picker.selected = (picker.selected + 1).min(picker.items.len().saturating_sub(1));
+            AppAction::SelectDown => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.selected =
+                        (picker.selected + 1).min(picker.shown.len().saturating_sub(1));
+                }
             }
-            KeyCode::Escape => {
+            AppAction::SelectPageUp => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.selected = picker.selected.saturating_sub(page);
+                }
+            }
+            AppAction::SelectPageDown => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.selected =
+                        (picker.selected + page).min(picker.shown.len().saturating_sub(1));
+                }
+            }
+            AppAction::SelectCancel => {
                 self.picker = None;
             }
-            KeyCode::Enter => {
-                let Some(mut picker) = self.picker.take() else {
+            AppAction::SelectConfirm => {
+                // Enter with nothing matching the filter keeps the picker
+                // open so the filter can be corrected.
+                if self.picker.as_ref().is_some_and(|p| p.shown.is_empty()) {
+                    return;
+                }
+                let Some(picker) = self.picker.take() else {
                     return;
                 };
-                let choice = if picker.values.is_empty() {
-                    picker.items.swap_remove(picker.selected)
-                } else {
-                    picker.values.swap_remove(picker.selected)
-                };
-                self.apply_picker_choice(picker.kind, &choice);
+                let kind = picker.kind;
+                if let Some(choice) = picker.take_choice() {
+                    self.apply_picker_choice(kind, &choice);
+                }
             }
             _ => {}
         }
+    }
+
+    fn picker_action(&self, key: &ftui::KeyEvent) -> Option<AppAction> {
+        let binding = KeyBinding::from_ftui_key(key)?;
+        let matches = self.keybindings.matching_actions(&binding);
+        [
+            AppAction::SelectCancel,
+            AppAction::SelectConfirm,
+            AppAction::SelectPageUp,
+            AppAction::SelectPageDown,
+            AppAction::SelectUp,
+            AppAction::SelectDown,
+        ]
+        .into_iter()
+        .find(|action| matches.contains(action))
+        .or_else(|| self.picker_default_alias(key))
+    }
+
+    fn picker_default_alias(&self, key: &ftui::KeyEvent) -> Option<AppAction> {
+        // Once a filter is typed, j and k are letters of it (gh #244).
+        if !key.modifiers.is_empty() || self.picker.as_ref().is_some_and(|p| !p.query.is_empty()) {
+            return None;
+        }
+        let action = match key.code {
+            KeyCode::Char('j') => AppAction::SelectDown,
+            KeyCode::Char('k') => AppAction::SelectUp,
+            _ => return None,
+        };
+        (self.keybindings.get_bindings(action) == KeyBindings::new().get_bindings(action))
+            .then_some(action)
     }
 
     fn apply_picker_choice(&mut self, kind: PickerKind, choice: &str) {
@@ -2292,6 +4124,62 @@ impl PiFtuiModel {
                     path: choice.to_string(),
                 });
             }
+            PickerKind::Rewind => {
+                self.scroll_from_tail = 0;
+                self.begin_busy("rewinding ...");
+                self.send_command(UiCommand::RewindTo {
+                    entry_id: choice.to_string(),
+                });
+            }
+            PickerKind::ForkFrom => {
+                self.scroll_from_tail = 0;
+                self.begin_busy("forking session ...");
+                self.send_command(UiCommand::Fork {
+                    args: choice.to_string(),
+                });
+            }
+            PickerKind::Copy => {
+                let outcome = crate::interactive::copy_text_to_clipboard(choice);
+                self.push_entry(EntryRole::System, outcome);
+                self.scroll_from_tail = 0;
+            }
+        }
+    }
+
+    /// Ask the driver for the messages on the current path; the picker opens
+    /// when they arrive (`PiMsg::MessagePicker`). Refused mid-turn: the path
+    /// is still growing.
+    fn request_message_picker(&mut self, fork: bool) {
+        if self.state == AgentUiState::Working {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Wait for the turn to finish (or Esc to stop it) before rewinding"),
+            );
+            return;
+        }
+        self.send_command(UiCommand::MessagePicker { fork });
+    }
+
+    /// Double-Esc on an idle, empty editor runs `doubleEscapeAction`: two
+    /// presses within 500ms, as in OMP and classic.
+    fn note_idle_escape(&mut self) {
+        if self.double_escape_action == DoubleEscapeAction::None {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_idle_escape
+            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(500))
+        {
+            self.last_idle_escape = None;
+            match self.double_escape_action {
+                DoubleEscapeAction::Rewind => self.request_message_picker(false),
+                DoubleEscapeAction::Fork => self.request_message_picker(true),
+                DoubleEscapeAction::Tree => self.send_command(UiCommand::TreeSummary),
+                DoubleEscapeAction::None => {}
+            }
+        } else {
+            self.last_idle_escape = Some(now);
         }
     }
 
@@ -2308,6 +4196,16 @@ impl PiFtuiModel {
     /// `label` until the driver replies. Call right before/after sending
     /// the matching [`UiCommand`]; the key handler that routed the input
     /// turns the pending flag into the spinner tick chain.
+    /// Render every background answer held during the turn that just ended.
+    ///
+    /// Drained in arrival order, so two `/tan` jobs that finish during one turn
+    /// appear in the order they completed rather than reversed.
+    fn drain_deferred_notes(&mut self) {
+        for text in std::mem::take(&mut self.deferred_notes) {
+            self.push_entry(EntryRole::System, text);
+        }
+    }
+
     fn begin_busy(&mut self, label: impl Into<String>) {
         self.busy = Some(BusyOp {
             label: label.into(),
@@ -2318,6 +4216,127 @@ impl PiFtuiModel {
     /// The active busy operation's status label, if any.
     fn busy_label(&self) -> Option<&str> {
         self.busy.as_ref().map(|op| op.label.as_str())
+    }
+
+    /// Carry out an extension UI effect, reporting whether it was handled.
+    ///
+    /// `false` leaves the caller to fall back to printing the request, which
+    /// is what happened to every one of these before: this stack had no
+    /// equivalent of the classic `apply_extension_ui_effect`, so
+    /// `ui.setWorkingMessage(...)` put a line in the transcript instead of a
+    /// status and `ui.setEditorText(...)` never reached the editor.
+    ///
+    /// Payload keys match the classic handlers exactly — the JS bridge sends
+    /// one shape and both stacks must read it the same way.
+    fn apply_extension_ui_effect(&mut self, request: &ExtensionUiRequest) -> bool {
+        let text_field = |keys: &[&str]| -> Option<String> {
+            keys.iter()
+                .find_map(|key| request.payload.get(*key).and_then(|v| v.as_str()))
+                .map(|value| sanitize(value).into_owned())
+        };
+
+        match request.method.as_str() {
+            "setStatus" | "set_status" => {
+                let status = text_field(&["statusText", "status_text", "text"]).unwrap_or_default();
+                // An empty status clears, matching the classic handler's
+                // treatment of an absent one.
+                self.ext_status = (!status.is_empty()).then_some(status);
+                true
+            }
+            "setTitle" | "set_title" => {
+                if let Some(title) = text_field(&["title", "text"]) {
+                    Self::write_terminal_title(&title);
+                }
+                true
+            }
+            "set_editor_text" => {
+                if let Some(text) = text_field(&["text"]) {
+                    self.input.set_text(&text);
+                    self.maybe_trigger_autocomplete();
+                }
+                true
+            }
+            // `setWidget` has no surface on this stack yet, and anything else
+            // is unknown; both keep the printed fallback.
+            _ => false,
+        }
+    }
+
+    /// Answer an extension UI request that asks for data, reporting whether it
+    /// was answered.
+    ///
+    /// These expect a response, so before this they fell through to
+    /// `activate_ext_request` and became a prompt card: the user was shown a
+    /// question they never asked for, and the extension received whatever the
+    /// user typed instead of the value it asked for. That is worse than the
+    /// printed fallback the effects got, which is why it is handled here.
+    ///
+    /// The theme answers describe what THIS stack supports, which is `dark`
+    /// and `light` — the two its `/theme` picker offers. The classic stack
+    /// additionally scans resource-provided themes. Reporting two is the
+    /// truthful answer for this stack rather than a degraded one; the
+    /// divergence is in theme support, not in the query.
+    fn answer_extension_ui_query(&mut self, request: &ExtensionUiRequest) -> bool {
+        let answer = |value: serde_json::Value| ExtensionUiResponse {
+            id: request.id.clone(),
+            value: Some(value),
+            cancelled: false,
+        };
+        let requested_name = || {
+            request
+                .payload
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        };
+
+        match request.method.as_str() {
+            "getEditorText" | "get_editor_text" => {
+                self.send_ext_reply(answer(serde_json::Value::String(self.input.text())));
+                true
+            }
+            "getAllThemes" | "get_all_themes" => {
+                let themes = ["dark", "light"]
+                    .into_iter()
+                    .map(
+                        |name| serde_json::json!({ "name": name, "path": serde_json::Value::Null }),
+                    )
+                    .collect();
+                self.send_ext_reply(answer(serde_json::Value::Array(themes)));
+                true
+            }
+            "getTheme" | "get_theme" => {
+                let value = match requested_name().as_str() {
+                    "dark" => serde_json::to_value(crate::theme::Theme::dark()).ok(),
+                    "light" => serde_json::to_value(crate::theme::Theme::light()).ok(),
+                    _ => None,
+                };
+                self.send_ext_reply(answer(value.unwrap_or(serde_json::Value::Null)));
+                true
+            }
+            "setTheme" | "set_theme" => {
+                let name = requested_name();
+                let applied = matches!(name.as_str(), "dark" | "light");
+                if applied {
+                    self.apply_picker_choice(PickerKind::Theme, &name);
+                }
+                self.send_ext_reply(answer(serde_json::Value::Bool(applied)));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Write the OSC title sequence, as `PiMsg::TerminalTitle` does.
+    fn write_terminal_title(title: &str) {
+        use std::io::Write as _;
+
+        let sequence = crate::delight::format_terminal_title(title);
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(sequence.as_bytes());
+        let _ = out.flush();
     }
 
     /// Convert a freshly armed busy operation into the tick command that
@@ -2368,12 +4387,43 @@ impl PiFtuiModel {
                 return Cmd::none();
             }
             Event::Key(key) => {
-                // Hard escape hatch independent of the catalog: the preview
-                // stack always quits on ctrl+c. (The bubbletea stack's richer
-                // ctrl+c semantics — clear input, double-press to exit,
-                // abort-turn — arrive with the launch-path integration.)
+                // gh #239: only presses and auto-repeats are input. Windows
+                // consoles report a Release for every key as well, and
+                // treating it as a second press moved list selections two
+                // rows per keystroke and let a `/model` Enter's release
+                // confirm the picker it had just opened. (The TextArea already
+                // ignores releases, so typed text was never doubled.)
+                if !key_event_is_input(key) {
+                    return Cmd::none();
+                }
+                // OMP semantics, independent of the catalog: ctrl+c clears
+                // the editor, and a second press within the window quits. A
+                // single stray press used to end the session, draft and all.
+                // (Esc interrupts a running turn.)
                 let ctrl_c =
                     key.code == KeyCode::Char('c') && key.modifiers.contains(Modifiers::CTRL);
+                let double_tap = self
+                    .last_ctrl_c
+                    .is_some_and(|at| at.elapsed() < CTRL_C_EXIT_WINDOW);
+                if ctrl_c && !double_tap {
+                    self.last_ctrl_c = Some(std::time::Instant::now());
+                    if self.picker.is_some() {
+                        // An open picker is what the first press dismisses;
+                        // the draft behind it is not touched.
+                        self.picker = None;
+                    } else {
+                        self.input.set_text("");
+                        self.autocomplete.close();
+                        self.history_cursor = None;
+                        self.history_draft.clear();
+                    }
+                    // A real error stays visible rather than being replaced
+                    // by the hint.
+                    if self.error_banner.is_none() {
+                        self.error_banner = Some(String::from("Press ctrl+c again to exit"));
+                    }
+                    return Cmd::none();
+                }
                 if ctrl_c {
                     // Issue #205: cancel the in-flight turn before quitting;
                     // otherwise teardown blocks on the driver joining a full
@@ -2385,6 +4435,9 @@ impl PiFtuiModel {
                             .take()
                     {
                         handle.abort();
+                    }
+                    if let Some(control) = self.live_turn_control() {
+                        control.abort();
                     }
                     return Cmd::quit();
                 }
@@ -2421,6 +4474,13 @@ impl PiFtuiModel {
                     .or_else(|| pick(AppAction::PageUp))
                     .or_else(|| pick(AppAction::PageDown))
                     .or_else(|| pick(AppAction::Submit))
+                    // alt+enter is FollowUp only while the agent works; idle,
+                    // it stays this stack's newline chord.
+                    .or_else(|| {
+                        (self.state == AgentUiState::Working)
+                            .then(|| pick(AppAction::FollowUp))
+                            .flatten()
+                    })
                     .or_else(|| pick(AppAction::NewLine))
                     .or_else(|| pick(AppAction::Interrupt))
                     .or_else(|| pick(AppAction::CursorLineEnd))
@@ -2433,7 +4493,52 @@ impl PiFtuiModel {
                         } else {
                             None
                         }
-                    });
+                    })
+                    // Application actions whose handler already exists on this
+                    // stack behind a slash command. Both keys are advertised by
+                    // /hotkeys and did nothing here until they were routed.
+                    .or_else(|| pick(AppAction::SelectModel))
+                    .or_else(|| pick(AppAction::Help))
+                    // shift+tab. Only the driver can see the model's catalog
+                    // entry, so the cycle itself lives there; this is the
+                    // routing that was missing. The completion popup claims
+                    // tab before this, above, which is why it stays correct
+                    // while the popup is open.
+                    .or_else(|| pick(AppAction::CycleThinkingLevel))
+                    .or_else(|| pick(AppAction::CycleModelForward))
+                    .or_else(|| pick(AppAction::CycleModelBackward))
+                    .or_else(|| pick(AppAction::Dequeue))
+                    // Editor-native actions come last so nothing above changes
+                    // meaning. They are routed at all because the ftui editor
+                    // handles only ctrl+a/k/z/y, arrows, Home/End, Backspace,
+                    // Delete and PageUp/Down — and ignores Alt outright — so
+                    // pi's shipped emacs-style defaults did nothing here, and
+                    // ctrl+a did the wrong thing: the editor's own binding is
+                    // select-all, so ctrl+a followed by a keystroke replaced
+                    // the whole message.
+                    .or_else(|| pick(AppAction::CursorLineStart))
+                    .or_else(|| pick(AppAction::CursorWordLeft))
+                    .or_else(|| pick(AppAction::CursorWordRight))
+                    .or_else(|| pick(AppAction::CursorLeft))
+                    .or_else(|| pick(AppAction::CursorRight))
+                    .or_else(|| pick(AppAction::JumpBackward))
+                    .or_else(|| pick(AppAction::JumpForward))
+                    .or_else(|| pick(AppAction::DeleteWordBackward))
+                    .or_else(|| pick(AppAction::DeleteWordForward))
+                    .or_else(|| pick(AppAction::DeleteToLineStart))
+                    .or_else(|| pick(AppAction::DeleteToLineEnd))
+                    .or_else(|| pick(AppAction::DeleteCharBackward))
+                    .or_else(|| pick(AppAction::DeleteCharForward))
+                    .or_else(|| pick(AppAction::Undo))
+                    // Display and editor-launch keys last: when a user binds
+                    // one of these chords (ctrl+o/t/g) to an editing action,
+                    // their binding wins over our default.
+                    .or_else(|| pick(AppAction::ExpandTools))
+                    .or_else(|| pick(AppAction::ToggleThinking))
+                    .or_else(|| pick(AppAction::ExternalEditor))
+                    .or_else(|| pick(AppAction::PasteImage))
+                    .or_else(|| pick(AppAction::CursorUp))
+                    .or_else(|| pick(AppAction::CursorDown));
                 let page = self.body_height().saturating_sub(1).max(1);
                 match action {
                     Some(AppAction::Suspend) => {
@@ -2442,16 +4547,15 @@ impl PiFtuiModel {
                         // hand the terminal dance to a task: it restores
                         // cooked mode, stops on SIGTSTP, re-acquires the
                         // terminal after SIGCONT, and reports back.
-                        self.suspending = true;
                         #[cfg(unix)]
                         {
+                            self.suspending = true;
                             #[cfg(test)]
-                            let task = self
-                                .suspend_task_override
-                                .take()
-                                .unwrap_or_else(|| Box::new(suspend_task(self.alt_screen)));
+                            let task = self.suspend_task_override.take().unwrap_or_else(|| {
+                                Box::new(suspend_task(self.alt_screen, self.mouse))
+                            });
                             #[cfg(not(test))]
-                            let task = suspend_task(self.alt_screen);
+                            let task = suspend_task(self.alt_screen, self.mouse);
                             return Cmd::task(task);
                         }
                         #[cfg(not(unix))]
@@ -2480,6 +4584,20 @@ impl PiFtuiModel {
                         self.cancel_active_ext();
                         return Cmd::none();
                     }
+                    Some(AppAction::Interrupt) if self.state == AgentUiState::Working => {
+                        // Escape aborts the running turn, as upstream does.
+                        // The driver reports how the turn ended.
+                        if let Some(control) = self.live_turn_control()
+                            && control.abort()
+                        {
+                            self.push_entry(EntryRole::System, String::from("Aborting..."));
+                        }
+                        return Cmd::none();
+                    }
+                    Some(AppAction::Interrupt) if self.input.is_empty() && self.busy.is_none() => {
+                        self.note_idle_escape();
+                        return Cmd::none();
+                    }
                     Some(AppAction::Submit) if self.input_active() => {
                         if self.active_ask.is_some() {
                             self.submit_ask_answer();
@@ -2490,10 +4608,22 @@ impl PiFtuiModel {
                             if self.pending_quit {
                                 return Cmd::quit();
                             }
+                            if let Some(task) = self.pending_task.take() {
+                                return Cmd::task(task);
+                            }
                         }
                         // A routed slash command may have armed a busy
                         // operation (issue #203); start its spinner chain.
                         return self.take_busy_tick();
+                    }
+                    Some(AppAction::FollowUp)
+                        if self.input_active()
+                            && self.active_ask.is_none()
+                            && self.active_ext.is_none() =>
+                    {
+                        // Only picked while the agent works (see above).
+                        self.submit_mid_turn(true);
+                        return Cmd::none();
                     }
                     Some(AppAction::NewLine) if self.input_active() => {
                         self.input.insert_newline();
@@ -2504,6 +4634,103 @@ impl PiFtuiModel {
                         // End with an empty editor resumes tail-follow; with
                         // content it falls through to the editor's line-end.
                         self.scroll_from_tail = 0;
+                        return Cmd::none();
+                    }
+                    Some(AppAction::SelectModel) => {
+                        // The same path a bare `/model` takes.
+                        self.route_model_command("");
+                        return Cmd::none();
+                    }
+                    Some(AppAction::Help) => {
+                        self.route_slash_command_tail("/help");
+                        return Cmd::none();
+                    }
+                    Some(AppAction::CycleThinkingLevel) => {
+                        self.send_command(UiCommand::CycleThinking);
+                        return Cmd::none();
+                    }
+                    Some(AppAction::CycleModelForward) => {
+                        self.send_command(UiCommand::CycleModel { forward: true });
+                        return Cmd::none();
+                    }
+                    Some(AppAction::CycleModelBackward) => {
+                        self.send_command(UiCommand::CycleModel { forward: false });
+                        return Cmd::none();
+                    }
+                    Some(AppAction::Dequeue) => {
+                        self.restore_queued_input();
+                        return Cmd::none();
+                    }
+                    Some(AppAction::ExternalEditor)
+                        if self.input_active()
+                            && self.active_ask.is_none()
+                            && self.active_ext.is_none() =>
+                    {
+                        // Run the editor right here, on the loop thread: as a
+                        // `Cmd::task` the loop kept polling the tty, so pi and
+                        // the editor raced for keystrokes and pi's renders
+                        // landed on the editor's screen. Blocking `update`
+                        // stops both until the editor exits.
+                        self.suspending = true;
+                        let draft = self.input.text();
+                        #[cfg(test)]
+                        let task = self.suspend_task_override.take().unwrap_or_else(|| {
+                            Box::new(external_editor_task(draft, self.alt_screen, self.mouse))
+                        });
+                        #[cfg(not(test))]
+                        let task = external_editor_task(draft, self.alt_screen, self.mouse);
+                        return self.update(task());
+                    }
+                    Some(AppAction::PasteImage)
+                        if self.input_active()
+                            && self.active_ask.is_none()
+                            && self.active_ext.is_none() =>
+                    {
+                        // The pasted screenshot is attached when the prompt
+                        // is sent, through its `@file` reference. Under WSL
+                        // the paste starts powershell.exe (seconds), so it
+                        // runs off the loop thread there.
+                        if crate::interactive::running_under_wsl() {
+                            return Cmd::task(|| {
+                                PiFtuiMsg::PastedImage(
+                                    crate::interactive::paste_clipboard_image_ref(),
+                                )
+                            });
+                        }
+                        self.insert_pasted_image(crate::interactive::paste_clipboard_image_ref());
+                        return Cmd::none();
+                    }
+                    Some(AppAction::ExpandTools) => {
+                        self.tools_expanded = !self.tools_expanded;
+                        // Cached card blocks were laid out for the old state.
+                        self.render_cache.borrow_mut().clear();
+                        return Cmd::none();
+                    }
+                    Some(AppAction::ToggleThinking) => {
+                        self.show_thinking = !self.show_thinking;
+                        self.render_cache.borrow_mut().clear();
+                        return Cmd::none();
+                    }
+                    // Editor-native actions, routed from pi's keybinding
+                    // catalog rather than left to the editor's own much
+                    // smaller one. `input_active` keeps them out of the way
+                    // while an ask card or extension prompt owns the editor.
+                    Some(editing) if self.input_active() && is_editor_action(editing) => {
+                        apply_editor_action(&mut self.input, editing);
+                        self.maybe_trigger_autocomplete();
+                        return Cmd::none();
+                    }
+                    // Input history: up/down recall earlier prompts while the
+                    // draft is one line (a multi-line draft keeps up/down for
+                    // moving between its lines).
+                    Some(AppAction::CursorUp) if self.history_navigable() => {
+                        self.history_back();
+                        return Cmd::none();
+                    }
+                    Some(AppAction::CursorDown)
+                        if self.history_navigable() && self.history_cursor.is_some() =>
+                    {
+                        self.history_forward();
                         return Cmd::none();
                     }
                     _ => {}
@@ -2521,9 +4748,11 @@ impl PiFtuiModel {
                 _ => {}
             },
             Event::Resize { width, height } => {
-                // Rendered markdown depends on the width only through the
-                // table budget; drop cached blocks when it changes so tables
-                // re-fit (gh #195). Height-only resizes keep the cache.
+                // Cached blocks are wrapped (issue #227) and their tables
+                // fitted (gh #195) for one width; drop them when it changes.
+                // Height-only resizes keep the cache. `conversation_text`
+                // repeats this check against the authoritative frame width,
+                // so a missed resize event cannot leave stale wrapping.
                 if *width != self.term.0 {
                     self.render_cache.borrow_mut().clear();
                 }
@@ -2533,6 +4762,13 @@ impl PiFtuiModel {
                 self.suspending = false;
                 // Re-clamp: a taller window may make the old offset overshoot.
                 self.scroll_from_tail = self.scroll_from_tail.min(self.max_scroll_from_tail());
+            }
+            // gh #244: an open picker is modal, so a paste edits its filter
+            // instead of landing unseen in the editor behind it.
+            Event::Paste(paste) if self.picker.is_some() => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.push_query_str(&paste.text);
+                }
             }
             _ => {
                 if self.input_active() && self.input.handle_event(event) {
@@ -2548,7 +4784,11 @@ impl PiFtuiModel {
     /// `editor_input_is_available()` in the bubbletea stack) or while an
     /// ask card / extension UI prompt is collecting its reply mid-turn.
     fn input_active(&self) -> bool {
-        self.state == AgentUiState::Ready || self.active_ask.is_some() || self.active_ext.is_some()
+        self.state == AgentUiState::Ready
+            || self.active_ask.is_some()
+            || self.active_ext.is_some()
+            // Mid-turn typing steers or queues through the control lane.
+            || (self.state == AgentUiState::Working && self.turn_control.is_some())
     }
 
     /// Fail closed every modal owned by the completed/replaced turn. Replies
@@ -2623,6 +4863,16 @@ impl PiFtuiModel {
         self.transcript.clear();
         self.render_cache.borrow_mut().clear();
         self.streaming.clear();
+        // A resumed conversation's prompts become recallable (up arrow) when
+        // nothing has been typed yet this run.
+        if self.input_history.is_empty() {
+            for message in &messages {
+                if message.role == crate::interactive::MessageRole::User {
+                    let text = sanitize(&message.content).into_owned();
+                    self.record_history(&text);
+                }
+            }
+        }
         for message in messages {
             let role = match message.role {
                 crate::interactive::MessageRole::User => EntryRole::User,
@@ -2631,6 +4881,11 @@ impl PiFtuiModel {
                     EntryRole::System
                 }
             };
+            if let Some(thinking) = message.thinking.as_deref().map(str::trim)
+                && !thinking.is_empty()
+            {
+                self.push_entry(EntryRole::Thinking, sanitize(thinking).into_owned());
+            }
             let text = sanitize(&message.content).into_owned();
             self.push_entry(role, text);
         }
@@ -2729,26 +4984,43 @@ impl PiFtuiModel {
         if usable < 20 { 20 } else { usable }
     }
 
-    /// Build the styled conversation. Assistant content renders as markdown
-    /// (auto-detected; plain text stays plain); other roles get their prefix
-    /// on the first line, matching indent on continuations, and role style.
+    /// Build the styled conversation, wrapped to `width` cells. Assistant
+    /// content renders as markdown (auto-detected; plain text stays plain);
+    /// other roles get their prefix on the first line, matching indent on
+    /// continuations, and role style.
     ///
-    /// Note: markdown rendering can change line counts vs the raw text, so
-    /// `conversation_line_count()` is an approximation for scroll clamping in
-    /// `update()`; the view recomputes offsets against the rendered total.
-    fn conversation_text(&self) -> Text<'static> {
+    /// `width` is the conversation body's own width, taken from the frame
+    /// rather than from `self.term`: the frame is authoritative (the first
+    /// frame renders before any `Event::Resize` arrives, and the test
+    /// simulator renders at an arbitrary size without one).
+    ///
+    /// Note: markdown rendering and wrapping both change line counts vs the
+    /// raw text, so `conversation_line_count()` is an approximation for
+    /// scroll clamping in `update()`; the view recomputes offsets against the
+    /// rendered total.
+    fn conversation_text(&self, width: u16) -> Text<'static> {
         // Assistant output always renders as markdown, matching the glamour
         // treatment in the bubbletea stack (auto-detection would leave short
-        // or mostly-plain replies unstyled). Tables are fitted to the
-        // terminal width (gh #195: at natural width a wide table overflowed
-        // the frame and its cells were clipped mid-column); the resize handler
-        // drops the render cache when the width changes so cached table
-        // blocks re-fit.
+        // or mostly-plain replies unstyled). Tables are fitted to the body
+        // width (gh #195: at natural width a wide table overflowed the frame
+        // and its cells were clipped mid-column).
         let theme = ftui_extras::markdown::MarkdownTheme::default();
         let md = ftui_extras::markdown::MarkdownRenderer::new(theme.clone())
-            .table_max_width(Self::table_width_for(self.term.0));
+            .table_max_width(Self::table_width_for(width));
         let palette = self.palette;
         let compact = self.markdown_spacing == crate::config::MarkdownSpacing::Compact;
+        let wrap_width = usize::from(width);
+        // Cached blocks hold lines already wrapped to (and tables already
+        // fitted to) one width, so a width change invalidates all of them
+        // (issue #227, gh #195). The resize handler clears the cache on the
+        // same condition; this check is what makes the guarantee hold
+        // against the frame rather than against `self.term`, covering the
+        // first frame — which renders before any `Event::Resize` arrives —
+        // and any later frame whose width the model was not told about.
+        if self.render_cache_width.get() != width {
+            self.render_cache.borrow_mut().clear();
+            self.render_cache_width.set(width);
+        }
         // Per-entry render cache (issue #201): reuse each block's styled
         // lines while its revision matches, so a frame costs O(changed
         // entries + streaming tail) markdown renders, not O(transcript).
@@ -2765,8 +5037,9 @@ impl PiFtuiModel {
                 // leave no stale cache slot behind.
                 cache[idx] = None;
                 rendered_blocks += 1;
+                let mut block_lines: Vec<ftui::text::Line<'static>> = Vec::new();
                 push_card_block(
-                    &mut lines,
+                    &mut block_lines,
                     CardState::Pending,
                     &entry.text,
                     entry.detail.as_ref(),
@@ -2774,7 +5047,10 @@ impl PiFtuiModel {
                     entry.group_count,
                     &palette,
                     self.spinner.current_frame,
+                    self.tools_expanded,
                 );
+                wrap_body_block(&mut block_lines, wrap_width, &theme);
+                lines.extend(block_lines);
                 continue;
             }
             if let Some(block) = cache[idx].as_ref()
@@ -2796,13 +5072,21 @@ impl PiFtuiModel {
                     entry.group_count,
                     &palette,
                     self.spinner.current_frame,
+                    self.tools_expanded,
                 );
+            } else if entry.role == EntryRole::Thinking && !self.show_thinking {
+                let summary = collapsed_thinking(&entry.text);
+                push_role_block(&mut block_lines, entry.role, &summary, &palette, &md);
             } else {
                 push_role_block(&mut block_lines, entry.role, &entry.text, &palette, &md);
                 if compact && entry.role == EntryRole::Assistant {
                     block_lines = apply_compact_spacing(&block_lines, &theme);
                 }
             }
+            // Wrap last, and cache the wrapped result: compact spacing reads
+            // blank-line runs, which wrapping must not manufacture, and the
+            // cached line count has to be the visual one the scroll math uses.
+            wrap_body_block(&mut block_lines, wrap_width, &theme);
             lines.extend(block_lines.iter().cloned());
             cache[idx] = Some(CachedBlock {
                 revision: entry.revision,
@@ -2810,16 +5094,33 @@ impl PiFtuiModel {
             });
         }
         self.render_stats.set((rendered_blocks, reused_blocks));
+        // In-flight thinking shows live, as OMP streams it, and shown or
+        // collapsed like the entry it becomes at the next flush. It used to
+        // stay invisible until the turn's text or a tool card flushed it.
+        let thinking = self.thinking.trim();
+        if !thinking.is_empty() {
+            let text = if self.show_thinking {
+                thinking.to_string()
+            } else {
+                collapsed_thinking(thinking)
+            };
+            let mut block = Vec::new();
+            push_role_block(&mut block, EntryRole::Thinking, &text, &palette, &md);
+            wrap_body_block(&mut block, wrap_width, &theme);
+            lines.extend(block);
+        }
         if !self.streaming.is_empty() {
             // Streaming fragments may end mid-construct; the streaming
             // renderer is tolerant of unterminated markdown. The in-flight
             // tail is deliberately uncached — it changes every delta.
             let rendered = md.render_streaming(&self.streaming);
-            if compact {
-                lines.extend(apply_compact_spacing(rendered.lines(), &theme));
+            let mut tail = if compact {
+                apply_compact_spacing(rendered.lines(), &theme)
             } else {
-                lines.extend(rendered.lines().iter().cloned());
-            }
+                rendered.lines().to_vec()
+            };
+            wrap_body_block(&mut tail, wrap_width, &theme);
+            lines.extend(tail);
         }
         Text::from_lines(lines)
     }
@@ -2831,11 +5132,33 @@ impl Model for PiFtuiModel {
     fn update(&mut self, msg: PiFtuiMsg) -> Cmd<PiFtuiMsg> {
         let probe = self.watchdog.start();
         let phase = match &msg {
-            PiFtuiMsg::Term(_) => LoopPhase::Input,
+            PiFtuiMsg::Term(_) | PiFtuiMsg::Edited { .. } | PiFtuiMsg::PastedImage(_) => {
+                LoopPhase::Input
+            }
             PiFtuiMsg::Agent(_) | PiFtuiMsg::Resumed => LoopPhase::AgentEvent,
         };
         let cmd = match msg {
             PiFtuiMsg::Term(event) => self.handle_term(&event),
+            PiFtuiMsg::Edited {
+                text,
+                width,
+                height,
+            } => {
+                // The resize path repaints and clears `suspending`.
+                let cmd = self.handle_term(&Event::Resize { width, height });
+                match text {
+                    Ok(text) => {
+                        // Editors end files with a newline the draft never had.
+                        self.input.set_text(text.trim_end_matches(['\n', '\r']));
+                    }
+                    Err(err) => self.error_banner = Some(err),
+                }
+                cmd
+            }
+            PiFtuiMsg::PastedImage(reference) => {
+                self.insert_pasted_image(reference);
+                Cmd::none()
+            }
             PiFtuiMsg::Agent(agent) => self.handle_agent(agent),
             // Back from a SIGTSTP stop: the suspend task already re-acquired
             // raw mode / alt screen / mouse; the next frame repaints the
@@ -2873,9 +5196,6 @@ impl PiFtuiModel {
         self.watchdog.snapshot()
     }
 
-    /// The real render pass. Split out of [`Model::view`] so the watchdog can
-    /// time it without an extra guard type.
-    #[allow(clippy::too_many_lines)]
     /// Suggestion rows plus a keyboard hint (issue #208). The highlighted
     /// row is kept inside the window via the shared `scroll_offset`, so a
     /// short terminal that clamps the region below `max_visible` still
@@ -2941,13 +5261,57 @@ impl PiFtuiModel {
 
     /// Modal picker body + footer hint. Lines borrow the picker's strings —
     /// no per-frame allocation.
+    ///
+    /// Only the window of items that keeps the selection on screen is
+    /// rendered: the body used to draw every item from the top, so a `/model`
+    /// list longer than the terminal never scrolled and the selection walked
+    /// off the bottom edge (gh #228). The title carries the `selected/total`
+    /// position whenever the list is longer than the window, or, once a
+    /// filter is typed, the filter and its match count (gh #244). Only the
+    /// matching items are listed.
     fn render_picker(&self, picker: &PickerOverlay, regions: &Regions, frame: &mut Frame) {
-        let mut lines = vec![ftui::text::Line::styled(
-            picker.title.as_str(),
-            ftui::Style::new().bold().fg(self.palette.accent),
-        )];
-        for (i, item) in picker.items.iter().enumerate() {
-            let (marker, style) = if i == picker.selected {
+        let title_style = ftui::Style::new().bold().fg(self.palette.accent);
+        // One row belongs to the title; the rest show items.
+        let visible = usize::from(regions.body.height).saturating_sub(1);
+        let shown = picker.shown.len();
+        let window = picker_window(picker.selected, shown, visible);
+        // Position when the list overflows the window; the filter and its
+        // match count whenever one is typed (gh #244).
+        let status = if !picker.query.is_empty() {
+            format!(
+                " · filter: {} ({shown}/{})",
+                sanitize(&picker.query),
+                picker.items.len()
+            )
+        } else if shown > visible {
+            format!(" ({}/{shown})", picker.selected.saturating_add(1))
+        } else {
+            String::new()
+        };
+        let title = if status.is_empty() {
+            ftui::text::Line::styled(picker.title.as_str(), title_style)
+        } else {
+            ftui::text::Line::from_spans([
+                ftui::text::Span::styled(picker.title.as_str(), title_style),
+                ftui::text::Span::styled(status.as_str(), title_style.dim()),
+            ])
+        };
+        let mut lines = vec![title];
+        if shown == 0 {
+            lines.push(ftui::text::Line::styled(
+                "  no matches (Backspace edits the filter)",
+                ftui::Style::new().dim().fg(self.palette.muted),
+            ));
+        }
+        for (pos, &index) in picker
+            .shown
+            .iter()
+            .enumerate()
+            .skip(window.start)
+            .take(window.len())
+        {
+            let item = &picker.items[index];
+            let (marker, style) = if pos == picker.selected {
                 ("▸ ", ftui::Style::new().bold().fg(self.palette.accent))
             } else {
                 ("  ", ftui::Style::new())
@@ -2966,6 +5330,9 @@ impl PiFtuiModel {
         .render(regions.footer, frame);
     }
 
+    /// The real render pass. Split out of [`Model::view`] so the watchdog can
+    /// time it without an extra guard type.
+    #[allow(clippy::too_many_lines)]
     fn render_frame(&self, frame: &mut Frame) {
         let area = Rect::new(0, 0, frame.width(), frame.height());
         let regions = layout_regions(
@@ -2993,7 +5360,7 @@ impl PiFtuiModel {
         // Conversation body with tail-follow scroll. `scroll_from_tail == 0`
         // sticks to the bottom; scrolling up pins an offset measured from the
         // tail so streaming appends don't yank the view.
-        let body_text = self.conversation_text();
+        let body_text = self.conversation_text(regions.body.width);
         let total_lines = body_text.lines().len();
         let visible = usize::from(regions.body.height).max(1);
         // Record the authoritative total for update()'s scroll clamping
@@ -3003,10 +5370,14 @@ impl PiFtuiModel {
             .scroll_from_tail
             .min(total_lines.saturating_sub(visible));
         let offset = total_lines.saturating_sub(visible + from_tail);
-        let offset_u16 = u16::try_from(offset).unwrap_or(u16::MAX);
-        Paragraph::new(body_text)
-            .scroll((offset_u16, 0))
-            .render(regions.body, frame);
+        // Hand the widget just the rows that fit rather than the whole
+        // transcript plus a scroll offset: `Paragraph::scroll` takes a u16,
+        // and past 65535 rows it saturates and draws from the wrong place
+        // instead of the tail — which wrapping (issue #227) makes a long
+        // session reach several times sooner. Slicing also means the widget
+        // measures a screenful instead of the entire history each frame.
+        let window = Text::from_lines(body_text.lines().iter().skip(offset).take(visible).cloned());
+        Paragraph::new(window).render(regions.body, frame);
 
         // Pinned error banner (bd-cv653.9.2): sits between the conversation
         // and the status line until the next sent input dismisses it.
@@ -3037,22 +5408,50 @@ impl PiFtuiModel {
         } else if let Some(busy) = self.busy_label() {
             let spin = DOTS[self.spinner.current_frame % DOTS.len()];
             format!("{spin} {busy}")
+        } else if let Some(status) = &self.ext_status {
+            status.clone()
         } else {
             self.todo_summary
                 .as_ref()
                 .map_or_else(String::new, |todo| format!("todo {todo}"))
         };
-        if !status_line.is_empty() {
+        // The powerline (OMP-ADOPT bd-cv653.9.4) fills the rest of the row:
+        // model, thinking, mode, path, VCS, context, cost.
+        let powerline = self
+            .status_snapshot
+            .as_ref()
+            .map_or_else(String::new, |snapshot| {
+                let used = if status_line.is_empty() {
+                    0
+                } else {
+                    display_width(&status_line) + 2
+                };
+                render_powerline(
+                    snapshot,
+                    usize::from(regions.status.width).saturating_sub(used),
+                )
+            });
+        if !status_line.is_empty() || !powerline.is_empty() {
             let status_style = if self.state == AgentUiState::Working || self.busy.is_some() {
                 ftui::Style::new().fg(self.palette.warning)
             } else {
                 ftui::Style::new().dim().fg(self.palette.muted)
             };
-            Paragraph::new(Text::from_lines([ftui::text::Line::styled(
-                status_line,
-                status_style,
-            )]))
-            .render(regions.status, frame);
+            let mut spans = Vec::new();
+            if !status_line.is_empty() {
+                spans.push(ftui::text::Span::styled(status_line, status_style));
+            }
+            if !powerline.is_empty() {
+                if !spans.is_empty() {
+                    spans.push(ftui::text::Span::raw(String::from("  ")));
+                }
+                spans.push(ftui::text::Span::styled(
+                    powerline,
+                    ftui::Style::new().fg(self.palette.accent),
+                ));
+            }
+            Paragraph::new(Text::from_lines([ftui::text::Line::from_spans(spans)]))
+                .render(regions.status, frame);
         }
 
         // Slash-command completion popup (issue #208), pinned to the editor.
@@ -3065,7 +5464,10 @@ impl PiFtuiModel {
         if self.input_active() {
             self.input.render(regions.input, frame);
         } else {
-            Paragraph::new(Text::raw("… processing (ctrl+c to quit)")).render(regions.input, frame);
+            Paragraph::new(Text::raw(
+                "… processing (esc to abort, ctrl+c twice to quit)",
+            ))
+            .render(regions.input, frame);
         }
 
         // Footer: scroll indicator wins; otherwise last-turn usage stats.
@@ -3074,7 +5476,7 @@ impl PiFtuiModel {
         } else if let Some(usage) = &self.usage_line {
             usage.clone()
         } else {
-            String::from("pi — ftui preview")
+            String::from("pi")
         };
         let footer_style = ftui::Style::new().dim().fg(self.palette.muted);
         Paragraph::new(Text::from_lines([ftui::text::Line::styled(
@@ -3087,10 +5489,11 @@ impl PiFtuiModel {
 
 // ── Launch path ─────────────────────────────────────────────────────────────
 
-/// Cap a tool result's text content into an 8-line preview for the card
-/// detail, with an elision counter. `None` when the result has no text.
+/// Cap a tool result's text content for the card detail (the card shows the
+/// first lines collapsed, all of these expanded), with an elision counter.
+/// `None` when the result has no text.
 fn tool_output_preview(result: &crate::tools::ToolOutput) -> Option<String> {
-    const MAX_DETAIL_LINES: usize = 8;
+    const MAX_DETAIL_LINES: usize = KEPT_DETAIL_LINES;
     const MAX_LINE_CHARS: usize = 300;
 
     let mut text = String::new();
@@ -3482,6 +5885,67 @@ type CurrentAsk = Arc<Mutex<Option<crate::ask::AskTool>>>;
 /// fires it on Ctrl-C.
 type TurnAbortSlot = Arc<Mutex<Option<crate::agent::AbortHandle>>>;
 
+const BTW_USAGE: &str = "Usage: /btw <question>";
+/// OMP's double-tap window: a second ctrl+c this soon after the first quits.
+const CTRL_C_EXIT_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+const BTW_UNAVAILABLE: &str =
+    "/btw unavailable: no smol role model configured (set --smol or model_roles.smol)";
+
+/// `/btw` in the driver: summarize the conversation tail, pass context and
+/// question through the secrets vault exactly as the main provider path
+/// does (a refusal stops it), and ask the smol role model off-thread. The
+/// answer is display-only and never enters the session.
+async fn run_btw_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    client: Option<&Arc<crate::btw::BtwClient>>,
+    question: String,
+    agent_tx: &Sender<PiMsg>,
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+) {
+    let Some(client) = client.cloned() else {
+        let _ = agent_tx.send(PiMsg::AgentError(String::from(BTW_UNAVAILABLE)));
+        return;
+    };
+    let summary = crate::btw::build_context_summary(handle.session().agent.messages());
+    let agent = &mut handle.session_mut().agent;
+    let prepared = agent
+        .secrets_transform_outbound_text(&summary)
+        .and_then(|context| {
+            agent
+                .secrets_transform_outbound_text(&question)
+                .map(|question| (context, question))
+        });
+    let (context, question) = match prepared {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("/btw refused: {err}")));
+            return;
+        }
+    };
+    let Ok(owner_session_id) = handle
+        .with_session(|session| session.header.id.clone())
+        .await
+    else {
+        let _ = agent_tx.send(PiMsg::AgentError(String::from("/btw: session busy")));
+        return;
+    };
+    // ubs:ignore Sender clone per background question — the task must own it
+    let tx = agent_tx.clone();
+    runtime_handle.spawn(async move {
+        let message = match client.ask(&context, &question).await {
+            Ok(answer) => format!("(/btw) {answer}"),
+            Err(err) => format!("(/btw) failed: {err}"),
+        };
+        let _ = tx.send(PiMsg::SessionSystemNote {
+            owner_session_id,
+            message,
+        });
+    });
+}
+
+/// The driver's running prompt turn's control lane, shared with the UI thread.
+type TurnControlSlot = Arc<Mutex<Option<crate::session_control::SessionControlHandle>>>;
+
 /// Install the per-handle half of the ask bridge: a channel picker surface on
 /// the tool plus a forwarder task that turns cards into `PiMsg::AskUiRequest`.
 /// The forwarder dies naturally when the handle (and its ask tool clones)
@@ -3569,30 +6033,193 @@ fn spawn_ask_reply_pump(
 
 /// Run one agent turn for a submitted prompt, translating events back to the
 /// UI and surfacing turn errors as transcript entries.
-async fn run_prompt_turn(
-    handle: &mut crate::sdk::AgentSessionHandle,
-    prompt: String,
-    agent_tx: &Sender<PiMsg>,
+/// Handle `/share` in the driver: export the session and publish it as a
+/// secret gist through `gh`.
+///
+/// The `gh` flow itself is `crate::interactive::share::run_share`, shared with
+/// the classic stack rather than copied (bd-ydz1t.1). What this contributes is
+/// the abort slot — so Ctrl-C cancels a share the same way it cancels a turn,
+/// instead of leaving the user watching a subprocess they cannot stop — and
+/// the mapping from outcome to transcript entry.
+///
+/// A cancellation is a system note, not an error: the user asked for it.
+async fn run_share_command(
+    handle: &crate::sdk::AgentSessionHandle,
+    cwd: &std::path::Path,
+    gh_path: Option<String>,
     turn_abort: &TurnAbortSlot,
+    agent_tx: &Sender<PiMsg>,
 ) {
-    // ubs:ignore Sender clone per turn — the event callback must own its sender
-    let tx = agent_tx.clone();
-    // Issue #205: install a per-turn abort handle the UI thread can fire on
-    // Ctrl-C, so exit doesn't wait out the provider stream and tool calls.
-    let (abort_handle, abort_signal) = crate::sdk::AgentSessionHandle::new_abort_handle();
+    use crate::interactive::share::ShareOutcome;
+
+    let (abort_handle, abort_signal) = crate::agent::AbortHandle::new();
     *turn_abort
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(abort_handle);
-    let result = handle
-        .prompt_with_abort(prompt, abort_signal, move |event| {
-            for msg in agent_event_to_pi_msgs(&event) {
-                let _ = tx.send(msg);
-            }
-        })
-        .await;
+    let store = handle.session_store();
+    let outcome = crate::interactive::share::run_share(gh_path, &store, cwd, &abort_signal).await;
     *turn_abort
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    let _ = agent_tx.send(match outcome {
+        ShareOutcome::Created(report) => PiMsg::System(report),
+        ShareOutcome::Cancelled => PiMsg::System(String::from("Share cancelled")),
+        ShareOutcome::Failed(reason) => PiMsg::AgentError(reason),
+    });
+}
+
+/// Handle `/tan` in the driver: start a background child agent and deliver its
+/// answer as a session note when it finishes.
+///
+/// The runner is `pi::subagents::SubagentTool::run_background_tan`, shared with
+/// the classic stack (bd-ydz1t.2). What this contributes is the gating and the
+/// delivery: the `subagent` tool is opt-in, so a session without it must say so
+/// rather than fail obscurely, and the completion is addressed to the session
+/// that ASKED, so an answer cannot land in a different session the user
+/// switched to meanwhile.
+///
+/// It does not await the child: the point of `/tan` is that the user keeps
+/// working. The UI holds the answer until the next turn boundary.
+async fn run_tan_command(
+    handle: &crate::sdk::AgentSessionHandle,
+    cwd: &std::path::Path,
+    role_spec: Option<String>,
+    work: String,
+    agent_tx: &Sender<PiMsg>,
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+) {
+    if !handle.has_tool("subagent") {
+        let _ = agent_tx.send(PiMsg::AgentError(String::from(
+            "/tan unavailable: enable the opt-in subagent tool with --tools ...subagent",
+        )));
+        return;
+    }
+    let owner_session_id = match handle
+        .with_session(|session| session.header.id.clone())
+        .await
+    {
+        Ok(id) => id,
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("/tan: {err}")));
+            return;
+        }
+    };
+
+    let tool = crate::subagents::SubagentTool::new(cwd).with_role_model_spec(role_spec);
+    // ubs:ignore Sender clone per background job — the task must own its sender
+    let tx = agent_tx.clone();
+    runtime_handle.spawn(async move {
+        let message = match tool.run_background_tan(&work).await {
+            // Two deliveries, exactly as the classic stack does it
+            // (`completed_tan_event`): the summary is queued through the
+            // background-jobs seam for the parent AGENT to pick up at its next
+            // idle turn boundary, and the card is what the USER sees. The
+            // agent half needs nothing from this stack — `Agent` drains
+            // completion notices itself, so it already worked here.
+            Ok(completion) => {
+                crate::jobs::push_completion_notice(&owner_session_id, completion.follow_up_text())
+                    .map_or_else(
+                        |err| format!("(/tan failed to queue follow-up)\n{err}"),
+                        |()| completion.card_text(),
+                    )
+            }
+            Err(err) => format!("(/tan failed)\n{err}"),
+        };
+        let _ = tx.send(PiMsg::SessionSystemNote {
+            owner_session_id,
+            message,
+        });
+    });
+}
+
+/// Run one prompt as a controlled turn (`session_control`): its control lane
+/// is published for the UI thread, so the user can steer, queue follow-ups
+/// or abort (Escape, Ctrl-C) while it runs. Input the turn never claimed
+/// (typed as it was ending) is not lost: it runs as the next turn.
+async fn run_prompt_turn(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    prompt: String,
+    images: Vec<crate::model::ImageContent>,
+    agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+) {
+    let mut next = Some((prompt, images));
+    while let Some((prompt, images)) = next.take() {
+        let (leftover, stopped) =
+            run_controlled_turn(handle, prompt, images, agent_tx, turn_control).await;
+        if leftover.is_empty() {
+            continue;
+        }
+        let text = leftover.join("\n\n");
+        if stopped {
+            // The turn was aborted or failed: hand unsent messages back
+            // rather than starting another turn nobody asked for.
+            if let Ok(owner_session_id) = handle
+                .with_session(|session| session.header.id.clone())
+                .await
+            {
+                let _ = agent_tx.send(PiMsg::SetEditorText {
+                    owner_session_id,
+                    text,
+                });
+                let _ = agent_tx.send(PiMsg::System(format!(
+                    "Restored {} unsent message(s) to the editor.",
+                    leftover.len()
+                )));
+            }
+        } else {
+            let _ = agent_tx.send(PiMsg::System(format!(
+                "Running {} message(s) sent as the last turn ended.",
+                leftover.len()
+            )));
+            next = Some((text, Vec::new()));
+        }
+    }
+}
+
+/// One controlled turn; returns the text of inputs it never claimed and
+/// whether the turn was aborted or failed.
+async fn run_controlled_turn(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    prompt: String,
+    images: Vec<crate::model::ImageContent>,
+    agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+) -> (Vec<String>, bool) {
+    // ubs:ignore Sender clone per turn — the event callback must own its sender
+    let tx = agent_tx.clone();
+    let turn = handle.prompt_controlled_with_images(prompt, images, move |event| {
+        for msg in agent_event_to_pi_msgs(&event) {
+            let _ = tx.send(msg);
+        }
+    });
+    let control = turn.control();
+    *turn_control
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(control.clone());
+    let result = turn.await;
+    *turn_control
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    let leftover = control
+        .take_pending()
+        .into_iter()
+        .map(|input| input.text)
+        .collect::<Vec<_>>();
+    // An aborted or failed turn hands unsent input back instead of running it.
+    let stopped = result.is_err()
+        || matches!(
+            &result,
+            Ok(message) if message.stop_reason == crate::model::StopReason::Aborted
+        );
+    report_turn_result(result, agent_tx);
+    (leftover, stopped)
+}
+
+fn report_turn_result(
+    result: crate::error::Result<crate::model::AssistantMessage>,
+    agent_tx: &Sender<PiMsg>,
+) {
     match result {
         // #209: the transcript already holds the structured turn-end card
         // (built from `AgentEnd`); the banner pinned above the editor carries
@@ -3627,14 +6254,171 @@ fn resume_template_from(options: &crate::sdk::SessionOptions) -> crate::sdk::Ses
     // The replacement session must receive the live handler created by this
     // driver's reply channel, never retain an earlier handler instance.
     template.extension_ui_handler = None;
+    // Likewise the runtime handle: the template is built on the UI thread
+    // before the driver thread's runtime exists, so it cannot carry one.
+    // `replacement_options` installs the live one at each construction site.
+    template.runtime_handle = None;
     template
+}
+
+/// Everything a `/new` or `/resume` replacement session must be given that the
+/// launch template cannot carry.
+///
+/// Both replacement paths clone the same template and then had to repeat the
+/// same wirings independently, which is how `runtime_handle` came to be missing
+/// from both. The symptom is invisible: the session works, and extensions
+/// simply stop receiving `message_*` and `tool_execution_*` after the first
+/// `/new` or `/resume`, because the SDK coalescer built for the replacement has
+/// nothing to dispatch onto (bd-82331). One function, so there is one place to
+/// forget and a test that watches it.
+fn replacement_options(
+    template: &crate::sdk::SessionOptions,
+    ext_handler: &Arc<FtuiExtensionUiHandler>,
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+) -> crate::sdk::SessionOptions {
+    let mut options = template.clone();
+    options.extension_ui_handler =
+        Some(Arc::clone(ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>);
+    options.runtime_handle = Some(runtime_handle.clone());
+    options.no_session = false;
+    options
 }
 
 /// Match the bubbletea stack's interactive extension-command budget.
 const EXT_COMMAND_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// What to tell someone whose slash command the extension runtime does not
+/// have.
+///
+/// Reaching this means two things at once: the routing chain in
+/// [`PiFtuiModel::route_slash_command_tail`] did not claim the command, and no
+/// extension registered it. If pi itself defines the name, "Unknown command"
+/// is then false — the command exists, this stack has not implemented it — and
+/// it points at `/help`, which lists only what this stack does have. Saying so
+/// costs nothing and is the difference between "pi is broken" and "use the
+/// other stack for this one".
+///
+/// An extension that registers a name pi also uses still wins: this runs only
+/// after `has_command` has already said no.
+fn unrouted_command_message(name: &str, extensions_enabled: bool) -> String {
+    if crate::interactive::SlashCommand::parse(&format!("/{name}")).is_some() {
+        return format!(
+            "/{name} is a pi command that this stack does not implement yet; run `pi --classic` for it"
+        );
+    }
+    if extensions_enabled {
+        format!("Unknown command: /{name} (try /help)")
+    } else {
+        format!("Unknown command: /{name} (extensions disabled; try /help)")
+    }
+}
+
 /// Dispatch a slash command to the extension runtime (bd-1eoh4): unknown or
 /// unavailable commands report the same way the bubbletea stack does.
+/// A typed prompt as the agent receives it, the classic stack's submit path:
+/// `@file` references are read in (text files inlined ahead of the message,
+/// images attached), then templates and `/skill:` commands expand. The
+/// default stack used to send `@path` to the model as literal text.
+fn prepare_prompt(
+    prompt: &str,
+    resources: Option<&crate::resources::ResourceLoader>,
+    cwd: &std::path::Path,
+    workspace: Option<&crate::workspace::WorkspaceHandle>,
+    auto_resize_images: bool,
+) -> std::result::Result<(String, Vec<crate::model::ImageContent>), String> {
+    let expand = |text: &str| resources.map_or_else(|| text.to_string(), |r| r.expand_input(text));
+    let (without_refs, refs) = crate::interactive::extract_file_references(prompt, |path| {
+        crate::tools::resolve_read_path(path, cwd)
+            .exists()
+            .then(|| path.to_string())
+    });
+    if refs.is_empty() {
+        return Ok((expand(prompt), Vec::new()));
+    }
+    let single;
+    #[allow(clippy::option_if_let_else)]
+    // deferred init: a closure cannot capture the unassigned `single`
+    let workspace = if let Some(workspace) = workspace {
+        workspace
+    } else {
+        single = crate::workspace::WorkspaceHandle::single(cwd);
+        &single
+    };
+    let processed = crate::tools::process_file_arguments(&refs, cwd, auto_resize_images, workspace)
+        .map_err(|err| err.to_string())?;
+    let mut text = processed.text;
+    let message = expand(without_refs.trim());
+    if !message.trim().is_empty() {
+        text.push_str(&message);
+    }
+    Ok((text, processed.images))
+}
+
+/// Run what the user typed as a turn: `@file` references, `/skill:name`
+/// and prompt templates are resolved first (see [`prepare_prompt`]). When
+/// that fails nothing is sent, and the text goes back to the editor (the UI
+/// already cleared it), as the classic stack keeps it.
+#[allow(clippy::too_many_arguments)]
+async fn run_typed_prompt(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    prompt: String,
+    resources: Option<&crate::resources::ResourceLoader>,
+    cwd: &std::path::Path,
+    auto_resize_images: bool,
+    agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+) {
+    let workspace = handle.workspace();
+    match prepare_prompt(
+        &prompt,
+        resources,
+        cwd,
+        workspace.as_ref(),
+        auto_resize_images,
+    ) {
+        Ok((text, images)) => {
+            run_prompt_turn(handle, text, images, agent_tx, turn_control).await;
+        }
+        Err(err) => {
+            if let Ok(owner_session_id) = handle
+                .with_session(|session| session.header.id.clone())
+                .await
+            {
+                let _ = agent_tx.send(PiMsg::SetEditorText {
+                    owner_session_id,
+                    text: prompt,
+                });
+            }
+            let _ = agent_tx.send(PiMsg::AgentError(format!("Not sent: {err}")));
+        }
+    }
+}
+
+/// `/name args` as a prompt-template turn: the expanded text when `name` is
+/// a loaded prompt template and no extension command claims it.
+fn template_prompt(
+    resources: Option<&crate::resources::ResourceLoader>,
+    extension_claims: bool,
+    name: &str,
+    args: &str,
+) -> Option<String> {
+    let resources = resources?;
+    if extension_claims
+        || !resources
+            .prompts()
+            .iter()
+            .any(|template| template.name == name)
+    {
+        return None;
+    }
+    let input = if args.is_empty() {
+        format!("/{name}")
+    } else {
+        format!("/{name} {args}")
+    };
+    Some(resources.expand_input(&input))
+}
+
 async fn run_extension_command(
     handle: &crate::sdk::AgentSessionHandle,
     cwd: &std::path::Path,
@@ -3648,15 +6432,11 @@ async fn run_extension_command(
         .as_ref()
         .map(|region| region.manager().clone());
     let Some(manager) = manager else {
-        let _ = agent_tx.send(PiMsg::System(format!(
-            "Unknown command: /{name} (extensions disabled; try /help)"
-        )));
+        let _ = agent_tx.send(PiMsg::System(unrouted_command_message(name, false)));
         return;
     };
     if !manager.has_command(name) {
-        let _ = agent_tx.send(PiMsg::System(format!(
-            "Unknown command: /{name} (try /help)"
-        )));
+        let _ = agent_tx.send(PiMsg::System(unrouted_command_message(name, true)));
         return;
     }
     let Some(runtime) = manager.runtime() else {
@@ -3729,13 +6509,7 @@ async fn run_mcp_command(
             }
         }
         for warning in manager.warnings() {
-            let _ = writeln!(
-                content,
-                "  ⚠ {}: {} ({})",
-                warning.source_file.display(),
-                warning.entry,
-                warning.reason
-            );
+            let _ = writeln!(content, "  ⚠ {warning}");
         }
         let _ = agent_tx.send(PiMsg::System(content));
         return;
@@ -3790,6 +6564,130 @@ async fn run_mcp_command(
     let _ = agent_tx.send(PiMsg::System(message));
 }
 
+/// A `/login` waiting for the user's input, with the localhost callback
+/// server that can complete it on its own.
+type DriverLogin = (
+    crate::interactive::login_flow::PendingLogin,
+    Option<crate::auth::OAuthCallbackServer>,
+);
+
+fn send_login_pending(agent_tx: &Sender<PiMsg>, pending: Option<&DriverLogin>) {
+    let _ = agent_tx.send(PiMsg::LoginPending {
+        provider: pending.map(|(login, _)| login.provider().to_string()),
+        accepts_empty_input: pending.is_some_and(|(login, _)| login.accepts_empty_input()),
+    });
+}
+
+/// `/login [provider]` in the driver: the shared flow the classic stack
+/// runs (login_flow), with this stack's transcript as its display.
+async fn run_login_command(
+    handle: &crate::sdk::AgentSessionHandle,
+    args: &str,
+    login: &mut Option<Box<DriverLogin>>,
+    agent_tx: &Sender<PiMsg>,
+) {
+    use crate::interactive::login_flow::{LoginStart, start_login};
+
+    let auth_path = crate::config::Config::auth_path();
+    let models = handle
+        .session()
+        .model_registry()
+        .map(|registry| registry.models().to_vec())
+        .unwrap_or_default();
+    match start_login(args, &auth_path, &models, handle.extension_manager()).await {
+        Ok(LoginStart::Listing(listing)) => {
+            let _ = agent_tx.send(PiMsg::System(listing));
+        }
+        Ok(LoginStart::Pending {
+            pending,
+            message,
+            callback,
+        }) => {
+            let pending = Box::new((pending, callback));
+            let _ = agent_tx.send(PiMsg::System(message));
+            send_login_pending(agent_tx, Some(&pending));
+            *login = Some(pending);
+        }
+        Err(message) => {
+            *login = None;
+            let _ = agent_tx.send(PiMsg::AgentError(message));
+            send_login_pending(agent_tx, None);
+        }
+    }
+}
+
+/// Complete the pending `/login` with the user's input (or the callback
+/// URL), save the credential, and switch the live session onto it.
+async fn run_login_submit(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    input: &str,
+    login: &mut Option<Box<DriverLogin>>,
+    agent_tx: &Sender<PiMsg>,
+) {
+    use crate::interactive::login_flow::{LoginFailure, complete_login};
+
+    let Some(pending) = login.take() else {
+        let _ = agent_tx.send(PiMsg::AgentError(String::from(
+            "No login in progress; run /login <provider>",
+        )));
+        send_login_pending(agent_tx, None);
+        return;
+    };
+    let (pending, callback) = *pending;
+    let auth_path = crate::config::Config::auth_path();
+    match complete_login(pending, input, &auth_path).await {
+        Ok((_provider, status)) => {
+            adopt_stored_credentials(handle, &auth_path);
+            let _ = agent_tx.send(PiMsg::System(status));
+            send_login_pending(agent_tx, None);
+        }
+        Err(LoginFailure::StillPending(pending, message)) => {
+            // Device flow not approved yet: the same prompt stays armed.
+            *login = Some(Box::new((pending, callback)));
+            let _ = agent_tx.send(PiMsg::System(message));
+        }
+        Err(LoginFailure::Failed(message)) => {
+            let _ = agent_tx.send(PiMsg::AgentError(message));
+            send_login_pending(agent_tx, None);
+        }
+    }
+}
+
+/// `/logout [provider]` in the driver.
+fn run_logout_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    args: &str,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let (active_provider, _) = handle.model();
+    let auth_path = crate::config::Config::auth_path();
+    match crate::interactive::login_flow::logout(args, &active_provider, &auth_path) {
+        Ok((_provider, status)) => {
+            adopt_stored_credentials(handle, &auth_path);
+            let _ = agent_tx.send(PiMsg::System(status));
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("logout: {err}")));
+        }
+    }
+}
+
+/// Re-read `auth.json` into the live session so the running model uses the
+/// credential `/login` or `/logout` just changed.
+fn adopt_stored_credentials(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    auth_path: &std::path::Path,
+) {
+    match crate::auth::AuthStorage::load(auth_path.to_path_buf()) {
+        Ok(auth) => handle.session_mut().adopt_auth_storage(auth),
+        Err(err) => tracing::warn!(
+            event = "ftui.login.adopt_credentials_failed",
+            error = %err,
+            "credentials were saved but could not be reloaded into the live session"
+        ),
+    }
+}
+
 /// Handle a model switch in the driver, reporting the outcome to the UI.
 async fn run_set_model_command(
     handle: &mut crate::sdk::AgentSessionHandle,
@@ -3798,7 +6696,15 @@ async fn run_set_model_command(
     agent_tx: &Sender<PiMsg>,
 ) {
     let msg = match handle.set_model(provider, model).await {
-        Ok(()) => PiMsg::System(format!("model set to {provider}/{model}")),
+        Ok(()) => {
+            // The registry resolves the canonical entry, whose name the
+            // label adds when it differs from the id (gh #214).
+            let label = handle.session().current_model_entry().map_or_else(
+                || format!("{provider}/{model}"),
+                |entry| entry.model.display_label(),
+            );
+            PiMsg::System(format!("model set to {label}"))
+        }
         Err(err) => PiMsg::AgentError(format!("model switch: {err}")),
     };
     let _ = agent_tx.send(msg);
@@ -3806,25 +6712,34 @@ async fn run_set_model_command(
 
 /// Handle `/compact` in the driver: run compaction with events translated to
 /// the UI, then replay the rewritten history into the transcript.
+/// `/compact`, or with `shake` OMP's `/shake` (drop bulky tool output, no
+/// model summary).
 async fn run_compact_command(
     handle: &mut crate::sdk::AgentSessionHandle,
+    shake: bool,
     agent_tx: &Sender<PiMsg>,
 ) {
     // ubs:ignore Sender clone per command — the event callback must own its sender
     let tx = agent_tx.clone();
-    let result = handle
-        .compact(move |event| {
-            for msg in agent_event_to_pi_msgs(&event) {
-                let _ = tx.send(msg);
-            }
-        })
-        .await;
-    match result {
-        Ok(()) => {
-            send_conversation_reset(handle, agent_tx, "conversation compacted").await;
+    let on_event = move |event| {
+        for msg in agent_event_to_pi_msgs(&event) {
+            let _ = tx.send(msg);
         }
+    };
+    let result = if shake {
+        handle.shake(on_event).await
+    } else {
+        handle.compact(on_event).await
+    };
+    let (label, done) = if shake {
+        ("shake", "conversation shaken: bulky tool output dropped")
+    } else {
+        ("compact", "conversation compacted")
+    };
+    match result {
+        Ok(()) => send_conversation_reset(handle, agent_tx, done).await,
         Err(err) => {
-            let _ = agent_tx.send(PiMsg::AgentError(format!("compact: {err}")));
+            let _ = agent_tx.send(PiMsg::AgentError(format!("{label}: {err}")));
         }
     }
 }
@@ -3873,15 +6788,13 @@ async fn new_session_command(
     runtime_handle: &asupersync::runtime::RuntimeHandle,
 ) -> std::result::Result<(), String> {
     let (provider, model_id) = handle.model();
-    let mut options = template.clone();
+    let mut options = replacement_options(template, ext_handler, runtime_handle);
+    // `thinking` is deliberately left as the template carries it: that is the
+    // launch selection, and a `None` there lets session creation re-resolve the
+    // configured default rather than force-resetting to off (issue #197).
     options.provider = Some(provider.clone());
     options.model = Some(model_id.clone());
     options.session_path = None;
-    options.extension_ui_handler =
-        Some(Arc::clone(ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>);
-    // `template.thinking` carries the launch selection; `None` lets session
-    // creation re-resolve the configured default (issue #197).
-    options.no_session = false;
     match crate::sdk::create_agent_session_deferred_mcp(options).await {
         Ok(new_handle) => {
             let prepared = match handle.preflight_replacement().await {
@@ -3935,7 +6848,11 @@ async fn new_session_command(
             .await;
             // Issue #200: the fresh session has no name; drop any previous
             // session's tab title back to the model label.
-            let _ = agent_tx.send(PiMsg::TerminalTitle(format!("Pi · {provider}/{model_id}")));
+            let label = handle.session().current_model_entry().map_or_else(
+                || format!("{provider}/{model_id}"),
+                |entry| crate::interactive::model_display_label(&entry),
+            );
+            let _ = agent_tx.send(PiMsg::TerminalTitle(format!("Pi · {label}")));
         }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("new session: {err}")));
@@ -3959,6 +6876,11 @@ async fn run_session_info_command(
             return;
         }
     };
+    // gh #214: the models.json display name, with the provider/id it is.
+    let model = handle.session().current_model_entry().map_or_else(
+        || format!("{}/{}", state.provider, state.model_id),
+        |entry| crate::interactive::session_model_line(&entry),
+    );
     let info = handle
         .with_session(|session| {
             let file = session.path.as_ref().map_or_else(
@@ -3967,10 +6889,8 @@ async fn run_session_info_command(
             );
             let name = session.get_name().unwrap_or_else(|| String::from("-"));
             format!(
-                "Session info:\n  file: {file}\n  id: {id}\n  name: {name}\n  model: {provider}/{model_id}\n  thinking: {thinking}\n  messageCount: {message_count}",
+                "Session info:\n  file: {file}\n  id: {id}\n  name: {name}\n  model: {model}\n  thinking: {thinking}\n  messageCount: {message_count}",
                 id = state.session_id.as_deref().unwrap_or("-"),
-                provider = state.provider,
-                model_id = state.model_id,
                 thinking = state
                     .thinking_level
                     .as_ref()
@@ -4025,6 +6945,280 @@ async fn run_tree_summary_command(
 
 /// Handle `/thinking`: bare shows the effective level, a parsed level sets
 /// it on the live session (`set_thinking_level` persists the header change).
+/// The newest shell command on the current path, in full: a bash tool call's
+/// `command` or a user `!cmd` run (OMP `/copy cmd`).
+fn last_shell_command(session: &crate::session::Session) -> Option<String> {
+    use crate::session::{SessionEntry, SessionMessage};
+    session
+        .entries_for_current_path()
+        .into_iter()
+        .rev()
+        .find_map(|entry| {
+            let SessionEntry::Message(message) = entry else {
+                return None;
+            };
+            match &message.message {
+                SessionMessage::BashExecution { command, .. } => Some(command.clone()),
+                SessionMessage::Assistant { message } => {
+                    message.content.iter().rev().find_map(|block| match block {
+                        crate::model::ContentBlock::ToolCall(call) if call.name == "bash" => call
+                            .arguments
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            }
+        })
+}
+
+/// The conversation as plain text (OMP `/dump`): each message under a role
+/// heading, tool calls with their arguments, tool results with their output.
+fn transcript_text(messages: &[crate::model::Message]) -> String {
+    use crate::model::{ContentBlock, Message, UserContent};
+    use std::fmt::Write as _;
+    fn blocks(out: &mut String, content: &[ContentBlock]) {
+        for block in content {
+            match block {
+                ContentBlock::Text(text) => {
+                    let _ = writeln!(out, "{}", text.text);
+                }
+                ContentBlock::Thinking(thinking) => {
+                    let _ = writeln!(out, "[thinking]\n{}", thinking.thinking);
+                }
+                ContentBlock::ToolCall(call) => {
+                    let _ = writeln!(out, "[tool call] {} {}", call.name, call.arguments);
+                }
+                ContentBlock::Image(image) => {
+                    let _ = writeln!(out, "[image {}]", image.mime_type);
+                }
+                ContentBlock::Media(_) => out.push_str("[media]\n"),
+                ContentBlock::RedactedThinking(_) => out.push_str("[redacted thinking]\n"),
+            }
+        }
+    }
+    let mut out = String::new();
+    for message in messages {
+        match message {
+            Message::User(user) => {
+                out.push_str("## User\n");
+                match &user.content {
+                    UserContent::Text(text) => {
+                        let _ = writeln!(out, "{text}");
+                    }
+                    UserContent::Blocks(content) => blocks(&mut out, content),
+                }
+            }
+            Message::Assistant(assistant) => {
+                out.push_str("## Assistant\n");
+                blocks(&mut out, &assistant.content);
+            }
+            Message::ToolResult(result) => {
+                let error = if result.is_error { " (error)" } else { "" };
+                let _ = writeln!(out, "## Tool result: {}{error}", result.tool_name);
+                blocks(&mut out, &result.content);
+            }
+            Message::Custom(custom) => {
+                let _ = writeln!(out, "## {}\n{}", custom.custom_type, custom.content);
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Write `contents` to a new file in `dir` that only the user can read.
+fn write_private_file(
+    dir: &std::path::Path,
+    stem: &str,
+    contents: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    let path = dir.join(format!(
+        "{stem}_{}.json",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(&path)?.write_all(contents.as_bytes())?;
+    Ok(path)
+}
+
+/// OMP `/dump`: copy the session as plain text (model, thinking level,
+/// system prompt, tools, then the conversation) and write what the next
+/// request would carry as JSON to a private temp file.
+fn run_dump_command(handle: &mut crate::sdk::AgentSessionHandle) -> PiMsg {
+    let (provider, model_id) = handle.model();
+    let agent = &mut handle.session_mut().agent;
+    if agent.messages().is_empty() {
+        return PiMsg::System(String::from("No messages to dump yet."));
+    }
+    let thinking = agent
+        .stream_options()
+        .thinking_level
+        .map_or_else(|| String::from("off"), |level| level.to_string());
+    let service_tier = agent.stream_options().service_tier.clone();
+    let mut request = agent.request_context_json();
+    let tool_names: Vec<String> = request["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut text = format!(
+        "Model: {provider}/{model_id}\nThinking: {thinking}\n{}Tools: {}\n\n",
+        service_tier
+            .as_deref()
+            .map_or_else(String::new, |tier| format!("Service tier: {tier}\n")),
+        tool_names.join(", ")
+    );
+    if let Some(system) = request["systemPrompt"].as_str() {
+        text.push_str("## System prompt\n");
+        text.push_str(system);
+        text.push_str("\n\n");
+    }
+    text.push_str(&transcript_text(agent.messages()));
+    let outcome = crate::interactive::copy_text_to_clipboard(&text);
+
+    request["model"] = serde_json::json!(format!("{provider}/{model_id}"));
+    request["thinkingLevel"] = serde_json::json!(thinking);
+    request["serviceTier"] = serde_json::json!(service_tier);
+    let sidecar = serde_json::to_string_pretty(&request)
+        .map_err(std::io::Error::other)
+        .and_then(|json| write_private_file(&std::env::temp_dir(), "pi_dump_request", &json));
+    PiMsg::System(match sidecar {
+        Ok(path) => format!(
+            "{outcome}\nLLM request JSON: {}\nThat file stays on disk and may contain raw \
+             context or secrets; treat it accordingly.",
+            path.display()
+        ),
+        Err(err) => format!("{outcome}\n(Could not write the LLM request JSON: {err})"),
+    })
+}
+
+/// Send the user messages on the current path for the rewind/fork picker.
+async fn send_message_picker(
+    handle: &crate::sdk::AgentSessionHandle,
+    fork: bool,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let msg = match handle
+        .with_session(crate::interactive::fork_candidates)
+        .await
+    {
+        Ok(candidates) => PiMsg::MessagePicker {
+            fork,
+            messages: candidates
+                .into_iter()
+                .map(|candidate| (candidate.summary, candidate.id))
+                .collect(),
+        },
+        Err(err) => PiMsg::AgentError(format!("messages: {err}")),
+    };
+    let _ = agent_tx.send(msg);
+}
+
+/// OMP `/branch`: rewind to just before a user message, show the shortened
+/// conversation, and hand the message back to the editor to edit and resend.
+/// The old path stays in the session tree.
+async fn run_rewind_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    entry_id: &str,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let prepared = match handle.rewind_to_user_message(entry_id).await {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("rewind: {err}")));
+            return;
+        }
+    };
+    let status = if prepared.dropped_images == 0 {
+        String::from("Rewound; the old path is kept as a branch (/tree)")
+    } else {
+        format!(
+            "Rewound; the old path is kept as a branch (/tree). The message's {} image(s) \
+             were not restored: attach them again with @path",
+            prepared.dropped_images
+        )
+    };
+    send_conversation_reset(handle, agent_tx, &status).await;
+    if let Ok(session_id) = handle
+        .with_session(|session| session.header.id.clone())
+        .await
+    {
+        let _ = agent_tx.send(PiMsg::SetEditorText {
+            owner_session_id: session_id,
+            text: prepared.text,
+        });
+    }
+}
+
+/// What `/fast` was asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastRequest {
+    Toggle,
+    On,
+    Off,
+    Status,
+}
+
+/// How the current model's provider realizes fast mode, or `None` when it
+/// has no priority tier to ask for.
+fn fast_mode_realization(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" | "openai-codex" | "openrouter" => Some("service_tier=priority"),
+        "anthropic" => Some("speed=fast, on models that offer it"),
+        _ => None,
+    }
+}
+
+/// Apply `/fast`. The tier lives in the session's stream options, so it
+/// survives model switches and simply goes unused on providers without one.
+/// Like OMP, turning it on is refused when the current model can't use it.
+fn run_fast_command(handle: &mut crate::sdk::AgentSessionHandle, request: FastRequest) -> PiMsg {
+    let (provider, _) = handle.model();
+    let realization = fast_mode_realization(&provider);
+    let options = handle.session_mut().agent.stream_options_mut();
+    let enabled = options.service_tier.as_deref() == Some("priority");
+    let enable = match request {
+        FastRequest::Toggle => !enabled,
+        FastRequest::On => true,
+        FastRequest::Off => false,
+        FastRequest::Status => {
+            return PiMsg::System(match (enabled, realization) {
+                (true, Some(how)) => format!("Fast mode is on ({provider}: {how})."),
+                (true, None) => format!("Fast mode is on, but {provider} has no priority tier."),
+                (false, _) => String::from("Fast mode is off."),
+            });
+        }
+    };
+    if !enable {
+        options.service_tier = None;
+        return PiMsg::System(String::from("Fast mode disabled."));
+    }
+    let Some(how) = realization else {
+        return PiMsg::System(format!(
+            "Fast mode is unavailable for {provider}: only OpenAI, Codex, OpenRouter and \
+             Anthropic models have a priority tier."
+        ));
+    };
+    options.service_tier = Some(String::from("priority"));
+    PiMsg::System(format!(
+        "Fast mode enabled ({provider}: {how}). Priority processing costs more."
+    ))
+}
+
 async fn run_set_thinking_command(
     handle: &mut crate::sdk::AgentSessionHandle,
     level: Option<crate::model::ThinkingLevel>,
@@ -4047,6 +7241,318 @@ async fn run_set_thinking_command(
         },
     };
     let _ = agent_tx.send(msg);
+}
+
+/// Capture what the status line shows from the live session and send it to
+/// the UI. The model is labelled the OMP way (display name, else id); the
+/// context figure is the last prompt's size against the model's window.
+async fn send_status_snapshot(
+    handle: &crate::sdk::AgentSessionHandle,
+    cwd: &std::path::Path,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let entry = handle.session().current_model_entry();
+    let (_, model_id) = handle.model();
+    let model = entry
+        .as_ref()
+        .map_or(model_id, |entry| entry.model.status_label());
+    let context_window = entry.as_ref().map(|entry| entry.model.context_window);
+    let mode = match handle.session().agent.plan_state().mode() {
+        crate::plan::PlanMode::Off => String::from("act"),
+        other => other.as_str().to_string(),
+    };
+    let totals = handle
+        .with_session(|session| {
+            let (_, usage) = crate::interactive::conversation_from_session(session);
+            let last_prompt = session
+                .to_messages_for_current_path()
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    crate::model::Message::Assistant(assistant) => Some(
+                        assistant.usage.input
+                            + assistant.usage.cache_read
+                            + assistant.usage.cache_write,
+                    ),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            (usage, last_prompt, session.get_name().unwrap_or_default())
+        })
+        .await;
+    let Ok((usage, last_prompt, session_name)) = totals else {
+        return;
+    };
+    let _ = agent_tx.send(PiMsg::StatusSnapshot(
+        crate::interactive::FtuiStatusSnapshot {
+            model,
+            thinking: handle.thinking_level().map(|level| level.to_string()),
+            mode,
+            cwd: home_relative(cwd),
+            vcs: crate::interactive::read_vcs_info(cwd),
+            context_pct: context_percent(last_prompt, context_window),
+            cost_usd: usage.cost.total,
+            tokens: usage.input + usage.output,
+            session_name,
+        },
+    ));
+}
+
+/// The powerline for the FTUI status row, fitted to `width` cells; segments
+/// drop by priority as the row narrows.
+fn render_powerline(snapshot: &crate::interactive::FtuiStatusSnapshot, width: usize) -> String {
+    let ctx = crate::status_line::StatusContext {
+        model: &snapshot.model,
+        thinking_level: snapshot.thinking.as_deref(),
+        mode: &snapshot.mode,
+        cwd: &snapshot.cwd,
+        git_branch: snapshot.vcs.as_deref(),
+        git_dirty: false,
+        context_pct: snapshot.context_pct,
+        cost_usd: snapshot.cost_usd,
+        tokens_used: snapshot.tokens,
+        subagent_count: 0,
+        session_name: &snapshot.session_name,
+        timestamp_str: "",
+    };
+    crate::status_line::PowerlineStatusLine::with_preset(
+        crate::status_line::StatusLinePreset::Default,
+    )
+    .render(&ctx, width)
+}
+
+/// `cwd` with the home directory shown as `~`.
+fn home_relative(cwd: &std::path::Path) -> String {
+    dirs::home_dir()
+        .and_then(|home| {
+            cwd.strip_prefix(&home)
+                .ok()
+                .map(std::path::Path::to_path_buf)
+        })
+        .map_or_else(
+            || cwd.display().to_string(),
+            |relative| {
+                if relative.as_os_str().is_empty() {
+                    String::from("~")
+                } else {
+                    format!("~{}{}", std::path::MAIN_SEPARATOR, relative.display())
+                }
+            },
+        )
+}
+
+/// `used` prompt tokens as a whole percentage of `window`, capped at 100.
+/// Unknown or zero windows read as 0.
+fn context_percent(used: u64, window: Option<u32>) -> u8 {
+    let Some(window) = window.filter(|window| *window > 0) else {
+        return 0;
+    };
+    u8::try_from((used.saturating_mul(100) / u64::from(window)).min(100)).unwrap_or(100)
+}
+
+/// The model ctrl+p (`forward`) or its reverse moves to from `current`
+/// (`provider/id`), over `models` in the classic stack's order: sorted,
+/// duplicates dropped, case-insensitive matching, wrapping at both ends. A
+/// running model outside the list starts at the first (or last) entry.
+/// `None` when there is nowhere to go.
+fn next_cycle_model(models: &[String], current: &str, forward: bool) -> Option<String> {
+    let mut ordered = models.to_vec();
+    // Case-insensitive, so spellings of one model sit together for dedup.
+    ordered.sort_by_key(|model| model.to_ascii_lowercase());
+    ordered.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    let position = ordered
+        .iter()
+        .position(|model| model.eq_ignore_ascii_case(current));
+    let next = match (position, forward) {
+        (Some(index), true) => ordered.get((index + 1) % ordered.len())?,
+        (Some(index), false) => ordered.get((index + ordered.len() - 1) % ordered.len())?,
+        (None, true) => ordered.first()?,
+        (None, false) => ordered.last()?,
+    };
+    (!next.eq_ignore_ascii_case(current)).then(|| next.clone())
+}
+
+/// Handle `AppAction::CycleModelForward`/`Backward` (ctrl+p): switch to the
+/// neighbouring model in the cycle list through the `/model` path.
+/// `/scoped-models` patterns (glob or exact; `provider/id` or a bare id; a
+/// `:thinking` suffix ignored) resolved against the available `provider/id`
+/// list, in pattern order without duplicates.
+fn scope_models(patterns: &[String], available: &[String]) -> Result<Vec<String>, String> {
+    let mut resolved: Vec<String> = Vec::new();
+    for pattern in patterns {
+        let raw = crate::interactive::strip_thinking_level_suffix(pattern).to_ascii_lowercase();
+        let glob = if raw.contains(['*', '?', '[']) {
+            Some(
+                glob::Pattern::new(&raw)
+                    .map_err(|err| format!("Invalid model pattern \"{pattern}\": {err}"))?,
+            )
+        } else {
+            None
+        };
+        for model in available {
+            let full = model.to_ascii_lowercase();
+            let id = full.split_once('/').map_or(full.as_str(), |(_, id)| id);
+            let hit = glob.as_ref().map_or_else(
+                || raw == full || raw == id,
+                |glob| glob.matches(&full) || glob.matches(id),
+            );
+            if hit && !resolved.iter().any(|m| m.eq_ignore_ascii_case(model)) {
+                resolved.push(model.clone());
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// `/scoped-models [patterns|clear]`: show or set the ctrl+p cycle, saved to
+/// the project's `enabled_models` as on the classic stack.
+fn run_scoped_models_command(
+    args: &str,
+    available: &[String],
+    cycle: &mut Vec<String>,
+    cwd: &std::path::Path,
+) -> PiMsg {
+    const USAGE: &str = "Usage: /scoped-models [patterns|clear] (e.g. gpt-5*,claude-sonnet*)";
+    let args = args.trim();
+    if args.is_empty() {
+        return PiMsg::System(format!(
+            "Scoped models: ctrl+p cycles {} model(s): {}",
+            cycle.len(),
+            cycle.join(", ")
+        ));
+    }
+    let patterns = if args.eq_ignore_ascii_case("clear") {
+        Vec::new()
+    } else {
+        let patterns = crate::interactive::parse_scoped_model_patterns(args);
+        if patterns.is_empty() {
+            return PiMsg::System(String::from(USAGE));
+        }
+        patterns
+    };
+    let next = if patterns.is_empty() {
+        available.to_vec()
+    } else {
+        match scope_models(&patterns, available) {
+            Ok(models) if models.is_empty() => {
+                return PiMsg::System(format!(
+                    "No models matched {}; the ctrl+p cycle is unchanged.",
+                    patterns.join(", ")
+                ));
+            }
+            Ok(models) => models,
+            Err(err) => return PiMsg::AgentError(err),
+        }
+    };
+    *cycle = next;
+    let mut message = if patterns.is_empty() {
+        format!(
+            "Scoped models cleared: ctrl+p cycles all {} models.",
+            cycle.len()
+        )
+    } else {
+        format!(
+            "Scoped models: ctrl+p cycles {} model(s): {}",
+            cycle.len(),
+            cycle.join(", ")
+        )
+    };
+    if let Err(err) = crate::config::Config::patch_settings_with_roots(
+        crate::config::SettingsScope::Project,
+        &crate::config::Config::global_dir(),
+        cwd,
+        serde_json::json!({ "enabled_models": patterns }),
+    ) {
+        let _ = write!(message, " (not saved: {err})");
+    }
+    PiMsg::System(message)
+}
+
+async fn run_cycle_model_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    models: &[String],
+    forward: bool,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let (provider, model_id) = handle.model();
+    let current = format!("{provider}/{model_id}");
+    let Some(next) = next_cycle_model(models, &current, forward) else {
+        let message = if models.is_empty() {
+            "No models available"
+        } else {
+            "Only one model available"
+        };
+        let _ = agent_tx.send(PiMsg::System(String::from(message)));
+        return;
+    };
+    let Some((provider, model)) = next.split_once('/') else {
+        let _ = agent_tx.send(PiMsg::AgentError(format!(
+            "model cycle: {next} is not provider/model"
+        )));
+        return;
+    };
+    run_set_model_command(handle, provider, model, agent_tx).await;
+}
+
+/// Handle `AppAction::CycleThinkingLevel` (shift+tab): step to the next
+/// thinking level this model offers.
+///
+/// The wording matches the charmed stack's `cycle_thinking_level` so the two
+/// stacks say the same thing about the same model.
+async fn run_cycle_thinking_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let msg = match handle.cycle_thinking_level().await {
+        Ok(Some(level)) => PiMsg::System(format!("Thinking level: {level}")),
+        Ok(None) => PiMsg::System(String::from("Current model does not support thinking")),
+        Err(err) => PiMsg::AgentError(format!("thinking: {err}")),
+    };
+    let _ = agent_tx.send(msg);
+}
+
+/// Handle `/export [path]`: write the conversation to an HTML file.
+///
+/// The same `Session::to_html` the charmed stack exports, written to the path
+/// its own helpers choose, so a conversation exported from either stack lands
+/// in the same place with the same contents.
+async fn run_export_command(
+    handle: &crate::sdk::AgentSessionHandle,
+    cwd: &std::path::Path,
+    raw_path: &str,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let cx = crate::agent_cx::AgentCx::for_request();
+    let (output_path, html) = {
+        let store = handle.session_store();
+        let Ok(session) = store.lock(cx.cx()).await else {
+            let _ = agent_tx.send(PiMsg::AgentError(String::from(
+                "export: session busy; try again",
+            )));
+            return;
+        };
+        let output_path = if raw_path.trim().is_empty() {
+            crate::interactive::default_export_path(cwd, &session)
+        } else {
+            crate::interactive::resolve_output_path(cwd, raw_path)
+        };
+        (output_path, session.to_html())
+    };
+
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        let _ = agent_tx.send(PiMsg::AgentError(format!(
+            "export: failed to create dir: {err}"
+        )));
+        return;
+    }
+    let message = match std::fs::write(&output_path, html) {
+        Ok(()) => PiMsg::System(format!("Exported HTML: {}", output_path.display())),
+        Err(err) => PiMsg::AgentError(format!("export: failed to write: {err}")),
+    };
+    let _ = agent_tx.send(message);
 }
 
 /// Handle `/name <name>`: set the session display name.
@@ -4186,6 +7692,229 @@ async fn run_usage_command(refresh: bool, agent_tx: &Sender<PiMsg>) {
     let _ = agent_tx.send(PiMsg::System(message));
 }
 
+/// Build the forked session `/fork` switches to: the source's path up to (not
+/// including) the selected user message, in the same session directory,
+/// recording where it branched from. Returns it with the selected message's
+/// text, which goes back into the editor. Same construction as the classic
+/// stack's `/fork`.
+fn build_fork_session(
+    source: &crate::session::Session,
+    entry_id: &str,
+    provider: String,
+    model_id: String,
+) -> crate::error::Result<(crate::session::Session, String)> {
+    let plan = source.plan_fork_from_user_message(entry_id)?;
+    let selected_text = plan.selected_text.clone();
+    let mut forked = crate::session::Session::create_with_dir(source.session_dir.clone());
+    forked.header.provider = Some(provider);
+    forked.header.model_id = Some(model_id);
+    forked
+        .header
+        .thinking_level
+        .clone_from(&source.header.thinking_level);
+    if let Some(parent) = source.path.as_ref() {
+        forked.set_branched_from(Some(parent.display().to_string()));
+    }
+    forked.init_from_fork_plan(plan);
+    Ok((forked, selected_text))
+}
+
+/// Handle `/fork [list|index|id]` in the driver: pick a user message, let
+/// extensions veto (`session_before_fork`), save the forked session, and
+/// switch to it through the `/resume` path. The selected message returns to
+/// the editor for rewording, as upstream does.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn fork_session_command(
+    args: &str,
+    template: &crate::sdk::SessionOptions,
+    handle: &mut crate::sdk::AgentSessionHandle,
+    current_ask: &CurrentAsk,
+    ext_handler: &Arc<FtuiExtensionUiHandler>,
+    agent_tx: &Sender<PiMsg>,
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+) -> std::result::Result<(), String> {
+    use crate::extensions::{EXTENSION_EVENT_TIMEOUT_MS, ExtensionEventName};
+
+    let args = args.trim();
+    let snapshot = handle
+        .with_session(|session| {
+            // Ids are backfilled on a copy so the candidates and the fork
+            // plan below agree on them.
+            let mut source = session.clone();
+            source.ensure_entry_ids();
+            let candidates = crate::interactive::fork_candidates(&source);
+            (source, candidates)
+        })
+        .await;
+    let (source, candidates) = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("fork: {err}")));
+            return Ok(());
+        }
+    };
+    if args.eq_ignore_ascii_case("list") || args.eq_ignore_ascii_case("ls") {
+        let text = if candidates.is_empty() {
+            String::from("No user messages to fork from")
+        } else {
+            crate::interactive::format_fork_candidates(&candidates)
+        };
+        let _ = agent_tx.send(PiMsg::System(text));
+        return Ok(());
+    }
+    let selection = match crate::interactive::select_fork_candidate(&candidates, args) {
+        Ok(selection) => selection,
+        Err(message) => {
+            let _ = agent_tx.send(PiMsg::AgentError(message));
+            return Ok(());
+        }
+    };
+    let session_id = source.header.id.clone();
+    if let Some(manager) = handle.extension_manager() {
+        let cancelled = manager
+            .dispatch_cancellable_event(
+                ExtensionEventName::SessionBeforeFork,
+                Some(serde_json::json!({
+                    "entryId": selection.id,
+                    "summary": selection.summary,
+                    "sessionId": session_id,
+                })),
+                EXTENSION_EVENT_TIMEOUT_MS,
+            )
+            .await
+            .unwrap_or(false);
+        if cancelled {
+            let _ = agent_tx.send(PiMsg::System(String::from("Fork cancelled by extension")));
+            return Ok(());
+        }
+    }
+
+    let (provider, model_id) = handle.model();
+    let (mut forked, selected_text) =
+        match build_fork_session(&source, &selection.id, provider, model_id) {
+            Ok(built) => built,
+            Err(err) => {
+                let _ = agent_tx.send(PiMsg::AgentError(format!("Failed to build fork: {err}")));
+                return Ok(());
+            }
+        };
+    let new_session_id = forked.header.id.clone();
+    if let Err(err) = forked.save().await {
+        let _ = agent_tx.send(PiMsg::AgentError(format!("Failed to save fork: {err}")));
+        return Ok(());
+    }
+    let Some(path) = forked.path.clone() else {
+        let _ = agent_tx.send(PiMsg::AgentError(String::from(
+            "Failed to save fork: the session has no file",
+        )));
+        return Ok(());
+    };
+    Box::pin(resume_session_command(
+        &path.to_string_lossy(),
+        template,
+        handle,
+        current_ask,
+        ext_handler,
+        agent_tx,
+        runtime_handle,
+    ))
+    .await?;
+    // The resume path reports its own failures and keeps the old session;
+    // only a completed switch gets the editor text and the fork event.
+    let switched = handle
+        .with_session(|session| session.header.id == new_session_id)
+        .await
+        .unwrap_or(false);
+    if switched {
+        let _ = agent_tx.send(PiMsg::System(format!(
+            "Forked new session from {}",
+            selection.summary
+        )));
+        let _ = agent_tx.send(PiMsg::SetEditorText {
+            owner_session_id: new_session_id.clone(),
+            text: selected_text,
+        });
+        if let Some(manager) = handle.extension_manager() {
+            let _ = manager
+                .dispatch_event(
+                    ExtensionEventName::SessionFork,
+                    Some(serde_json::json!({
+                        "entryId": selection.id,
+                        "summary": selection.summary,
+                        "sessionId": session_id,
+                        "newSessionId": new_session_id,
+                    })),
+                )
+                .await;
+        }
+    }
+    Ok(())
+}
+
+/// Handle `/reload` in the driver: rebuild the session from its own file so
+/// extensions, skills, prompt templates, themes and context files are read
+/// afresh, keeping the conversation. A session with nothing saved yet reloads
+/// as a fresh session, which loses nothing. An unsaved in-memory conversation
+/// is refused rather than dropped.
+async fn reload_session_command(
+    template: &crate::sdk::SessionOptions,
+    handle: &mut crate::sdk::AgentSessionHandle,
+    current_ask: &CurrentAsk,
+    ext_handler: &Arc<FtuiExtensionUiHandler>,
+    agent_tx: &Sender<PiMsg>,
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+) -> std::result::Result<(), String> {
+    let snapshot = handle
+        .with_session(|session| {
+            let saved = session.path.clone().filter(|path| path.exists());
+            (saved, session.entries.is_empty())
+        })
+        .await;
+    let (saved, empty) = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("reload: {err}")));
+            return Ok(());
+        }
+    };
+    match saved {
+        Some(path) => {
+            Box::pin(resume_session_command(
+                &path.to_string_lossy(),
+                template,
+                handle,
+                current_ask,
+                ext_handler,
+                agent_tx,
+                runtime_handle,
+            ))
+            .await?;
+        }
+        None if empty => {
+            Box::pin(new_session_command(
+                template,
+                handle,
+                current_ask,
+                ext_handler,
+                agent_tx,
+                runtime_handle,
+            ))
+            .await?;
+        }
+        None => {
+            let _ = agent_tx.send(PiMsg::AgentError(String::from(
+                "reload: this conversation is not saved to a session file, so reloading would \
+                 lose it. Start a saved session (/new) to reload resources.",
+            )));
+            return Ok(());
+        }
+    }
+    let _ = agent_tx.send(PiMsg::System(String::from(
+        "Reloaded extensions, skills, prompt templates, themes and context files.",
+    )));
+    Ok(())
+}
+
 /// Handle `/resume` in the driver: open the chosen session file with the
 /// launch selection preserved, await the previous handle's shutdown before
 /// starting the replacement's MCP servers, rewire the ask bridge, and replay
@@ -4200,11 +7929,8 @@ async fn resume_session_command(
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
 ) -> std::result::Result<(), String> {
-    let mut options = template.clone();
+    let mut options = replacement_options(template, ext_handler, runtime_handle);
     options.session_path = Some(std::path::PathBuf::from(path));
-    options.extension_ui_handler =
-        Some(Arc::clone(ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>);
-    options.no_session = false;
     match crate::sdk::create_agent_session_deferred_mcp(options).await {
         Ok(new_handle) => {
             let prepared = match handle.preflight_replacement().await {
@@ -4251,6 +7977,44 @@ async fn resume_session_command(
 }
 
 /// Snapshot the handle's conversation and reset the UI transcript from it.
+/// `/retry` driver half: branch the session back to before the last user
+/// turn and replay the history (with the turn's text) into the transcript.
+/// Returns the text to re-send, or `None` after reporting why not.
+async fn prepare_retry_turn(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    agent_tx: &Sender<PiMsg>,
+) -> Option<String> {
+    let text = match handle.prepare_retry().await {
+        Ok(text) => text,
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("retry: {err}")));
+            return None;
+        }
+    };
+    let snapshot = handle
+        .with_session(|session| {
+            let (messages, usage) = crate::interactive::conversation_from_session(session);
+            (session.header.id.clone(), messages, usage)
+        })
+        .await;
+    match snapshot {
+        Ok((session_id, messages, usage)) => {
+            let _ = agent_tx.send(PiMsg::RetryCommitted {
+                session_id,
+                messages,
+                usage,
+                text: text.clone(),
+                status: Some(String::from("Retrying last turn")),
+            });
+            Some(text)
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("retry: {err}")));
+            None
+        }
+    }
+}
+
 async fn send_conversation_reset(
     handle: &crate::sdk::AgentSessionHandle,
     agent_tx: &Sender<PiMsg>,
@@ -4278,12 +8042,32 @@ async fn send_conversation_reset(
     }
 }
 
+/// `shell_path` and `shell_command_prefix` from settings, for `!command`.
+/// The classic stack always passed them; this stack ran the default shell
+/// regardless, so a configured `shell_path` (the documented fix on Windows
+/// when no bash is found, GH #182) had no effect on `!command`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BashUiShell {
+    path: Option<String>,
+    command_prefix: Option<String>,
+}
+
+impl BashUiShell {
+    fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            path: config.shell_path.clone(),
+            command_prefix: config.shell_command_prefix.clone(),
+        }
+    }
+}
+
 /// Run a `!command` for the driver loop: tool-status blips around the shared
 /// bash runner, result rendered via the session display formatter. Returns
 /// the display text on success so the caller can submit it as a turn
 /// (`!` context-inclusion); `!!` gets the exclusion note appended.
 async fn run_bash_ui_command(
     cwd: &std::path::Path,
+    shell: &BashUiShell,
     command: &str,
     exclude: bool,
     agent_tx: &Sender<PiMsg>,
@@ -4297,7 +8081,15 @@ async fn run_bash_ui_command(
         name: String::from("bash"),
         tool_id: String::from("ftui-bash"),
     });
-    let result = crate::tools::run_bash_command(cwd, None, None, command, None, None).await;
+    let result = crate::tools::run_bash_command(
+        cwd,
+        shell.path.as_deref(),
+        shell.command_prefix.as_deref(),
+        command,
+        None,
+        None,
+    )
+    .await;
     let output = match result {
         Ok(result) => {
             let display = crate::session::bash_execution_to_text(
@@ -4362,6 +8154,11 @@ async fn create_driver_session(
     let ext_handler = Arc::new(FtuiExtensionUiHandler::new(agent_tx.clone()));
     session_options.extension_ui_handler =
         Some(Arc::clone(&ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>);
+    // The driver runtime is what extension observation events are dispatched
+    // onto. Without it the SDK builds a coalescer that can never fire and
+    // extensions on this stack see lifecycle events and nothing else
+    // (bd-82331).
+    session_options.runtime_handle = Some(runtime_handle.clone());
     spawn_ext_reply_pump(Arc::clone(&ext_handler), ext_reply_rx, runtime_handle);
     match crate::sdk::create_agent_session(session_options).await {
         Ok(handle) => Some((handle, ext_handler)),
@@ -4410,6 +8207,42 @@ fn terminal_replacement_error(
     ))
 }
 
+/// Config values this stack reads directly rather than through the SDK session
+/// options, grouped so `run` keeps a signature someone can read.
+pub struct FtuiSettings {
+    /// Conversation spacing for the markdown renderer.
+    pub markdown_spacing: crate::config::MarkdownSpacing,
+    /// The `ghPath` setting, for `/share`. Empty or `None` means `gh` from
+    /// `PATH`; the e2e scenarios point it at a mock.
+    pub gh_path: Option<String>,
+    /// Honour `disableMouseCapture` / `--no-mouse-capture` /
+    /// `PI_NO_MOUSE_CAPTURE`, which the classic frontend already respects.
+    /// With capture on, the terminal routes mouse events to the app and
+    /// native drag-to-select stops working (pi_agent_rust#78).
+    pub disable_mouse_capture: bool,
+    /// Model spec a `/tan` child agent runs under, from the `task` role falling
+    /// back to `smol` (`app::subagent_role_spec`). `None` lets the child pick
+    /// its own default.
+    pub subagent_role_spec: Option<String>,
+    /// `provider/id` models ctrl+p cycles through: the resolved scope
+    /// (`--models`, path overrides, `enabledModels`) when one is configured.
+    /// Empty means the whole available list, as on the classic stack.
+    pub cycle_models: Vec<String>,
+    /// `/btw` side-question client for the smol role model, when it resolves
+    /// with credentials.
+    pub btw_client: Option<Arc<crate::btw::BtwClient>>,
+    /// The `hideThinkingBlock` setting: start with thinking collapsed to
+    /// one line (ctrl+t still shows it). Off, as in OMP and classic, shows
+    /// thinking in full.
+    pub hide_thinking_block: bool,
+    /// The `doubleEscapeAction` setting.
+    pub double_escape_action: DoubleEscapeAction,
+    /// Model display names by `provider/model-id`, for the `/model` picker.
+    pub model_names: HashMap<String, String>,
+    /// `--plan-mode`: start in planning, as the classic stack does.
+    pub start_in_plan_mode: bool,
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn run(
     session_options: crate::sdk::SessionOptions,
@@ -4417,24 +8250,71 @@ pub fn run(
     inline: bool,
     available_models: Vec<String>,
     available_sessions: Vec<(String, String)>,
-    markdown_spacing: crate::config::MarkdownSpacing,
+    settings: FtuiSettings,
     autocomplete: AutocompleteLaunch,
 ) -> std::io::Result<()> {
     const DRIVER_STACK_BYTES: usize = 16 * 1024 * 1024;
+    let FtuiSettings {
+        markdown_spacing,
+        gh_path,
+        disable_mouse_capture,
+        subagent_role_spec,
+        cycle_models,
+        btw_client,
+        hide_thinking_block,
+        double_escape_action,
+        model_names,
+        start_in_plan_mode,
+    } = settings;
+    let driver_btw_client = btw_client.clone();
+    let mut cycle_models = if cycle_models.is_empty() {
+        available_models.clone()
+    } else {
+        cycle_models
+    };
+    let driver_available_models = available_models.clone();
+    // `/restart`: the UI raises the flag and quits; the driver, once it has
+    // saved and shut the session down, records the session file to reopen.
+    let restart_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let restart_session: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+    let driver_restart_requested = Arc::clone(&restart_requested);
+    let driver_restart_session = Arc::clone(&restart_session);
     // Issue #208: the driver re-sends the catalog with extension commands
     // once its session exists; the model starts from the resource catalog.
     let driver_catalog = autocomplete.catalog.clone();
+    let mut driver_resources = autocomplete.resources.clone();
+    let resource_source = autocomplete.resource_source.clone();
+    // `images.autoResize` from settings; default on, as on the classic stack.
+    let auto_resize_images = resource_source
+        .as_ref()
+        .is_none_or(|source| source.config.image_auto_resize());
 
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<UiCommand>();
+    // `--plan-mode` enters planning the way `/plan` does. Queued before the
+    // UI exists, the driver runs it as soon as its session is ready.
+    if start_in_plan_mode {
+        let _ = submit_tx.send(UiCommand::Plan {
+            action: String::from("enter"),
+        });
+    }
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
     let (ask_reply_tx, ask_reply_rx) = std::sync::mpsc::channel::<AskUiReply>();
     let (ext_reply_tx, ext_reply_rx) = std::sync::mpsc::channel::<ExtensionUiResponse>();
     let bash_cwd = driver_bash_cwd(&session_options);
+    let resume_cwd = bash_cwd.display().to_string();
+    let bash_shell = resource_source
+        .as_ref()
+        .map(|source| BashUiShell::from_config(&source.config))
+        .unwrap_or_default();
     let resume_template = resume_template_from(&session_options);
     // Issue #205: shared slot so Ctrl-C on the UI thread can abort the
     // driver's in-flight prompt turn instead of waiting it out.
     let turn_abort: TurnAbortSlot = Arc::new(Mutex::new(None));
     let driver_turn_abort = Arc::clone(&turn_abort);
+    // The running prompt turn's control lane: the UI thread steers, queues
+    // follow-ups and aborts through it while the driver awaits the turn.
+    let turn_control: TurnControlSlot = Arc::new(Mutex::new(None));
+    let driver_turn_control = Arc::clone(&turn_control);
 
     let driver = std::thread::Builder::new()
         .name("pi-ftui-agent-driver".into())
@@ -4451,24 +8331,29 @@ pub fn run(
             };
             let runtime_handle = runtime.handle();
             let terminal_agent_tx = agent_tx.clone();
+            // The driver future is a few bytes over clippy's 16 KiB
+            // large_futures threshold on Windows. It is built once per FTUI
+            // session and handed straight to block_on, and boxing it does not
+            // help: the lint then fires on the future moved into Box::pin.
+            #[cfg_attr(windows, allow(clippy::large_futures))]
             let shutdown = runtime.block_on(async move {
-                let (mut handle, ext_handler) = create_driver_session(
+                // Boxed: clippy::large_futures (SessionOptions carries the
+                // advisor too).
+                let (mut handle, ext_handler) = Box::pin(create_driver_session(
                     session_options,
                     &agent_tx,
                     ext_reply_rx,
                     &runtime_handle,
-                )
+                ))
                 .await?;
                 let current_ask =
                     install_ask_bridges(&handle, &agent_tx, ask_reply_rx, &runtime_handle);
-                send_conversation_reset(
-                    &handle,
-                    &agent_tx,
-                    "ftui preview stack — experimental (bd-cv653.9.1)",
-                )
-                .await;
+                send_conversation_reset(&handle, &agent_tx, "pi interactive stack").await;
+                Box::pin(send_status_snapshot(&handle, &bash_cwd, &agent_tx)).await;
                 // Issue #208: extension-contributed slash commands become
                 // completable now that the extension runtime is up.
+                // Resource catalog for the info commands (/skills).
+                let mut info_catalog = driver_catalog.clone();
                 if let Some(manager) = handle.extension_manager() {
                     let mut catalog = driver_catalog;
                     catalog.extension_commands = extension_commands_for_catalog(manager);
@@ -4480,12 +8365,28 @@ pub fn run(
                 {
                     let _ = agent_tx.send(PiMsg::TerminalTitle(format!("Pi · {name}")));
                 }
+                let mut plans = plan_commands::PlanController::default();
                 let mut replacement_failure = None;
+                // The `/login` waiting for input, if any (boxed: the driver
+                // future sits near clippy's large_futures threshold).
+                let mut login: Option<Box<DriverLogin>> = None;
                 loop {
-                    match submit_rx.try_recv() {
+                    let received = submit_rx.try_recv();
+                    // Every handled command may change what the status line
+                    // shows (model, thinking, mode, session, usage).
+                    let refresh_status = received.is_ok();
+                    match received {
                         Ok(UiCommand::Prompt(prompt)) => {
-                            run_prompt_turn(&mut handle, prompt, &agent_tx, &driver_turn_abort)
-                                .await;
+                            run_typed_prompt(
+                                &mut handle,
+                                prompt,
+                                driver_resources.as_ref(),
+                                &bash_cwd,
+                                auto_resize_images,
+                                &agent_tx,
+                                &driver_turn_control,
+                            )
+                            .await;
                         }
                         Ok(UiCommand::SetModel { provider, model }) => {
                             run_set_model_command(&mut handle, &provider, &model, &agent_tx).await;
@@ -4493,16 +8394,34 @@ pub fn run(
                         Ok(UiCommand::Bash { command, exclude }) => {
                             // `!` semantics: the output becomes the next
                             // turn's user content (submit_content parity).
-                            if let Some(output) =
-                                run_bash_ui_command(&bash_cwd, &command, exclude, &agent_tx).await
+                            if let Some(output) = run_bash_ui_command(
+                                &bash_cwd,
+                                &bash_shell,
+                                &command,
+                                exclude,
+                                &agent_tx,
+                            )
+                            .await
                                 && !exclude
                             {
-                                run_prompt_turn(&mut handle, output, &agent_tx, &driver_turn_abort)
-                                    .await;
+                                run_prompt_turn(
+                                    &mut handle,
+                                    output,
+                                    Vec::new(),
+                                    &agent_tx,
+                                    &driver_turn_control,
+                                )
+                                .await;
                             }
                         }
                         Ok(UiCommand::Compact) => {
-                            run_compact_command(&mut handle, &agent_tx).await;
+                            run_compact_command(&mut handle, false, &agent_tx).await;
+                        }
+                        Ok(UiCommand::Shake) => {
+                            run_compact_command(&mut handle, true, &agent_tx).await;
+                        }
+                        Ok(UiCommand::Plan { action }) => {
+                            plans.run(&mut handle, &action, &agent_tx).await;
                         }
                         Ok(UiCommand::AddDir { dir }) => {
                             run_add_dir_command(&mut handle, &dir, &agent_tx).await;
@@ -4524,10 +8443,39 @@ pub fn run(
                                 .await;
                         }
                         Ok(UiCommand::ExtensionCommand { name, args }) => {
-                            run_extension_command(&handle, &bash_cwd, &name, &args, &agent_tx)
+                            // A prompt template runs as a turn, unless an
+                            // extension registered the same name (extensions
+                            // win, as on the classic stack).
+                            let claimed = handle
+                                .extension_manager()
+                                .is_some_and(|manager| manager.has_command(&name));
+                            if template_prompt(driver_resources.as_ref(), claimed, &name, &args)
+                                .is_some()
+                            {
+                                // Through the typed-prompt path, so `@file`
+                                // references in the arguments attach too.
+                                let input = if args.is_empty() {
+                                    format!("/{name}")
+                                } else {
+                                    format!("/{name} {args}")
+                                };
+                                run_typed_prompt(
+                                    &mut handle,
+                                    input,
+                                    driver_resources.as_ref(),
+                                    &bash_cwd,
+                                    auto_resize_images,
+                                    &agent_tx,
+                                    &driver_turn_control,
+                                )
                                 .await;
+                            } else {
+                                run_extension_command(&handle, &bash_cwd, &name, &args, &agent_tx)
+                                    .await;
+                            }
                         }
                         Ok(UiCommand::ResumeSession { path }) => {
+                            plans.clear_review();
                             // Boxed: clippy::large_futures.
                             if let Err(err) = Box::pin(resume_session_command(
                                 &path,
@@ -4544,7 +8492,73 @@ pub fn run(
                                 break;
                             }
                         }
+                        Ok(UiCommand::DeleteSession) => {
+                            // Only a file that exists: a new or in-memory
+                            // session has nothing to delete.
+                            let doomed = handle
+                                .with_session(|session| session.path.clone())
+                                .await
+                                .ok()
+                                .flatten()
+                                .filter(|path| path.is_file());
+                            let Some(doomed) = doomed else {
+                                let _ = agent_tx.send(PiMsg::AgentError(String::from(
+                                    "No saved session file to delete (the session is new or in-memory).",
+                                )));
+                                continue;
+                            };
+                            // Move to a fresh session first, so the old one is
+                            // saved and released before its file goes.
+                            plans.clear_review();
+                            if let Err(err) = Box::pin(new_session_command(
+                                &resume_template,
+                                &mut handle,
+                                &current_ask,
+                                &ext_handler,
+                                &agent_tx,
+                                &runtime_handle,
+                            ))
+                            .await
+                            {
+                                replacement_failure = Some(err);
+                                break;
+                            }
+                            // A refused or failed switch is reported in the UI
+                            // and keeps the current session: never delete the
+                            // file that is still live (or that cannot be checked).
+                            let still_live = handle
+                                .with_session(|session| session.path.clone())
+                                .await
+                                .map_or(true, |path| path.as_deref() == Some(doomed.as_path()));
+                            if still_live {
+                                let _ = agent_tx.send(PiMsg::AgentError(format!(
+                                    "Kept {}: no new session started, so it is still the live session.",
+                                    doomed.display()
+                                )));
+                                continue;
+                            }
+                            // The shared helper takes the session persistence
+                            // lock, prefers the trash, and removes the SQLite
+                            // and v2 sidecars that a bare remove_file leaves.
+                            // Then drop the index row, as the session picker
+                            // does, or /resume keeps listing the deleted file.
+                            let _ = agent_tx.send(match crate::session_picker::delete_session_file(&doomed) {
+                                Ok(()) => {
+                                    let _ = crate::session_index::SessionIndex::new()
+                                        .delete_session_path(&doomed);
+                                    PiMsg::System(format!(
+                                        "Deleted {}; this is a new session.",
+                                        doomed.display()
+                                    ))
+                                }
+                                Err(err) => PiMsg::AgentError(format!(
+                                    "Could not delete {}: {err}",
+                                    doomed.display()
+                                )),
+                            });
+                        }
                         Ok(UiCommand::NewSession) => {
+                            plans.clear_review();
                             // Boxed: clippy::large_futures.
                             if let Err(err) = Box::pin(new_session_command(
                                 &resume_template,
@@ -4563,27 +8577,272 @@ pub fn run(
                         Ok(UiCommand::SessionInfo) => {
                             run_session_info_command(&handle, &agent_tx).await;
                         }
+                        Ok(UiCommand::Fresh) => {
+                            let messages = handle.session().agent.messages().len();
+                            let _ = agent_tx.send(match handle.fresh_stream_state().await {
+                                Ok(id) => PiMsg::System(format!(
+                                    "Fresh stream state (session id {id}); transcript untouched ({messages} messages)."
+                                )),
+                                Err(err) => PiMsg::AgentError(format!("fresh: {err}")),
+                            });
+                        }
+                        Ok(UiCommand::Workspace { command, args }) => {
+                            let advisor = resume_template
+                                .advisor
+                                .as_ref()
+                                .map(|advisor| advisor.label.clone());
+                            Box::pin(workspace_commands::run(
+                                command,
+                                &args,
+                                &mut handle,
+                                &bash_cwd,
+                                advisor.as_deref(),
+                                resource_source
+                                    .as_ref()
+                                    .map(|source| &source.package_manager),
+                                &agent_tx,
+                            ))
+                            .await;
+                        }
+                        Ok(UiCommand::Checkpoint { args }) => {
+                            let (name, note) =
+                                args.split_once(char::is_whitespace).unwrap_or((args.as_str(), ""));
+                            let note = Some(note.trim()).filter(|note| !note.is_empty());
+                            let _ = agent_tx.send(
+                                match handle.mark_checkpoint(name.trim(), note).await {
+                                    Ok(checkpoint) => PiMsg::System(format!(
+                                        "Checkpoint '{}' marked ({} messages, ~{} tokens). Rewind with /rewind{}.",
+                                        checkpoint.name,
+                                        checkpoint.message_count,
+                                        checkpoint.token_estimate,
+                                        if checkpoint.name == "checkpoint" {
+                                            String::new()
+                                        } else {
+                                            format!(" {}", checkpoint.name)
+                                        }
+                                    )),
+                                    Err(err) => PiMsg::AgentError(format!("checkpoint: {err}")),
+                                },
+                            );
+                        }
+                        Ok(UiCommand::Rewind { name }) => {
+                            let name = Some(name.as_str()).filter(|name| !name.is_empty());
+                            let _ = agent_tx.send(match handle.rewind_to_checkpoint(name).await {
+                                Ok(outcome) => PiMsg::System(format!(
+                                    "Rewound to '{}': {} messages collapsed into a report (~{} tokens). The tree kept everything.",
+                                    outcome.checkpoint,
+                                    outcome.collapsed_messages,
+                                    outcome.summary_tokens_estimate
+                                )),
+                                Err(err) => PiMsg::AgentError(format!("rewind: {err}")),
+                            });
+                        }
+                        Ok(UiCommand::Retry) => {
+                            if let Some(text) = prepare_retry_turn(&mut handle, &agent_tx).await {
+                                run_prompt_turn(
+                                    &mut handle,
+                                    text,
+                                    Vec::new(),
+                                    &agent_tx,
+                                    &driver_turn_control,
+                                )
+                                .await;
+                            }
+                        }
+                        Ok(UiCommand::Btw(question)) => {
+                            run_btw_command(
+                                &mut handle,
+                                driver_btw_client.as_ref(),
+                                question,
+                                &agent_tx,
+                                &runtime_handle,
+                            )
+                            .await;
+                        }
+                        Ok(UiCommand::Tan(work)) => {
+                            run_tan_command(
+                                &handle,
+                                &bash_cwd,
+                                subagent_role_spec.clone(),
+                                work,
+                                &agent_tx,
+                                &runtime_handle,
+                            )
+                            .await;
+                        }
+                        Ok(UiCommand::Share) => {
+                            run_share_command(
+                                &handle,
+                                &bash_cwd,
+                                gh_path.clone(),
+                                &driver_turn_abort,
+                                &agent_tx,
+                            )
+                            .await;
+                        }
                         Ok(UiCommand::TreeSummary) => {
                             run_tree_summary_command(&handle, &agent_tx).await;
+                        }
+                        Ok(UiCommand::Fast(request)) => {
+                            let _ = agent_tx.send(run_fast_command(&mut handle, request));
+                        }
+                        Ok(UiCommand::Dump) => {
+                            let _ = agent_tx.send(run_dump_command(&mut handle));
+                        }
+                        Ok(UiCommand::CopyLastCommand) => {
+                            let found = handle.with_session(last_shell_command).await;
+                            let _ = agent_tx.send(match found {
+                                Ok(Some(command)) => PiMsg::System(
+                                    crate::interactive::copy_text_to_clipboard(&command),
+                                ),
+                                Ok(None) => PiMsg::AgentError(String::from("No command to copy.")),
+                                Err(err) => PiMsg::AgentError(format!("copy: {err}")),
+                            });
+                        }
+                        Ok(UiCommand::MessagePicker { fork }) => {
+                            send_message_picker(&handle, fork, &agent_tx).await;
+                        }
+                        Ok(UiCommand::RewindTo { entry_id }) => {
+                            run_rewind_command(&mut handle, &entry_id, &agent_tx).await;
                         }
                         Ok(UiCommand::SetThinking(level)) => {
                             run_set_thinking_command(&mut handle, level, &agent_tx).await;
                         }
+                        Ok(UiCommand::CycleThinking) => {
+                            run_cycle_thinking_command(&mut handle, &agent_tx).await;
+                        }
+                        Ok(UiCommand::ScopedModels { args }) => {
+                            let _ = agent_tx.send(run_scoped_models_command(
+                                &args,
+                                &driver_available_models,
+                                &mut cycle_models,
+                                &bash_cwd,
+                            ));
+                        }
+                        Ok(UiCommand::CycleModel { forward }) => {
+                            run_cycle_model_command(&mut handle, &cycle_models, forward, &agent_tx)
+                                .await;
+                        }
+                        Ok(UiCommand::Export { path }) => {
+                            run_export_command(&handle, &bash_cwd, &path, &agent_tx).await;
+                        }
                         Ok(UiCommand::SetName(name)) => {
                             run_set_name_command(&mut handle, &name, &agent_tx).await;
                         }
+                        Ok(UiCommand::Login { args }) => {
+                            Box::pin(run_login_command(&handle, &args, &mut login, &agent_tx))
+                                .await;
+                        }
+                        Ok(UiCommand::LoginSubmit(LoginInput(input))) => {
+                            Box::pin(run_login_submit(&mut handle, &input, &mut login, &agent_tx))
+                                .await;
+                        }
+                        Ok(UiCommand::Logout { args }) => {
+                            run_logout_command(&mut handle, &args, &agent_tx);
+                        }
+                        Ok(UiCommand::Info(command)) => {
+                            Box::pin(info_commands::run(
+                                command,
+                                &handle,
+                                &info_catalog,
+                                &bash_cwd,
+                                &agent_tx,
+                            ))
+                            .await;
+                        }
+                        Ok(UiCommand::Reload) => {
+                            // Boxed: clippy::large_futures.
+                            if let Err(err) = Box::pin(reload_session_command(
+                                &resume_template,
+                                &mut handle,
+                                &current_ask,
+                                &ext_handler,
+                                &agent_tx,
+                                &runtime_handle,
+                            ))
+                            .await
+                            {
+                                replacement_failure = Some(err);
+                                break;
+                            }
+                            if let Some(source) = &resource_source {
+                                let extension_commands = handle
+                                    .extension_manager()
+                                    .map(extension_commands_for_catalog)
+                                    .unwrap_or_default();
+                                Box::pin(reload_driver_resources(
+                                    source,
+                                    &bash_cwd,
+                                    extension_commands,
+                                    &mut driver_resources,
+                                    &mut info_catalog,
+                                    &agent_tx,
+                                ))
+                                .await;
+                            }
+                        }
+                        Ok(UiCommand::Fork { args }) => {
+                            // Boxed: clippy::large_futures.
+                            if let Err(err) = Box::pin(fork_session_command(
+                                &args,
+                                &resume_template,
+                                &mut handle,
+                                &current_ask,
+                                &ext_handler,
+                                &agent_tx,
+                                &runtime_handle,
+                            ))
+                            .await
+                            {
+                                replacement_failure = Some(err);
+                                break;
+                            }
+                        }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            // A browser redirect caught by the login's
+                            // localhost callback server completes it without
+                            // the user pasting anything.
+                            let redirect = login
+                                .as_ref()
+                                .and_then(|pending| pending.1.as_ref())
+                                .and_then(|server| server.rx.try_recv().ok());
+                            if let Some(path) = redirect {
+                                let url = format!("http://localhost{path}");
+                                Box::pin(run_login_submit(
+                                    &mut handle,
+                                    &url,
+                                    &mut login,
+                                    &agent_tx,
+                                ))
+                                .await;
+                                continue;
+                            }
                             asupersync::time::sleep(asupersync::time::wall_now(), SUBMIT_POLL)
                                 .await;
                         }
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                     }
+                    if refresh_status {
+                        Box::pin(send_status_snapshot(&handle, &bash_cwd, &agent_tx)).await;
+                    }
                 }
+                let session_store = handle.session_store();
                 let shutdown = if replacement_failure.is_some() {
                     handle.discard_uncommitted_resources().await
                 } else {
                     handle.shutdown_owned_resources().await
                 };
+                if driver_restart_requested.load(std::sync::atomic::Ordering::SeqCst) {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    let saved = session_store
+                        .lock(cx.cx())
+                        .await
+                        .ok()
+                        .and_then(|session| session.path.clone().filter(|path| path.is_file()));
+                    if let Ok(mut slot) = driver_restart_session.lock() {
+                        *slot = saved;
+                    }
+                }
                 Some((shutdown, replacement_failure))
             });
             let Some((shutdown, replacement_failure)) = shutdown else {
@@ -4624,15 +8883,36 @@ pub fn run(
         ftui::core::capability_override::push_override(over)
     });
 
+    // The catalog every key on this stack resolves against. Loading it here is
+    // what makes `keybindings.json` apply at all: the model defaults to the
+    // shipped bindings, and nothing on this path used to replace them.
+    let keybindings_result = KeyBindings::load_from_user_config();
+    if keybindings_result.has_warnings() {
+        tracing::warn!(
+            target: crate::config::USER_DIAGNOSTIC_TARGET,
+            "Keybindings warnings: {}",
+            keybindings_result.format_warnings()
+        );
+    }
+
     let model = PiFtuiModel::new(agent_rx)
+        .with_keybindings(keybindings_result.bindings)
         .with_submit_channel(submit_tx)
         .with_turn_abort(turn_abort)
+        .with_turn_control(turn_control)
+        .with_btw_client(btw_client)
         .with_ask_reply_channel(ask_reply_tx)
         .with_palette(FtuiPalette::from_theme(theme))
         .with_available_models(available_models)
+        .with_model_names(model_names)
+        .with_restart_request(Arc::clone(&restart_requested))
         .with_available_sessions(available_sessions)
+        .with_resume_cwd(resume_cwd)
         .with_alt_screen(!inline)
+        .with_mouse_enabled(!disable_mouse_capture)
         .with_markdown_spacing(markdown_spacing)
+        .with_thinking_visible(!hide_thinking_block)
+        .with_double_escape_action(double_escape_action)
         .with_autocomplete(autocomplete)
         .with_ext_reply_channel(ext_reply_tx);
     // Inline mode preserves shell scrollback (bead acceptance #2): the UI
@@ -4646,13 +8926,134 @@ pub fn run(
     // Divert tracing output away from the terminal while the TUI owns it
     // (bd-trkef); restored on drop.
     let log_guard = crate::tui::TuiLogRedirectGuard::begin();
-    let result = app.with_mouse().run();
+    // Mouse capture defaults on; when the user asked for native terminal
+    // selection it must stay off, exactly as the classic frontend does.
+    let result = if disable_mouse_capture {
+        app.run()
+    } else {
+        app.with_mouse().run()
+    };
     drop(log_guard);
 
     // The UI (and with it the submit sender) is gone; the driver's next poll
     // sees Disconnected and unwinds. Await the teardown result so final save
     // or resource-shutdown failures cannot be reported as a successful exit.
-    finish_ftui_run(result, driver.join())
+    finish_ftui_run(result, driver.join())?;
+    // Restart only after a clean teardown: the session is saved and the
+    // terminal is the user's again.
+    if restart_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        let session = restart_session.lock().ok().and_then(|mut slot| slot.take());
+        return restart_process(&restart_argv(
+            std::env::args_os().skip(1),
+            session.as_deref(),
+        ));
+    }
+    Ok(())
+}
+
+/// argv for `/restart` (OMP `restartArgv`): the launch flags without the
+/// positional arguments (an initial prompt must not be sent again) or the
+/// session-source flags (`-c`, `-r`, `--session`), then `--session <file>`
+/// when this session was saved. Which flags take a value comes from the CLI
+/// definition itself; an unknown (extension) flag keeps a following
+/// non-flag argument as its value.
+fn restart_argv(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    session: Option<&std::path::Path>,
+) -> Vec<std::ffi::OsString> {
+    use clap::CommandFactory;
+    let command = crate::cli::Cli::command();
+    let mut valued: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for arg in command.get_arguments() {
+        let takes_value = arg.get_action().takes_values();
+        for name in arg
+            .get_long_and_visible_aliases()
+            .into_iter()
+            .flatten()
+            .map(|long| format!("--{long}"))
+            .chain(
+                arg.get_short_and_visible_aliases()
+                    .into_iter()
+                    .flatten()
+                    .map(|short| format!("-{short}")),
+            )
+        {
+            if takes_value {
+                valued.insert(name.clone());
+            }
+            known.insert(name);
+        }
+    }
+    let session_source = ["-c", "--continue", "-r", "--resume", "--session"];
+
+    let args: Vec<std::ffi::OsString> = args.into_iter().collect();
+    let mut kept = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        let text = arg.to_string_lossy();
+        if text == "--" {
+            break;
+        }
+        if !text.starts_with('-') || text == "-" {
+            i += 1;
+            continue;
+        }
+        let (flag, inline_value) = match text.split_once('=') {
+            Some((flag, _)) if text.starts_with("--") => (flag.to_string(), true),
+            _ => (text.to_string(), false),
+        };
+        let next_is_value = args
+            .get(i + 1)
+            .is_some_and(|next| !next.to_string_lossy().starts_with('-'));
+        let consumes_next = !inline_value
+            && if known.contains(&flag) {
+                valued.contains(&flag)
+            } else {
+                next_is_value
+            };
+        if !session_source.contains(&flag.as_str()) {
+            kept.push(arg.clone());
+            if consumes_next {
+                kept.push(args[i + 1].clone());
+            }
+        }
+        i += if consumes_next { 2 } else { 1 };
+    }
+    if let Some(session) = session {
+        kept.push("--session".into());
+        kept.push(session.as_os_str().to_owned());
+    }
+    kept
+}
+
+/// Replace this process with a fresh `pi` run with `args` (Unix exec); on
+/// Windows, run it and exit with its status.
+fn restart_process(args: &[std::ffi::OsString]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let exe = std::env::current_exe()?;
+    let _ = std::io::stdout().flush();
+    let mut command = std::process::Command::new(exe);
+    command.args(args);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // Only returns on failure.
+        Err(command.exec())
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command.status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+/// Whether a key event is user input. Release events are reported by
+/// Windows consoles (and by kitty-protocol terminals asked for event types)
+/// and must never act a second time.
+const fn key_event_is_input(key: &ftui::KeyEvent) -> bool {
+    !matches!(key.kind, ftui::KeyEventKind::Release)
 }
 
 #[cfg(test)]
@@ -4675,6 +9076,11 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         (tx, PiFtuiModel::new(rx))
     }
+
+    /// Body width for tests that call `conversation_text` directly. Cached
+    /// blocks are width-specific (issue #227), so repeated calls in one test
+    /// must agree on a width or every frame reads as cold.
+    const TEST_BODY_WIDTH: u16 = 80;
 
     #[test]
     fn replacement_session_template_preserves_launch_capabilities() {
@@ -4710,6 +9116,50 @@ mod tests {
         assert_eq!(
             mcp.global_dir,
             Some(std::path::PathBuf::from("isolated-global"))
+        );
+        assert!(
+            template.runtime_handle.is_none(),
+            "the template is built before the driver runtime exists, so it must not pretend to \
+             carry a handle; `replacement_options` installs the live one (bd-82331)"
+        );
+    }
+
+    /// A `/new` or `/resume` replacement keeps extensions observing (bd-82331).
+    ///
+    /// The launch path installs a runtime handle on the session it builds, but
+    /// both replacement paths clone the launch *template*, which cannot carry
+    /// one. Without this the session still works and extensions simply stop
+    /// receiving `message_*` and `tool_execution_*` the moment the user runs
+    /// `/new` or `/resume` — no error, no warning, on the default stack.
+    #[test]
+    fn replacement_options_install_the_driver_runtime_and_ui_handler() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .build()
+            .expect("runtime for handle");
+        let runtime_handle = runtime.handle();
+        let (agent_tx, _agent_rx) = mpsc::channel::<PiMsg>();
+        let ext_handler = Arc::new(FtuiExtensionUiHandler::new(agent_tx));
+        let template = resume_template_from(&crate::sdk::SessionOptions {
+            no_session: true,
+            ..crate::sdk::SessionOptions::default()
+        });
+
+        let options = replacement_options(&template, &ext_handler, &runtime_handle);
+
+        assert!(
+            options.runtime_handle.is_some(),
+            "a replacement session must be handed the driver runtime, or the SDK coalescer it \
+             builds has nothing to dispatch onto and extension observation events are silently \
+             dropped for the rest of the session (bd-82331)"
+        );
+        assert!(
+            options.extension_ui_handler.is_some(),
+            "a replacement session must be handed this driver's live UI handler, never an \
+             earlier instance"
+        );
+        assert!(
+            !options.no_session,
+            "a replacement session is always persisted, whatever the launch flags said"
         );
     }
 
@@ -4796,6 +9246,7 @@ mod tests {
         assert!(sim.model().streaming.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn ctrl_z_dispatches_suspend_task_and_fake_resumes() {
         let (_tx, model) = new_model();
@@ -4816,6 +9267,91 @@ mod tests {
                 .iter()
                 .any(|record| matches!(record, CmdRecord::Task))
         );
+    }
+
+    /// ctrl+g hands the draft to the external-editor task (faked here: the
+    /// real one takes over the terminal) and the saved text replaces the
+    /// draft, minus the editor's trailing newline.
+    #[test]
+    fn ctrl_g_replaces_the_draft_with_the_edited_text() {
+        let (_tx, model) = new_model();
+        let model = model.with_suspend_task(|| PiFtuiMsg::Edited {
+            text: Ok(String::from("rewritten in vim\n")),
+            width: 100,
+            height: 30,
+        });
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "first draft");
+        sim.inject_event(key(KeyCode::Char('g'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "rewritten in vim");
+        assert!(!sim.model().suspending, "the repaint path unfreezes");
+        assert_eq!(sim.model().term, (100, 30));
+        // The editor runs inside `update`, not as a task: a task left the
+        // event loop polling the tty the editor was using.
+        assert!(
+            !sim.command_log()
+                .iter()
+                .any(|record| matches!(record, CmdRecord::Task)),
+            "ctrl+g must block the loop, not spawn a task"
+        );
+    }
+
+    /// A failed edit keeps the draft and says why.
+    #[test]
+    fn ctrl_g_failure_keeps_the_draft() {
+        let (_tx, model) = new_model();
+        let model = model.with_suspend_task(|| PiFtuiMsg::Edited {
+            text: Err(String::from("external editor: vi exited with 1")),
+            width: 80,
+            height: 24,
+        });
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "keep me");
+        sim.inject_event(key(KeyCode::Char('g'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "keep me");
+        assert!(
+            sim.model()
+                .error_banner
+                .as_deref()
+                .is_some_and(|banner| banner.contains("exited with 1"))
+        );
+    }
+
+    /// A user who bound ctrl+g to an editing action keeps it: the default
+    /// external-editor chord yields to their binding.
+    #[test]
+    fn a_user_binding_on_ctrl_g_beats_the_external_editor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keybindings.json");
+        std::fs::write(&path, r#"{ "deleteWordBackward": ["ctrl+g"] }"#).expect("write config");
+        let keybindings = KeyBindings::load(&path).expect("load keybindings");
+        let (_tx, model) = new_model();
+        let model = model
+            .with_keybindings(keybindings)
+            .with_suspend_task(|| panic!("the external editor must not open"));
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "keep drop");
+        sim.inject_event(key(KeyCode::Char('g'), Modifiers::CTRL));
+        let text = sim.model().input.text();
+        assert!(
+            text.starts_with("keep") && !text.contains("drop"),
+            "{text:?}"
+        );
+    }
+
+    /// The real editor round trip, with a shell command standing in for the
+    /// user's editor: it receives the draft's file and what it saves comes
+    /// back. A failing editor is an error, not an empty draft.
+    #[cfg(unix)]
+    #[test]
+    fn run_external_editor_returns_what_the_editor_saved() {
+        let saved =
+            run_external_editor("perl -pi -e 's/draft/edited/'", "a draft\n").expect("editor ran");
+        assert_eq!(saved, "a edited\n");
+        assert!(run_external_editor("false", "a draft").is_err());
     }
 
     #[test]
@@ -4883,13 +9419,63 @@ mod tests {
         assert!(streamed.contains("text"));
     }
 
+    /// OMP semantics: the first ctrl+c clears the draft and keeps running;
+    /// a second one inside the window quits.
     #[test]
-    fn ctrl_c_quits() {
+    fn ctrl_c_clears_then_a_second_press_quits() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "half-written thought");
+        sim.inject_event(key(KeyCode::Char('c'), Modifiers::CTRL));
+        assert!(sim.is_running(), "one press must not end the session");
+        assert!(sim.model().input.is_empty(), "the draft is cleared");
+        sim.inject_event(key(KeyCode::Char('c'), Modifiers::CTRL));
+        assert!(!sim.is_running());
+    }
+
+    /// With a picker open, the first ctrl+c closes the picker and leaves the
+    /// draft; a real error banner is not replaced by the hint.
+    #[test]
+    fn ctrl_c_closes_an_open_picker_before_touching_the_draft() {
+        let (_tx, model) = new_model();
+        let model = model.with_available_models(vec![
+            String::from("openai/gpt-5"),
+            String::from("anthropic/claude-x"),
+        ]);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "keep this draft");
+        sim.model_mut().error_banner = Some(String::from("provider said no"));
+        sim.inject_event(key(KeyCode::Char('l'), Modifiers::CTRL));
+        assert!(
+            sim.model().picker.is_some(),
+            "ctrl+l opens the model picker"
+        );
+        sim.inject_event(key(KeyCode::Char('c'), Modifiers::CTRL));
+        assert!(sim.is_running());
+        assert!(sim.model().picker.is_none(), "the picker is dismissed");
+        assert_eq!(sim.model().input.text(), "keep this draft");
+        assert_eq!(
+            sim.model().error_banner.as_deref(),
+            Some("provider said no")
+        );
+    }
+
+    /// Outside the window, a press only clears again.
+    #[test]
+    fn ctrl_c_after_the_window_does_not_quit() {
         let (_tx, model) = new_model();
         let mut sim = ProgramSimulator::new(model);
         sim.init();
         sim.inject_event(key(KeyCode::Char('c'), Modifiers::CTRL));
-        assert!(!sim.is_running());
+        sim.model_mut().last_ctrl_c = Some(
+            std::time::Instant::now()
+                .checked_sub(CTRL_C_EXIT_WINDOW * 2)
+                .expect("instant"),
+        );
+        sim.inject_event(key(KeyCode::Char('c'), Modifiers::CTRL));
+        assert!(sim.is_running());
     }
 
     /// Flatten a captured frame to plain text, one row per line.
@@ -4963,6 +9549,1268 @@ mod tests {
     }
 
     #[test]
+    fn slash_hotkeys_prints_the_key_map_from_the_users_catalog() {
+        // Before this the command answered "Unknown command: /hotkeys (try
+        // /help)", so the key map was unreachable on the default stack.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keybindings.json");
+        std::fs::write(&path, r#"{ "deleteWordBackward": ["ctrl+g"] }"#).expect("write config");
+        let keybindings = KeyBindings::load(&path).expect("load keybindings");
+
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model.with_keybindings(keybindings));
+        sim.init();
+        let before = sim.model().transcript.len();
+        for ch in "/hotkeys".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+
+        // Submitting also echoes the typed line as a User entry, so the
+        // listing is the System one that follows it.
+        let listing = sim.model().transcript[before..]
+            .iter()
+            .find(|entry| entry.role == EntryRole::System)
+            .map(|entry| entry.text.clone())
+            .expect("a System entry carrying the listing");
+        assert!(
+            listing.contains("Keyboard Shortcuts"),
+            "not the key map: {listing:?}"
+        );
+        let text = &listing;
+        assert!(
+            text.contains("ctrl+g"),
+            "the listing should reflect the user's own override: {text:?}"
+        );
+        assert!(
+            text.contains("Collapse/expand tool output"),
+            "ctrl+o is routed on FTUI now: {text:?}"
+        );
+        assert!(
+            !text.contains("Open settings"),
+            "unsupported actions like OpenSettings must not be advertised on FTUI: {text:?}"
+        );
+    }
+
+    #[test]
+    fn slash_keys_is_an_alias_for_hotkeys() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+        for ch in "/keys".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            sim.model().transcript[before..]
+                .iter()
+                .any(|entry| entry.role == EntryRole::System
+                    && entry.text.contains("Keyboard Shortcuts")),
+            "/keys should print the same listing"
+        );
+    }
+
+    #[test]
+    fn ctrl_l_opens_the_model_picker() {
+        // `/hotkeys` has always listed ctrl+l for SelectModel, and on this
+        // stack it did nothing: the action was in the catalog and in no
+        // resolution chain, so the key reached the editor and was dropped.
+        let (_tx, model) = new_model();
+        let model = model.with_available_models(vec![
+            "anthropic/claude-sonnet-5".to_string(),
+            "openai/gpt-5".to_string(),
+        ]);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        assert!(sim.model().picker.is_none(), "picker open before the key");
+
+        sim.inject_event(key(KeyCode::Char('l'), Modifiers::CTRL));
+        assert!(
+            sim.model().picker.is_some(),
+            "ctrl+l should open the same picker a bare /model opens"
+        );
+    }
+
+    #[test]
+    fn f1_prints_the_help_entry() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+
+        sim.inject_event(key(KeyCode::F(1), Modifiers::empty()));
+        let added = &sim.model().transcript[before..];
+        assert_eq!(added.len(), 1, "f1 should add exactly one entry");
+        assert!(
+            added[0].text.contains("/model"),
+            "f1 should print the help entry, got {:?}",
+            added[0].text
+        );
+    }
+
+    #[test]
+    fn shift_tab_routes_the_thinking_cycle_to_the_driver() {
+        // `/hotkeys` advertises shift+tab for CycleThinkingLevel and it did
+        // nothing here: the catalog knew the action, no chain picked it, and
+        // the key reached the editor, which ignores Tab with a modifier.
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        sim.inject_event(key(KeyCode::Tab, Modifiers::SHIFT));
+        assert_eq!(
+            submit_rx.try_recv().expect("shift+tab routed"),
+            UiCommand::CycleThinking
+        );
+        // The driver owns the level, so the key must not invent transcript
+        // text of its own; the reply it sends back is what the user sees.
+        assert!(
+            sim.model().transcript.is_empty(),
+            "shift+tab should report through the driver, not locally: {:?}",
+            sim.model().transcript
+        );
+    }
+
+    /// gh #214 under OMP direction: the default stack's status row carries the
+    /// powerline, and its model segment is the display name, not provider/id.
+    #[test]
+    fn status_row_shows_the_powerline_with_the_model_display_name() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::StatusSnapshot(
+            crate::interactive::FtuiStatusSnapshot {
+                model: String::from("DeepSeek V4 Pro"),
+                thinking: Some(String::from("high")),
+                mode: String::from("act"),
+                cwd: String::from("~/proj"),
+                vcs: Some(String::from("main")),
+                context_pct: 42,
+                ..crate::interactive::FtuiStatusSnapshot::default()
+            },
+        )));
+        let rendered = buffer_text(sim.capture_frame(100, 8), 100, 8);
+        assert!(rendered.contains("DeepSeek V4 Pro"), "{rendered}");
+        assert!(!rendered.contains("deepseek/"), "{rendered}");
+        assert!(rendered.contains("ACT"), "{rendered}");
+        assert!(rendered.contains("ctx: 42%"), "{rendered}");
+    }
+
+    #[test]
+    fn context_percent_is_capped_and_zero_without_a_window() {
+        assert_eq!(context_percent(64_000, Some(128_000)), 50);
+        assert_eq!(context_percent(500_000, Some(128_000)), 100);
+        assert_eq!(context_percent(10, Some(0)), 0);
+        assert_eq!(context_percent(10, None), 0);
+    }
+
+    /// The driver builds the snapshot from the live session: the catalog
+    /// entry's display name, the last prompt's share of the context window,
+    /// and plan mode.
+    #[test]
+    fn status_snapshot_uses_the_catalog_name_and_last_prompt_context() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth = crate::auth::AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+        let registry = crate::models::ModelRegistry::load(&auth, None);
+        let entry = registry
+            .find("openai", "gpt-4o")
+            .expect("gpt-4o in catalog");
+        let provider = Arc::new(crate::providers::openai::OpenAIProvider::new("gpt-4o"));
+        let agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(&[], std::path::Path::new("."), None),
+            crate::agent::AgentConfig::default(),
+        );
+        let mut stored = crate::session::Session::in_memory();
+        let window = u64::from(entry.model.context_window);
+        stored.append_message(crate::session::SessionMessage::Assistant {
+            message: crate::model::AssistantMessage {
+                content: Vec::new(),
+                api: String::from("openai-responses"),
+                provider: String::from("openai"),
+                model: String::from("gpt-4o"),
+                usage: crate::model::Usage {
+                    input: window / 4,
+                    cache_read: window / 4,
+                    ..crate::model::Usage::default()
+                },
+                stop_reason: crate::model::StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            },
+        });
+        let session = crate::agent::AgentSession::new(
+            agent,
+            Arc::new(asupersync::sync::Mutex::new(stored)),
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        let mut handle = crate::sdk::AgentSessionHandle::from_session_with_listeners(
+            session,
+            crate::sdk::EventListeners::default(),
+        );
+        handle.session_mut().set_model_registry(registry);
+        let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
+        runtime.block_on(send_status_snapshot(&handle, dir.path(), &agent_tx));
+        let Ok(PiMsg::StatusSnapshot(snapshot)) = agent_rx.try_recv() else {
+            panic!("no status snapshot sent");
+        };
+        assert_eq!(snapshot.model, entry.model.status_label());
+        assert_ne!(snapshot.model, "openai/gpt-4o");
+        assert_eq!(snapshot.context_pct, 50);
+        assert_eq!(snapshot.mode, "act");
+    }
+
+    /// Mid-turn input on the default stack: Enter steers the running turn,
+    /// alt+enter queues a follow-up, commands are refused (text kept), Escape
+    /// aborts, and alt+up restores unsent messages. Everything goes through
+    /// the turn's real control lane.
+    /// A steered message's `@file` is read in before it joins the turn (it
+    /// used to arrive as literal `@path`), and an image mid-turn keeps the
+    /// draft instead of being dropped.
+    #[test]
+    fn mid_turn_steering_reads_file_references() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "the secret is 42\n").expect("write");
+        std::fs::write(
+            dir.path().join("shot.png"),
+            [
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+                0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xF0, 0x1F, 0x00, 0x05, 0x00, 0x01, 0xFF, 0x89, 0x99,
+                0x3D, 0x1D, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            ],
+        )
+        .expect("write png");
+        let provider = Arc::new(
+            crate::providers::openai::OpenAIProvider::new("ftui-steer-fixture")
+                .with_base_url("http://127.0.0.1:1/v1"),
+        );
+        let agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(&[], std::path::Path::new("."), None),
+            crate::agent::AgentConfig::default(),
+        );
+        let session = crate::agent::AgentSession::new(
+            agent,
+            Arc::new(asupersync::sync::Mutex::new(
+                crate::session::Session::in_memory(),
+            )),
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        let mut handle = crate::sdk::AgentSessionHandle::from_session_with_listeners(
+            session,
+            crate::sdk::EventListeners::default(),
+        );
+        let turn = handle.prompt_controlled(String::from("start"), |_| {});
+        let control = turn.control();
+        let slot: TurnControlSlot = Arc::new(Mutex::new(Some(control.clone())));
+        let (_agent_tx, rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx)
+            .with_turn_control(slot)
+            .with_autocomplete(AutocompleteLaunch {
+                catalog: AutocompleteCatalog::default(),
+                cwd: dir.path().to_path_buf(),
+                max_visible: 5,
+                resources: None,
+                resource_source: None,
+            });
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+
+        type_str(&mut sim, "also check @shot.png");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "also check @shot.png");
+        assert_eq!(control.snapshot().pending_steering, 0, "nothing queued");
+
+        sim.model_mut().input.set_text("");
+        type_str(&mut sim, "use @notes.txt");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        let pending = control.take_pending();
+        assert_eq!(pending.len(), 1);
+        assert!(
+            pending[0].text.contains("the secret is 42"),
+            "{}",
+            pending[0].text
+        );
+        assert!(
+            !pending[0].text.contains("@notes.txt"),
+            "{}",
+            pending[0].text
+        );
+    }
+
+    #[test]
+    fn mid_turn_enter_steers_alt_enter_queues_and_escape_aborts() {
+        let provider = Arc::new(
+            crate::providers::openai::OpenAIProvider::new("ftui-steer-fixture")
+                .with_base_url("http://127.0.0.1:1/v1"),
+        );
+        let agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(&[], std::path::Path::new("."), None),
+            crate::agent::AgentConfig::default(),
+        );
+        let session = crate::agent::AgentSession::new(
+            agent,
+            Arc::new(asupersync::sync::Mutex::new(
+                crate::session::Session::in_memory(),
+            )),
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        let mut handle = crate::sdk::AgentSessionHandle::from_session_with_listeners(
+            session,
+            crate::sdk::EventListeners::default(),
+        );
+        // Never polled: no request is made, but the lane is live until the
+        // turn is dropped, exactly as while a real turn streams.
+        let turn = handle.prompt_controlled(String::from("start"), |_| {});
+        let control = turn.control();
+        let slot: TurnControlSlot = Arc::new(Mutex::new(Some(control.clone())));
+
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_turn_control(slot);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+
+        type_str(&mut sim, "focus on tests");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        type_str(&mut sim, "then summarize");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::ALT));
+        let snapshot = control.snapshot();
+        assert_eq!(snapshot.pending_steering, 1, "{snapshot:?}");
+        assert_eq!(snapshot.pending_follow_up, 1, "{snapshot:?}");
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "mid-turn input goes to the lane, not the command channel"
+        );
+        let texts = sim
+            .model()
+            .transcript
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            texts.contains(&String::from("(steer) focus on tests")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.contains(&String::from("(follow-up) then summarize")),
+            "{texts:?}"
+        );
+
+        // Commands wait for the turn; the text stays for later.
+        type_str(&mut sim, "/model");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "/model");
+        assert!(submit_rx.try_recv().is_err());
+        assert_eq!(control.snapshot().pending_steering, 1);
+
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        assert!(
+            !control.snapshot().accepting_input,
+            "Escape must abort the running turn"
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|entry| entry.text == "Aborting..."),
+            "the abort is acknowledged"
+        );
+
+        // alt+up pulls the unsent messages back, in order, ahead of what is
+        // still in the editor; the lane is empty afterwards.
+        sim.inject_event(key(KeyCode::Up, Modifiers::ALT));
+        assert_eq!(
+            sim.model().input.text(),
+            "focus on tests\n\nthen summarize\n\n/model"
+        );
+        let snapshot = control.snapshot();
+        assert_eq!(
+            (snapshot.pending_steering, snapshot.pending_follow_up),
+            (0, 0),
+            "{snapshot:?}"
+        );
+        drop(turn);
+    }
+
+    /// ctrl+p / shift+ctrl+p were listed by `/hotkeys` on the classic stack
+    /// only; here they did nothing. They route to the driver, which owns the
+    /// running model.
+    #[test]
+    fn ctrl_p_routes_model_cycling_to_the_driver() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(key(KeyCode::Char('p'), Modifiers::CTRL));
+        assert_eq!(
+            submit_rx.try_recv().expect("ctrl+p routed"),
+            UiCommand::CycleModel { forward: true }
+        );
+        sim.inject_event(key(KeyCode::Char('p'), Modifiers::CTRL | Modifiers::SHIFT));
+        assert_eq!(
+            submit_rx.try_recv().expect("shift+ctrl+p routed"),
+            UiCommand::CycleModel { forward: false }
+        );
+        assert!(
+            sim.model().input.text().is_empty(),
+            "no 'p' may reach the editor"
+        );
+    }
+
+    #[test]
+    fn model_cycle_order_matches_the_classic_stack() {
+        let models = [
+            "openai/gpt-4o",
+            "anthropic/claude-a",
+            "google/gemini-a",
+            "OpenAI/GPT-4o",
+        ]
+        .map(String::from);
+        // Sorted case-insensitively with the two spellings of gpt-4o
+        // collapsed: anthropic/claude-a, google/gemini-a, openai/gpt-4o.
+        assert_eq!(
+            next_cycle_model(&models, "anthropic/claude-a", true).as_deref(),
+            Some("google/gemini-a")
+        );
+        assert_eq!(
+            next_cycle_model(&models, "google/gemini-a", false).as_deref(),
+            Some("anthropic/claude-a")
+        );
+        assert_eq!(
+            next_cycle_model(&models, "anthropic/claude-a", false).as_deref(),
+            Some("openai/gpt-4o"),
+            "backward from the first wraps to the last"
+        );
+        assert_eq!(
+            next_cycle_model(&models, "OPENAI/gpt-4o", true).as_deref(),
+            Some("anthropic/claude-a"),
+            "the running model matches case-insensitively and forward wraps"
+        );
+        // A model outside the scope starts at the ends.
+        assert_eq!(
+            next_cycle_model(&models, "xai/grok", true).as_deref(),
+            Some("anthropic/claude-a")
+        );
+        // Nowhere to go: empty list, or only the running model.
+        assert_eq!(next_cycle_model(&[], "openai/gpt-4o", true), None);
+        assert_eq!(
+            next_cycle_model(&[String::from("openai/gpt-4o")], "OPENAI/gpt-4o", true),
+            None
+        );
+    }
+
+    #[test]
+    fn shift_tab_belongs_to_the_completion_popup_while_it_is_open() {
+        // The popup claims navigation keys before the catalog chain runs, so
+        // cycling the thinking level must not steal them mid-completion.
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/he");
+        assert!(
+            sim.model().completion_visible(),
+            "expected the completion popup for a slash prefix"
+        );
+
+        sim.inject_event(key(KeyCode::Tab, Modifiers::SHIFT));
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "the popup must consume shift+tab before the thinking cycle"
+        );
+    }
+
+    #[test]
+    fn every_pi_command_is_either_routed_here_or_named_as_unimplemented() {
+        // Type each canonical pi slash command and see whether this stack
+        // claims it. Whatever it does not claim falls through to extension
+        // dispatch, and the message there must not call a real pi command
+        // "Unknown command" — that reads as "pi is broken" and sends the user
+        // to a /help that lists only what this stack already has.
+        //
+        // This also keeps the size of the ftui/charmed command gap measured
+        // rather than asserted: implementing one here moves it between the two
+        // buckets and the test keeps passing either way.
+        let mut routed = Vec::new();
+        let mut unrouted = Vec::new();
+        for command in crate::interactive::SlashCommand::ALL {
+            let name = command.canonical();
+            let (_agent_tx, rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+            let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            type_str(&mut sim, name);
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            match submit_rx.try_recv() {
+                Ok(UiCommand::ExtensionCommand { name: sent, .. }) => unrouted.push(sent),
+                _ => routed.push(name),
+            }
+        }
+
+        assert!(
+            !routed.is_empty() && !unrouted.is_empty(),
+            "expected both buckets to be non-empty; routed {routed:?}, unrouted {unrouted:?}"
+        );
+        // The bucket a command lands in is deliberately not frozen — that is
+        // the point of measuring rather than listing — but these five are what
+        // this stack is FOR, and one of them falling through to extension
+        // dispatch is a routing regression, not progress.
+        for core in ["/help", "/model", "/clear", "/new", "/exit"] {
+            assert!(
+                routed.contains(&core),
+                "{core} must be handled here, not dispatched as an extension command; \
+                 routed {routed:?}"
+            );
+        }
+        for name in &unrouted {
+            let message = unrouted_command_message(name, true);
+            assert!(
+                message.contains("does not implement yet") && message.contains("--classic"),
+                "/{name} is a real pi command; this stack must say so: {message}"
+            );
+            assert!(
+                !message.contains("Unknown command"),
+                "/{name} is a real pi command and must not be called unknown: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_export_routes_with_and_without_a_path() {
+        // /export was one of the 24 this stack did not implement; it answered
+        // "Unknown command: /export" until it was routed.
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        type_str(&mut sim, "/export");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("bare /export routed"),
+            UiCommand::Export {
+                path: String::new()
+            },
+            "a bare /export must let the driver choose the default filename"
+        );
+
+        type_str(&mut sim, "/export  out/report.html ");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("/export <path> routed"),
+            UiCommand::Export {
+                path: String::from("out/report.html")
+            },
+            "the argument must reach the driver trimmed and otherwise untouched"
+        );
+    }
+
+    #[test]
+    fn slash_changelog_prints_the_embedded_changelog_without_the_driver() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+
+        type_str(&mut sim, "/changelog");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "the changelog is an embedded asset; it must not cost a driver round trip"
+        );
+        // Submitting echoes the typed command as a User entry first, so the
+        // changelog is the System entry that follows it.
+        // Submitting echoes the typed command as a User entry first, so the
+        // changelog is the System entry that follows it.
+        let added: Vec<(EntryRole, String)> = sim.model().transcript[before..]
+            .iter()
+            .map(|entry| (entry.role, entry.text.clone()))
+            .collect();
+        assert_eq!(added.len(), 2, "expected the echo and one reply: {added:?}");
+        assert_eq!(added[0].0, EntryRole::User);
+        assert_eq!(added[1].0, EntryRole::System);
+        assert!(
+            added[1].1.contains("# Changelog"),
+            "expected the embedded changelog, got {:?}",
+            added[1].1
+        );
+    }
+
+    #[test]
+    fn slash_copy_picks_a_reply_or_one_of_its_code_blocks() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let mut model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        model.push_entry(EntryRole::Assistant, String::from("first answer"));
+        model.push_entry(EntryRole::User, String::from("a follow-up question"));
+        model.push_entry(
+            EntryRole::Assistant,
+            String::from("Run this:\n```sh\ncargo test\n```\nthen\n```\nls\n```"),
+        );
+        model.push_entry(EntryRole::Assistant, String::from("   "));
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        // Newest first: the last reply's code blocks (last first), the
+        // reply itself, then the older reply. Blank replies are skipped.
+        let rows: Vec<String> = copy_choices(&sim.model().transcript)
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "code: ls",
+                "code (sh): cargo test",
+                "reply: Run this:",
+                "reply: first answer",
+            ]
+        );
+
+        type_str(&mut sim, "/copy");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().picker.is_some(), "bare /copy opens the picker");
+        let before = sim.model().transcript.len();
+        // Filter to the older reply and copy it.
+        type_str(&mut sim, "first");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "copying reads the transcript this stack already has"
+        );
+        let added: Vec<(EntryRole, String)> = sim.model().transcript[before..]
+            .iter()
+            .map(|entry| (entry.role, entry.text.clone()))
+            .collect();
+        let [(role, outcome)] = added.as_slice() else {
+            panic!("expected exactly one outcome: {added:?}");
+        };
+        assert_eq!(
+            *role,
+            EntryRole::System,
+            "a successful copy is not an error: {added:?}"
+        );
+        // Every outcome the shared helper can report names the clipboard —
+        // copied, or disabled/unavailable with where it wrote instead — so
+        // this holds whether or not the host running the suite has one.
+        assert!(
+            outcome.contains("lipboard"),
+            "unexpected copy outcome: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn dump_renders_the_conversation_and_the_request_context() {
+        use crate::model::{
+            ContentBlock, Message, TextContent, ToolCall, UserContent, UserMessage,
+        };
+        let messages = vec![
+            Message::User(UserMessage {
+                content: UserContent::Text(String::from("list the files")),
+                timestamp: 0,
+            }),
+            Message::Assistant(Arc::new(crate::model::AssistantMessage {
+                content: vec![
+                    ContentBlock::Text(TextContent::new("Looking.")),
+                    ContentBlock::ToolCall(ToolCall {
+                        id: String::from("t1"),
+                        name: String::from("bash"),
+                        arguments: serde_json::json!({"command": "ls"}),
+                        thought_signature: None,
+                    }),
+                ],
+                ..Default::default()
+            })),
+            Message::ToolResult(Arc::new(crate::model::ToolResultMessage {
+                tool_call_id: String::from("t1"),
+                tool_name: String::from("bash"),
+                content: vec![ContentBlock::Text(TextContent::new("no such dir"))],
+                details: None,
+                is_error: true,
+                timestamp: 0,
+            })),
+        ];
+        assert_eq!(
+            transcript_text(&messages),
+            "## User\nlist the files\n\n## Assistant\nLooking.\n[tool call] bash \
+             {\"command\":\"ls\"}\n\n## Tool result: bash (error)\nno such dir\n\n"
+        );
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cwd = tempfile::tempdir().expect("tempdir");
+        runtime.block_on(async {
+            let mut handle = crate::sdk::create_agent_session(crate::sdk::SessionOptions {
+                provider: Some(String::from("openai")),
+                model: Some(String::from("gpt-4o")),
+                api_key: Some(String::from("dummy-key")),
+                working_directory: Some(cwd.path().to_path_buf()),
+                no_session: true,
+                ..crate::sdk::SessionOptions::default()
+            })
+            .await
+            .expect("create session");
+            // Nothing said yet: nothing is copied or written.
+            assert!(matches!(
+                run_dump_command(&mut handle),
+                PiMsg::System(text) if text == "No messages to dump yet."
+            ));
+            let agent = &mut handle.session_mut().agent;
+            agent.replace_messages(messages[..1].to_vec());
+            let request = agent.request_context_json();
+            assert!(
+                request["systemPrompt"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+            );
+            let tools = request["tools"].as_array().expect("tools");
+            assert!(tools.iter().any(|tool| tool["name"] == "bash"
+                && tool["parameters"].is_object()
+                && tool["description"].is_string()));
+            assert_eq!(request["messages"].as_array().map(Vec::len), Some(1));
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_private_file(dir.path(), "pi_dump_request", "{}").expect("write");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "{}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "request dumps may hold secrets");
+        }
+    }
+
+    #[test]
+    fn slash_delete_needs_yes_before_it_routes() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx).with_submit_channel(submit_tx));
+        sim.init();
+        type_str(&mut sim, "/delete");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "bare /delete deletes nothing"
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .last()
+                .is_some_and(|e| e.text.contains("/delete yes"))
+        );
+        type_str(&mut sim, "/delete YES");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(submit_rx.try_recv().ok(), Some(UiCommand::DeleteSession));
+    }
+
+    #[test]
+    fn slash_pin_toggles_the_shown_session() {
+        let pins = tempfile::tempdir().expect("tempdir");
+        let (_agent_tx, rx) = mpsc::channel();
+        let mut model = PiFtuiModel::new(rx).with_pins_dir(pins.path().to_path_buf());
+        let mut sim_without = ProgramSimulator::new(
+            PiFtuiModel::new(mpsc::channel().1).with_pins_dir(pins.path().to_path_buf()),
+        );
+        sim_without.init();
+        type_str(&mut sim_without, "/pin");
+        sim_without.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            sim_without
+                .model()
+                .transcript
+                .last()
+                .is_some_and(|e| e.text == "No active session to pin.")
+        );
+
+        model.displayed_session_id = Some(String::from("sess-1"));
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/pin");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(session_pins::load_pinned(pins.path()).contains("sess-1"));
+        assert!(
+            sim.model()
+                .transcript
+                .last()
+                .is_some_and(|e| e.text.starts_with("Pinned"))
+        );
+        type_str(&mut sim, "/pin");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(session_pins::load_pinned(pins.path()).is_empty());
+        assert!(
+            sim.model()
+                .transcript
+                .last()
+                .is_some_and(|e| e.text == "Unpinned.")
+        );
+    }
+
+    #[test]
+    fn restart_argv_keeps_launch_flags_and_reopens_this_session() {
+        let argv = |args: &[&str]| {
+            args.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        let kept = restart_argv(
+            argv(&[
+                "--provider",
+                "openai",
+                "-c",
+                "--model",
+                "gpt-5",
+                "fix the bug", // the initial prompt: never sent twice
+                "--session",
+                "/old/session.jsonl",
+                "--trust",
+                "also positional",
+                "--thinking=high",
+                "--session=/older.jsonl",
+                "--extension",
+                "ext.js",
+                "--my-ext-flag", // unknown: keeps its value
+                "on",
+                "-r",
+                "--",
+                "--literal prompt",
+            ]),
+            Some(std::path::Path::new("/saved/now.jsonl")),
+        );
+        assert_eq!(
+            kept,
+            argv(&[
+                "--provider",
+                "openai",
+                "--model",
+                "gpt-5",
+                "--trust",
+                "--thinking=high",
+                "--extension",
+                "ext.js",
+                "--my-ext-flag",
+                "on",
+                "--session",
+                "/saved/now.jsonl",
+            ])
+        );
+        // Nothing saved yet (or --no-session): the same flags, fresh session.
+        assert_eq!(
+            restart_argv(argv(&["--no-session", "-c", "hi"]), None),
+            argv(&["--no-session"])
+        );
+    }
+
+    #[test]
+    fn slash_restart_raises_the_flag_and_quits_when_idle() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_agent_tx, rx) = mpsc::channel();
+        let mut sim =
+            ProgramSimulator::new(PiFtuiModel::new(rx).with_restart_request(Arc::clone(&flag)));
+        sim.init();
+        type_str(&mut sim, "/restart");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(sim.model().pending_quit, "quits so run() can relaunch");
+
+        // Without the launch hook (tests, embedders) it says so instead of
+        // quitting.
+        let (_agent_tx, rx) = mpsc::channel();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx));
+        sim.init();
+        type_str(&mut sim, "/restart");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(!sim.model().pending_quit);
+        assert!(
+            sim.model()
+                .transcript
+                .last()
+                .is_some_and(|e| e.text == "/restart is not available here")
+        );
+    }
+
+    #[test]
+    fn copy_subcommands_find_the_newest_code_block_and_link() {
+        assert_eq!(
+            fenced_code_blocks("a\n```rust\nfn x() {}\n```\nb\n~~~\n```not a fence```\n~~~"),
+            [
+                (String::from("rust"), String::from("fn x() {}")),
+                (String::new(), String::from("```not a fence```")),
+            ]
+        );
+        // A block still streaming (no closing fence) counts.
+        assert_eq!(
+            fenced_code_blocks("```py\nprint(1)"),
+            [(String::from("py"), String::from("print(1)"))]
+        );
+        assert!(fenced_code_blocks("no code here").is_empty());
+
+        // Unknown subcommands get the usage line and copy nothing; `cmd`
+        // goes to the driver, which holds the full command.
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx).with_submit_channel(submit_tx));
+        sim.init();
+        type_str(&mut sim, "/copy everything");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            sim.model()
+                .transcript
+                .last()
+                .is_some_and(|e| e.text == "Usage: /copy [code|cmd|link]")
+        );
+        type_str(&mut sim, "/copy cmd");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(submit_rx.try_recv().ok(), Some(UiCommand::CopyLastCommand));
+        type_str(&mut sim, "/copy code");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            sim.model()
+                .transcript
+                .last()
+                .is_some_and(|e| e.role == EntryRole::Error && e.text == "No code block to copy.")
+        );
+    }
+
+    #[test]
+    fn last_shell_command_is_the_newest_bash_call_or_user_run_in_full() {
+        let mut session = crate::session::Session::in_memory();
+        assert_eq!(last_shell_command(&session), None);
+        session.append_message(crate::session::SessionMessage::from(
+            crate::model::Message::Assistant(Arc::new(crate::model::AssistantMessage {
+                content: vec![crate::model::ContentBlock::ToolCall(
+                    crate::model::ToolCall {
+                        id: String::from("t1"),
+                        name: String::from("bash"),
+                        arguments: serde_json::json!({"command": "cargo build\ncargo test --all"}),
+                        thought_signature: None,
+                    },
+                )],
+                ..Default::default()
+            })),
+        ));
+        assert_eq!(
+            last_shell_command(&session).as_deref(),
+            Some("cargo build\ncargo test --all"),
+            "the whole multi-line command, not the card's clipped first line"
+        );
+        session.append_message(crate::session::SessionMessage::BashExecution {
+            command: String::from("git status"),
+            output: String::new(),
+            exit_code: 0,
+            cancelled: None,
+            truncated: None,
+            full_output_path: None,
+            timestamp: None,
+            extra: std::collections::HashMap::new(),
+        });
+        assert_eq!(last_shell_command(&session).as_deref(), Some("git status"));
+    }
+
+    #[test]
+    fn slash_copy_says_so_when_there_is_nothing_to_copy() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        type_str(&mut sim, "/copy");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+
+        let last = {
+            let entry = sim.model().transcript.last().expect("an entry");
+            (entry.role, entry.text.clone())
+        };
+        assert_eq!(last.0, EntryRole::Error);
+        assert!(last.1.contains("No agent messages to copy yet"), "{last:?}");
+    }
+
+    #[test]
+    fn help_lists_every_command_this_stack_actually_routes() {
+        // /help was a hand-written string and had gone stale: it omitted
+        // /share, /undo, /redo, /usage, /add-dir, /remove-dir, /tan and
+        // /crash, all of which work here. A user cannot run what the only
+        // discovery surface does not mention, so the list drifting is the
+        // same bug as a command being missing.
+        //
+        // Rather than trust a second hand-written list, ask the router: any
+        // canonical command this stack claims must appear in /help.
+        let help = {
+            let (_agent_tx, rx) = mpsc::channel();
+            let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx));
+            sim.init();
+            type_str(&mut sim, "/help");
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            sim.model()
+                .transcript
+                .last()
+                .expect("help entry")
+                .text
+                .clone()
+        };
+
+        let mut missing = Vec::new();
+        for command in crate::interactive::SlashCommand::ALL {
+            let name = command.canonical();
+            let (_agent_tx, rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+            let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            type_str(&mut sim, name);
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            let routed = !matches!(submit_rx.try_recv(), Ok(UiCommand::ExtensionCommand { .. }));
+            if routed && !help.contains(name) {
+                missing.push(name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "/help omits commands this stack routes: {missing:?}\n\nhelp said: {help}"
+        );
+    }
+
+    #[test]
+    fn a_command_pi_does_not_have_is_still_reported_as_unknown() {
+        // The other half: the honest message must not swallow genuine typos,
+        // and it has to keep saying whether extensions were even available.
+        let message = unrouted_command_message("definitely-not-a-pi-command", true);
+        assert_eq!(
+            message,
+            "Unknown command: /definitely-not-a-pi-command (try /help)"
+        );
+        let disabled = unrouted_command_message("definitely-not-a-pi-command", false);
+        assert!(disabled.contains("extensions disabled"), "{disabled}");
+    }
+
+    #[test]
+    fn routing_the_two_new_hotkeys_leaves_typing_alone() {
+        // Both are chords the editor never claimed, but the picks sit in a
+        // shared chain, so it is worth pinning that ordinary input still
+        // reaches the editor.
+        assert_eq!(
+            after_key("hi", KeyCode::Char('x'), Modifiers::empty()),
+            "hix"
+        );
+    }
+
+    /// Type `text`, then send `code`+`modifiers`, and report what the editor
+    /// holds afterwards.
+    fn after_key(text: &str, code: KeyCode, modifiers: Modifiers) -> String {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for ch in text.chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(code, modifiers));
+        sim.model().input.text()
+    }
+
+    #[test]
+    fn pis_own_default_editor_keys_reach_the_editor() {
+        // Every one of these is in `AppAction`'s default bindings and is shown
+        // by /hotkeys. The ftui editor handles only ctrl+a/k/z/y and ignores
+        // Alt entirely, so before these were routed the whole emacs-style half
+        // of pi's shipped keymap did nothing on the default stack.
+        assert_eq!(
+            after_key("hello world", KeyCode::Char('w'), Modifiers::CTRL),
+            "hello ",
+            "ctrl+w (DeleteWordBackward)"
+        );
+        assert_eq!(
+            after_key("hello world", KeyCode::Backspace, Modifiers::ALT),
+            "hello ",
+            "alt+backspace (DeleteWordBackward)"
+        );
+        assert_eq!(
+            after_key("hello world", KeyCode::Char('d'), Modifiers::ALT),
+            "hello world",
+            "alt+d (DeleteWordForward) at end of line has nothing ahead of it"
+        );
+        assert_eq!(
+            after_key("hi", KeyCode::Char('a'), Modifiers::CTRL),
+            "hi",
+            "ctrl+a (CursorLineStart) must not disturb the text"
+        );
+        assert_eq!(
+            after_key("hi", KeyCode::Char('b'), Modifiers::CTRL),
+            "hi",
+            "ctrl+b (CursorLeft) must not disturb the text"
+        );
+    }
+
+    #[test]
+    fn routed_editor_actions_edit_from_where_the_cursor_lands() {
+        // Composing two routed actions proves the cursor moves really happen
+        // rather than being swallowed: ctrl+a to line start, then ctrl+d.
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for ch in "abc".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Char('a'), Modifiers::CTRL));
+        sim.inject_event(key(KeyCode::Char('d'), Modifiers::CTRL));
+        assert_eq!(
+            sim.model().input.text(),
+            "bc",
+            "ctrl+a then ctrl+d should delete the first character"
+        );
+
+        // ctrl+u kills back to line start; at end of line that is everything.
+        assert_eq!(
+            after_key("one two", KeyCode::Char('u'), Modifiers::CTRL),
+            "",
+            "ctrl+u (DeleteToLineStart)"
+        );
+    }
+
+    #[test]
+    fn ctrl_u_kills_back_to_line_start_and_stops_there() {
+        // Built from the editor's cursor offset plus backward delete, so the
+        // thing worth pinning is that it stops at column 0 rather than running
+        // on and joining the line above.
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for ch in "keep".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Enter, Modifiers::ALT));
+        for ch in "drop".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        assert_eq!(sim.model().input.text(), "keep\ndrop");
+
+        sim.inject_event(key(KeyCode::Char('u'), Modifiers::CTRL));
+        assert_eq!(
+            sim.model().input.text(),
+            "keep\n",
+            "ctrl+u must clear the line it is on and leave the one above"
+        );
+
+        // A second press at column 0 has nothing to take and must not eat the
+        // newline.
+        sim.inject_event(key(KeyCode::Char('u'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "keep\n", "ctrl+u at column 0");
+    }
+
+    #[test]
+    fn a_rebound_key_from_the_users_config_works_on_this_stack() {
+        // The model used to hold `KeyBindings::default()` and the launch path
+        // never replaced it, so keybindings.json was read by nobody here and
+        // every override in it — editor or application — was inert.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keybindings.json");
+        std::fs::write(&path, r#"{ "deleteWordBackward": ["ctrl+g"] }"#).expect("write config");
+        let keybindings = KeyBindings::load(&path).expect("load keybindings");
+
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model.with_keybindings(keybindings));
+        sim.init();
+        for ch in "hello world".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Char('g'), Modifiers::CTRL));
+        assert_eq!(
+            sim.model().input.text(),
+            "hello ",
+            "the rebound key did not reach the editor"
+        );
+    }
+
+    #[test]
+    fn the_default_catalog_still_applies_when_nothing_is_rebound() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model.with_keybindings(KeyBindings::new()));
+        sim.init();
+        for ch in "hello world".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Char('w'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "hello ");
+    }
+
+    #[test]
+    fn ctrl_u_in_the_middle_of_a_line_keeps_what_is_ahead_of_the_cursor() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for ch in "drop keep".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        // Move to just before "keep": four lefts from the end.
+        for _ in 0..4 {
+            sim.inject_event(key(KeyCode::Left, Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Char('u'), Modifiers::CTRL));
+        assert_eq!(sim.model().input.text(), "keep");
+    }
+
+    #[test]
+    fn routing_editor_actions_leaves_the_application_keys_alone() {
+        // The editor-native picks sit last in the chain precisely so these
+        // keep their meaning. ctrl+d on an empty editor is Exit, not delete.
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(key(KeyCode::Char('d'), Modifiers::CTRL));
+        assert!(
+            sim.command_log()
+                .iter()
+                .any(|record| matches!(record, CmdRecord::Quit)),
+            "ctrl+d on an empty editor must still quit"
+        );
+    }
+
+    #[test]
+    fn ctrl_a_moves_to_line_start_rather_than_selecting_everything() {
+        // pi binds ctrl+a to CursorLineStart; the ftui editor's own handler
+        // binds it to select-all, so typing after it replaced the message.
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for ch in "bcd".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Char('a'), Modifiers::CTRL));
+        sim.inject_event(key(KeyCode::Char('a'), Modifiers::empty()));
+        assert_eq!(
+            sim.model().input.text(),
+            "abcd",
+            "ctrl+a should move to line start, not select the message"
+        );
+    }
+
+    #[test]
     fn empty_submit_is_a_noop() {
         let (_tx, model) = new_model();
         let mut sim = ProgramSimulator::new(model);
@@ -5031,8 +10879,143 @@ mod tests {
             sim.model()
                 .transcript
                 .iter()
-                .any(|e| e.role == EntryRole::Error && e.text.contains("usage: /model")),
-            "usage error missing"
+                .any(|e| e.role == EntryRole::Error && e.text == "Model not found: nonsense"),
+            "not-found error missing"
+        );
+    }
+
+    /// OMP selectors on /model and /switch: exact id, unique substring,
+    /// `:level`, and ambiguity reported instead of guessed.
+    #[test]
+    fn model_selectors_resolve_like_omp() {
+        let available = vec![
+            String::from("anthropic/claude-opus-5"),
+            String::from("anthropic/claude-sonnet-5"),
+            String::from("openai/gpt-5"),
+        ];
+        let resolve = |s: &str| resolve_model_selector(&available, s);
+        assert_eq!(
+            resolve("gpt-5"),
+            Ok((String::from("openai"), String::from("gpt-5"), None))
+        );
+        assert_eq!(
+            resolve("opus:high"),
+            Ok((
+                String::from("anthropic"),
+                String::from("claude-opus-5"),
+                Some(crate::model::ThinkingLevel::High)
+            ))
+        );
+        assert!(
+            resolve("claude").is_err_and(|e| e.starts_with("Ambiguous") && e.contains("sonnet"))
+        );
+        assert_eq!(resolve("nope"), Err(String::from("Model not found: nope")));
+        // Unlisted provider/id still passes through (the driver judges it).
+        assert_eq!(
+            resolve("ollama/llama3.2:latest"),
+            Ok((
+                String::from("ollama"),
+                String::from("llama3.2:latest"),
+                None
+            ))
+        );
+        // Bedrock ids end in `:0`; that suffix is part of the id, never a
+        // thinking level, whether or not the model is listed.
+        let bedrock = vec![String::from(
+            "amazon-bedrock/anthropic.claude-sonnet-4-20250514-v1:0",
+        )];
+        assert_eq!(
+            resolve_model_selector(&bedrock, "anthropic.claude-sonnet-4-20250514-v1:0"),
+            Ok((
+                String::from("amazon-bedrock"),
+                String::from("anthropic.claude-sonnet-4-20250514-v1:0"),
+                None
+            ))
+        );
+        assert_eq!(
+            resolve("amazon-bedrock/anthropic.claude-opus-4-1-20250805-v1:0"),
+            Ok((
+                String::from("amazon-bedrock"),
+                String::from("anthropic.claude-opus-4-1-20250805-v1:0"),
+                None
+            ))
+        );
+
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let mut sim = ProgramSimulator::new(
+            PiFtuiModel::new(rx)
+                .with_submit_channel(submit_tx)
+                .with_available_models(available.clone()),
+        );
+        sim.init();
+        type_str(&mut sim, "/switch sonnet:low");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_iter().collect::<Vec<_>>(),
+            [
+                UiCommand::SetModel {
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-5".into(),
+                },
+                UiCommand::SetThinking(Some(crate::model::ThinkingLevel::Low)),
+            ]
+        );
+    }
+
+    /// OMP /queue: idle it is just a prompt; mid-turn it is a follow-up,
+    /// which a bare slash command never used to be.
+    #[test]
+    fn slash_queue_sends_idle_and_follows_up_mid_turn() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        // An empty turn-control slot: the launch path always installs one,
+        // and between turns (or while one starts) it holds no live lane.
+        let slot: TurnControlSlot = Arc::new(Mutex::new(None));
+        let mut sim = ProgramSimulator::new(
+            PiFtuiModel::new(rx)
+                .with_submit_channel(submit_tx)
+                .with_turn_control(slot),
+        );
+        sim.init();
+        type_str(&mut sim, "/queue run the tests");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().ok(),
+            Some(UiCommand::Prompt(String::from("run the tests")))
+        );
+        type_str(&mut sim, "/queue");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(submit_rx.try_recv().is_err());
+        assert!(
+            sim.model()
+                .transcript
+                .last()
+                .is_some_and(|e| e.text == "Usage: /queue <message>")
+        );
+
+        // Mid-turn with no live lane, the follow-up becomes the next prompt
+        // (the same fallback Alt+Enter takes) rather than a refusal.
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        type_str(&mut sim, "/queue and then lint");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().ok(),
+            Some(UiCommand::Prompt(String::from("and then lint"))),
+            "transcript: {:?}; editor: {:?}",
+            sim.model()
+                .transcript
+                .iter()
+                .map(|e| e.text.clone())
+                .collect::<Vec<_>>(),
+            sim.model().input.text()
+        );
+        assert!(
+            !sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.starts_with("Commands wait")),
+            "/queue is not refused mid-turn"
         );
     }
 
@@ -5196,6 +11179,11 @@ mod tests {
         let model = model.with_turn_abort(Arc::clone(&slot));
         let mut sim = ProgramSimulator::new(model);
         sim.init();
+        sim.inject_event(key(KeyCode::Char('c'), Modifiers::CTRL));
+        assert!(
+            !abort_signal.is_aborted(),
+            "the first press only clears the editor"
+        );
         sim.inject_event(key(KeyCode::Char('c'), Modifiers::CTRL));
 
         assert!(
@@ -5569,6 +11557,153 @@ mod tests {
     fn ext_request(id: &str, method: &str, payload: serde_json::Value) -> ExtensionUiRequest {
         ExtensionUiRequest::new(id, method, payload)
             .with_extension_id(Some(String::from("demo-ext")))
+    }
+
+    fn send_ui_effect(
+        sim: &mut ProgramSimulator<PiFtuiModel>,
+        method: &str,
+        payload: serde_json::Value,
+    ) {
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+            "effect", method, payload,
+        ))));
+    }
+
+    #[test]
+    fn set_status_reaches_the_status_line_instead_of_the_transcript() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+
+        send_ui_effect(
+            &mut sim,
+            "setStatus",
+            serde_json::json!({"statusKey": "working", "statusText": "indexing"}),
+        );
+        assert_eq!(
+            sim.model().ext_status.as_deref(),
+            Some("indexing"),
+            "ui.setWorkingMessage should set the status"
+        );
+        assert_eq!(
+            sim.model().transcript.len(),
+            before,
+            "an applied effect should not also print a line"
+        );
+
+        // An empty status clears it, as the classic handler treats an absent
+        // one.
+        send_ui_effect(&mut sim, "setStatus", serde_json::json!({"statusText": ""}));
+        assert_eq!(sim.model().ext_status, None);
+    }
+
+    #[test]
+    fn set_editor_text_reaches_the_editor() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+
+        send_ui_effect(
+            &mut sim,
+            "set_editor_text",
+            serde_json::json!({"text": "drafted by an extension"}),
+        );
+        assert_eq!(sim.model().input.text(), "drafted by an extension");
+        assert_eq!(sim.model().transcript.len(), before);
+    }
+
+    /// Drive a request that expects a response and return what the extension
+    /// received, plus whether a prompt card was raised.
+    fn ask_ui_query(
+        method: &str,
+        payload: serde_json::Value,
+    ) -> (Option<serde_json::Value>, bool, usize) {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ext_tx, ext_rx) = mpsc::channel::<ExtensionUiResponse>();
+        let model = PiFtuiModel::new(rx).with_ext_reply_channel(ext_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+            "q", method, payload,
+        ))));
+        let reply = ext_rx.try_recv().ok().and_then(|r| r.value);
+        (
+            reply,
+            sim.model().active_ext.is_some(),
+            sim.model().transcript.len() - before,
+        )
+    }
+
+    #[test]
+    fn get_editor_text_answers_the_extension_instead_of_prompting_the_user() {
+        // Before this, a query expecting a response fell through to a prompt
+        // card: the user saw a question nobody asked, and the extension got
+        // whatever they typed rather than the editor's contents.
+        let (reply, card, _) = ask_ui_query("getEditorText", serde_json::json!({}));
+        assert_eq!(reply, Some(serde_json::Value::String(String::new())));
+        assert!(!card, "a query must not raise a prompt card");
+    }
+
+    #[test]
+    fn theme_queries_report_what_this_stack_actually_supports() {
+        let (all, card, _) = ask_ui_query("getAllThemes", serde_json::json!({}));
+        assert!(!card);
+        let names: Vec<String> = all
+            .expect("themes")
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|entry| entry["name"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(names, vec!["dark".to_string(), "light".to_string()]);
+
+        let (one, _, _) = ask_ui_query("getTheme", serde_json::json!({"name": "light"}));
+        assert!(one.is_some_and(|value| !value.is_null()), "light resolves");
+
+        let (missing, _, _) = ask_ui_query("getTheme", serde_json::json!({"name": "nope"}));
+        assert_eq!(
+            missing,
+            Some(serde_json::Value::Null),
+            "an unknown theme is null"
+        );
+    }
+
+    #[test]
+    fn set_theme_applies_and_reports_whether_it_took() {
+        let (applied, card, entries) =
+            ask_ui_query("setTheme", serde_json::json!({"name": "light"}));
+        assert_eq!(applied, Some(serde_json::Value::Bool(true)));
+        assert!(!card);
+        assert_eq!(entries, 1, "applying a theme announces it");
+
+        let (refused, _, _) = ask_ui_query("setTheme", serde_json::json!({"name": "nope"}));
+        assert_eq!(
+            refused,
+            Some(serde_json::Value::Bool(false)),
+            "an unsupported theme reports false rather than pretending"
+        );
+    }
+
+    #[test]
+    fn an_effect_this_stack_cannot_carry_out_still_prints() {
+        // `setWidget` has no surface here, so the old printed fallback is
+        // still the honest outcome — better than swallowing it.
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let before = sim.model().transcript.len();
+
+        send_ui_effect(
+            &mut sim,
+            "setWidget",
+            serde_json::json!({"widgetKey": "k", "lines": ["a"]}),
+        );
+        let added = &sim.model().transcript[before..];
+        assert_eq!(added.len(), 1, "setWidget should still surface somehow");
+        assert_eq!(added[0].role, EntryRole::System);
     }
 
     #[test]
@@ -6262,6 +12397,232 @@ mod tests {
     }
 
     #[test]
+    fn picker_respects_custom_keybindings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("keybindings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "selectDown": ["ctrl+j"],
+                "selectUp": ["ctrl+k"],
+                "selectCancel": ["q"],
+                "selectConfirm": ["ctrl+g"]
+            }"#,
+        )
+        .expect("write keybindings");
+        let keybindings = KeyBindings::load(&path).expect("load keybindings");
+
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model.with_keybindings(keybindings));
+        sim.init();
+
+        type_str(&mut sim, "/theme");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().picker.is_some(), "picker did not open");
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 0);
+
+        // Plain 'j' and 'down' should not navigate because selectDown was
+        // overridden; the unbound 'j' types into the filter instead (gh #244).
+        sim.inject_event(key(KeyCode::Char('j'), Modifiers::empty()));
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 0);
+        assert_eq!(sim.model().picker.as_ref().unwrap().query, "j");
+        sim.inject_event(key(KeyCode::Backspace, Modifiers::empty()));
+        assert!(sim.model().picker.as_ref().unwrap().query.is_empty());
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 0);
+
+        // Rebound 'ctrl+j' navigates down
+        sim.inject_event(key(KeyCode::Char('j'), Modifiers::CTRL));
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 1);
+
+        // 'up' should not navigate because selectUp was overridden, and
+        // plain 'k' is filter text rather than an alias for it.
+        sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 1);
+        sim.inject_event(key(KeyCode::Char('k'), Modifiers::empty()));
+        assert_eq!(sim.model().picker.as_ref().unwrap().query, "k");
+        sim.inject_event(key(KeyCode::Backspace, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Char('j'), Modifiers::CTRL));
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 1);
+
+        // Rebound 'ctrl+k' navigates up
+        sim.inject_event(key(KeyCode::Char('k'), Modifiers::CTRL));
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 0);
+
+        // Plain 'Escape' should not close because selectCancel was rebound to 'q'
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        assert!(
+            sim.model().picker.is_some(),
+            "picker unexpectedly closed on Escape"
+        );
+
+        // Rebound 'q' closes the picker
+        sim.inject_event(key(KeyCode::Char('q'), Modifiers::empty()));
+        assert!(
+            sim.model().picker.is_none(),
+            "picker did not close on rebound key 'q'"
+        );
+    }
+
+    #[test]
+    fn picker_window_keeps_selection_visible() {
+        // Empty inputs render nothing.
+        assert_eq!(picker_window(0, 0, 5), 0..0);
+        assert_eq!(picker_window(3, 10, 0), 0..0);
+        // Short lists are shown whole.
+        assert_eq!(picker_window(2, 3, 5), 0..3);
+        // Anchored to the top until the selection reaches the last row.
+        assert_eq!(picker_window(0, 20, 5), 0..5);
+        assert_eq!(picker_window(4, 20, 5), 0..5);
+        // Then slides one row at a time, selection on the last row.
+        assert_eq!(picker_window(5, 20, 5), 1..6);
+        assert_eq!(picker_window(12, 20, 5), 8..13);
+        // The last page stays full instead of starting past the end.
+        assert_eq!(picker_window(19, 20, 5), 15..20);
+        // Out-of-range selections clamp to the last item.
+        assert_eq!(picker_window(99, 20, 5), 15..20);
+        // Every window contains its selection.
+        for len in 1..40 {
+            for visible in 1..12 {
+                for selected in 0..len {
+                    let window = picker_window(selected, len, visible);
+                    assert!(
+                        window.contains(&selected),
+                        "selected {selected} outside {window:?} (len {len}, visible {visible})"
+                    );
+                    assert_eq!(window.len(), visible.min(len));
+                }
+            }
+        }
+    }
+
+    /// gh #228: a `/model` list longer than the body never scrolled — every
+    /// item was drawn from the top and the selection walked off screen.
+    #[test]
+    fn long_picker_scrolls_to_keep_the_selection_on_screen() {
+        let (_tx, mut model) = new_model();
+        model.picker = Some(PickerOverlay::new(
+            "Select model",
+            (0..40).map(|i| format!("provider/model-{i:02}")).collect(),
+            Vec::new(),
+            PickerKind::Model,
+        ));
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        // 10 rows: header, body, status, input, footer... the body gets a
+        // handful of rows, far fewer than 40 items.
+        let rendered = buffer_text(sim.capture_frame(50, 10), 50, 10);
+        assert!(rendered.contains("▸ provider/model-00"), "{rendered:?}");
+        assert!(
+            rendered.contains("(1/40)"),
+            "position missing: {rendered:?}"
+        );
+        assert!(!rendered.contains("model-30"), "{rendered:?}");
+
+        // Walk past the first page with `j`: the selection must stay visible.
+        for _ in 0..30 {
+            sim.inject_event(key(KeyCode::Char('j'), Modifiers::empty()));
+        }
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 30);
+        let rendered = buffer_text(sim.capture_frame(50, 10), 50, 10);
+        assert!(
+            rendered.contains("▸ provider/model-30"),
+            "selection scrolled off screen: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("(31/40)"),
+            "position missing: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("model-00"),
+            "top of list still drawn: {rendered:?}"
+        );
+
+        // Page to the very end, then walk back to the top.
+        for _ in 0..12 {
+            sim.inject_event(key(KeyCode::PageDown, Modifiers::empty()));
+        }
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 39);
+        let rendered = buffer_text(sim.capture_frame(50, 10), 50, 10);
+        assert!(rendered.contains("▸ provider/model-39"), "{rendered:?}");
+        assert!(rendered.contains("(40/40)"), "{rendered:?}");
+        for _ in 0..40 {
+            sim.inject_event(key(KeyCode::Char('k'), Modifiers::empty()));
+        }
+        let rendered = buffer_text(sim.capture_frame(50, 10), 50, 10);
+        assert!(rendered.contains("▸ provider/model-00"), "{rendered:?}");
+    }
+
+    #[test]
+    fn picker_supports_page_up_page_down() {
+        let (_tx, mut model) = new_model();
+        // Give the picker 20 items so paging has visible effect
+        model.picker = Some(PickerOverlay::new(
+            "Long list",
+            (0..20).map(|i| format!("item-{i}")).collect(),
+            Vec::new(),
+            PickerKind::Theme,
+        ));
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 0);
+
+        // PageDown jumps by body_height() page size
+        sim.inject_event(key(KeyCode::PageDown, Modifiers::empty()));
+        let after_pagedown = sim.model().picker.as_ref().unwrap().selected;
+        assert!(after_pagedown > 0, "PageDown did not advance selection");
+
+        // PageUp jumps back toward top
+        sim.inject_event(key(KeyCode::PageUp, Modifiers::empty()));
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 0);
+    }
+
+    /// GH #214: the picker row shows a model's display name, but what the
+    /// pick routes is still `provider/id`, even for a name with a slash.
+    #[test]
+    fn model_picker_shows_display_names_and_routes_the_identity() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_available_models(vec![
+                String::from("openai/gpt-5"),
+                String::from("deepseek/deepseek-v4-pro"),
+            ])
+            .with_model_names(HashMap::from([
+                (String::from("openai/gpt-5"), String::from("openai/gpt-5")),
+                (
+                    String::from("deepseek/deepseek-v4-pro"),
+                    String::from("DeepSeek V4/Pro"),
+                ),
+            ]));
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/model");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        let rendered = buffer_text(sim.capture_frame(80, 10), 80, 10);
+        assert!(
+            rendered.contains("deepseek/deepseek-v4-pro · DeepSeek V4/Pro"),
+            "{rendered:?}"
+        );
+        // A name equal to the id is not repeated.
+        assert!(!rendered.contains("gpt-5 · "), "{rendered:?}");
+
+        // Filtering by the display name finds the row; the pick routes the id.
+        type_str(&mut sim, "V4/Pro");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::SetModel {
+                provider: "deepseek".into(),
+                model: "deepseek-v4-pro".into(),
+            }
+        );
+    }
+
+    #[test]
     fn bare_model_command_opens_picker_and_selection_routes_set_model() {
         let (_agent_tx, rx) = mpsc::channel();
         let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
@@ -6292,6 +12653,577 @@ mod tests {
             }
         );
         assert!(sim.model().picker.is_none());
+    }
+
+    fn filter_test_model(
+        models: &[&str],
+    ) -> (ProgramSimulator<PiFtuiModel>, mpsc::Receiver<UiCommand>) {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_available_models(models.iter().map(|m| (*m).to_string()).collect());
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/model");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().picker.is_some(), "picker did not open");
+        (sim, submit_rx)
+    }
+
+    const FILTER_MODELS: [&str; 4] = [
+        "openai/gpt-5",
+        "anthropic/claude-opus-5",
+        "google/gemini-3-pro",
+        "xai/grok-4",
+    ];
+
+    /// gh #244: typing in the `/model` picker narrows the list, the title
+    /// shows the filter and match count, and Enter picks the highlighted
+    /// match.
+    #[test]
+    fn typing_filters_the_model_picker() {
+        let (mut sim, submit_rx) = filter_test_model(&FILTER_MODELS);
+        type_str(&mut sim, "claude");
+        let rendered = buffer_text(sim.capture_frame(80, 10), 80, 10);
+        assert!(
+            rendered.contains("▸ anthropic/claude-opus-5"),
+            "match not selected: {rendered:?}"
+        );
+        assert!(rendered.contains("filter: claude (1/4)"), "{rendered:?}");
+        assert!(!rendered.contains("openai/gpt-5"), "{rendered:?}");
+        assert!(!rendered.contains("google/gemini"), "{rendered:?}");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::SetModel {
+                provider: "anthropic".into(),
+                model: "claude-opus-5".into(),
+            }
+        );
+        assert!(sim.model().picker.is_none());
+    }
+
+    /// gh #244: j/k navigate only until a filter is typed; after that they
+    /// are letters of it. Backspace widens the filter again, and provider
+    /// aliases match as on the classic stack ("grok" is an xai alias).
+    #[test]
+    fn model_picker_filter_takes_j_k_and_backspace() {
+        let (mut sim, _submit_rx) = filter_test_model(&FILTER_MODELS);
+        sim.inject_event(key(KeyCode::Char('j'), Modifiers::empty()));
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 1);
+        assert!(sim.model().picker.as_ref().unwrap().query.is_empty());
+
+        type_str(&mut sim, "g");
+        let picker = sim.model().picker.as_ref().unwrap();
+        assert_eq!(picker.selected, 0, "filtering resets the selection");
+        assert_eq!(picker.shown, vec![0, 2, 3]);
+
+        sim.inject_event(key(KeyCode::Char('k'), Modifiers::empty()));
+        let picker = sim.model().picker.as_ref().unwrap();
+        assert_eq!(picker.query, "gk");
+        assert_eq!(picker.shown, vec![3]);
+
+        sim.inject_event(key(KeyCode::Backspace, Modifiers::empty()));
+        let picker = sim.model().picker.as_ref().unwrap();
+        assert_eq!(picker.query, "g");
+        assert_eq!(picker.shown, vec![0, 2, 3]);
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        assert_eq!(
+            sim.model().picker.as_ref().unwrap().selected,
+            2,
+            "Down stops at the last match"
+        );
+    }
+
+    /// gh #244: a filter that matches nothing says so, Enter leaves the
+    /// picker open without routing anything, and Esc still closes it.
+    #[test]
+    fn model_picker_with_no_matches_keeps_enter_inert() {
+        let (mut sim, submit_rx) = filter_test_model(&FILTER_MODELS);
+        type_str(&mut sim, "zzz");
+        let rendered = buffer_text(sim.capture_frame(80, 10), 80, 10);
+        assert!(rendered.contains("no matches"), "{rendered:?}");
+        assert!(rendered.contains("filter: zzz (0/4)"), "{rendered:?}");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().picker.is_some(), "Enter closed an empty picker");
+        assert!(submit_rx.try_recv().is_err(), "Enter routed a command");
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        assert!(sim.model().picker.is_none());
+    }
+
+    /// gh #244: the `/resume` picker filters on its labels (shifted letters
+    /// type) and still selects the matching session's path.
+    #[test]
+    fn resume_picker_filters_on_labels() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_available_sessions(vec![
+                (
+                    String::from("fix parser · 12 msgs"),
+                    String::from("/tmp/sessions/a.jsonl"),
+                ),
+                (
+                    String::from("Older run · 3 msgs"),
+                    String::from("/tmp/sessions/b.jsonl"),
+                ),
+            ]);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/resume");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Char('O'), Modifiers::SHIFT));
+        type_str(&mut sim, "ld");
+        let rendered = buffer_text(sim.capture_frame(80, 10), 80, 10);
+        assert!(rendered.contains("▸ Older run"), "{rendered:?}");
+        assert!(!rendered.contains("fix parser"), "{rendered:?}");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::ResumeSession {
+                path: "/tmp/sessions/b.jsonl".into()
+            }
+        );
+    }
+
+    /// gh #244: a paste while a picker is open edits its filter (line
+    /// breaks dropped) rather than landing in the hidden editor.
+    #[test]
+    fn paste_into_open_picker_edits_the_filter() {
+        let (mut sim, _submit_rx) = filter_test_model(&FILTER_MODELS);
+        sim.inject_event(Event::Paste(ftui::PasteEvent::new("claude\r\n", true)));
+        let picker = sim.model().picker.as_ref().expect("picker stays open");
+        assert_eq!(picker.query, "claude");
+        assert_eq!(picker.shown, vec![1]);
+        assert!(
+            sim.model().input.is_empty(),
+            "paste leaked into the editor: {:?}",
+            sim.model().input.text()
+        );
+        // A paste of only control characters leaves the filter alone.
+        sim.inject_event(Event::Paste(ftui::PasteEvent::new("\n", true)));
+        assert_eq!(sim.model().picker.as_ref().unwrap().query, "claude");
+    }
+
+    /// GH #182: `!command` on this stack honors `shell_path` and
+    /// `shell_command_prefix` from settings, as the classic stack does.
+    #[cfg(unix)]
+    #[test]
+    fn fast_command_sets_the_priority_tier_the_provider_sends() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cwd = tempfile::tempdir().expect("tempdir");
+        runtime.block_on(async {
+            let mut handle = crate::sdk::create_agent_session(crate::sdk::SessionOptions {
+                provider: Some(String::from("openai")),
+                model: Some(String::from("gpt-4o")),
+                api_key: Some(String::from("dummy-key")),
+                working_directory: Some(cwd.path().to_path_buf()),
+                no_session: true,
+                ..crate::sdk::SessionOptions::default()
+            })
+            .await
+            .expect("create session");
+            let tier = |handle: &crate::sdk::AgentSessionHandle| {
+                handle.session().agent.stream_options().service_tier.clone()
+            };
+            let text = |msg: PiMsg| match msg {
+                PiMsg::System(text) => text,
+                other => panic!("unexpected reply {other:?}"),
+            };
+
+            assert_eq!(
+                text(run_fast_command(&mut handle, FastRequest::Status)),
+                "Fast mode is off."
+            );
+            assert!(
+                text(run_fast_command(&mut handle, FastRequest::On))
+                    .starts_with("Fast mode enabled")
+            );
+            assert_eq!(tier(&handle).as_deref(), Some("priority"));
+            assert!(
+                text(run_fast_command(&mut handle, FastRequest::Status))
+                    .contains("service_tier=priority")
+            );
+            // Bare /fast toggles.
+            assert_eq!(
+                text(run_fast_command(&mut handle, FastRequest::Toggle)),
+                "Fast mode disabled."
+            );
+            assert_eq!(tier(&handle), None);
+            run_fast_command(&mut handle, FastRequest::Toggle);
+            assert_eq!(tier(&handle).as_deref(), Some("priority"));
+            run_fast_command(&mut handle, FastRequest::Off);
+            assert_eq!(tier(&handle), None);
+        });
+
+        // Providers without a priority tier refuse `on`, as OMP does.
+        assert!(fast_mode_realization("groq").is_none());
+        assert!(fast_mode_realization("anthropic").is_some());
+    }
+
+    #[test]
+    fn double_escape_on_an_idle_empty_editor_runs_the_configured_action() {
+        let esc_esc = |action: DoubleEscapeAction, typed: &str| {
+            let (_agent_tx, rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+            let model = PiFtuiModel::new(rx)
+                .with_submit_channel(submit_tx)
+                .with_double_escape_action(action);
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            type_str(&mut sim, typed);
+            sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+            let after_one = submit_rx.try_recv().ok();
+            sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+            (after_one, submit_rx.try_recv().ok())
+        };
+        assert_eq!(
+            esc_esc(DoubleEscapeAction::Rewind, ""),
+            (None, Some(UiCommand::MessagePicker { fork: false }))
+        );
+        assert_eq!(
+            esc_esc(DoubleEscapeAction::Fork, ""),
+            (None, Some(UiCommand::MessagePicker { fork: true }))
+        );
+        assert_eq!(
+            esc_esc(DoubleEscapeAction::Tree, ""),
+            (None, Some(UiCommand::TreeSummary))
+        );
+        assert_eq!(esc_esc(DoubleEscapeAction::None, ""), (None, None));
+        // A draft in the editor is never thrown away by a stray double-Esc.
+        assert_eq!(esc_esc(DoubleEscapeAction::Rewind, "draft"), (None, None));
+
+        assert_eq!(
+            DoubleEscapeAction::from_setting(None),
+            DoubleEscapeAction::Rewind
+        );
+        assert_eq!(
+            DoubleEscapeAction::from_setting(Some("branch")),
+            DoubleEscapeAction::Rewind
+        );
+        assert_eq!(
+            DoubleEscapeAction::from_setting(Some(" Fork ")),
+            DoubleEscapeAction::Fork
+        );
+        assert_eq!(
+            DoubleEscapeAction::from_setting(Some("none")),
+            DoubleEscapeAction::None
+        );
+    }
+
+    #[test]
+    fn message_picker_lists_newest_first_and_routes_the_pick() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/branch");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::MessagePicker { fork: false }
+        );
+        let messages = vec![
+            (String::from("first question"), String::from("id-1")),
+            (String::from("second question"), String::from("id-2")),
+        ];
+        sim.send(PiFtuiMsg::Agent(PiMsg::MessagePicker {
+            fork: false,
+            messages: messages.clone(),
+        }));
+        let frame = buffer_text(sim.capture_frame(100, 24), 100, 24);
+        let newest = frame.find("2. second question").expect("newest listed");
+        let oldest = frame.find("1. first question").expect("oldest listed");
+        assert!(newest < oldest, "{frame}");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::RewindTo {
+                entry_id: String::from("id-2")
+            }
+        );
+
+        // The fork flavour forks from the picked message instead.
+        sim.send(PiFtuiMsg::Agent(PiMsg::MessagePicker {
+            fork: true,
+            messages,
+        }));
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::Fork {
+                args: String::from("id-1")
+            }
+        );
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::MessagePicker {
+            fork: false,
+            messages: Vec::new(),
+        }));
+        assert!(sim.model().picker.is_none());
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text == "No messages to branch from")
+        );
+    }
+
+    #[test]
+    fn rewind_moves_the_leaf_back_and_returns_the_message_to_the_editor() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cwd = tempfile::tempdir().expect("tempdir");
+        runtime.block_on(async {
+            let mut handle = crate::sdk::create_agent_session(crate::sdk::SessionOptions {
+                provider: Some(String::from("openai")),
+                model: Some(String::from("gpt-4o")),
+                api_key: Some(String::from("dummy-key")),
+                working_directory: Some(cwd.path().to_path_buf()),
+                no_session: true,
+                ..crate::sdk::SessionOptions::default()
+            })
+            .await
+            .expect("create session");
+            {
+                let store = handle.session_store();
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = store.lock(cx.cx()).await.expect("session lock");
+                for text in ["first question", "second question"] {
+                    session.append_message(crate::session::SessionMessage::User {
+                        content: crate::model::UserContent::Text(String::from(text)),
+                        timestamp: Some(0),
+                    });
+                    session.append_message(crate::session::SessionMessage::from(
+                        crate::model::Message::Assistant(Arc::new(
+                            crate::model::AssistantMessage {
+                                content: vec![crate::model::ContentBlock::Text(
+                                    crate::model::TextContent::new("answer"),
+                                )],
+                                ..Default::default()
+                            },
+                        )),
+                    ));
+                }
+            }
+
+            let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
+            send_message_picker(&handle, false, &agent_tx).await;
+            let Ok(PiMsg::MessagePicker { messages, .. }) = agent_rx.try_recv() else {
+                panic!("expected the message list");
+            };
+            let summaries: Vec<&str> = messages.iter().map(|(s, _)| s.as_str()).collect();
+            assert_eq!(summaries, ["first question", "second question"]);
+
+            run_rewind_command(&mut handle, &messages[1].1, &agent_tx).await;
+            let replies: Vec<PiMsg> = agent_rx.try_iter().collect();
+            let Some(PiMsg::ConversationReset {
+                messages: shown, ..
+            }) = replies.first()
+            else {
+                panic!("expected a conversation reset, got {replies:?}");
+            };
+            assert_eq!(shown.len(), 2, "first question and its answer remain");
+            assert!(
+                replies.iter().any(|msg| matches!(
+                    msg,
+                    PiMsg::SetEditorText { text, .. } if text == "second question"
+                )),
+                "{replies:?}"
+            );
+            // The agent's context was rebuilt from the shorter path.
+            assert_eq!(handle.session().agent.messages().len(), 2);
+
+            // A stale id is reported, not silently ignored.
+            run_rewind_command(&mut handle, "no-such-id", &agent_tx).await;
+            assert!(matches!(
+                agent_rx.try_recv(),
+                Ok(PiMsg::AgentError(text)) if text.starts_with("rewind:")
+            ));
+        });
+    }
+
+    #[test]
+    fn fast_slash_command_routes_to_driver() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for (typed, request) in [
+            ("/fast", FastRequest::Toggle),
+            ("/fast on", FastRequest::On),
+            ("/fast OFF", FastRequest::Off),
+            ("/fast status", FastRequest::Status),
+        ] {
+            type_str(&mut sim, typed);
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert_eq!(
+                submit_rx.try_recv().expect("routed"),
+                UiCommand::Fast(request),
+                "{typed}"
+            );
+        }
+        type_str(&mut sim, "/fast turbo");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(submit_rx.try_recv().is_err());
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.role == EntryRole::Error && e.text.contains("Usage: /fast"))
+        );
+    }
+
+    #[test]
+    fn bash_ui_command_uses_configured_shell_and_prefix() {
+        let config = crate::config::Config {
+            shell_path: Some(String::from("/bin/sh")),
+            shell_command_prefix: Some(String::from("PI_GH182=prefixed")),
+            ..crate::config::Config::default()
+        };
+        let shell = BashUiShell::from_config(&config);
+        assert_eq!(shell.path.as_deref(), Some("/bin/sh"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (agent_tx, _agent_rx) = mpsc::channel();
+        let output = runtime.block_on(run_bash_ui_command(
+            dir.path(),
+            &shell,
+            "echo \"value=$PI_GH182\"",
+            false,
+            &agent_tx,
+        ));
+        let output = output.expect("command ran");
+        assert!(output.contains("value=prefixed"), "{output}");
+
+        // A configured shell that does not exist is used, not silently
+        // replaced by the default: the run fails and names it.
+        let missing = BashUiShell {
+            path: Some(String::from("/nonexistent/pi-gh182-shell")),
+            command_prefix: None,
+        };
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let output = runtime.block_on(run_bash_ui_command(
+            dir.path(),
+            &missing,
+            "true",
+            false,
+            &agent_tx,
+        ));
+        assert!(output.is_none());
+        let errors: Vec<String> = agent_rx
+            .try_iter()
+            .filter_map(|msg| match msg {
+                PiMsg::AgentError(err) => Some(err),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            errors.iter().any(|err| err.contains("pi-gh182-shell")),
+            "{errors:?}"
+        );
+    }
+
+    /// Deliver one keystroke the way a Windows console does: a Press
+    /// followed by a Release of the same key.
+    fn windows_keystroke(sim: &mut ProgramSimulator<PiFtuiModel>, code: KeyCode) {
+        sim.inject_event(key(code, Modifiers::empty()));
+        sim.inject_event(Event::Key(KeyEvent {
+            code,
+            modifiers: Modifiers::empty(),
+            kind: KeyEventKind::Release,
+        }));
+    }
+
+    fn windows_type_str(sim: &mut ProgramSimulator<PiFtuiModel>, s: &str) {
+        for ch in s.chars() {
+            windows_keystroke(sim, KeyCode::Char(ch));
+        }
+    }
+
+    /// gh #239: with press+release pairs, `/model` + Enter must open the
+    /// picker without confirming it, and each Down must move one row.
+    #[test]
+    fn windows_key_releases_do_not_confirm_or_skip_in_the_model_picker() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_available_models(vec![
+                String::from("openai/gpt-5"),
+                String::from("anthropic/claude-opus-5"),
+                String::from("google/gemini-3-pro"),
+            ]);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        windows_type_str(&mut sim, "/model");
+        assert_eq!(sim.model().input.text(), "/model", "typed text doubled");
+        windows_keystroke(&mut sim, KeyCode::Enter);
+        assert!(
+            sim.model().picker.is_some(),
+            "the Enter release confirmed the picker the press had just opened"
+        );
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "no model may be chosen before the user picks one"
+        );
+
+        windows_keystroke(&mut sim, KeyCode::Down);
+        let rendered = buffer_text(sim.capture_frame(50, 10), 50, 10);
+        assert!(
+            rendered.contains("▸ anthropic/claude-opus-5"),
+            "one Down keystroke must move exactly one row: {rendered:?}"
+        );
+        windows_keystroke(&mut sim, KeyCode::Enter);
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::SetModel {
+                provider: "anthropic".into(),
+                model: "claude-opus-5".into(),
+            }
+        );
+        assert!(submit_rx.try_recv().is_err(), "exactly one selection");
+        assert!(sim.model().picker.is_none());
+    }
+
+    /// gh #239: the slash completion popup must advance one item per
+    /// keystroke, while a held key (Repeat) still keeps moving.
+    #[test]
+    fn windows_key_releases_do_not_skip_completion_rows() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        windows_type_str(&mut sim, "/");
+        assert!(sim.model().completion_visible(), "slash opens the popup");
+        assert!(sim.model().autocomplete.items.len() >= 4);
+
+        windows_keystroke(&mut sim, KeyCode::Down);
+        assert_eq!(sim.model().autocomplete.selected, Some(0));
+        windows_keystroke(&mut sim, KeyCode::Down);
+        assert_eq!(sim.model().autocomplete.selected, Some(1));
+
+        sim.inject_event(Event::Key(KeyEvent {
+            code: KeyCode::Down,
+            modifiers: Modifiers::empty(),
+            kind: KeyEventKind::Repeat,
+        }));
+        assert_eq!(
+            sim.model().autocomplete.selected,
+            Some(2),
+            "auto-repeat is still input"
+        );
     }
 
     /// bd-cv653.3.13/7.4 parity: /undo //redo //usage route driver commands.
@@ -6374,6 +13306,652 @@ mod tests {
         );
     }
 
+    /// bd-ydz1t.2: `/tan` existed only on the classic stack, so on the default
+    /// stack it fell through to extension dispatch and reported "Unknown
+    /// command".
+    #[test]
+    fn slash_tan_routes_command() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/tan summarise the changelog");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::Tan("summarise the changelog".to_string())
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("(/tan started)")),
+            "the user must be told the background job started"
+        );
+        assert_eq!(
+            sim.model().state,
+            AgentUiState::Ready,
+            "/tan must NOT put the session in a working state — the point is \
+             that the user keeps working while the child runs"
+        );
+    }
+
+    /// `/tan` with no work is a usage error, and must not reach the driver:
+    /// launching a child agent with an empty task would burn a real provider
+    /// call on nothing.
+    #[test]
+    fn slash_tan_without_work_is_refused_before_the_driver() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/tan");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "an empty /tan must never reach the driver"
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("Usage: /tan")),
+            "the refusal must say how to use it"
+        );
+    }
+
+    /// The delivery half (bd-ydz1t.2): a background answer that arrives while a
+    /// turn is streaming is HELD until the turn ends. Splicing it in mid-stream
+    /// would show an answer to an earlier question inside the current one.
+    #[test]
+    fn a_background_note_arriving_mid_turn_waits_for_the_turn_boundary() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx));
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            session_id: "s1".to_string(),
+            messages: Vec::new(),
+            usage: crate::model::Usage::default(),
+            status: None,
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta("partial".to_string())));
+        sim.send(PiFtuiMsg::Agent(PiMsg::SessionSystemNote {
+            owner_session_id: "s1".to_string(),
+            message: "(/tan completed)\nbackground answer".to_string(),
+        }));
+
+        assert!(
+            !sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("background answer")),
+            "the note must not interleave with the streaming reply"
+        );
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: crate::model::StopReason::Stop,
+            error_message: None,
+        }));
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("background answer")),
+            "the turn ended, so the held note is owed to the user now"
+        );
+    }
+
+    /// bd-ydz1t.1: `/share` existed only on the classic stack, so on the stack
+    /// most people run it fell through to extension dispatch and reported
+    /// "Unknown command".
+    #[test]
+    fn slash_share_routes_command() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/share");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(submit_rx.try_recv().expect("routed"), UiCommand::Share);
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("Sharing session")),
+            "share note missing"
+        );
+    }
+
+    /// `/login` and `/logout` existed only on the classic stack; on the default
+    /// stack they fell through to extension dispatch as unknown commands, so
+    /// an OAuth provider could not be logged into at all.
+    #[test]
+    fn slash_login_and_logout_route_to_the_driver() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/login anthropic");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("login routed"),
+            UiCommand::Login {
+                args: String::from("anthropic")
+            }
+        );
+        type_str(&mut sim, "/logout");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("logout routed"),
+            UiCommand::Logout {
+                args: String::new()
+            }
+        );
+    }
+
+    /// `/reload` re-reads resources and keeps the conversation: an extension
+    /// edited on disk after launch is replaced by its new version, and the
+    /// session (id and messages) is the same one. An unsaved in-memory
+    /// conversation is refused, not dropped.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reload_picks_up_an_edited_extension_and_keeps_the_conversation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        let cwd = tempfile::tempdir().expect("cwd");
+        let sessions = tempfile::tempdir().expect("sessions");
+        let extension = cwd.path().join("reload-probe.mjs");
+        let write_extension = |command: &str| {
+            std::fs::write(
+                &extension,
+                format!(
+                    "export default function init(pi) {{\n\
+                     pi.registerCommand(\"{command}\", {{ description: \"probe\", handler: async () => {{}} }});\n\
+                     }}\n"
+                ),
+            )
+            .expect("write extension");
+        };
+        write_extension("v1-cmd");
+
+        let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
+        let ext_handler = Arc::new(FtuiExtensionUiHandler::new(agent_tx.clone()));
+        let template = resume_template_from(&crate::sdk::SessionOptions {
+            provider: Some(String::from("openai")),
+            model: Some(String::from("gpt-4o")),
+            api_key: Some(String::from("dummy-key")),
+            working_directory: Some(cwd.path().to_path_buf()),
+            workspace_trusted: true,
+            session_dir: Some(sessions.path().to_path_buf()),
+            extension_paths: vec![extension.clone()],
+            ..crate::sdk::SessionOptions::default()
+        });
+        let current_ask: CurrentAsk = Arc::new(Mutex::new(None));
+
+        runtime.block_on(async move {
+            let mut handle = crate::sdk::create_agent_session_deferred_mcp(replacement_options(
+                &template,
+                &ext_handler,
+                &runtime_handle,
+            ))
+            .await
+            .expect("create session");
+            assert!(
+                handle
+                    .extension_manager()
+                    .is_some_and(|manager| manager.has_command("v1-cmd"))
+            );
+
+            // A saved conversation to keep across the reload.
+            let session_id = {
+                let store = handle.session_store();
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = store.lock(cx.cx()).await.expect("session lock");
+                session.append_message(crate::session::SessionMessage::User {
+                    content: crate::model::UserContent::Text(String::from("keep me")),
+                    timestamp: Some(0),
+                });
+                session.save().await.expect("save session");
+                session.header.id.clone()
+            };
+
+            write_extension("v2-cmd");
+            reload_session_command(
+                &template,
+                &mut handle,
+                &current_ask,
+                &ext_handler,
+                &agent_tx,
+                &runtime_handle,
+            )
+            .await
+            .expect("reload");
+
+            let manager = handle.extension_manager().expect("extensions after reload");
+            assert!(manager.has_command("v2-cmd"), "the edited extension must load");
+            assert!(!manager.has_command("v1-cmd"), "the old version must be gone");
+            let (id, kept) = handle
+                .with_session(|session| {
+                    let kept = session
+                        .to_messages_for_current_path()
+                        .iter()
+                        .any(|message| matches!(
+                            message,
+                            crate::model::Message::User(user)
+                                if matches!(&user.content, crate::model::UserContent::Text(text) if text == "keep me")
+                        ));
+                    (session.header.id.clone(), kept)
+                })
+                .await
+                .expect("session snapshot");
+            assert_eq!(id, session_id, "reload keeps the same session");
+            assert!(kept, "reload keeps the conversation");
+            let replies = agent_rx.try_iter().collect::<Vec<_>>();
+            assert!(
+                replies
+                    .iter()
+                    .any(|msg| matches!(msg, PiMsg::System(text) if text.starts_with("Reloaded"))),
+                "the user is told the reload happened"
+            );
+
+            // The planted negative: an unsaved in-memory conversation.
+            let mut unsaved = crate::sdk::create_agent_session_deferred_mcp({
+                let mut options = replacement_options(&template, &ext_handler, &runtime_handle);
+                options.no_session = true;
+                options
+            })
+            .await
+            .expect("in-memory session");
+            {
+                let store = unsaved.session_store();
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = store.lock(cx.cx()).await.expect("session lock");
+                session.path = None;
+                session.append_message(crate::session::SessionMessage::User {
+                    content: crate::model::UserContent::Text(String::from("unsaved")),
+                    timestamp: Some(0),
+                });
+            }
+            let unsaved_id = unsaved
+                .with_session(|session| session.header.id.clone())
+                .await
+                .expect("id");
+            reload_session_command(
+                &template,
+                &mut unsaved,
+                &current_ask,
+                &ext_handler,
+                &agent_tx,
+                &runtime_handle,
+            )
+            .await
+            .expect("refusal is not a driver failure");
+            assert_eq!(
+                unsaved
+                    .with_session(|session| session.header.id.clone())
+                    .await
+                    .expect("id"),
+                unsaved_id,
+                "an unsaved conversation must not be replaced"
+            );
+            assert!(
+                agent_rx
+                    .try_iter()
+                    .any(|msg| matches!(msg, PiMsg::AgentError(text) if text.contains("not saved"))),
+                "the refusal is reported"
+            );
+            let _ = unsaved.shutdown_owned_resources().await;
+            let _ = handle.shutdown_owned_resources().await;
+        });
+    }
+
+    fn unroutable_btw_client() -> Arc<crate::btw::BtwClient> {
+        Arc::new(crate::btw::BtwClient::new(
+            Arc::new(
+                crate::providers::openai::OpenAIProvider::new("btw-fixture")
+                    .with_base_url("http://127.0.0.1:1/v1"),
+            ),
+            None,
+        ))
+    }
+
+    /// OMP's /btw on the default stack: idle, it goes to the driver (which
+    /// adds vault-transformed context); without a smol model it is refused
+    /// before anything is sent.
+    #[test]
+    fn slash_btw_routes_when_a_smol_client_exists_and_refuses_otherwise() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_btw_client(Some(unroutable_btw_client()));
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/btw what is a monad");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::Btw(String::from("what is a monad"))
+        );
+
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx).with_submit_channel(submit_tx));
+        sim.init();
+        type_str(&mut sim, "/btw anything");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "no smol model: nothing is sent"
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|entry| entry.text == BTW_UNAVAILABLE),
+            "the refusal says why"
+        );
+    }
+
+    /// Mid-turn, /btw is the one command allowed: it is asked from the UI
+    /// thread without context (the driver is inside the turn) and never
+    /// reaches the steering lane or the command channel.
+    #[test]
+    fn slash_btw_mid_turn_asks_without_context_instead_of_steering() {
+        let slot: TurnControlSlot = Arc::new(Mutex::new(None));
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_turn_control(slot)
+            .with_btw_client(Some(unroutable_btw_client()));
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        type_str(&mut sim, "/btw quick check");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "the busy driver is not asked"
+        );
+        assert!(sim.model().input.text().is_empty());
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|entry| entry.text.starts_with("(/btw) quick check — agent busy")),
+            "the note says there is no conversation context"
+        );
+    }
+
+    /// OMP's read-only info commands and aliases route on the default stack;
+    /// near-miss tokens still reach extension dispatch.
+    #[test]
+    fn omp_info_commands_and_aliases_route_to_the_driver() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let mut send = |text: &str| {
+            type_str(&mut sim, text);
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            submit_rx.try_recv().expect("routed")
+        };
+        for (text, expected) in [
+            ("/tools", info_commands::InfoCommand::Tools),
+            ("/extensions", info_commands::InfoCommand::Extensions),
+            ("/skills", info_commands::InfoCommand::Skills),
+            ("/dirs", info_commands::InfoCommand::Dirs),
+            ("/context", info_commands::InfoCommand::Context),
+            ("/todo", info_commands::InfoCommand::Todo),
+            ("/jobs", info_commands::InfoCommand::Jobs),
+            ("/stats", info_commands::InfoCommand::Stats),
+        ] {
+            assert_eq!(send(text), UiCommand::Info(expected), "{text}");
+        }
+        assert_eq!(
+            send("/plan-review"),
+            UiCommand::Plan {
+                action: String::from("review")
+            }
+        );
+        assert_eq!(
+            send("/rename release prep"),
+            UiCommand::SetName(String::from("release prep"))
+        );
+        assert_eq!(send("/fresh"), UiCommand::Fresh);
+        assert_eq!(send("/retry"), UiCommand::Retry);
+        assert_eq!(send("/shake"), UiCommand::Shake);
+        assert_eq!(
+            send("/template"),
+            UiCommand::Info(info_commands::InfoCommand::Templates)
+        );
+        assert_eq!(
+            send("/template fix src/a.rs"),
+            UiCommand::ExtensionCommand {
+                name: String::from("fix"),
+                args: String::from("src/a.rs")
+            }
+        );
+        assert_eq!(send("/compact shake"), UiCommand::Shake);
+        assert_eq!(
+            send("/checkpoint before-refactor risky part"),
+            UiCommand::Checkpoint {
+                args: String::from("before-refactor risky part")
+            }
+        );
+        assert_eq!(
+            send("/rewind"),
+            UiCommand::Rewind {
+                name: String::new()
+            }
+        );
+        assert_eq!(
+            send("/commit --dry-run"),
+            UiCommand::Workspace {
+                command: workspace_commands::WorkspaceCommand::Commit,
+                args: String::from("--dry-run")
+            }
+        );
+        assert_eq!(
+            send("/advisor"),
+            UiCommand::Workspace {
+                command: workspace_commands::WorkspaceCommand::Advisor,
+                args: String::new()
+            }
+        );
+        assert_eq!(
+            send("/toolsy"),
+            UiCommand::ExtensionCommand {
+                name: String::from("toolsy"),
+                args: String::new()
+            },
+            "a near-miss token is an extension command, not /tools"
+        );
+    }
+
+    /// `/fork` existed only on the classic stack. It routes to the driver, and
+    /// the selected message the driver hands back lands in the editor only
+    /// for the session on screen.
+    #[test]
+    fn slash_fork_routes_and_the_selected_text_returns_to_the_editor() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/fork 2");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("fork routed"),
+            UiCommand::Fork {
+                args: String::from("2")
+            }
+        );
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            session_id: String::from("forked"),
+            messages: Vec::new(),
+            usage: crate::model::Usage::default(),
+            status: None,
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::SetEditorText {
+            owner_session_id: String::from("some-other-session"),
+            text: String::from("stale"),
+        }));
+        assert_eq!(sim.model().input.text(), "", "a stale hand-back is dropped");
+        sim.send(PiFtuiMsg::Agent(PiMsg::SetEditorText {
+            owner_session_id: String::from("forked"),
+            text: String::from("reword me"),
+        }));
+        assert_eq!(sim.model().input.text(), "reword me");
+    }
+
+    /// The fork keeps everything before the selected user message, drops that
+    /// message and what followed, and returns its text for the editor.
+    #[test]
+    fn build_fork_session_branches_before_the_selected_message() {
+        use crate::model::UserContent;
+        use crate::session::{Session, SessionMessage};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut source = Session::create_with_dir(Some(dir.path().to_path_buf()));
+        source.header.thinking_level = Some(String::from("high"));
+        for text in ["first question", "second question"] {
+            source.append_message(SessionMessage::User {
+                content: UserContent::Text(text.to_string()),
+                timestamp: Some(0),
+            });
+        }
+        source.ensure_entry_ids();
+        let candidates = crate::interactive::fork_candidates(&source);
+        assert_eq!(candidates.len(), 2);
+        let second = crate::interactive::select_fork_candidate(&candidates, "2").expect("select");
+
+        let (forked, selected_text) = build_fork_session(
+            &source,
+            &second.id,
+            String::from("anthropic"),
+            String::from("claude-test"),
+        )
+        .expect("build fork");
+        assert_eq!(selected_text, "second question");
+        let texts = forked
+            .to_messages_for_current_path()
+            .iter()
+            .filter_map(|message| match message {
+                crate::model::Message::User(user) => match &user.content {
+                    UserContent::Text(text) => Some(text.clone()),
+                    UserContent::Blocks(_) => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec![String::from("first question")]);
+        assert_ne!(forked.header.id, source.header.id);
+        assert_eq!(forked.header.provider.as_deref(), Some("anthropic"));
+        assert_eq!(forked.header.model_id.as_deref(), Some("claude-test"));
+        assert_eq!(forked.header.thinking_level.as_deref(), Some("high"));
+        assert_eq!(forked.session_dir.as_deref(), Some(dir.path()));
+    }
+
+    /// While a login waits for input, the next line is the secret: it goes to
+    /// the driver and never into the transcript. A slash command abandons the
+    /// prompt and runs normally.
+    #[test]
+    fn pending_login_input_reaches_the_driver_without_being_echoed() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::LoginPending {
+            provider: Some(String::from("openai")),
+            accepts_empty_input: false,
+        }));
+
+        // A bare Enter is not an API key; nothing is sent.
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "an empty line must not submit"
+        );
+
+        type_str(&mut sim, "sk-very-secret");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("login input routed"),
+            UiCommand::LoginSubmit(LoginInput(String::from("sk-very-secret")))
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .all(|entry| !entry.text.contains("sk-very-secret")),
+            "the key must never be echoed"
+        );
+        assert!(
+            format!(
+                "{:?}",
+                UiCommand::LoginSubmit(LoginInput(String::from("sk-very-secret")))
+            )
+            .contains("<redacted>"),
+            "Debug must not print the key"
+        );
+
+        // The driver keeps the prompt armed until it says otherwise; a slash
+        // command abandons it and routes as a command.
+        type_str(&mut sim, "/session");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("slash command routed"),
+            UiCommand::SessionInfo
+        );
+        assert!(sim.model().login_pending.is_none());
+        type_str(&mut sim, "hello");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("prompt routed"),
+            UiCommand::Prompt(String::from("hello")),
+            "after cancelling, input is an ordinary prompt again"
+        );
+    }
+
+    /// The planted negative, and the one that matters most: `/share public` is
+    /// asking for the opposite of what this does. It must be refused in the UI,
+    /// BEFORE anything reaches the driver — so the safe answer never depends on
+    /// the driver, the `gh` subprocess, or the network.
+    #[test]
+    fn slash_share_refuses_an_argument_without_reaching_the_driver() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/share public");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "/share public must never reach the driver"
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("public sharing is disabled")),
+            "the refusal must say why"
+        );
+    }
+
     #[test]
     fn slash_exit_quits() {
         let (_tx, model) = new_model();
@@ -6438,6 +14016,39 @@ mod tests {
                 path: "/tmp/sessions/b.jsonl".into()
             }
         );
+    }
+
+    /// `/retry` routes to the driver; the driver's `RetryCommitted` replays the
+    /// branched history and ends with the re-sent prompt as a user entry
+    /// (the abandoned reply is gone).
+    #[test]
+    fn slash_retry_routes_and_the_commit_replays_the_branch() {
+        use crate::interactive::{ConversationMessage, MessageRole};
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx).with_submit_channel(submit_tx));
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::System("abandoned reply".into())));
+        type_str(&mut sim, "/retry");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(submit_rx.try_recv().expect("routed"), UiCommand::Retry);
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::RetryCommitted {
+            session_id: "s".into(),
+            messages: vec![ConversationMessage {
+                role: MessageRole::User,
+                content: "earlier".into(),
+                thinking: None,
+                collapsed: false,
+            }],
+            usage: crate::model::Usage::default(),
+            text: "second question".into(),
+            status: Some("Retrying last turn".into()),
+        }));
+        let transcript = &sim.model().transcript;
+        assert!(!transcript.iter().any(|e| e.text == "abandoned reply"));
+        let last = transcript.last().expect("entries");
+        assert!(last.role == EntryRole::User && last.text == "second question");
     }
 
     #[test]
@@ -6733,7 +14344,7 @@ mod tests {
             sim.model()
                 .transcript
                 .iter()
-                .any(|e| e.text.contains("ftui preview commands")),
+                .any(|e| e.text.contains("pi commands")),
             "uppercase /H must show help"
         );
         type_str(&mut sim, "/Q");
@@ -6819,7 +14430,7 @@ mod tests {
             sim.model()
                 .transcript
                 .iter()
-                .any(|e| e.text.contains("ftui preview commands")),
+                .any(|e| e.text.contains("pi commands")),
             "the completed /help must route like a typed one"
         );
     }
@@ -6883,7 +14494,7 @@ mod tests {
             sim.model()
                 .transcript
                 .iter()
-                .any(|e| e.text.contains("ftui preview commands")),
+                .any(|e| e.text.contains("pi commands")),
             "Enter with no highlight submits what was typed"
         );
     }
@@ -6976,6 +14587,8 @@ mod tests {
             catalog: AutocompleteCatalog::default(),
             cwd: std::path::PathBuf::from("."),
             max_visible: 3,
+            resources: None,
+            resource_source: None,
         });
         let mut sim = ProgramSimulator::new(model);
         sim.init();
@@ -7330,6 +14943,468 @@ mod tests {
             "group counter missing: {rendered:?}"
         );
     }
+    /// `@file` references are read in: a text file is inlined ahead of the
+    /// message, an image is attached, and the reference leaves the text. A
+    /// prompt without references still expands templates.
+    #[test]
+    fn prepare_prompt_reads_file_references_and_attaches_images() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "remember the milk\n").expect("write");
+        // A 1x1 PNG.
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xF0, 0x1F, 0x00, 0x05, 0x00, 0x01, 0xFF, 0x89, 0x99,
+            0x3D, 0x1D, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(dir.path().join("shot.png"), png).expect("write png");
+
+        let (text, images) = prepare_prompt(
+            "summarize @notes.txt and look at @shot.png please",
+            None,
+            dir.path(),
+            None,
+            false,
+        )
+        .expect("prepared");
+        assert!(text.contains("remember the milk"), "{text}");
+        assert!(text.contains("summarize and look at please"), "{text}");
+        assert!(!text.contains("@notes.txt"), "{text}");
+        assert_eq!(images.len(), 1, "the image is attached");
+
+        let (plain, none) =
+            prepare_prompt("no refs, @missing.txt stays", None, dir.path(), None, false)
+                .expect("prepared");
+        assert_eq!(plain, "no refs, @missing.txt stays");
+        assert!(none.is_empty());
+    }
+
+    /// A template invoked with an `@file` argument gets both: the file read
+    /// in and the template expanded (the template path used to skip files).
+    #[test]
+    fn prepare_prompt_expands_a_template_and_reads_its_file_argument() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("bug.txt"), "stack trace here\n").expect("write");
+        let mut resources = crate::resources::ResourceLoader::empty(true);
+        resources.push_prompt_for_tests(crate::resources::PromptTemplate {
+            name: "triage".to_string(),
+            description: String::new(),
+            content: "Triage the attached report.".to_string(),
+            source: "user".to_string(),
+            file_path: std::path::PathBuf::from("/tmp/triage.md"),
+        });
+        let (text, images) = prepare_prompt(
+            "/triage @bug.txt",
+            Some(&resources),
+            dir.path(),
+            None,
+            false,
+        )
+        .expect("prepared");
+        assert!(text.contains("stack trace here"), "{text}");
+        assert!(text.contains("Triage the attached report."), "{text}");
+        assert!(images.is_empty());
+    }
+
+    /// `/scoped-models` resolves globs and exact ids (full or bare, with a
+    /// thinking suffix), keeps pattern order, and rejects a bad glob.
+    #[test]
+    fn scope_models_matches_globs_and_exact_ids() {
+        let available: Vec<String> = [
+            "openai/gpt-4o",
+            "openai/gpt-5",
+            "anthropic/claude-sonnet-4-5",
+            "google/gemini-2.5-pro",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let pats = |p: &[&str]| p.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            scope_models(&pats(&["gpt-*"]), &available).unwrap(),
+            vec!["openai/gpt-4o", "openai/gpt-5"]
+        );
+        assert_eq!(
+            scope_models(
+                &pats(&["claude-sonnet-4-5:high", "google/gemini-2.5-pro"]),
+                &available
+            )
+            .unwrap(),
+            vec!["anthropic/claude-sonnet-4-5", "google/gemini-2.5-pro"]
+        );
+        assert!(
+            scope_models(&pats(&["nothing-like-it"]), &available)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(scope_models(&pats(&["[bad"]), &available).is_err());
+    }
+
+    /// Setting a scope narrows the live cycle and saves the patterns to the
+    /// project settings; a pattern that matches nothing leaves it alone.
+    #[test]
+    fn scoped_models_command_sets_the_cycle_and_saves_the_patterns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let available = vec![
+            String::from("openai/gpt-5"),
+            String::from("anthropic/claude-x"),
+        ];
+        let mut cycle = available.clone();
+        let reply = run_scoped_models_command("gpt-*", &available, &mut cycle, dir.path());
+        assert!(matches!(reply, PiMsg::System(ref text) if text.contains("1 model(s)")));
+        assert_eq!(cycle, vec![String::from("openai/gpt-5")]);
+        let saved = std::fs::read_to_string(dir.path().join(".pi").join("settings.json"))
+            .expect("project settings written");
+        assert!(saved.contains("gpt-*"), "{saved}");
+
+        let unchanged = run_scoped_models_command("zzz-*", &available, &mut cycle, dir.path());
+        assert!(matches!(unchanged, PiMsg::System(ref text) if text.contains("unchanged")));
+        assert_eq!(cycle, vec![String::from("openai/gpt-5")]);
+
+        run_scoped_models_command("clear", &available, &mut cycle, dir.path());
+        assert_eq!(cycle, available);
+    }
+
+    /// `/open` finds the newest link, in text or tool output, without the
+    /// punctuation that follows it in prose.
+    #[test]
+    fn last_url_finds_the_newest_link_without_trailing_punctuation() {
+        let (_tx, mut model) = new_model();
+        assert_eq!(last_url(&model.transcript), None);
+        model.push_entry(
+            EntryRole::Assistant,
+            String::from("Docs are at https://example.com/old."),
+        );
+        model.push_entry(
+            EntryRole::Assistant,
+            String::from("See (https://example.com/new?q=1), then rerun."),
+        );
+        model.push_entry(EntryRole::System, String::from("no link here"));
+        assert_eq!(
+            last_url(&model.transcript).as_deref(),
+            Some("https://example.com/new?q=1")
+        );
+    }
+
+    /// Up recalls earlier prompts newest first, down walks forward and ends
+    /// on the draft that was set aside; `/history` lists them.
+    #[test]
+    fn up_and_down_recall_sent_prompts_and_restore_the_draft() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, _submit_rx) = mpsc::channel::<UiCommand>();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx).with_submit_channel(submit_tx));
+        sim.init();
+        for prompt in ["first prompt", "second prompt"] {
+            type_str(&mut sim, prompt);
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            // The driver never answers here; let the next prompt submit idle.
+            sim.model_mut().state = AgentUiState::Ready;
+        }
+        type_str(&mut sim, "half a draft");
+        let up = || key(KeyCode::Up, Modifiers::empty());
+        let down = || key(KeyCode::Down, Modifiers::empty());
+        sim.inject_event(up());
+        assert_eq!(sim.model().input.text(), "second prompt");
+        sim.inject_event(up());
+        assert_eq!(sim.model().input.text(), "first prompt");
+        sim.inject_event(up());
+        assert_eq!(
+            sim.model().input.text(),
+            "first prompt",
+            "stays on the oldest"
+        );
+        sim.inject_event(down());
+        assert_eq!(sim.model().input.text(), "second prompt");
+        sim.inject_event(down());
+        assert_eq!(sim.model().input.text(), "half a draft");
+
+        sim.model_mut().input.set_text("");
+        type_str(&mut sim, "/history");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        let listing = &sim.model().transcript.last().expect("listing").text;
+        assert!(
+            listing.contains("2. second prompt") && listing.contains("3. first prompt"),
+            "{listing}"
+        );
+    }
+
+    /// A multi-line draft keeps up/down for moving between its own lines.
+    #[test]
+    fn up_in_a_multiline_draft_does_not_recall() {
+        let (_tx, mut model) = new_model();
+        model.record_history("an old prompt");
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.model_mut().input.set_text("line one\nline two");
+        sim.inject_event(key(KeyCode::Up, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "line one\nline two");
+    }
+
+    /// Recall walks past a multi-line entry in both directions and back to
+    /// the draft; it used to stop dead on the first multi-line entry.
+    #[test]
+    fn recall_walks_through_a_multiline_entry() {
+        let (_tx, mut model) = new_model();
+        model.record_history("oldest");
+        model.record_history("two\nlines");
+        model.record_history("newest");
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "draft");
+        let up = || key(KeyCode::Up, Modifiers::empty());
+        let down = || key(KeyCode::Down, Modifiers::empty());
+        sim.inject_event(up());
+        sim.inject_event(up());
+        assert_eq!(sim.model().input.text(), "two\nlines");
+        sim.inject_event(up());
+        assert_eq!(sim.model().input.text(), "oldest");
+        sim.inject_event(down());
+        sim.inject_event(down());
+        sim.inject_event(down());
+        assert_eq!(sim.model().input.text(), "draft");
+    }
+
+    /// A turn that thinks, speaks, calls a tool and speaks again reads in
+    /// that order. Text streamed before the tool used to be held back and
+    /// glued onto the post-tool text after every card.
+    #[test]
+    fn turn_entries_keep_their_order_around_a_tool_call() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ThinkingDelta("look first".into())));
+        sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta("Let me look.".into())));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "read".into(),
+            tool_id: "r1".into(),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "read".into(),
+            tool_id: "r1".into(),
+            is_error: false,
+            output: None,
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta("Found it.".into())));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        }));
+        let order: Vec<(EntryRole, &str)> = sim
+            .model()
+            .transcript
+            .iter()
+            .map(|e| (e.role, e.text.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (EntryRole::Thinking, "look first"),
+                (EntryRole::Assistant, "Let me look."),
+                (EntryRole::System, "read"),
+                (EntryRole::Assistant, "Found it."),
+            ]
+        );
+    }
+
+    /// Thinking shows as one line until ctrl+t, then in full, and back.
+    #[test]
+    fn ctrl_t_shows_and_hides_thinking() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ThinkingDelta(
+            "weigh option alpha\nweigh option beta".into(),
+        )));
+        sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta("beta.".into())));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        }));
+        let hidden = buffer_text(sim.capture_frame(80, 24), 80, 24);
+        assert!(hidden.contains("thinking · 2 lines (ctrl+t"), "{hidden}");
+        assert!(!hidden.contains("option beta"), "{hidden}");
+
+        sim.inject_event(key(KeyCode::Char('t'), Modifiers::CTRL));
+        let shown = buffer_text(sim.capture_frame(80, 24), 80, 24);
+        assert!(shown.contains("weigh option beta"), "{shown}");
+
+        sim.inject_event(key(KeyCode::Char('t'), Modifiers::CTRL));
+        let again = buffer_text(sim.capture_frame(80, 24), 80, 24);
+        assert!(!again.contains("option beta"), "{again}");
+    }
+
+    /// With `hideThinkingBlock` off (the launch default, as in OMP) thinking
+    /// shows in full from the start, and ctrl+t collapses it.
+    #[test]
+    fn thinking_starts_visible_when_the_setting_allows() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model.with_thinking_visible(true));
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ThinkingDelta(
+            "weigh option alpha\nweigh option beta".into(),
+        )));
+        // Live, while the model is still thinking...
+        let live = buffer_text(sim.capture_frame(80, 24), 80, 24);
+        assert!(live.contains("weigh option beta"), "{live}");
+        sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta("beta.".into())));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        }));
+        // ...and once the turn ends.
+        let shown = buffer_text(sim.capture_frame(80, 24), 80, 24);
+        assert!(shown.contains("weigh option beta"), "{shown}");
+        sim.inject_event(key(KeyCode::Char('t'), Modifiers::CTRL));
+        let hidden = buffer_text(sim.capture_frame(80, 24), 80, 24);
+        assert!(!hidden.contains("option beta"), "{hidden}");
+
+        // Collapsed, in-flight thinking still shows its one-line summary
+        // rather than nothing.
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ThinkingDelta("one\ntwo".into())));
+        let live = buffer_text(sim.capture_frame(80, 24), 80, 24);
+        assert!(live.contains("thinking · 2 lines (ctrl+t"), "{live}");
+        assert!(!live.contains("two"), "{live}");
+    }
+
+    /// A `/name` that is a prompt template expands into its text for a turn;
+    /// an extension command of the same name keeps the name, and anything
+    /// else is not a template.
+    #[test]
+    fn prompt_templates_expand_unless_an_extension_claims_the_name() {
+        let mut resources = crate::resources::ResourceLoader::empty(true);
+        resources.push_prompt_for_tests(crate::resources::PromptTemplate {
+            name: "fix".to_string(),
+            description: "Fix a bug".to_string(),
+            content: "Find and fix the bug in $1".to_string(),
+            source: "user".to_string(),
+            file_path: std::path::PathBuf::from("/tmp/fix.md"),
+        });
+        assert_eq!(
+            template_prompt(Some(&resources), false, "fix", "src/parser.rs").as_deref(),
+            Some("Find and fix the bug in src/parser.rs")
+        );
+        assert_eq!(template_prompt(Some(&resources), true, "fix", "x"), None);
+        assert_eq!(template_prompt(Some(&resources), false, "nope", ""), None);
+        assert_eq!(template_prompt(None, false, "fix", ""), None);
+    }
+
+    /// `/reload` re-reads prompt templates: one added after launch expands
+    /// afterwards, and the completion catalog lists it next to the session's
+    /// extension commands.
+    #[test]
+    fn reload_picks_up_a_prompt_template_added_after_launch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = ResourceSource {
+            package_manager: crate::package_manager::PackageManager::new(dir.path().to_path_buf()),
+            config: crate::config::Config::default(),
+            cli: crate::resources::ResourceCliOptions {
+                no_skills: true,
+                no_prompt_templates: false,
+                no_extensions: true,
+                no_themes: true,
+                skill_paths: Vec::new(),
+                prompt_paths: Vec::new(),
+                extension_paths: Vec::new(),
+                theme_paths: Vec::new(),
+            },
+        };
+        let prompts = dir.path().join(".pi").join("prompts");
+        std::fs::create_dir_all(&prompts).expect("prompts dir");
+        std::fs::write(
+            prompts.join("triage.md"),
+            "---\ndescription: Triage an issue\n---\nTriage issue $1",
+        )
+        .expect("write template");
+
+        let (tx, rx) = mpsc::channel();
+        let mut resources = None;
+        let mut catalog = AutocompleteCatalog::default();
+        let ext = vec![crate::autocomplete::NamedEntry {
+            name: String::from("ext-cmd"),
+            description: None,
+        }];
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(reload_driver_resources(
+            &source,
+            dir.path(),
+            ext,
+            &mut resources,
+            &mut catalog,
+            &tx,
+        ));
+
+        assert_eq!(
+            template_prompt(resources.as_ref(), false, "triage", "#12").as_deref(),
+            Some("Triage issue #12")
+        );
+        assert!(catalog.prompt_templates.iter().any(|t| t.name == "triage"));
+        let Ok(PiMsg::AutocompleteCatalog(sent)) = rx.try_recv() else {
+            panic!("the refreshed catalog goes to the UI");
+        };
+        assert!(sent.prompt_templates.iter().any(|t| t.name == "triage"));
+        assert!(sent.extension_commands.iter().any(|c| c.name == "ext-cmd"));
+    }
+
+    /// ctrl+o expands a long tool result the card keeps and collapses it
+    /// again; collapsed, the card says how much it hides.
+    #[test]
+    fn ctrl_o_expands_and_collapses_tool_output() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let output = (1..=20)
+            .map(|n| format!("row{n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "grep".into(),
+            tool_id: "g1".into(),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "grep".into(),
+            tool_id: "g1".into(),
+            is_error: false,
+            output: Some(output),
+        }));
+        let collapsed = buffer_text(sim.capture_frame(80, 40), 80, 40);
+        assert!(collapsed.contains("row08"), "{collapsed}");
+        assert!(!collapsed.contains("row09"), "{collapsed}");
+        assert!(collapsed.contains("+12 more lines (ctrl+o"), "{collapsed}");
+
+        sim.inject_event(key(KeyCode::Char('o'), Modifiers::CTRL));
+        let expanded = buffer_text(sim.capture_frame(80, 40), 80, 40);
+        assert!(expanded.contains("row20"), "{expanded}");
+        assert!(!expanded.contains("ctrl+o to expand"), "{expanded}");
+
+        sim.inject_event(key(KeyCode::Char('o'), Modifiers::CTRL));
+        let again = buffer_text(sim.capture_frame(80, 40), 80, 40);
+        assert!(!again.contains("row20"), "{again}");
+    }
+
+    #[test]
+    fn collapse_detail_counts_lines_the_source_already_elided() {
+        let mut body: Vec<&str> = vec!["x"; 10];
+        body.push("… +300 more lines");
+        let (shown, hidden) = collapse_detail(&body);
+        assert_eq!(shown.len(), COLLAPSED_DETAIL_LINES);
+        assert_eq!(hidden, 2 + 300);
+        let (shown, hidden) = collapse_detail(&["a", "b"]);
+        assert_eq!((shown.len(), hidden), (2, 0));
+    }
+
     #[test]
     fn word_diff_parts_pairs_shared_framing() {
         let (prefix, removed_mid, added_mid, suffix) =
@@ -7379,26 +15454,26 @@ mod tests {
             finish_turn(&mut sim, &format!("message **{i}** body"));
         }
         assert_eq!(sim.model().transcript.len(), 4);
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         assert_eq!(
             sim.model().render_stats.get(),
             (4, 0),
             "cold frame renders every block"
         );
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         assert_eq!(
             sim.model().render_stats.get(),
             (0, 4),
             "warm frame must reuse every unchanged block"
         );
         finish_turn(&mut sim, "one more");
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         assert_eq!(
             sim.model().render_stats.get(),
             (1, 4),
             "only the new entry may render"
         );
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         assert_eq!(sim.model().render_stats.get(), (0, 5));
     }
 
@@ -7413,8 +15488,8 @@ mod tests {
             name: "bash".into(),
             tool_id: "t1".into(),
         }));
-        let _ = sim.model().conversation_text();
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         assert_eq!(
             sim.model().render_stats.get(),
             (1, 1),
@@ -7431,13 +15506,13 @@ mod tests {
             stop_reason: StopReason::Stop,
             error_message: None,
         }));
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         let (rendered, _) = sim.model().render_stats.get();
         assert!(
             rendered >= 1,
             "the settled card must re-render once after mutation"
         );
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         let (rendered, reused) = sim.model().render_stats.get();
         assert_eq!(rendered, 0, "settled card caches like any other block");
         assert_eq!(reused, sim.model().transcript.len());
@@ -7450,7 +15525,7 @@ mod tests {
         sim.init();
         sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
         sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta("streaming tail".into())));
-        let text = sim.model().conversation_text();
+        let text = sim.model().conversation_text(TEST_BODY_WIDTH);
         assert!(
             text.lines()
                 .iter()
@@ -7470,13 +15545,13 @@ mod tests {
         let mut sim = ProgramSimulator::new(model);
         sim.init();
         finish_turn(&mut sim, "themed message");
-        let _ = sim.model().conversation_text();
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         assert_eq!(sim.model().render_stats.get(), (0, 1));
         type_str(&mut sim, "/theme");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty())); // apply "dark"
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(TEST_BODY_WIDTH);
         let (rendered, reused) = sim.model().render_stats.get();
         assert_eq!(reused, 0, "theme change must drop every cached block");
         assert_eq!(rendered, sim.model().transcript.len());
@@ -7498,16 +15573,18 @@ mod tests {
             height: 24,
         });
         finish_turn(&mut sim, source);
-        let widest = |model: &PiFtuiModel| {
+        // The body width is the render argument, matching `render_frame`;
+        // the resize events drive the cache-invalidation half of the test.
+        let widest = |model: &PiFtuiModel, width: u16| {
             model
-                .conversation_text()
+                .conversation_text(width)
                 .lines()
                 .iter()
                 .map(|line| line.to_plain_text().chars().count())
                 .max()
                 .unwrap_or(0)
         };
-        let narrow = widest(sim.model());
+        let narrow = widest(sim.model(), 48);
         assert!(
             narrow <= 48,
             "table must be fitted to a 48-column terminal, widest rendered line is {narrow}"
@@ -7518,23 +15595,23 @@ mod tests {
             width: 120,
             height: 24,
         });
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(120);
         let (rendered, reused) = sim.model().render_stats.get();
         assert_eq!(reused, 0, "width change must drop every cached block");
         assert_eq!(rendered, sim.model().transcript.len());
-        let wide = widest(sim.model());
+        let wide = widest(sim.model(), 120);
         assert!(
             wide > narrow,
             "a wider terminal must let the table use more width (narrow={narrow}, wide={wide})"
         );
 
         // A height-only resize keeps the cache warm.
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(120);
         sim.inject_event(Event::Resize {
             width: 120,
             height: 40,
         });
-        let _ = sim.model().conversation_text();
+        let _ = sim.model().conversation_text(120);
         let (_, reused) = sim.model().render_stats.get();
         assert!(
             reused > 0,
@@ -7554,7 +15631,7 @@ mod tests {
             sim.init();
             finish_turn(&mut sim, source);
             sim.model()
-                .conversation_text()
+                .conversation_text(TEST_BODY_WIDTH)
                 .lines()
                 .iter()
                 .map(ftui::text::Line::to_plain_text)
@@ -7710,6 +15787,276 @@ mod tests {
             output: None,
         }));
         assert!(sim.model().busy.is_none(), "ToolEnd settles the busy op");
+    }
+
+    // ── Issue #227: the conversation body must wrap, not clip ───────────
+
+    /// Widths spanning a narrow pane, the usual defaults, and the very wide
+    /// terminal in the report (3840 px at ~16 px/cell is ~240 columns).
+    const WRAP_WIDTHS: [u16; 5] = [40, 80, 120, 200, 240];
+
+    /// Sentinel at the end of a paragraph far longer than any width under
+    /// test: it can only reach the screen if the line wrapped.
+    const WRAP_TAIL: &str = "ENDMARK";
+
+    fn wrap_probe_paragraph() -> String {
+        format!(
+            "The sky appears blue because of a phenomenon called Rayleigh scattering, \
+             in which the shorter wavelengths of visible light are scattered far more \
+             strongly by the molecules of the atmosphere than the longer red \
+             wavelengths are, which is also the reason sunsets turn red once the light \
+             has to travel a much greater distance through the air {WRAP_TAIL}"
+        )
+    }
+
+    fn plain_lines(text: &Text<'static>) -> Vec<String> {
+        text.lines()
+            .iter()
+            .map(ftui::text::Line::to_plain_text)
+            .collect()
+    }
+
+    /// Issue #227: long answer lines were clipped at the right edge of the
+    /// conversation body instead of wrapping, so everything past the frame
+    /// width was silently lost. Tail-follow keeps the end of the answer on
+    /// screen, so the sentinel must be visible at every width.
+    #[test]
+    fn long_answer_lines_wrap_at_every_terminal_width() {
+        for width in WRAP_WIDTHS {
+            let (_tx, mut model) = new_model();
+            model.push_entry(EntryRole::Assistant, wrap_probe_paragraph());
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            let height = 40_u16;
+            let rendered = buffer_text(sim.capture_frame(width, height), width, height);
+            assert!(
+                rendered.contains(WRAP_TAIL),
+                "width {width}: answer clipped instead of wrapped:\n{rendered}"
+            );
+        }
+    }
+
+    /// Every rendered body line must fit the body width, and the answer's
+    /// words must survive in order — wrapping may move a word to the next
+    /// row but may never drop or reorder one.
+    #[test]
+    fn wrapped_body_lines_fit_the_width_and_keep_every_word() {
+        let source = wrap_probe_paragraph();
+        let expected: Vec<&str> = source.split_whitespace().collect();
+        for width in WRAP_WIDTHS {
+            let (_tx, mut model) = new_model();
+            model.push_entry(EntryRole::Assistant, source.clone());
+            let text = model.conversation_text(width);
+            for line in text.lines() {
+                assert!(
+                    line.width() <= usize::from(width),
+                    "width {width}: line overflows by {} cells: {:?}",
+                    line.width() - usize::from(width),
+                    line.to_plain_text()
+                );
+            }
+            let words: Vec<String> = plain_lines(&text)
+                .join(" ")
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(
+                words, expected,
+                "width {width}: wrapping altered the answer text"
+            );
+        }
+    }
+
+    /// An unbroken token longer than the row (a URL, a hash) must hard-break
+    /// rather than overflow, and no character may be dropped.
+    #[test]
+    fn unbreakable_tokens_hard_break_instead_of_overflowing() {
+        let url = format!(
+            "https://example.com/{}/end",
+            "segment-with-no-spaces-at-all".repeat(6)
+        );
+        for width in [20_u16, 40, 80] {
+            let (_tx, mut model) = new_model();
+            model.push_entry(EntryRole::Assistant, url.clone());
+            let text = model.conversation_text(width);
+            for line in text.lines() {
+                assert!(
+                    line.width() <= usize::from(width),
+                    "width {width}: unbroken token overflowed: {:?}",
+                    line.to_plain_text()
+                );
+            }
+            let joined: String = plain_lines(&text)
+                .iter()
+                .flat_map(|line| line.chars())
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            let want: String = url.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                joined.contains(&want),
+                "width {width}: hard break lost characters: {joined:?}"
+            );
+        }
+    }
+
+    /// Double-width characters are measured in cells, so a CJK answer must
+    /// still fit. Widths stay above the degenerate case where one glyph is
+    /// wider than the whole row.
+    #[test]
+    fn wide_characters_wrap_by_display_cells() {
+        let cjk = "天空之所以是蓝色的是因为瑞利散射现象".repeat(8);
+        for width in [10_u16, 40, 80, 240] {
+            let (_tx, mut model) = new_model();
+            model.push_entry(EntryRole::Assistant, cjk.clone());
+            let text = model.conversation_text(width);
+            for line in text.lines() {
+                assert!(
+                    line.width() <= usize::from(width),
+                    "width {width}: wide-char line overflowed: {:?}",
+                    line.to_plain_text()
+                );
+            }
+        }
+    }
+
+    /// A wrapped list item must hang under its own text rather than sliding
+    /// back to the margin, and the bullet must not be repeated on every row.
+    #[test]
+    fn wrapped_list_items_hang_under_their_marker() {
+        let source = format!(
+            "- {} {WRAP_TAIL}",
+            "a list item whose body runs well past the frame ".repeat(3)
+        );
+        let (_tx, mut model) = new_model();
+        model.push_entry(EntryRole::Assistant, source);
+        let lines = plain_lines(&model.conversation_text(40));
+        let start = lines
+            .iter()
+            .position(|line| line.contains("a list item"))
+            .expect("list item rendered");
+        let tail = lines
+            .iter()
+            .position(|line| line.contains(WRAP_TAIL))
+            .expect("list item tail rendered");
+        assert!(tail > start, "the list item must have wrapped: {lines:?}");
+        // Cells, not bytes: the bullet glyph is multi-byte but one cell wide.
+        let text_at = lines[start]
+            .find("a list item")
+            .expect("marker precedes the text");
+        let marker_cells = display_width(&lines[start][..text_at]);
+        assert!(
+            marker_cells > 0,
+            "markdown emits a bullet marker: {lines:?}"
+        );
+        for line in &lines[start + 1..=tail] {
+            assert!(
+                line.starts_with(&" ".repeat(marker_cells)),
+                "continuation lost the hanging indent: {line:?} in {lines:?}"
+            );
+            assert!(
+                !line.trim_start().starts_with('•'),
+                "the bullet must not repeat on continuations: {line:?}"
+            );
+        }
+    }
+
+    /// A fenced code block's indent is real whitespace and carries the block
+    /// tint; wrapped rows keep it so the block stays a column.
+    #[test]
+    fn wrapped_code_block_rows_keep_their_indent() {
+        let long = format!("let value = \"{}\"; // {WRAP_TAIL}", "x".repeat(30));
+        let source = format!("```rust\n{long}\n```");
+        let (_tx, mut model) = new_model();
+        model.push_entry(EntryRole::Assistant, source);
+        let lines = plain_lines(&model.conversation_text(40));
+        let start = lines
+            .iter()
+            .position(|line| line.contains("let value"))
+            .expect("code line rendered");
+        let tail = lines
+            .iter()
+            .position(|line| line.contains(WRAP_TAIL))
+            .expect("code tail rendered");
+        assert!(tail > start, "the code line must have wrapped: {lines:?}");
+        let indent = lines[start].len() - lines[start].trim_start().len();
+        assert!(indent > 0, "code blocks are indented: {lines:?}");
+        for line in &lines[start + 1..=tail] {
+            assert!(
+                line.starts_with(&" ".repeat(indent)),
+                "code continuation lost its column: {line:?} in {lines:?}"
+            );
+        }
+    }
+
+    /// The render cache stores wrapped lines, so it is width-specific: a
+    /// frame at a new width must re-render every block rather than reuse
+    /// rows wrapped for the old one.
+    #[test]
+    fn render_cache_is_dropped_when_the_body_width_changes() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for i in 0..4 {
+            finish_turn(&mut sim, &format!("message **{i}** body"));
+        }
+        let _ = sim.model().conversation_text(80);
+        assert_eq!(sim.model().render_stats.get(), (4, 0), "cold frame");
+        let _ = sim.model().conversation_text(80);
+        assert_eq!(sim.model().render_stats.get(), (0, 4), "warm frame reuses");
+        let _ = sim.model().conversation_text(120);
+        assert_eq!(
+            sim.model().render_stats.get(),
+            (4, 0),
+            "a width change must invalidate wrapped blocks"
+        );
+        let _ = sim.model().conversation_text(120);
+        assert_eq!(sim.model().render_stats.get(), (0, 4), "then stay warm");
+    }
+
+    /// The body is sliced to the visible window, so a transcript far longer
+    /// than the frame still shows its tail. This is the same arithmetic that
+    /// used to run through a `u16` scroll offset, which saturates past 65535
+    /// rows; the slice has no such ceiling.
+    #[test]
+    fn deep_transcript_still_renders_its_tail() {
+        let (_tx, mut model) = new_model();
+        for i in 0..2000 {
+            model.push_entry(EntryRole::System, format!("line-{i}"));
+        }
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let (width, height) = (40_u16, 12_u16);
+        let rendered = buffer_text(sim.capture_frame(width, height), width, height);
+        assert!(
+            rendered.contains("line-1999"),
+            "tail-follow lost the newest line:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("line-0 "),
+            "the top of the transcript must be scrolled off:\n{rendered}"
+        );
+    }
+
+    /// The scroll math counts wrapped rows: tail-follow must land on the end
+    /// of a long answer, not on the row the unwrapped count pointed at.
+    #[test]
+    fn scroll_total_counts_wrapped_rows() {
+        let (_tx, mut model) = new_model();
+        model.push_entry(EntryRole::Assistant, wrap_probe_paragraph());
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let narrow = sim.model().conversation_text(40).lines().len();
+        let wide = sim.model().conversation_text(240).lines().len();
+        assert!(
+            narrow > wide,
+            "a narrower body must produce more rows: narrow={narrow}, wide={wide}"
+        );
+        let _ = sim.capture_frame(40, 20);
+        assert_eq!(
+            sim.model().rendered_total_lines.get(),
+            narrow,
+            "the frame must record the wrapped total"
+        );
     }
 }
 

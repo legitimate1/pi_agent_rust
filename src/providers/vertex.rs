@@ -12,22 +12,24 @@
 
 use crate::error::{Error, Result};
 use crate::http::client::Client;
-use crate::model::{
-    AssistantMessage, ContentBlock, StopReason, StreamEvent, TextContent, ToolCall, Usage,
-};
+use crate::model::StreamEvent;
+#[cfg(test)]
+use crate::model::{ContentBlock, StopReason, TextContent};
 use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions};
 use crate::providers::gemini::{
-    self, GeminiCandidate, GeminiContent, GeminiFunctionCall, GeminiFunctionCallingConfig,
-    GeminiGenerationConfig, GeminiPart, GeminiRequest, GeminiStreamResponse, GeminiTool,
-    GeminiToolConfig,
+    self, GeminiContent, GeminiFunctionCallingConfig, GeminiGenerationConfig, GeminiPart,
+    GeminiRequest, GeminiTool, GeminiToolConfig, StreamState,
 };
 use crate::sse::SseStream;
 use async_trait::async_trait;
+#[cfg(test)]
 use futures::StreamExt;
-use futures::stream::{self, Stream};
-use std::collections::VecDeque;
+use futures::stream::Stream;
 use std::pin::Pin;
+
+#[cfg(test)]
+mod tests_transport;
 
 // ============================================================================
 // Constants
@@ -161,20 +163,25 @@ impl VertexProvider {
         let method = if self.publisher == "anthropic" {
             "streamRawPredict"
         } else {
-            "streamGenerateContent"
+            "streamGenerateContent?alt=sse"
+        };
+        // Global requests use the unprefixed host, not the non-existent
+        // global-aiplatform.googleapis.com endpoint.
+        let host = if location == "global" {
+            "aiplatform.googleapis.com".to_string()
+        } else {
+            format!("{location}-aiplatform.googleapis.com")
         };
 
         format!(
-            "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:{method}",
-            location = location,
-            project = project,
+            "https://{host}/v1/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:{method}",
             publisher = self.publisher,
             model = self.model,
-            method = method,
         )
     }
 
-    /// Build the Gemini-format request body (for Google-native models).
+    /// Build the base Gemini request. Live requests apply model-specific
+    /// thinking controls before the request-rewrite hook.
     #[allow(clippy::unused_self)]
     pub fn build_gemini_request(
         &self,
@@ -252,47 +259,51 @@ impl Provider for VertexProvider {
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        // Resolve auth: Bearer token for Vertex AI.
-        let auth_value = options
-            .api_key
-            .clone()
-            .or_else(|| std::env::var("GOOGLE_CLOUD_API_KEY").ok())
-            .or_else(|| std::env::var("VERTEX_API_KEY").ok())
-            .ok_or_else(|| {
-                Error::provider(
-                    "google-vertex",
-                    "Missing Vertex AI API key / access token. \
-                     Set GOOGLE_CLOUD_API_KEY or VERTEX_API_KEY.",
-                )
-            })?;
-
+        // Select the protocol before dispatch. An unknown publisher must not
+        // receive a Gemini request with the user's Google credentials.
+        if !matches!(self.publisher.as_str(), "google" | "anthropic") {
+            return Err(Error::provider(
+                self.name(),
+                "Unsupported Vertex AI publisher",
+            ));
+        }
+        let authorization = vertex_authorization(options, self.compat.as_ref(), |name| {
+            std::env::var(name).ok()
+        })?;
         let project = self.resolve_project()?;
         let location = self.resolve_location();
         let url = self.streaming_url(&project, &location);
 
-        // Build request body in Gemini format (Google-native models).
+        if self.publisher == "anthropic" {
+            let provider = super::anthropic::AnthropicProvider::new(self.model.clone())
+                .with_provider_name(self.name())
+                .with_base_url(url)
+                .with_client(self.client.clone())
+                .with_compat(self.compat.clone());
+            return Box::pin(provider.stream_vertex(context, options, &authorization)).await;
+        }
+
+        // Apply the same native thinking contract as Developer API and CLI.
         let request_body = self.build_gemini_request(context, options);
-
-        // Build HTTP request with Bearer auth.
-        let mut request = self
-            .client
-            .post(&url)
-            .header("Accept", "text/event-stream")
-            .header("Authorization", format!("Bearer {auth_value}"));
-
-        // Apply provider-specific custom headers from compat config.
-        if let Some(compat) = &self.compat
-            && let Some(custom_headers) = &compat.custom_headers
+        let request_body = gemini::reasoning::prepare_request(&self.model, options, &request_body)?;
+        let mut request = self.client.post(&url).header("Accept", "text/event-stream");
+        if let Some(headers) = self
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.custom_headers.as_ref())
         {
-            for (key, value) in custom_headers {
-                request = request.header(key, value);
-            }
+            request = super::apply_headers_ignoring_blank_auth_overrides(
+                request,
+                headers,
+                &["authorization"],
+            );
         }
-
-        // Per-request headers from `StreamOptions` (highest priority).
-        for (key, value) in &options.headers {
-            request = request.header(key, value);
-        }
+        request = super::apply_headers_ignoring_blank_auth_overrides(
+            request,
+            &options.headers,
+            &["authorization"],
+        );
+        request = request.header("Authorization", authorization);
 
         let rewritten_body = super::offer_before_provider_request(
             options,
@@ -322,267 +333,57 @@ impl Provider for VertexProvider {
             ));
         }
 
-        // Create SSE stream for streaming responses.
-        let event_source = SseStream::new(response.bytes_stream());
-
-        // Create stream state — same response format as Gemini.
-        let model = self.model.clone();
-        let api = self.api().to_string();
-        let provider = self.name().to_string();
-
-        let stream = stream::unfold(
-            StreamState::new(event_source, model, api, provider),
-            |mut state| async move {
-                if state.finished {
-                    return None;
-                }
-                loop {
-                    // Drain pending events before polling for more SSE data.
-                    if let Some(event) = state.pending_events.pop_front() {
-                        return Some((Ok(event), state));
-                    }
-
-                    match state.event_source.next().await {
-                        Some(Ok(msg)) => {
-                            state.transient_error_count = 0;
-                            if msg.event == "ping" {
-                                continue;
-                            }
-
-                            if let Err(e) = state.process_event(&msg.data) {
-                                state.finished = true;
-                                return Some((Err(e), state));
-                            }
-                        }
-                        Some(Err(e)) => {
-                            // WriteZero, WouldBlock, and TimedOut errors are treated as transient.
-                            // Skip them and keep reading the stream, but cap
-                            // consecutive occurrences to avoid infinite loops.
-                            const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 5;
-                            if e.kind() == std::io::ErrorKind::WriteZero
-                                || e.kind() == std::io::ErrorKind::WouldBlock
-                                || e.kind() == std::io::ErrorKind::TimedOut
-                            {
-                                state.transient_error_count += 1;
-                                if state.transient_error_count <= MAX_CONSECUTIVE_TRANSIENT_ERRORS {
-                                    tracing::warn!(
-                                        kind = ?e.kind(),
-                                        count = state.transient_error_count,
-                                        "Transient error in SSE stream, continuing"
-                                    );
-                                    continue;
-                                }
-                                tracing::warn!(
-                                    kind = ?e.kind(),
-                                    "Error persisted after {MAX_CONSECUTIVE_TRANSIENT_ERRORS} \
-                                     consecutive attempts, treating as fatal"
-                                );
-                            }
-                            state.finished = true;
-                            let err = Error::sse(&e);
-                            return Some((Err(err), state));
-                        }
-                        None => {
-                            // Stream ended naturally.
-                            state.finished = true;
-                            let reason = state.partial.stop_reason;
-                            let message = std::mem::take(&mut state.partial);
-                            return Some((Ok(StreamEvent::Done { reason, message }), state));
-                        }
-                    }
-                }
-            },
+        // Google-native Vertex shares the exact decoder, content lifecycle,
+        // usage state and terminal-error handling with the other Google routes.
+        let state = StreamState::new(
+            SseStream::new(response.bytes_stream()),
+            self.model.clone(),
+            self.api().to_string(),
+            self.name().to_string(),
         );
-
-        Ok(Box::pin(stream))
+        Ok(Box::pin(state.into_stream(false)))
     }
 }
 
-// ============================================================================
-// Stream State (reuses Gemini response format)
-// ============================================================================
-
-struct StreamState<S>
-where
-    S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
-{
-    event_source: SseStream<S>,
-    partial: AssistantMessage,
-    pending_events: VecDeque<StreamEvent>,
-    started: bool,
-    finished: bool,
-    /// Consecutive WriteZero errors seen without a successful event in between.
-    transient_error_count: usize,
-}
-
-impl<S> StreamState<S>
-where
-    S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
-{
-    fn new(event_source: SseStream<S>, model: String, api: String, provider: String) -> Self {
-        Self {
-            event_source,
-            partial: AssistantMessage {
-                content: Vec::new(),
-                api,
-                provider,
-                model,
-                usage: Usage::default(),
-                stop_reason: StopReason::Stop,
-                stop_details: None,
-                error_message: None,
-                timestamp: chrono::Utc::now().timestamp_millis(),
-            },
-            pending_events: VecDeque::new(),
-            started: false,
-            finished: false,
-            transient_error_count: 0,
-        }
-    }
-
-    fn process_event(&mut self, data: &str) -> Result<()> {
-        let response: GeminiStreamResponse = serde_json::from_str(data)
-            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
-
-        // Handle usage metadata.
-        if let Some(metadata) = response.usage_metadata {
-            self.partial.usage.input = metadata.prompt_token_count.unwrap_or(0);
-            self.partial.usage.output = metadata.candidates_token_count.unwrap_or(0);
-            self.partial.usage.total_tokens = metadata.total_token_count.unwrap_or(0);
-        }
-
-        // Process candidates.
-        if let Some(candidates) = response.candidates
-            && let Some(candidate) = candidates.into_iter().next()
-        {
-            self.process_candidate(candidate)?;
-        }
-
-        Ok(())
-    }
-
-    #[allow(clippy::unnecessary_wraps)]
-    fn process_candidate(&mut self, candidate: GeminiCandidate) -> Result<()> {
-        // Handle finish reason.
-        if let Some(ref reason) = candidate.finish_reason {
-            self.partial.stop_reason = match reason.as_str() {
-                "MAX_TOKENS" => StopReason::Length,
-                "SAFETY" | "RECITATION" | "OTHER" => StopReason::Error,
-                "FUNCTION_CALL" => StopReason::ToolUse,
-                _ => StopReason::Stop,
-            };
-        }
-
-        // Process content parts — queue all events into pending_events.
-        if let Some(content) = candidate.content {
-            for part in content.parts {
-                match part {
-                    GeminiPart::Text { text } => {
-                        let last_is_text =
-                            matches!(self.partial.content.last(), Some(ContentBlock::Text(_)));
-                        if !last_is_text {
-                            let content_index = self.partial.content.len();
-                            self.partial
-                                .content
-                                .push(ContentBlock::Text(TextContent::new("")));
-
-                            self.ensure_started();
-
-                            self.pending_events
-                                .push_back(StreamEvent::TextStart { content_index });
-                        }
-                        let content_index = self.partial.content.len() - 1;
-
-                        if let Some(ContentBlock::Text(t)) =
-                            self.partial.content.get_mut(content_index)
-                        {
-                            t.text.push_str(&text);
-                        }
-
-                        self.ensure_started();
-
-                        self.pending_events.push_back(StreamEvent::TextDelta {
-                            content_index,
-                            delta: text,
-                        });
-                    }
-                    GeminiPart::FunctionCall { function_call } => {
-                        let id = format!("call_{}", uuid::Uuid::new_v4().simple());
-
-                        let args_str = serde_json::to_string(&function_call.args)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        let GeminiFunctionCall { name, args } = function_call;
-
-                        let tool_call = ToolCall {
-                            id,
-                            name,
-                            arguments: args,
-                            thought_signature: None,
-                        };
-
-                        self.partial
-                            .content
-                            .push(ContentBlock::ToolCall(tool_call.clone()));
-                        let content_index = self.partial.content.len() - 1;
-
-                        self.partial.stop_reason = StopReason::ToolUse;
-
-                        self.ensure_started();
-
-                        self.pending_events.push_back(StreamEvent::ToolCallStart {
-                            content_index,
-                            id: tool_call.id.clone(),
-                            name: tool_call.name.clone(),
-                        });
-                        self.pending_events.push_back(StreamEvent::ToolCallDelta {
-                            content_index,
-                            delta: args_str,
-                        });
-                        self.pending_events.push_back(StreamEvent::ToolCallEnd {
-                            content_index,
-                            tool_call,
-                        });
-                    }
-                    GeminiPart::InlineData { .. }
-                    | GeminiPart::FunctionResponse { .. }
-                    | GeminiPart::Unknown(_) => {
-                        // Input-only parts are skipped.
-                        // Unknown parts are also skipped so new Gemini API part
-                        // variants don't break streaming.
-                    }
-                }
-            }
-        }
-
-        // Emit TextEnd/ThinkingEnd for all open text/thinking blocks when a finish reason
-        // is present.
-        if candidate.finish_reason.is_some() {
-            for (content_index, block) in self.partial.content.iter().enumerate() {
-                if let ContentBlock::Text(t) = block {
-                    self.pending_events.push_back(StreamEvent::TextEnd {
-                        content_index,
-                        content: t.text.clone(),
-                    });
-                } else if let ContentBlock::Thinking(t) = block {
-                    self.pending_events.push_back(StreamEvent::ThinkingEnd {
-                        content_index,
-                        content: t.thinking.clone(),
-                    });
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn ensure_started(&mut self) {
-        if !self.started {
-            self.started = true;
-            self.pending_events.push_back(StreamEvent::Start {
-                partial: self.partial.clone(),
+/// Resolve only Google-scoped credentials, with case-insensitive non-empty
+/// request headers taking precedence over compatibility headers and tokens.
+fn vertex_authorization(
+    options: &StreamOptions,
+    compat: Option<&CompatConfig>,
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String> {
+    let explicit =
+        super::first_non_empty_header_value_case_insensitive(&options.headers, &["authorization"])
+            .or_else(|| {
+                compat
+                    .and_then(|compat| compat.custom_headers.as_ref())
+                    .and_then(|headers| {
+                        super::first_non_empty_header_value_case_insensitive(
+                            headers,
+                            &["authorization"],
+                        )
+                    })
             });
-        }
+    if let Some(authorization) = explicit {
+        return Ok(authorization);
     }
+    let non_empty = |value: String| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    let token = options
+        .api_key
+        .clone()
+        .and_then(non_empty)
+        .or_else(|| env_lookup("GOOGLE_CLOUD_API_KEY").and_then(non_empty))
+        .or_else(|| env_lookup("VERTEX_API_KEY").and_then(non_empty))
+        .ok_or_else(|| {
+            Error::provider(
+                "google-vertex",
+                "Missing Vertex AI access token. Configure Google credentials, an Authorization header, or GOOGLE_CLOUD_API_KEY / VERTEX_API_KEY.",
+            )
+        })?;
+    Ok(format!("Bearer {token}"))
 }
 
 // ============================================================================
@@ -647,19 +448,18 @@ fn parse_vertex_base_url(base_url: &str) -> (Option<String>, Option<String>, Opt
         return (None, None, None);
     }
 
-    // Extract location from hostname: "{location}-aiplatform.googleapis.com"
-    let location_from_host = base_url
-        .strip_prefix("https://")
-        .or_else(|| base_url.strip_prefix("http://"))
-        .and_then(|rest| rest.split('-').next())
-        .and_then(|loc| {
-            // Validate it looks like a region (e.g. "us", "europe", "asia").
-            if loc.chars().all(|c| c.is_ascii_lowercase() || c == '-') && !loc.is_empty() {
-                Some(loc.to_string())
-            } else {
-                None
-            }
-        });
+    // Keep the complete region (us-east5, not just us), and never infer a
+    // location from an unrelated custom hostname. Explicit path fields below
+    // still take precedence over this host-derived fallback.
+    let location_from_host = url::Url::parse(base_url).ok().and_then(|url| {
+        let host = url.host_str()?;
+        if host == "aiplatform.googleapis.com" {
+            return Some("global".to_string());
+        }
+        host.strip_suffix("-aiplatform.googleapis.com")
+            .filter(|location| !location.is_empty())
+            .map(ToString::to_string)
+    });
 
     // Extract project, location, publisher from path segments.
     let path_segments: Vec<&str> = base_url.split('/').collect();
@@ -716,7 +516,7 @@ mod tests {
         let url = provider.streaming_url("my-project", "us-central1");
         assert_eq!(
             url,
-            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-2.0-flash:streamGenerateContent"
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-2.0-flash:streamGenerateContent?alt=sse"
         );
     }
 
@@ -1017,6 +817,141 @@ mod tests {
         );
     }
 
+    /// gh #213 (truncated streams): a transport close before any chunk with
+    /// `finishReason` must be an error, never a `Done` that commits the
+    /// partial text as a clean stop.
+    #[test]
+    fn test_stream_eof_before_finish_reason_is_an_error() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let error =
+            runtime.block_on(async move {
+                let event = serde_json::json!({
+                    "candidates": [{"content": {"parts": [{"text": "partial"}]}}]
+                });
+                let byte_stream = stream::iter(vec![Ok(format!("data: {event}\n\n").into_bytes())]);
+                let mut state = StreamState::new(
+                    crate::sse::SseStream::new(Box::pin(byte_stream)),
+                    "gemini-test".to_string(),
+                    "google-vertex".to_string(),
+                    "google-vertex".to_string(),
+                );
+                while let Some(item) = state.event_source.next().await {
+                    let msg = item.expect("SSE event");
+                    state.process_event(&msg.data).expect("process_event");
+                }
+                assert!(state.pending_events.iter().any(
+                    |e| matches!(e, StreamEvent::TextDelta { delta, .. } if delta == "partial")
+                ));
+                state.finish_at_eof().expect_err("EOF without finishReason")
+            });
+        let text = error.to_string();
+        assert!(text.contains("unexpected EOF"), "{text}");
+        assert!(
+            crate::error::is_retryable_error(&text, None, None),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_blocked_prompt_is_terminal_error() {
+        let events = vec![serde_json::json!({
+            "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}
+        })];
+        let stream_events = collect_events(&events);
+        let Some(StreamEvent::Done { reason, message }) = stream_events.last() else {
+            panic!("expected Done: {stream_events:?}");
+        };
+        assert_eq!(*reason, StopReason::Error);
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("Vertex AI blocked the prompt: PROHIBITED_CONTENT")
+        );
+    }
+
+    #[test]
+    fn signed_tool_call_survives_vertex_stream_session_and_replay() {
+        let events = [
+            serde_json::json!({"candidates": [{"content": {"parts": [{
+                "functionCall": {"name": "read", "args": {"path": "a.txt"}},
+                "thoughtSignature": "dmVydGV4"
+            }]}}]}),
+            serde_json::json!({"candidates": [{"finishReason": "STOP"}]}),
+        ];
+        let stream_events = collect_events(&events);
+        let call = stream_events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call),
+                _ => None,
+            })
+            .expect("completed tool call");
+        assert_eq!(call.thought_signature.as_deref(), Some("dmVydGV4"));
+        let Some(StreamEvent::Done { reason, message }) = stream_events.last() else {
+            panic!("expected Done");
+        };
+        assert_eq!(*reason, StopReason::ToolUse);
+        assert_eq!(message.stop_reason, StopReason::ToolUse);
+        let stored = serde_json::to_string(&Message::assistant(message.clone())).unwrap();
+        let replay: Message = serde_json::from_str(&stored).unwrap();
+        let context = Context::owned(
+            None,
+            vec![
+                Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("Read a.txt".to_string()),
+                    timestamp: 0,
+                }),
+                replay,
+                Message::tool_result(crate::model::ToolResultMessage {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    content: vec![ContentBlock::Text(TextContent::new("contents"))],
+                    details: None,
+                    is_error: false,
+                    timestamp: 1,
+                }),
+            ],
+            Vec::new(),
+        );
+        let provider = VertexProvider::new("gemini-3-pro");
+        let wire = serde_json::to_value(
+            provider.build_gemini_request(&context, &StreamOptions::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            wire["contents"][1]["parts"][0]["thoughtSignature"],
+            "dmVydGV4"
+        );
+        assert_eq!(
+            wire["contents"][1]["parts"][0]["functionCall"]["args"],
+            serde_json::json!({"path": "a.txt"})
+        );
+        assert_eq!(
+            wire["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "read"
+        );
+    }
+
+    #[test]
+    fn vertex_terminal_failure_is_preserved_with_a_tool_call() {
+        for (finish, expected) in [
+            ("SAFETY", StopReason::Error),
+            ("MAX_TOKENS", StopReason::Length),
+        ] {
+            let events = [serde_json::json!({"candidates": [{
+                "content": {"parts": [{"functionCall": {"name": "read", "args": {}}}]},
+                "finishReason": finish
+            }]})];
+            let stream_events = collect_events(&events);
+            let Some(StreamEvent::Done { reason, message }) = stream_events.last() else {
+                panic!("expected Done");
+            };
+            assert_eq!(*reason, expected);
+            assert_eq!(message.stop_reason, expected);
+        }
+    }
+
     // ─── Test helpers ────────────────────────────────────────────────────
 
     fn collect_events(events: &[Value]) -> Vec<StreamEvent> {
@@ -1045,11 +980,7 @@ mod tests {
             loop {
                 let Some(item) = state.event_source.next().await else {
                     if !state.finished {
-                        state.finished = true;
-                        out.push(StreamEvent::Done {
-                            reason: state.partial.stop_reason,
-                            message: std::mem::take(&mut state.partial),
-                        });
+                        out.push(state.finish_at_eof().expect("terminal chunk seen"));
                     }
                     break;
                 };

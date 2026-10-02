@@ -48,12 +48,23 @@ impl pi::provider::Provider for FixtureReflectProvider {
             Box<dyn futures::Stream<Item = pi::error::Result<pi::model::StreamEvent>> + Send>,
         >,
     > {
-        Ok(Box::pin(futures::stream::iter(vec![Ok(
-            pi::model::StreamEvent::TextDelta {
+        let message = pi::model::AssistantMessage {
+            content: vec![ContentBlock::Text(pi::model::TextContent::new(
+                "Fixture synthesis cites memory [1].",
+            ))],
+            stop_reason: pi::model::StopReason::Stop,
+            ..pi::model::AssistantMessage::default()
+        };
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(pi::model::StreamEvent::TextDelta {
                 content_index: 0,
                 delta: "Fixture synthesis cites memory [1].".to_string(),
-            },
-        )])))
+            }),
+            Ok(pi::model::StreamEvent::Done {
+                reason: pi::model::StopReason::Stop,
+                message,
+            }),
+        ])))
     }
 }
 
@@ -423,7 +434,8 @@ impl Tool for FixtureMcpClientTool {
         input: Value,
         _on_update: Option<Box<dyn Fn(pi::tools::ToolUpdate) + Send + Sync>>,
     ) -> pi::error::Result<pi::tools::ToolOutput> {
-        let manager = pi::mcp::McpManager::bootstrap(&self.cwd, &self.cwd.join("global"), &[])?;
+        let manager =
+            pi::mcp::McpManager::bootstrap(&self.cwd, &self.cwd.join("global"), &[], true)?;
         let op = input.get("op").and_then(Value::as_str).unwrap_or("list");
         let (text, details) = match op {
             "list" => {
@@ -696,6 +708,15 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
             return TestResult::fail(&case_name, format!("Unexpected error: {e}"));
         }
     };
+
+    if let Some(expected) = case.expected.is_error
+        && output.is_error != expected
+    {
+        return TestResult::fail(
+            &case_name,
+            format!("Expected is_error={expected}, got {}", output.is_error),
+        );
+    }
 
     // Extract text content
     let content = extract_text_content(&output.content);

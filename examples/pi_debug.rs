@@ -1,3 +1,8 @@
+// Examples are separate crates, so src/lib.rs's `recursion_limit` does not
+// reach here; asupersync 0.5.0 nests its runtime future types deeply enough
+// that proving `Send` exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! Debug wrapper for pi that traces each step of the `run()` sequence.
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;

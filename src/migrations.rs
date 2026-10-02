@@ -468,6 +468,12 @@ fn check_deprecated_extension_dirs(base_dir: &Path, label: &str) -> Vec<String> 
     warnings
 }
 
+// The Unix arm really can fail, so the fallible signature has to stay even
+// though the `cfg(not(unix))` arm below cannot.
+#[cfg_attr(
+    not(unix),
+    allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)
+)]
 fn set_owner_only_permissions(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -642,11 +648,11 @@ mod tests {
         fs::create_dir_all(&agent_dir).expect("create agent dir");
         fs::create_dir_all(&cwd).expect("create cwd");
 
+        let escaped_cwd = cwd.to_string_lossy().replace('\\', "\\\\");
         write(
             &agent_dir.join("legacy-session.jsonl"),
             &format!(
-                "{{\"type\":\"session\",\"cwd\":\"{}\",\"id\":\"abc\"}}\n{{\"type\":\"message\"}}\n",
-                cwd.display()
+                "{{\"type\":\"session\",\"cwd\":\"{escaped_cwd}\",\"id\":\"abc\"}}\n{{\"type\":\"message\"}}\n"
             ),
         );
 
@@ -739,9 +745,10 @@ mod tests {
             &agent_dir.join("oauth.json"),
             r#"{"anthropic":{"access_token":"a","refresh_token":"r","expires":1}}"#,
         );
+        let escaped_cwd = cwd.to_string_lossy().replace('\\', "\\\\");
         write(
             &agent_dir.join("legacy.jsonl"),
-            &format!("{{\"type\":\"session\",\"cwd\":\"{}\"}}\n", cwd.display()),
+            &format!("{{\"type\":\"session\",\"cwd\":\"{escaped_cwd}\"}}\n"),
         );
         write(&agent_dir.join("commands/hello.md"), "# hello");
         write(&agent_dir.join("tools/fd"), "fd-binary");

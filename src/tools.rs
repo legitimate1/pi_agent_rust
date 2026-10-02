@@ -873,10 +873,12 @@ fn escape_bytes_for_line_output(bytes: &[u8]) -> String {
 }
 
 fn path_for_line_output(path: &Path) -> String {
+    // Each arm is the function tail on its own platform; only one is ever
+    // compiled, so none of them needs an explicit `return`.
     #[cfg(windows)]
     {
         let rendered = path.to_string_lossy().replace('\\', "/");
-        return escape_bytes_for_line_output(rendered.as_bytes());
+        escape_bytes_for_line_output(rendered.as_bytes())
     }
 
     #[cfg(unix)]
@@ -2286,6 +2288,7 @@ fn cacheable_tool_output_weight(output: &ToolOutput) -> Option<usize> {
                 }
             }
             ContentBlock::Image(_)
+            | ContentBlock::Media(_)
             | ContentBlock::Thinking(_)
             | ContentBlock::RedactedThinking(_)
             | ContentBlock::ToolCall(_) => return None,
@@ -2422,24 +2425,62 @@ fn positioned_file_read(
     std::os::unix::fs::FileExt::read_at(file, buffer, offset)
 }
 
+/// Restore `resume` as the handle's position after a positioned read that
+/// moved it, and fold the two fallible steps into one result.
+///
+/// A failure to restore is reported even when the read itself succeeded: the
+/// cursor is then at an unknown offset, and callers that share it would read
+/// from the wrong place rather than fail. The read's own error wins when both
+/// fail, because it is the more informative one.
+#[cfg(not(unix))]
+fn restore_file_position(
+    file: &std::fs::File,
+    resume: u64,
+    read: std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    // `Seek` is implemented for `&File`, so seeking needs `&mut &File` and
+    // never `&mut File`; the handle itself stays shared.
+    let mut handle: &std::fs::File = file;
+    let restored = std::io::Seek::seek(&mut handle, std::io::SeekFrom::Start(resume));
+    match (read, restored) {
+        (Ok(read), Ok(_)) => Ok(read),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+// `seek_read` sets the cursor to the end of the read, unlike the Unix `read_at`
+// above, which never touches it. Callers treat this function as cursor-neutral
+// on every platform, and at least one of them fingerprints through a
+// `try_clone()` that shares its cursor with the handle doing the real read
+// (`ReadTool::execute`). Leaving the cursor at EOF there made `read` return an
+// empty file with no error for every file on Windows (bd-kgkrq, GH #182), so
+// put the position back where we found it.
 #[cfg(windows)]
 fn positioned_file_read(
     file: &std::fs::File,
     buffer: &mut [u8],
     offset: u64,
 ) -> std::io::Result<usize> {
-    std::os::windows::fs::FileExt::seek_read(file, buffer, offset)
+    let mut handle: &std::fs::File = file;
+    let resume = std::io::Seek::stream_position(&mut handle)?;
+    let read = std::os::windows::fs::FileExt::seek_read(file, buffer, offset);
+    restore_file_position(file, resume, read)
 }
 
+// `try_clone` shares the OS file position with the original handle, so seeking
+// the clone moves the caller's cursor exactly as `seek_read` does above. Same
+// contract, same restore.
 #[cfg(not(any(unix, windows)))]
 fn positioned_file_read(
     file: &std::fs::File,
     buffer: &mut [u8],
     offset: u64,
 ) -> std::io::Result<usize> {
-    let mut cloned = file.try_clone()?;
-    std::io::Seek::seek(&mut cloned, std::io::SeekFrom::Start(offset))?;
-    cloned.read(buffer)
+    let mut handle: &std::fs::File = file;
+    let resume = std::io::Seek::stream_position(&mut handle)?;
+    let read = std::io::Seek::seek(&mut handle, std::io::SeekFrom::Start(offset))
+        .and_then(|_| handle.read(buffer));
+    restore_file_position(file, resume, read)
 }
 
 fn fingerprint_directory_immediate(path: &Path) -> Option<[u8; 32]> {
@@ -2677,11 +2718,26 @@ fn expand_path(file_path: &str) -> String {
             .to_string_lossy()
             .to_string();
     }
-    if let Some(rest) = normalized.strip_prefix("~/") {
+    if let Some(rest) = home_relative_rest(&normalized, cfg!(windows)) {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
         return home.join(rest).to_string_lossy().to_string();
     }
     normalized
+}
+
+/// The remainder of `path` after a leading `~` home marker, or `None`.
+///
+/// `~/` is a home marker everywhere. `~\` is one only where backslash is a
+/// path separator (Windows, where models naturally write `~\Documents\x`);
+/// on Unix `~\x` is a legal relative file name and must stay literal.
+fn home_relative_rest(path: &str, backslash_separates: bool) -> Option<&str> {
+    path.strip_prefix("~/").or_else(|| {
+        if backslash_separates {
+            path.strip_prefix("~\\")
+        } else {
+            None
+        }
+    })
 }
 
 /// Resolve a path relative to `cwd`. Handles `~` expansion and absolute paths.
@@ -2913,7 +2969,9 @@ impl ScopedScanRoot {
         Ok(Stdio::from(self.handle.try_clone()?))
     }
 
+    // Mirrors the Unix arm, which clones a real handle off `self` and can fail.
     #[cfg(windows)]
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
     fn child_stdin(&self) -> std::io::Result<Stdio> {
         Ok(Stdio::null())
     }
@@ -4286,7 +4344,9 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     )
 }
 
+// Mirrors the Unix arm's fallible signature, which really can fail.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -5318,9 +5378,58 @@ pub struct ToolRegistry {
     /// Session undo recorder shared with write/edit/hashline_edit
     /// (bd-cv653.3.13); the interactive host reads it back for /undo //redo.
     mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    /// Host-owned picker surface shared by permission-gated built-ins and the
+    /// optional model-facing ask tool. This exists even when `ask` is not in
+    /// the model schema: host authorization must not disappear merely because
+    /// the model cannot ask arbitrary questions.
+    host_ask: crate::ask::AskTool,
     /// Back-pointer to the [`SharedToolRegistry`] this snapshot belongs to,
     /// so a hostcall holding only a snapshot can publish an update.
     shared: Option<std::sync::Weak<SharedToolRegistryInner>>,
+}
+
+/// How the memory-bank tools are turned on, quoted in the `--tools` warning.
+const MEMORY_BANK_HOW: &str = "set memory.backend to \"local\" in settings.json";
+
+/// The requested tool names pi does not provide at all.
+///
+/// A name pi DOES provide but does not select through `--tools` is not one of
+/// these; see [`unselectable_tool_names`]. Calling both a typo and a real tool
+/// "not a tool pi provides" was wrong about seven shipped tools.
+///
+/// Order and duplicates follow the request, so the warning reads back what the
+/// user typed.
+#[must_use]
+pub fn unknown_tool_names(requested: &[&str]) -> Vec<String> {
+    requested
+        .iter()
+        .filter(|name| {
+            !ToolRegistry::KNOWN_TOOL_NAMES.contains(*name)
+                && !ToolRegistry::TOOLS_NOT_SELECTED_BY_FLAG
+                    .iter()
+                    .any(|(name_, _)| name_ == *name)
+        })
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+/// The requested names that are real tools `--tools` has no say over, paired
+/// with what does decide them.
+///
+/// Listing one of these is harmless but has no effect, which is worth saying:
+/// the user asked for a tool by name and pi is about to decide its presence on
+/// other grounds entirely.
+#[must_use]
+pub fn unselectable_tool_names(requested: &[&str]) -> Vec<(String, &'static str)> {
+    requested
+        .iter()
+        .filter_map(|name| {
+            ToolRegistry::TOOLS_NOT_SELECTED_BY_FLAG
+                .iter()
+                .find(|(name_, _)| name_ == name)
+                .map(|(_, how)| ((*name).to_string(), *how))
+        })
+        .collect()
 }
 
 impl ToolRegistry {
@@ -5335,6 +5444,83 @@ impl ToolRegistry {
         self.mutation_recorder.clone()
     }
 
+    /// Every name `--tools` will honour.
+    ///
+    /// The match in [`Self::with_mutation_recorder`] ends in `_ => {}`, so a
+    /// name it does not know is dropped without a word: `pi --tools
+    /// completely_made_up` starts an agent with no tools at all and says
+    /// nothing, and `--tools read,bsah,edit` quietly hands the model two tools
+    /// instead of three. This list is what [`unknown_tool_names`] measures a
+    /// request against.
+    ///
+    /// Keep it in step with that match. `tool_registry_builds_every_listed_name`
+    /// fails if a name here builds nothing, which is the direction that would
+    /// promise a tool pi cannot deliver. The reverse direction — a tool pi
+    /// registers that no list mentions — used to cost a spurious "not a tool pi
+    /// provides" warning; it is now covered by
+    /// [`Self::TOOLS_NOT_SELECTED_BY_FLAG`] and
+    /// `every_registerable_tool_is_named_in_one_of_the_two_lists`.
+    pub const KNOWN_TOOL_NAMES: &'static [&'static str] = &[
+        // Built here, one arm each.
+        "ast_edit",
+        "ast_grep",
+        "bash",
+        "browser",
+        "computer",
+        "current_time",
+        "debug",
+        "edit",
+        "eval",
+        "find",
+        "generate_image",
+        "github",
+        "grep",
+        "hashline_edit",
+        "hub",
+        "inspect_image",
+        "jobs",
+        "ls",
+        "lsp",
+        "read",
+        "read_media",
+        "security_scan",
+        "subagent",
+        "tts",
+        "web_search",
+        "write",
+        // Host-coupled: joined after construction by main.rs / sdk.rs.
+        "ask",
+        "todo",
+        "submit_plan",
+    ];
+
+    /// Tools pi provides that `--tools` does not select, and what decides them.
+    ///
+    /// These reach the registry outside the `--tools` match, so naming one on
+    /// the flag changes nothing. That is worth telling the user, and it is not
+    /// the same thing as a typo: before this list existed, `--tools xdev` was
+    /// answered with "xdev is not a tool pi provides", which is false about the
+    /// dispatcher the entire discoverable tier hangs off.
+    ///
+    /// The second field is the whole message a user needs to actually get the
+    /// tool, so keep it specific enough to act on.
+    pub const TOOLS_NOT_SELECTED_BY_FLAG: &'static [(&'static str, &'static str)] = &[
+        (
+            "xdev",
+            "the dispatcher appears whenever any discoverable-tier tool is enabled \
+             (ast_grep, ast_edit, lsp, debug, or the memory bank)",
+        ),
+        (
+            "manage_skill",
+            "always registered; it cannot touch user-authored skills, so it needs no opt-in",
+        ),
+        ("retain", MEMORY_BANK_HOW),
+        ("recall", MEMORY_BANK_HOW),
+        ("reflect", MEMORY_BANK_HOW),
+        ("memory_edit", MEMORY_BANK_HOW),
+        ("learn", MEMORY_BANK_HOW),
+    ];
+
     /// Like [`ToolRegistry::new`] but attaches a session undo recorder to the
     /// mutating file tools (bd-cv653.3.13). `workspace` installs the shared
     /// multi-root handle on every path-confining tool (bd-cv653.3.12).
@@ -5348,6 +5534,9 @@ impl ToolRegistry {
     ) -> Self {
         let legacy_workspace = WorkspaceHandle::default();
         let workspace = workspace.unwrap_or(&legacy_workspace);
+        let host_ask = crate::ask::AskTool::new(crate::ask::AskPolicy::from_config(
+            config.and_then(|config| config.ask_policy.as_deref()),
+        ));
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
         let job_session_scope = crate::jobs::JobSessionScope::default();
         let shell_path = config.and_then(|c| c.shell_path.clone());
@@ -5435,20 +5624,28 @@ impl ToolRegistry {
                         ),
                     ));
                 }
-                "generate_image" => {
-                    let provider = config
+                "read_media" => {
+                    let max_bytes = config
                         .and_then(|c| c.media.as_ref())
-                        .and_then(|m| m.image_gen_provider.clone());
+                        .and_then(|m| m.max_bytes);
                     tools.push(Box::new(
-                        crate::media_tools::GenerateImageTool::with_provider(cwd, provider),
+                        crate::media_tools::ReadMediaTool::new(cwd).with_max_bytes(max_bytes),
+                    ));
+                }
+                "generate_image" => {
+                    let media = config.and_then(|c| c.media.as_ref());
+                    let provider = media.and_then(|m| m.image_gen_provider.clone());
+                    let model = media.and_then(|m| m.image_gen_model.clone());
+                    tools.push(Box::new(
+                        crate::media_tools::GenerateImageTool::with_defaults(cwd, provider, model),
                     ));
                 }
                 "tts" => {
-                    let voice = config
-                        .and_then(|c| c.media.as_ref())
-                        .and_then(|m| m.tts_voice.clone());
-                    tools.push(Box::new(crate::media_tools::TtsTool::with_voice(
-                        cwd, voice,
+                    let media = config.and_then(|c| c.media.as_ref());
+                    let provider = media.and_then(|m| m.tts_provider.clone());
+                    let voice = media.and_then(|m| m.tts_voice.clone());
+                    tools.push(Box::new(crate::media_tools::TtsTool::with_defaults(
+                        cwd, provider, voice,
                     )));
                 }
                 "computer" => {
@@ -5458,7 +5655,14 @@ impl ToolRegistry {
                         .unwrap_or(true);
                     tools.push(Box::new(
                         crate::computer::ComputerTool::new(cwd)
-                            .with_require_approval(require_approval),
+                            .with_require_approval(require_approval)
+                            .with_approval_handler({
+                                let ask = host_ask.clone();
+                                std::sync::Arc::new(move |request| {
+                                    let ask = ask.clone();
+                                    Box::pin(async move { ask.prompt_installed(request).await })
+                                })
+                            }),
                     ));
                 }
                 "browser" => {
@@ -5481,6 +5685,12 @@ impl ToolRegistry {
                             .with_role_model_spec(role_model_spec),
                     ));
                 }
+                // Nothing to build: either a host-coupled tool the session host
+                // joins after construction (`ask`, `todo`, `submit_plan` — see
+                // main.rs and sdk.rs) or a name pi does not have. The two are
+                // told apart by [`ToolRegistry::KNOWN_TOOL_NAMES`], which is
+                // what warns about the second; they cannot be told apart here,
+                // because both do nothing.
                 _ => {}
             }
         }
@@ -5521,19 +5731,28 @@ impl ToolRegistry {
                     ),
                 ));
             }
+            if media_cfg.enable_read_media.unwrap_or(false)
+                && !tools.iter().any(|t| t.name() == "read_media")
+            {
+                tools.push(Box::new(
+                    crate::media_tools::ReadMediaTool::new(cwd).with_max_bytes(media_cfg.max_bytes),
+                ));
+            }
             if media_cfg.enable_generate_image.unwrap_or(false)
                 && !tools.iter().any(|t| t.name() == "generate_image")
             {
                 tools.push(Box::new(
-                    crate::media_tools::GenerateImageTool::with_provider(
+                    crate::media_tools::GenerateImageTool::with_defaults(
                         cwd,
                         media_cfg.image_gen_provider.clone(),
+                        media_cfg.image_gen_model.clone(),
                     ),
                 ));
             }
             if media_cfg.enable_tts.unwrap_or(false) && !tools.iter().any(|t| t.name() == "tts") {
-                tools.push(Box::new(crate::media_tools::TtsTool::with_voice(
+                tools.push(Box::new(crate::media_tools::TtsTool::with_defaults(
                     cwd,
+                    media_cfg.tts_provider.clone(),
                     media_cfg.tts_voice.clone(),
                 )));
             }
@@ -5546,7 +5765,15 @@ impl ToolRegistry {
         {
             let require_approval = comp_cfg.require_approval.unwrap_or(true);
             tools.push(Box::new(
-                crate::computer::ComputerTool::new(cwd).with_require_approval(require_approval),
+                crate::computer::ComputerTool::new(cwd)
+                    .with_require_approval(require_approval)
+                    .with_approval_handler({
+                        let ask = host_ask.clone();
+                        std::sync::Arc::new(move |request| {
+                            let ask = ask.clone();
+                            Box::pin(async move { ask.prompt_installed(request).await })
+                        })
+                    }),
             ));
         }
 
@@ -5601,13 +5828,25 @@ impl ToolRegistry {
             job_session_scope,
             discoverable: discoverable_names,
             mutation_recorder,
+            host_ask,
             shared: None,
         }
+    }
+
+    /// Host-owned interactive picker shared with permission-gated built-ins.
+    ///
+    /// This is deliberately independent of whether the model-facing `ask`
+    /// tool is enabled. Installing a UI here gives the host somewhere to make
+    /// authorization decisions without granting the model a new tool.
+    #[must_use]
+    pub fn host_ask_tool(&self) -> crate::ask::AskTool {
+        self.host_ask.clone()
     }
 
     /// Construct a registry from a pre-built tool list.
     pub fn from_tools(mut tools: Vec<Box<dyn Tool>>) -> Self {
         let job_session_scope = crate::jobs::JobSessionScope::default();
+        let host_ask = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
         for tool in &mut tools {
             tool.bind_job_session_scope(job_session_scope.clone());
         }
@@ -5617,6 +5856,7 @@ impl ToolRegistry {
             job_session_scope,
             discoverable: std::collections::HashSet::new(),
             mutation_recorder: None,
+            host_ask,
             shared: None,
         }
     }
@@ -5632,6 +5872,7 @@ impl ToolRegistry {
             job_session_scope: self.job_session_scope.clone(),
             discoverable: self.discoverable.clone(),
             mutation_recorder: self.mutation_recorder.clone(),
+            host_ask: self.host_ask.clone(),
             shared: self.shared.clone(),
         }
     }
@@ -5709,7 +5950,12 @@ impl ToolRegistry {
     /// Append a tool.
     pub fn push(&mut self, mut tool: Box<dyn Tool>) {
         tool.bind_job_session_scope(self.job_session_scope.clone());
-        self.tools.push(Arc::from(tool));
+        let name = tool.name();
+        if let Some(pos) = self.tools.iter().position(|t| t.name() == name) {
+            self.tools[pos] = Arc::from(tool);
+        } else {
+            self.tools.push(Arc::from(tool));
+        }
     }
 
     /// Extend the registry with additional tools.
@@ -5719,7 +5965,12 @@ impl ToolRegistry {
     {
         for mut tool in tools {
             tool.bind_job_session_scope(self.job_session_scope.clone());
-            self.tools.push(Arc::from(tool));
+            let name = tool.name();
+            if let Some(pos) = self.tools.iter().position(|t| t.name() == name) {
+                self.tools[pos] = Arc::from(tool);
+            } else {
+                self.tools.push(Arc::from(tool));
+            }
         }
     }
 
@@ -6761,6 +7012,185 @@ async fn execute_bash_spawn(
     }
 }
 
+/// What the bash tool says on Windows when no bash can be found (GH #182).
+#[cfg(any(windows, test))]
+const NO_WINDOWS_BASH: &str = "No bash found to run the command. Install Git for Windows \
+(https://git-scm.com/download/win), put a bash.exe (Git Bash, MSYS2, Cygwin) on PATH, \
+or set \"shell_path\" in settings.json to a bash executable.";
+
+/// Logged once per process when no native bash exists and the bash tool,
+/// `!command` or a background job falls back to WSL's launcher (GH #182).
+#[cfg(any(windows, test))]
+const WSL_BASH_NOTICE: &str = "No native bash (Git for Windows, MSYS2, Cygwin) was found, so \
+shell commands run through WSL's bash.exe, inside the default WSL Linux distro: Windows drives \
+appear under /mnt/<drive>, Windows programs and PATH entries may not be available, and a UNC \
+working directory (\\\\server\\share) may not translate, so commands can start in a different \
+directory. To choose the shell, install Git for Windows or set \"shell_path\" in settings.json, \
+e.g. \"C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe\".";
+
+/// Log [`WSL_BASH_NOTICE`] on the user-diagnostic channel (stderr, or the TUI
+/// log while the TUI owns the terminal; never tool output) the first time
+/// `shell` is WSL's launcher. `shown` makes it once per process. Returns
+/// whether the notice was emitted.
+#[cfg(any(windows, test))]
+fn notice_wsl_bash_once(shell: &Path, shown: &std::sync::atomic::AtomicBool) -> bool {
+    if !is_wsl_bash_launcher(shell) || shown.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return false;
+    }
+    tracing::warn!(
+        target: crate::config::USER_DIAGNOSTIC_TARGET,
+        shell = %shell.display(),
+        "{WSL_BASH_NOTICE}"
+    );
+    true
+}
+
+/// The shell the bash tool, `!command` and background jobs run when
+/// `shell_path` is not configured.
+///
+/// Unix: the first of `/bin/bash`, `/usr/bin/bash`, `/usr/local/bin/bash`,
+/// else `sh`. Windows has neither those paths nor an `sh` on `PATH`, so the
+/// old `sh` fallback failed every call with "program not found" (GH #182);
+/// see [`find_windows_bash`] for the Windows order.
+///
+/// On Windows, the first time a process falls back to WSL's `bash.exe` it
+/// logs [`WSL_BASH_NOTICE`] once on the user-diagnostic channel; use
+/// [`resolve_default_bash_shell`] to look the shell up without that notice.
+pub(crate) fn default_bash_shell() -> Result<String> {
+    let shell = resolve_default_bash_shell()?;
+    #[cfg(windows)]
+    {
+        static WSL_NOTICE_SHOWN: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        notice_wsl_bash_once(Path::new(&shell), &WSL_NOTICE_SHOWN);
+    }
+    Ok(shell)
+}
+
+/// [`default_bash_shell`] without the one-time WSL notice, for callers such
+/// as `pi doctor` that report the resolved shell themselves.
+// Only the Windows arm can fail.
+#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
+pub(crate) fn resolve_default_bash_shell() -> Result<String> {
+    #[cfg(windows)]
+    {
+        find_windows_bash(&WindowsShellEnv::from_process(), Path::is_file)
+            .map(|path| path.to_string_lossy().into_owned())
+            .ok_or_else(|| Error::tool("bash", NO_WINDOWS_BASH))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"]
+            .into_iter()
+            .find(|path| Path::new(path).exists())
+            .unwrap_or("sh")
+            .to_string())
+    }
+}
+
+/// Where [`find_windows_bash`] looks, read from the environment.
+#[cfg(any(windows, test))]
+struct WindowsShellEnv {
+    /// `%ProgramFiles%`, `%ProgramW6432%`, `%ProgramFiles(x86)%`.
+    program_files: Vec<PathBuf>,
+    /// `%LOCALAPPDATA%` (per-user Git for Windows installs).
+    local_app_data: Option<PathBuf>,
+    /// `%SystemRoot%`, for the WSL launcher.
+    system_root: Option<PathBuf>,
+    path_dirs: Vec<PathBuf>,
+}
+
+#[cfg(any(windows, test))]
+impl WindowsShellEnv {
+    fn from_process() -> Self {
+        let var = |name: &str| {
+            std::env::var_os(name)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        };
+        Self {
+            program_files: ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
+                .into_iter()
+                .filter_map(var)
+                .collect(),
+            local_app_data: var("LOCALAPPDATA"),
+            system_root: var("SystemRoot"),
+            path_dirs: std::env::var_os("PATH")
+                .map(|path| absolute_path_dirs(&path))
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// The absolute directories of a `PATH` value. An empty entry (a stray or
+/// trailing `;` is common on Windows) or a relative one such as `.` would
+/// otherwise make a `bash.exe` in the current directory, e.g. one committed
+/// to the repository being worked on, the shell every command runs through.
+#[cfg(any(windows, test))]
+fn absolute_path_dirs(path: &std::ffi::OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .collect()
+}
+
+/// Whether `path` is WSL's `bash.exe` launcher (`System32\bash.exe`, or the
+/// Store app alias under `WindowsApps`), which runs the command inside the
+/// default Linux distro rather than on Windows.
+pub(crate) fn is_wsl_bash_launcher(path: &Path) -> bool {
+    let in_system32 = path.parent().and_then(Path::file_name).is_some_and(|dir| {
+        dir.eq_ignore_ascii_case("system32") || dir.eq_ignore_ascii_case("sysnative")
+    });
+    in_system32
+        || path
+            .components()
+            .any(|part| part.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+}
+
+/// Pick a bash on Windows (GH #182), in this order:
+///
+/// 1. Git for Windows in its standard install locations
+///    (`<ProgramFiles>\Git\bin\bash.exe`,
+///    `%LOCALAPPDATA%\Programs\Git\bin\bash.exe`).
+/// 2. `PATH`, in order: a `bash.exe` (Git Bash, MSYS2, Cygwin, Scoop shims),
+///    or the `bin\bash.exe` next to a Git install whose `cmd\git.exe` is on
+///    `PATH` (Git's default PATH option adds only `Git\cmd`).
+/// 3. WSL's `bash.exe` launcher, last: it works, but the command runs inside
+///    Linux, where Windows paths appear under `/mnt/<drive>`.
+#[cfg(any(windows, test))]
+fn find_windows_bash(env: &WindowsShellEnv, is_file: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    let git_bash = |git_root: &Path| git_root.join("bin").join("bash.exe");
+    let installed = env
+        .program_files
+        .iter()
+        .map(|dir| git_bash(&dir.join("Git")))
+        .chain(
+            env.local_app_data
+                .iter()
+                .map(|dir| git_bash(&dir.join("Programs").join("Git"))),
+        );
+    let on_path = env.path_dirs.iter().flat_map(|dir| {
+        let beside_git = is_file(&dir.join("git.exe"))
+            .then(|| dir.parent().map(git_bash))
+            .flatten();
+        std::iter::once(dir.join("bash.exe")).chain(beside_git)
+    });
+    if let Some(found) = installed
+        .chain(on_path)
+        .find(|candidate| !is_wsl_bash_launcher(candidate) && is_file(candidate))
+    {
+        return Some(found);
+    }
+    env.path_dirs
+        .iter()
+        .map(|dir| dir.join("bash.exe"))
+        .chain(
+            env.system_root
+                .iter()
+                .map(|root| root.join("System32").join("bash.exe")),
+        )
+        .find(|candidate| is_wsl_bash_launcher(candidate) && is_file(candidate))
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run_bash_command(
     cwd: &Path,
@@ -6791,17 +7221,11 @@ pub(crate) async fn run_bash_command(
         ));
     }
 
-    let shell = shell_path.unwrap_or_else(|| {
-        for path in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
-            if Path::new(path).exists() {
-                return path;
-            }
-        }
-        "sh"
-    });
+    let shell = shell_path.map_or_else(default_bash_shell, |path| Ok(path.to_string()))?;
+    let shell = shell.as_str();
 
     let mut cmd = command_with_default_sigpipe_in_dir(shell, cwd)
-        .map_err(|e| Error::tool("bash", format!("Failed to prepare shell: {e}")))?;
+        .map_err(|e| Error::tool("bash", format!("Failed to prepare shell {shell}: {e}")))?;
     cmd.arg("-c")
         .arg(&command)
         .current_dir(cwd)
@@ -6822,7 +7246,7 @@ pub(crate) async fn run_bash_command(
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell: {e}")))?;
+        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell}: {e}")))?;
     attach_child_job_discipline(&child);
 
     let stdout = child
@@ -7160,14 +7584,8 @@ pub(crate) async fn run_bash_command_pty(
         ));
     }
 
-    let shell = shell_path.unwrap_or_else(|| {
-        for path in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
-            if Path::new(path).exists() {
-                return path;
-            }
-        }
-        "sh"
-    });
+    let shell = shell_path.map_or_else(default_bash_shell, |path| Ok(path.to_string()))?;
+    let shell = shell.as_str();
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -7194,7 +7612,7 @@ pub(crate) async fn run_bash_command_pty(
     let mut child = pair
         .slave
         .spawn_command(pty_cmd)
-        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell on PTY: {e}")))?;
+        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell} on PTY: {e}")))?;
     // Drop our handle to the slave side so the master sees EOF when the child
     // exits; otherwise the pump thread would block forever.
     drop(pair.slave);
@@ -7455,8 +7873,11 @@ impl Tool for BashTool {
         };
 
         // Mediation gate (bd-cv653.1.7): classify before spawn against
-        // `bash.mediation`. `forced` beats any approval override; off mode
-        // is byte-identical to the pre-mediation path.
+        // `bash.mediation`. This runs on the execution path, so it applies
+        // whatever the approval mode said — including yolo — and `off` is
+        // byte-identical to the pre-mediation path. (`bash.mediationForced`
+        // was meant to select this; it turned out to be the only behaviour,
+        // and nothing reads the field. See `config::BashSettings`.)
         if let Some(mediation) = &self.mediation {
             let mode =
                 crate::bash_mediation::MediationMode::from_setting(mediation.mediation.as_deref());
@@ -13375,7 +13796,8 @@ mod win_job {
     /// Returns whether the child is now covered by a registered Job. Most
     /// callers can retain the walk-based fallback on failure; subprocess
     /// surfaces that cannot safely tolerate inherited handles can fail closed.
-    pub(crate) fn attach(child: &Child) -> bool {
+    // `win_job` is a private module, so `pub` here is already crate-limited.
+    pub fn attach(child: &Child) -> bool {
         let Ok(mut map) = REGISTRY.lock() else {
             return false;
         };
@@ -13398,7 +13820,7 @@ mod win_job {
     /// Kill the tree rooted at `pid` via its job, returning whether one
     /// existed. Dropping the stored `Job` closes the handle, and
     /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` does the actual termination.
-    pub(crate) fn terminate(pid: u32) -> bool {
+    pub fn terminate(pid: u32) -> bool {
         REGISTRY
             .lock()
             .ok()
@@ -13728,7 +14150,9 @@ fn command_with_default_sigpipe_for_cwd(
     Ok(command)
 }
 
+// Mirrors the Unix arm, which resolves the program against `cwd` and can fail.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn command_with_default_sigpipe_for_cwd(
     program: &OsStr,
     _cwd: Option<&Path>,
@@ -13800,6 +14224,12 @@ fn resolve_executable_for_shell_trampoline(
 }
 
 /// Detach a child process from pi's controlling terminal.
+// The Unix arm mutates `command`; off Unix there is no controlling terminal to
+// detach from, so the parameter is untouched and the body is a no-op.
+#[cfg_attr(
+    not(unix),
+    allow(clippy::needless_pass_by_ref_mut, clippy::missing_const_for_fn)
+)]
 pub(crate) fn isolate_command_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
@@ -14557,6 +14987,248 @@ mod tests {
     use proptest::prelude::*;
     #[cfg(target_os = "linux")]
     use std::time::Duration;
+
+    /// A Windows-shaped environment for [`find_windows_bash`] with the given
+    /// `PATH`. Which files exist is up to each test. Paths are built with
+    /// `join`, so the tests run on any OS.
+    fn windows_shell_env(path_dirs: Vec<PathBuf>) -> WindowsShellEnv {
+        WindowsShellEnv {
+            program_files: vec![PathBuf::from("C:").join("Program Files")],
+            local_app_data: Some(
+                PathBuf::from("C:")
+                    .join("Users")
+                    .join("me")
+                    .join("AppData")
+                    .join("Local"),
+            ),
+            system_root: Some(PathBuf::from("C:").join("Windows")),
+            path_dirs,
+        }
+    }
+
+    fn system32() -> PathBuf {
+        PathBuf::from("C:").join("Windows").join("System32")
+    }
+
+    fn pick(env: &WindowsShellEnv, existing: &[PathBuf]) -> Option<PathBuf> {
+        find_windows_bash(env, |path| existing.iter().any(|file| file == path))
+    }
+
+    /// GH #182: with WSL's System32\bash.exe first on PATH, Git for
+    /// Windows in Program Files still wins.
+    #[test]
+    fn windows_bash_prefers_git_for_windows_over_the_wsl_launcher() {
+        let git_bash = PathBuf::from("C:")
+            .join("Program Files")
+            .join("Git")
+            .join("bin")
+            .join("bash.exe");
+        let wsl = system32().join("bash.exe");
+        let env = windows_shell_env(vec![system32()]);
+        assert_eq!(pick(&env, &[wsl, git_bash.clone()]), Some(git_bash));
+    }
+
+    /// Per-user Git installs live under %LOCALAPPDATA%\Programs\Git.
+    #[test]
+    fn windows_bash_finds_a_per_user_git_install() {
+        let git_bash = PathBuf::from("C:")
+            .join("Users")
+            .join("me")
+            .join("AppData")
+            .join("Local")
+            .join("Programs")
+            .join("Git")
+            .join("bin")
+            .join("bash.exe");
+        let env = windows_shell_env(Vec::new());
+        assert_eq!(pick(&env, std::slice::from_ref(&git_bash)), Some(git_bash));
+    }
+
+    /// A bash.exe on PATH (MSYS2 here) beats WSL's launcher even when the
+    /// launcher's directory comes first on PATH.
+    #[test]
+    fn windows_bash_takes_a_path_bash_before_the_wsl_launcher() {
+        let msys = PathBuf::from("C:").join("msys64").join("usr").join("bin");
+        let env = windows_shell_env(vec![system32(), msys.clone()]);
+        let existing = [system32().join("bash.exe"), msys.join("bash.exe")];
+        assert_eq!(pick(&env, &existing), Some(msys.join("bash.exe")));
+    }
+
+    /// Git's default PATH option adds only `Git\cmd`; its bash is found
+    /// next to it, wherever Git was installed.
+    #[test]
+    fn windows_bash_derives_git_bash_from_git_cmd_on_path() {
+        let git = PathBuf::from("D:").join("Tools").join("Git");
+        let env = windows_shell_env(vec![system32(), git.join("cmd")]);
+        let existing = [
+            system32().join("bash.exe"),
+            git.join("cmd").join("git.exe"),
+            git.join("bin").join("bash.exe"),
+        ];
+        assert_eq!(
+            pick(&env, &existing),
+            Some(git.join("bin").join("bash.exe"))
+        );
+    }
+
+    /// GH #182's setup: only WSL's launcher exists. It is used as the last
+    /// resort, from PATH or from %SystemRoot%\System32.
+    #[test]
+    fn windows_bash_falls_back_to_the_wsl_launcher() {
+        let wsl = system32().join("bash.exe");
+        assert_eq!(
+            pick(
+                &windows_shell_env(vec![system32()]),
+                std::slice::from_ref(&wsl)
+            ),
+            Some(wsl.clone())
+        );
+        assert_eq!(
+            pick(&windows_shell_env(Vec::new()), std::slice::from_ref(&wsl)),
+            Some(wsl)
+        );
+    }
+
+    /// Logs at WARN on `target` while `emit` runs and returns what was written.
+    fn warnings_on_target(target: &str, emit: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(format!("{target}=warn")))
+            .with_ansi(false)
+            .with_writer(captured.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        let bytes = captured
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        String::from_utf8(bytes).expect("utf-8 log output")
+    }
+
+    /// Falling back to WSL's launcher explains itself once per process, on
+    /// the user-diagnostic channel: that commands run inside WSL, the UNC
+    /// working-directory caveat, and how to pick a shell with `shell_path`.
+    /// A native bash never triggers it.
+    #[test]
+    fn wsl_launcher_fallback_notices_once_on_the_user_channel() {
+        let shown = std::sync::atomic::AtomicBool::new(false);
+        let wsl = system32().join("bash.exe");
+        let git_bash = PathBuf::from("C:")
+            .join("Program Files")
+            .join("Git")
+            .join("bin")
+            .join("bash.exe");
+
+        let mut results = Vec::new();
+        let logged = warnings_on_target(crate::config::USER_DIAGNOSTIC_TARGET, || {
+            results.push(notice_wsl_bash_once(&git_bash, &shown));
+            results.push(notice_wsl_bash_once(&wsl, &shown));
+            results.push(notice_wsl_bash_once(&wsl, &shown));
+        });
+        assert_eq!(results, [false, true, false]);
+        assert_eq!(logged.matches("WSL's bash.exe").count(), 1, "{logged}");
+        assert!(
+            logged.contains("inside the default WSL Linux distro"),
+            "{logged}"
+        );
+        assert!(logged.contains("UNC"), "{logged}");
+        assert!(logged.contains("\"shell_path\""), "{logged}");
+        assert!(logged.contains(&wsl.display().to_string()), "{logged}");
+
+        // Nothing is shown for a native bash even before any WSL notice.
+        let fresh = std::sync::atomic::AtomicBool::new(false);
+        let quiet = warnings_on_target(crate::config::USER_DIAGNOSTIC_TARGET, || {
+            assert!(!notice_wsl_bash_once(&git_bash, &fresh));
+        });
+        assert!(quiet.is_empty(), "{quiet}");
+    }
+
+    #[test]
+    fn windows_bash_is_none_without_any_bash() {
+        let env = windows_shell_env(vec![system32()]);
+        assert_eq!(pick(&env, &[]), None);
+        assert!(NO_WINDOWS_BASH.contains("shell_path"));
+    }
+
+    #[test]
+    fn wsl_launcher_detection() {
+        assert!(is_wsl_bash_launcher(&system32().join("bash.exe")));
+        assert!(is_wsl_bash_launcher(
+            &PathBuf::from("C:")
+                .join("WINDOWS")
+                .join("SYSTEM32")
+                .join("bash.exe")
+        ));
+        assert!(is_wsl_bash_launcher(
+            &PathBuf::from("C:")
+                .join("Users")
+                .join("me")
+                .join("AppData")
+                .join("Local")
+                .join("Microsoft")
+                .join("WindowsApps")
+                .join("bash.exe")
+        ));
+        assert!(!is_wsl_bash_launcher(
+            &PathBuf::from("C:")
+                .join("Program Files")
+                .join("Git")
+                .join("bin")
+                .join("bash.exe")
+        ));
+    }
+
+    /// Empty and relative `PATH` entries are never searched for bash.exe.
+    #[test]
+    fn windows_bash_path_skips_empty_and_relative_entries() {
+        let absolute = std::env::temp_dir();
+        let path = std::env::join_paths([
+            PathBuf::new(),
+            PathBuf::from("."),
+            PathBuf::from("relative").join("bin"),
+            absolute.clone(),
+        ])
+        .expect("joinable PATH");
+        assert_eq!(absolute_path_dirs(&path), vec![absolute]);
+    }
+
+    /// The process environment reader runs on every OS; `PATH` is always
+    /// set for the test process.
+    #[test]
+    fn windows_shell_env_reads_path_from_the_process() {
+        let env = WindowsShellEnv::from_process();
+        assert!(!env.path_dirs.is_empty());
+        let _ = find_windows_bash(&env, Path::is_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_bash_shell_on_unix_is_an_absolute_bash_or_sh() {
+        let shell = default_bash_shell().expect("unix always has a default");
+        assert!(shell == "sh" || shell.ends_with("/bash"), "{shell}");
+    }
 
     #[cfg(unix)]
     struct UnixModeGuard {
@@ -17184,6 +17856,75 @@ mod tests {
             assert!(!out.is_error);
         });
     }
+
+    #[test]
+    fn positioned_file_read_leaves_the_cursor_where_it_found_it() {
+        // bd-kgkrq / GH #182. Callers treat `positioned_file_read` as
+        // cursor-neutral on every platform: Unix `read_at` never moves the
+        // cursor, but Windows `seek_read` sets it to the end of the read and
+        // the portable fallback seeks a `try_clone()` that shares it. This
+        // asserts the contract itself rather than a platform symptom, so it
+        // passes trivially on Unix and fails on Windows without the restore.
+        let tmp = tempfile::tempdir().expect("cursor fixture");
+        let path = tmp.path().join("cursor.txt");
+        std::fs::write(&path, b"abcdefghij").expect("write cursor fixture");
+
+        let file = std::fs::File::open(&path).expect("open cursor fixture");
+        let mut handle: &std::fs::File = &file;
+        std::io::Seek::seek(&mut handle, std::io::SeekFrom::Start(3)).expect("seek to 3");
+        assert_eq!(
+            std::io::Seek::stream_position(&mut handle).expect("position before"),
+            3
+        );
+
+        let mut buffer = [0_u8; 4];
+        let read = positioned_file_read(&file, &mut buffer, 0).expect("positioned read");
+        assert_eq!(read, 4);
+        assert_eq!(&buffer, b"abcd");
+
+        assert_eq!(
+            std::io::Seek::stream_position(&mut handle).expect("position after"),
+            3,
+            "positioned_file_read must not move the caller's cursor"
+        );
+
+        // The consequence that actually broke `read`: a sequential read after
+        // a positioned read must continue from where the caller was, not EOF.
+        let mut rest = String::new();
+        handle.read_to_string(&mut rest).expect("sequential read");
+        assert_eq!(rest, "defghij");
+    }
+
+    #[test]
+    fn fingerprinting_a_cloned_handle_leaves_the_original_readable() {
+        // The exact shape of ReadTool::execute (bd-kgkrq / GH #182): open the
+        // file once, clone the handle for the tool-output-cache fingerprint,
+        // then read the content through the original. `try_clone` shares the
+        // OS file position, so a fingerprint that moves the clone's cursor
+        // leaves the real read at EOF and returns an empty file with no error.
+        let tmp = tempfile::tempdir().expect("fingerprint fixture");
+        let path = tmp.path().join("shared.txt");
+        let body = b"alpha\nbeta\ngamma\n";
+        std::fs::write(&path, body).expect("write fingerprint fixture");
+
+        let file = std::fs::File::open(&path).expect("open fingerprint fixture");
+        let clone = file.try_clone().expect("clone fingerprint handle");
+        assert!(
+            fingerprint_open_file_content(&clone).is_some(),
+            "fixture must be small enough to fingerprint"
+        );
+
+        let mut contents = Vec::new();
+        let mut handle: &std::fs::File = &file;
+        handle
+            .read_to_end(&mut contents)
+            .expect("read through the original handle");
+        assert_eq!(
+            contents, body,
+            "fingerprinting through a shared clone must not consume the original handle"
+        );
+    }
+
     #[test]
     fn write_tool_persists_inside_additional_root() {
         // /add-dir grants read AND write: the atomic-replace containment
@@ -19874,6 +20615,35 @@ mod tests {
         assert!(!result.to_string_lossy().starts_with("~/"));
     }
 
+    /// Windows models write `~\Documents\x`; that must reach the home
+    /// directory there, while on Unix `~\x` stays a literal relative name.
+    #[test]
+    fn test_home_relative_rest_accepts_backslash_only_where_it_separates() {
+        assert_eq!(home_relative_rest("~/a/b.txt", false), Some("a/b.txt"));
+        assert_eq!(home_relative_rest("~/a/b.txt", true), Some("a/b.txt"));
+        assert_eq!(
+            home_relative_rest("~\\Documents\\b.txt", true),
+            Some("Documents\\b.txt")
+        );
+        assert_eq!(home_relative_rest("~\\Documents\\b.txt", false), None);
+        assert_eq!(home_relative_rest("~user/b.txt", true), None);
+        assert_eq!(home_relative_rest("a/~/b.txt", true), None);
+        assert_eq!(home_relative_rest("~", true), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_resolve_path_backslash_tilde_expands_on_windows() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let cwd = PathBuf::from(r"C:\work\project");
+        assert_eq!(
+            resolve_path(r"~\notes\todo.txt", &cwd),
+            home.join("notes").join("todo.txt")
+        );
+    }
+
     fn arbitrary_text() -> impl Strategy<Value = String> {
         prop::collection::vec(any::<u8>(), 0..512)
             .prop_map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
@@ -21338,5 +22108,273 @@ mod tests {
             !registry.is_discoverable("current_time"),
             "current_time must be essential-tier (directly callable)"
         );
+    }
+}
+
+#[cfg(test)]
+mod known_tool_name_tests {
+    use super::*;
+
+    /// Joined after construction by the session host, so the registry builds
+    /// nothing for them and neither does this test.
+    const HOST_COUPLED: &[&str] = &["ask", "todo", "submit_plan"];
+
+    /// What the registry holds for a request naming nothing at all.
+    ///
+    /// Not necessarily zero — some tools join regardless of `--tools` — so
+    /// "this name built something" has to be measured as a difference.
+    fn baseline_tool_count(dir: &std::path::Path) -> usize {
+        ToolRegistry::new(&[], dir, None).tools().len()
+    }
+
+    #[test]
+    fn tool_registry_builds_every_listed_name() {
+        // The direction that matters: a name in KNOWN_TOOL_NAMES that builds
+        // nothing is pi promising a tool it will then drop in silence, which
+        // is the whole defect the list exists to report.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let baseline = baseline_tool_count(dir.path());
+        let mut built_nothing = Vec::new();
+        for name in ToolRegistry::KNOWN_TOOL_NAMES {
+            if HOST_COUPLED.contains(name) {
+                continue;
+            }
+            if ToolRegistry::new(&[name], dir.path(), None).tools().len() <= baseline {
+                built_nothing.push(*name);
+            }
+        }
+        assert!(
+            built_nothing.is_empty(),
+            "listed but built nothing beyond the {baseline}-tool baseline: \
+             {built_nothing:?} — either the arm went away or the name is \
+             misspelled in KNOWN_TOOL_NAMES"
+        );
+    }
+
+    #[test]
+    fn every_registerable_tool_is_named_in_one_of_the_two_lists() {
+        // The direction `tool_registry_builds_every_listed_name` leaves open,
+        // and the one that shipped a false warning: a tool the registry really
+        // does build, named in neither list, is reported to the user as "not a
+        // tool pi provides". Seven were in that state — xdev, manage_skill and
+        // the five memory-bank tools — because they join outside the --tools
+        // match and nothing measured that.
+        //
+        // Build with everything the config can switch on, so config-gated
+        // tools are present rather than silently skipped.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "memory": {"backend": "local"},
+            "browser": {"enableBrowser": true},
+            "computer": {"enableComputer": true},
+            "media": {
+                "enableInspectImage": true,
+                "enableGenerateImage": true,
+                "enableTts": true,
+                "enableReadMedia": true
+            }
+        }))
+        .expect("config");
+        let enabled: Vec<&str> = ToolRegistry::KNOWN_TOOL_NAMES.to_vec();
+        let registry = ToolRegistry::new(&enabled, dir.path(), Some(&config));
+
+        let unnamed: Vec<String> = registry
+            .tools()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .filter(|name| {
+                !ToolRegistry::KNOWN_TOOL_NAMES.contains(&name.as_str())
+                    && !ToolRegistry::TOOLS_NOT_SELECTED_BY_FLAG
+                        .iter()
+                        .any(|(listed, _)| listed == name)
+            })
+            .collect();
+        assert!(
+            unnamed.is_empty(),
+            "the registry builds {unnamed:?}, which appears in neither \
+             KNOWN_TOOL_NAMES nor TOOLS_NOT_SELECTED_BY_FLAG — `--tools` will \
+             tell a user these are not tools pi provides"
+        );
+
+        // And the converse for the new list: a name here that the registry
+        // never produces would be advice pointing at nothing.
+        let built: Vec<String> = registry
+            .tools()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let phantom: Vec<&str> = ToolRegistry::TOOLS_NOT_SELECTED_BY_FLAG
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !built.iter().any(|b| b == name))
+            .collect();
+        assert!(
+            phantom.is_empty(),
+            "listed as provided-but-unselectable yet never registered: {phantom:?}"
+        );
+    }
+
+    #[test]
+    fn a_real_tool_the_flag_cannot_select_is_not_called_unknown() {
+        for name in [
+            "xdev",
+            "manage_skill",
+            "retain",
+            "recall",
+            "reflect",
+            "memory_edit",
+            "learn",
+        ] {
+            assert!(
+                unknown_tool_names(&[name]).is_empty(),
+                "{name} is a tool pi provides; --tools must not call it unknown"
+            );
+            let advice = unselectable_tool_names(&[name]);
+            assert_eq!(advice.len(), 1, "{name} should be explained, not ignored");
+            assert!(
+                !advice[0].1.is_empty(),
+                "{name} needs advice a user can act on"
+            );
+        }
+        // A genuine typo is still a typo.
+        assert_eq!(unknown_tool_names(&["bsah"]), vec!["bsah".to_string()]);
+        assert!(unselectable_tool_names(&["bsah"]).is_empty());
+    }
+
+    #[test]
+    fn host_coupled_names_are_listed_and_build_nothing_here() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let baseline = baseline_tool_count(dir.path());
+        for name in HOST_COUPLED {
+            assert!(
+                ToolRegistry::KNOWN_TOOL_NAMES.contains(name),
+                "{name} would be reported as a typo"
+            );
+            assert_eq!(
+                ToolRegistry::new(&[name], dir.path(), None).tools().len(),
+                baseline,
+                "{name} now builds in the registry; move it out of HOST_COUPLED"
+            );
+        }
+    }
+
+    #[test]
+    fn a_misspelled_tool_name_is_reported_and_a_real_one_is_not() {
+        assert_eq!(
+            unknown_tool_names(&["read", "bsah", "edit"]),
+            vec!["bsah".to_string()]
+        );
+        assert!(unknown_tool_names(&["read", "ask", "todo", "submit_plan"]).is_empty());
+        assert_eq!(
+            unknown_tool_names(&["completely_made_up"]),
+            vec!["completely_made_up".to_string()]
+        );
+        assert!(unknown_tool_names(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_default_tool_set_is_entirely_honoured() {
+        // `--tools`' own default must not contain a name pi drops.
+        use clap::Parser as _;
+        let cli = crate::cli::Cli::parse_from(["pi"]);
+        let requested = cli.enabled_tools();
+        assert!(!requested.is_empty(), "the default set should not be empty");
+        assert!(
+            unknown_tool_names(&requested).is_empty(),
+            "pi's own default --tools names something it drops: {:?}",
+            unknown_tool_names(&requested)
+        );
+    }
+}
+
+#[cfg(test)]
+mod host_picker_registry_tests {
+    use super::*;
+
+    #[test]
+    fn host_picker_survives_shallow_registry_clones_without_model_ask() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = ToolRegistry::new(&["read"], dir.path(), None);
+            assert!(registry.get("ask").is_none());
+            let picker = registry.host_ask_tool();
+            picker.set_handler(std::sync::Arc::new(|request| {
+                Box::pin(async move {
+                    Ok(crate::ask::AskResponse {
+                        answers: vec![crate::ask::AskAnswer {
+                            question_id: request.questions[0]
+                                .id
+                                .clone()
+                                .unwrap_or_else(|| "q".into()),
+                            selected: vec!["Allow once".into()],
+                            other: None,
+                        }],
+                        dismissed: false,
+                    })
+                })
+            }));
+            let clone = registry.clone_shallow().host_ask_tool();
+            let response = clone
+                .prompt_installed(crate::ask::AskRequest {
+                    questions: vec![crate::ask::AskQuestion {
+                        id: Some("q".into()),
+                        header: None,
+                        question: "Host decision?".into(),
+                        options: vec![
+                            crate::ask::AskOption {
+                                label: "Deny".into(),
+                                description: None,
+                            },
+                            crate::ask::AskOption {
+                                label: "Allow once".into(),
+                                description: None,
+                            },
+                        ],
+                        recommended: None,
+                        multi: false,
+                    }],
+                })
+                .await
+                .unwrap();
+            assert_eq!(response.answers[0].selected, ["Allow once"]);
+        });
+    }
+
+    #[test]
+    fn default_registry_computer_uses_host_picker_before_native_input() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "computer": { "enableComputer": true, "requireApproval": true }
+            }))
+            .unwrap();
+            let registry = ToolRegistry::new(&["computer"], dir.path(), Some(&config));
+            let picker = registry.host_ask_tool();
+            picker.set_handler(std::sync::Arc::new(|request| {
+                Box::pin(async move {
+                    Ok(crate::ask::AskResponse {
+                        answers: vec![crate::ask::AskAnswer {
+                            question_id: request.questions[0].id.clone().unwrap(),
+                            selected: vec!["Deny".into()],
+                            other: None,
+                        }],
+                        dismissed: false,
+                    })
+                })
+            }));
+            let error = registry
+                .get("computer")
+                .unwrap()
+                .execute(
+                    "host-picker",
+                    serde_json::json!({"action":"key_type","text":"must-not-reach-native"}),
+                    None,
+                )
+                .await
+                .expect_err("host denial must stop before native input");
+            let message = error.to_string();
+            assert!(message.contains("not approved"), "{message}");
+            assert!(!message.contains("no approval handler"), "{message}");
+        });
     }
 }

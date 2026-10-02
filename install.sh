@@ -161,6 +161,29 @@ run_with_spinner() {
   fi
 }
 
+# BSD mktemp, which is what macOS ships, ignores TMPDIR unless it is handed an
+# explicit template (or -t); GNU mktemp honours TMPDIR on its own. With a bare
+# `mktemp -d` the installer scratch therefore always landed in the system temp
+# directory on macOS, so a caller-supplied TMPDIR — and PI_INSTALLER_RETAIN_TEMP
+# with it — was silently ignored there while working on Linux. Always pass a
+# template rooted at TMPDIR so both platforms agree.
+installer_tmp_root() {
+  local root="${TMPDIR:-/tmp}"
+  root="${root%/}"
+  if [ -z "$root" ]; then
+    root="/tmp"
+  fi
+  printf '%s' "$root"
+}
+
+installer_mktemp_file() {
+  mktemp "$(installer_tmp_root)/pi-install.XXXXXXXX"
+}
+
+installer_mktemp_dir() {
+  mktemp -d "$(installer_tmp_root)/pi-install.XXXXXXXX"
+}
+
 version_timeout_cmd() {
   if command -v timeout >/dev/null 2>&1; then
     printf '%s\n' "timeout"
@@ -193,13 +216,13 @@ run_command_with_timeout_capture() {
   fi
 
   local out_file=""
-  out_file="$(mktemp 2>/dev/null || true)"
+  out_file="$(installer_mktemp_file 2>/dev/null || true)"
   if [ -z "$out_file" ]; then
     return 125
   fi
 
   local timed_out_file=""
-  timed_out_file="$(mktemp 2>/dev/null || true)"
+  timed_out_file="$(installer_mktemp_file 2>/dev/null || true)"
   if [ -z "$timed_out_file" ]; then
     rm -f "$out_file" 2>/dev/null || true
     return 125
@@ -262,13 +285,13 @@ run_bounded_stderr_capture() {
   : > "$err_file"
 
   local out_file=""
-  out_file="$(mktemp 2>/dev/null || true)"
+  out_file="$(installer_mktemp_file 2>/dev/null || true)"
   if [ -z "$out_file" ]; then
     return 125
   fi
 
   local timed_out_file=""
-  timed_out_file="$(mktemp 2>/dev/null || true)"
+  timed_out_file="$(installer_mktemp_file 2>/dev/null || true)"
   if [ -z "$timed_out_file" ]; then
     rm -f "$out_file" 2>/dev/null || true
     return 125
@@ -2147,10 +2170,25 @@ build_from_source() {
       return 1
     fi
     src_dir="$TMP/src"
-    git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$src_dir" >&2
+    if ! git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$src_dir" >&2; then
+      err "Failed to clone source for ${VERSION}; no binary was installed"
+      return 1
+    fi
   fi
 
-  (cd "$src_dir" && cargo build --release --locked --bin pi >&2)
+  # Pin the output directory on the command line, which takes precedence over
+  # both CARGO_TARGET_DIR and build.target-dir in Cargo configuration. The
+  # artifact lookup below must use the very same directory (GH-235).
+  local build_args=(build --release --locked --bin pi --target-dir "$src_dir/target")
+  if [ "$OFFLINE" -eq 1 ]; then
+    build_args+=(--offline)
+  fi
+  # A caller can use this function in a conditional, disabling Bash errexit
+  # throughout its body. Never mistake a previous executable for a failed build.
+  if ! (cd "$src_dir" && cargo "${build_args[@]}" >&2); then
+    err "Source build failed; no binary was installed"
+    return 1
+  fi
 
   local built_bin="$src_dir/target/release/pi${EXE_EXT}"
   if [ ! -x "$built_bin" ]; then
@@ -2791,11 +2829,11 @@ bash tests/installer_regression.sh
 
 | Symptom | First 3 Commands |
 |---|---|
-| Provider stream/tool-call regression | `cargo test provider_streaming -- --nocapture` ; `rg -n "stream|tool|delta|event|SSE" src/providers src/sse.rs` ; `cargo test conformance` |
+| Provider stream/tool-call regression | `cargo test --test provider_streaming -- --nocapture` ; `rg -n "stream|tool|delta|event|SSE" src/providers src/sse.rs` ; `cargo test conformance` |
 | Session replay/index drift | `cargo test session -- --nocapture` ; `rg -n "Session|save|open|index|jsonl|sqlite" src/session.rs src/session_index.rs` ; `cargo test conformance` |
 | Extension policy/runtime failure | `cargo test extension -- --nocapture` ; `rg -n "policy|hostcall|capability|quickjs|deny|allow" src/extensions.rs src/extensions_js.rs` ; `cargo test conformance` |
 | Installer/uninstaller/skill issue | `bash tests/installer_regression.sh` ; `rg -n "AGENT_SKILL_STATUS|CHECKSUM_STATUS|SIGSTORE_STATUS|COMPLETIONS_STATUS" install.sh` ; `rg -n "managed skill|expected skill directory|PIAR_AGENT_SKILL" uninstall.sh` |
-| Interactive vs RPC divergence | `cargo test e2e_rpc -- --nocapture` ; `rg -n "interactive|rpc|stdin|event|session" src/main.rs src/interactive.rs src/rpc.rs` ; `cargo test conformance` |
+| Interactive vs RPC divergence | `cargo test --test e2e_rpc -- --nocapture` ; `rg -n "interactive|rpc|stdin|event|session" src/main.rs src/interactive.rs src/rpc.rs` ; `cargo test conformance` |
 
 For deeper diagnosis, use `references/DEBUGGING-PLAYBOOKS.md`.
 
@@ -2822,11 +2860,11 @@ For deeper diagnosis, use `references/DEBUGGING-PLAYBOOKS.md`.
 | Changed Files (examples) | Minimum Required Tests |
 |---|---|
 | `install.sh`, `uninstall.sh`, `.claude/skills/pi-agent-rust/**` | `bash -n install.sh uninstall.sh tests/installer_regression.sh` ; `shellcheck -x install.sh uninstall.sh tests/installer_regression.sh` ; `bash tests/installer_regression.sh` ; `bash scripts/skill-smoke.sh` |
-| `src/providers/**`, `src/provider.rs`, `src/sse.rs` | `cargo test provider_streaming` ; `cargo test conformance` |
+| `src/providers/**`, `src/provider.rs`, `src/sse.rs` | `cargo test --test provider_streaming` ; `cargo test --test e2e_provider_streaming` ; `cargo test conformance` |
 | `src/session.rs`, `src/session_index.rs`, `src/session_test.rs` | `cargo test session` ; `cargo test conformance` |
 | `src/extensions.rs`, `src/extensions_js.rs` | `cargo test extension` ; `cargo test conformance` |
 | `src/tools.rs` | `cargo test tools` ; `cargo test conformance` |
-| `src/interactive.rs`, `src/rpc.rs`, `src/main.rs` | `cargo test e2e_rpc` ; `cargo test conformance` |
+| `src/interactive.rs`, `src/rpc.rs`, `src/main.rs` | `cargo test --test e2e_rpc` ; `cargo test conformance` |
 
 ## Do Not Run Yet
 
@@ -2985,8 +3023,12 @@ cargo fmt --check
 # Tool behavior
 cargo test tools
 
-# Provider streaming/protocol
-cargo test provider_streaming
+# Provider streaming/protocol: VCR playback for every provider (tests/provider_streaming.rs
+# and tests/provider_streaming/*.rs). A bare `cargo test provider_streaming` is a
+# name filter, and no test path contains that string, so it runs nothing.
+cargo test --test provider_streaming
+# Anthropic end-to-end scenarios (tests/e2e_provider_streaming.rs)
+cargo test --test e2e_provider_streaming
 
 # Session persistence/index
 cargo test session
@@ -2994,8 +3036,8 @@ cargo test session
 # Extension runtime/policy
 cargo test extension
 
-# RPC surface
-cargo test e2e_rpc
+# RPC surface (tests/e2e_rpc.rs target)
+cargo test --test e2e_rpc
 
 # Broader safety net after targeted slices
 cargo test conformance
@@ -3056,7 +3098,7 @@ Each playbook is symptom-first and ends with a concrete fix verification checkli
 | `Custom artifact download failed; cannot fall back to source` | Synthetic custom artifact flow | `rg -n "custom-artifact|artifact-url|fall back to source" install.sh tests/installer_regression.sh` |
 | `Skills:    partial (...)` | Mixed skill-install outcome logic | `rg -n "install_agent_skills|AGENT_SKILL_STATUS|failed_writes|skipped_custom" install.sh` |
 | `Skipping unexpected skill directory path:` | Uninstall path guard triggered | `rg -n "is_expected_skill_directory|remove_installed_skills" uninstall.sh` |
-| Streaming/tool-call mismatch in provider tests | Provider streaming/event normalization | `cargo test provider_streaming -- --nocapture` |
+| Streaming/tool-call mismatch in provider tests | Provider streaming/event normalization | `cargo test --test provider_streaming -- --nocapture` |
 | Session replay/index drift | Session persistence/index metadata logic | `cargo test session -- --nocapture` |
 | Extension hostcall/capability denial mismatch | Extension policy + QuickJS bridge | `cargo test extension -- --nocapture` |
 
@@ -3070,16 +3112,21 @@ Each playbook is symptom-first and ends with a concrete fix verification checkli
 ### First 3 Commands
 
 ```bash
-cargo test provider_streaming -- --nocapture
+cargo test --test provider_streaming -- --nocapture
 rg -n "stream|tool|delta|event|SSE|responses|completions" src/providers src/provider.rs src/sse.rs
 cargo test conformance
 ```
 
+`--test provider_streaming` replays the VCR cassettes for every provider (one module per provider:
+`anthropic::`, `openai::`, `gemini::` ...). `--test e2e_provider_streaming` adds the Anthropic
+end-to-end scenarios. Under rch, set `PI_PROVIDER_REPLAY_GIT_COMMIT="$(git rev-parse HEAD)"`, because
+rch omits repository metadata.
+
 ### Minimal Repro Template
 
 ```bash
-# Replace with the narrowest failing test name from provider_streaming output.
-cargo test provider_streaming::<failing_case> -- --nocapture
+# Replace with the narrowest failing test path from the output, e.g. anthropic::<case>.
+cargo test --test provider_streaming <failing_case> -- --nocapture
 ```
 
 ### Narrow the Change Surface
@@ -3114,8 +3161,9 @@ cargo test conformance
 ### Minimal Repro Template
 
 ```bash
-# Replace with specific failing session test from output.
-cargo test session::<failing_case> -- --nocapture
+# Replace with the full failing test path printed in the output
+# (lib tests look like session::tests::<case>).
+cargo test <failing_test_path> -- --nocapture
 ```
 
 ### Narrow the Change Surface
@@ -3149,8 +3197,9 @@ cargo test conformance
 ### Minimal Repro Template
 
 ```bash
-# Replace with specific failing extension test from output.
-cargo test extension::<failing_case> -- --nocapture
+# Replace with the full failing test path printed in the output
+# (the lib module is `extensions`, so `extension::<case>` matches nothing).
+cargo test <failing_test_path> -- --nocapture
 ```
 
 ### Narrow the Change Surface
@@ -3216,7 +3265,7 @@ rg -n "remove_installed_skills|is_expected_skill_directory|is_managed_skill_file
 ### First 3 Commands
 
 ```bash
-cargo test e2e_rpc -- --nocapture
+cargo test --test e2e_rpc -- --nocapture
 rg -n "interactive|rpc|stdin|event|session" src/main.rs src/interactive.rs src/rpc.rs
 cargo test conformance
 ```
@@ -3225,7 +3274,7 @@ cargo test conformance
 
 ```bash
 # Replace with specific failing RPC test from output.
-cargo test e2e_rpc::<failing_case> -- --nocapture
+cargo test --test e2e_rpc <failing_case> -- --nocapture
 ```
 
 ### Fix Verification Checklist
@@ -3496,7 +3545,7 @@ install_agent_skills() {
         fi
         prev_ref="$ref"
         local downloaded_dir=""
-        downloaded_dir="$(mktemp -d 2>/dev/null || true)"
+        downloaded_dir="$(installer_mktemp_dir 2>/dev/null || true)"
         if [ -z "$downloaded_dir" ] || [ ! -d "$downloaded_dir" ]; then
           break
         fi
@@ -3512,7 +3561,7 @@ install_agent_skills() {
 
     if [ -z "$source_path" ]; then
       local inline_skill_dir=""
-      inline_skill_dir="$(mktemp -d 2>/dev/null || true)"
+      inline_skill_dir="$(installer_mktemp_dir 2>/dev/null || true)"
       if [ -z "$inline_skill_dir" ] || [ ! -d "$inline_skill_dir" ]; then
         AGENT_SKILL_STATUS="failed (temp dir error)"
         warn "Failed to prepare inline agent skill directory"
@@ -3775,7 +3824,7 @@ main() {
   fi
 
   acquire_lock
-  TMP=$(mktemp -d)
+  TMP=$(installer_mktemp_dir)
 
   local source_bin=""
   if [ "$FROM_SOURCE" -eq 1 ]; then

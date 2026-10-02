@@ -525,7 +525,7 @@ fn js_to_json_inner(value: &Value<'_>, depth: usize) -> rquickjs::Result<serde_j
         return Ok(serde_json::json!(i));
     }
     if let Some(f) = value.as_float() {
-        return Ok(serde_json::json!(f));
+        return Ok(js_float_to_json(f));
     }
     if let Some(s) = value.as_string() {
         let s = s.to_string()?;
@@ -567,6 +567,32 @@ fn js_to_json_inner(value: &Value<'_>, depth: usize) -> rquickjs::Result<serde_j
     }
     // Fallback for functions, symbols, etc.
     Ok(serde_json::Value::Null)
+}
+
+/// Largest magnitude a JS number can hold while still naming every integer
+/// exactly (`Number.MAX_SAFE_INTEGER`, 2^53 - 1).
+const JS_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// Map a QuickJS float64 onto the JSON number that `JSON.stringify` would
+/// produce for it.
+///
+/// QuickJS keeps integers that fit in `i32` under `JS_TAG_INT` and promotes
+/// everything else — including `Date.now()`, which passed 2^31 in 1970 — to
+/// `JS_TAG_FLOAT64`. The tag is a storage detail: a JS number has no integer
+/// vs. float distinction, and `JSON.stringify(2147483648)` is `2147483648`,
+/// not `2147483648.0`. Emitting the tag as-is made every `i64` field on the
+/// Rust side reject an integral timestamp with "invalid type: floating point,
+/// expected i64" (gh #238). Integral finite values inside the exactly
+/// representable range therefore become JSON integers; non-integral, huge,
+/// or non-finite values keep the float path (`serde_json` renders non-finite
+/// as `null`, matching `JSON.stringify`).
+fn js_float_to_json(f: f64) -> serde_json::Value {
+    if f.is_finite() && f.fract() == 0.0 && f.abs() <= JS_MAX_SAFE_INTEGER {
+        // Exact by construction: |f| <= 2^53 - 1 fits in i64 losslessly.
+        #[allow(clippy::cast_possible_truncation)]
+        return serde_json::json!(f as i64);
+    }
+    serde_json::json!(f)
 }
 
 pub type HostcallQueue = Rc<RefCell<HostcallRequestQueue<HostcallRequest>>>;
@@ -9819,10 +9845,25 @@ export function rawKeyHint(key, description = "") {
 // extension-composed request cross the bridge for host-side sanitization
 // and a host-credentialed POST to the provider's native compact endpoint.
 // A legacy Model object in that position (no `strategy` key) keeps the
-// original summary-compaction path. An AbortSignal in `options.signal` is
-// accepted but not propagated -- the host's dedicated compact event budget
-// (gh #178) bounds the round-trip instead.
+// original summary-compaction path.
+//
+// Cancellation (gh #178): a signal (`options.signal`, or the legacy fifth
+// argument) that has already aborted rejects before any host work starts.
+// An abort that fires mid-call is NOT propagated: hostcalls are serialized on
+// the extension runtime thread, so no JS abort handler can run until the
+// compact hostcall returns. The host's dedicated compact event budget bounds
+// that round-trip instead.
 export async function compact(preparation, modelOrOptions, _apiKey, _customInstructions, _signal) {
+  const signal =
+    (modelOrOptions && typeof modelOrOptions === "object" && modelOrOptions.signal) || _signal;
+  if (signal && signal.aborted) {
+    if (signal.reason !== undefined) {
+      throw signal.reason;
+    }
+    const aborted = new Error("This operation was aborted");
+    aborted.name = "AbortError";
+    throw aborted;
+  }
   if (!globalThis.pi || typeof globalThis.pi.events !== "function") {
     throw new Error("compact() host bridge is unavailable in this runtime");
   }
@@ -9935,6 +9976,48 @@ export class DefaultResourceLoader {
   async reload() { return; }
 }
 
+// Upstream exports DefaultPackageManager from this module, and extensions
+// import it. In this host the package manager lives in Rust and is not
+// reachable from inside QuickJS, so this is a shim like SettingsManager and
+// DefaultResourceLoader above. Without it the import is a static link error —
+// "Could not find export 'DefaultPackageManager'" — which kills the whole
+// extension at load even when it never calls the class (gh #223).
+//
+// The read-shaped methods are inert and return the upstream shapes. The three
+// mutating ones throw instead of resolving: an install() that silently
+// succeeds without installing anything is a worse answer than a named error,
+// because the caller cannot tell the difference and will act on a package that
+// is not there.
+export class DefaultPackageManager {
+  constructor(options = {}) {
+    this.cwd = String(options.cwd ?? "");
+    this.agentDir = String(options.agentDir ?? "");
+    this.settingsManager = options.settingsManager ?? null;
+    this.progressCallback = undefined;
+  }
+  setProgressCallback(callback) {
+    this.progressCallback = typeof callback === "function" ? callback : undefined;
+  }
+  getInstalledPath(_source, _scope) { return undefined; }
+  async resolve(_onMissing) {
+    return { extensions: [], skills: [], prompts: [], themes: [] };
+  }
+  async resolveExtensionSources(_sources, _options) {
+    return { extensions: [], skills: [], prompts: [], themes: [] };
+  }
+  async install(source, _options) { throw this._unsupported("install", source); }
+  async remove(source, _options) { throw this._unsupported("remove", source); }
+  async update(source) { throw this._unsupported("update", source); }
+  _unsupported(action, source) {
+    const target = source ? ` '${String(source)}'` : "";
+    return new Error(
+      `DefaultPackageManager.${action}()${target} is not available to extensions in this host: ` +
+      "package installation is owned by the pi binary. Use `pi install` from the shell, " +
+      "or declare the package in settings.json."
+    );
+  }
+}
+
 export function highlightCode(code, _lang, _theme) {
   return String(code ?? "");
 }
@@ -10039,6 +10122,7 @@ export default {
   SessionManager,
   SettingsManager,
   DefaultResourceLoader,
+  DefaultPackageManager,
   highlightCode,
   getLanguageFromPath,
   isBashToolResult,
@@ -20938,6 +21022,7 @@ function __pi_register_provider(provider_id, spec) {
         if (m && m.cost) out.cost = m.cost;
         if (m && m.contextWindow !== undefined) out.contextWindow = m.contextWindow;
         if (m && m.maxTokens !== undefined) out.maxTokens = m.maxTokens;
+        if (m && m.headers && typeof m.headers === 'object') out.headers = Object.assign({}, m.headers);
         return out;
     }) : [];
 
@@ -20978,6 +21063,9 @@ function __pi_register_provider(provider_id, spec) {
         models: models,
         hasStreamSimple: effectiveHasStreamSimple,
     };
+    if (spec.headers && typeof spec.headers === 'object') {
+        providerSpec.headers = Object.assign({}, spec.headers);
+    }
     if (spec.oauth && typeof spec.oauth === 'object') {
         const oauth = {};
         if (spec.oauth.authUrl !== undefined && spec.oauth.authUrl !== null) {
@@ -22293,6 +22381,41 @@ function __pi_project_model_entry(raw) {
 	            return response;
 	        }
 	        return undefined;
+	    }
+
+	    if (eventName === 'before_provider_request') {
+	        // gh #219: handlers chain in load order. Each handler sees the
+	        // payload as rewritten by the handlers before it; returning
+	        // undefined/null keeps that payload, returning an object replaces
+	        // it (the payload itself or `{ payload }`, the two shapes the host
+	        // normalizer accepts). The final payload is always handed back so
+	        // in-place mutations of `event.payload` reach the wire too.
+	        const base = event_payload && typeof event_payload === 'object' ? event_payload : {};
+	        let currentPayload = base.payload;
+	        for (const entry of handlers) {
+	            const handler = entry && entry.handler;
+	            if (typeof handler !== 'function') continue;
+	            const event = Object.assign({}, base, { payload: currentPayload });
+	            let result = undefined;
+	            try {
+	                result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
+	            } catch (e) {
+	                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, e); } catch (_e) {}
+	                continue;
+	            }
+	            if (result === undefined || result === null) {
+	                currentPayload = event.payload;
+	                continue;
+	            }
+	            if (typeof result !== 'object' || Array.isArray(result)) {
+	                try { globalThis.console && globalThis.console.error && globalThis.console.error('before_provider_request handler returned a non-object rewrite (ignored):', entry.extensionId); } catch (_e) {}
+	                currentPayload = event.payload;
+	                continue;
+	            }
+	            const next = Object.prototype.hasOwnProperty.call(result, 'payload') ? result.payload : result;
+	            currentPayload = (next && typeof next === 'object' && !Array.isArray(next)) ? next : event.payload;
+	        }
+	        return { payload: currentPayload };
 	    }
 
 	    let last = undefined;
@@ -25248,107 +25371,221 @@ mod tests {
         hex_lower(&Sha256::digest(bytes))
     }
 
+    /// gh #238: QuickJS stores integers above `i32` as float64. `js_to_json`
+    /// used to surface the storage tag, so a `Date.now()` timestamp became
+    /// `2147483648.0` and every `i64` field on the Rust side rejected it.
+    #[test]
+    fn js_to_json_renders_integral_floats_as_json_integers() {
+        /// The field shape that failed in the wild: an `i64` timestamp.
+        #[derive(serde::Deserialize)]
+        struct Stamped {
+            timestamp: i64,
+        }
+
+        let runtime = rquickjs::Runtime::new().expect("quickjs runtime");
+        let context = rquickjs::Context::full(&runtime).expect("quickjs context");
+        let converted = context.with(|ctx| {
+            let value: Value<'_> = ctx
+                .eval(
+                    r"({
+                        i32Max: 2147483647,
+                        i32MaxPlusOne: 2147483648,
+                        negative: -2147483649,
+                        epochMs: 1758556800123,
+                        maxSafe: 9007199254740991,
+                        beyondSafe: 9007199254740992,
+                        fraction: 1.5,
+                        negZero: -0,
+                        inf: Infinity,
+                        nan: NaN,
+                        nested: [4294967296, { ts: 3000000000 }],
+                    })",
+                )
+                .expect("eval literal");
+            js_to_json(&value).expect("convert")
+        });
+
+        assert_eq!(converted["i32Max"], json!(2_147_483_647_i64));
+        assert!(converted["i32MaxPlusOne"].is_i64(), "{converted}");
+        assert_eq!(converted["i32MaxPlusOne"], json!(2_147_483_648_i64));
+        assert_eq!(converted["negative"], json!(-2_147_483_649_i64));
+        assert!(converted["epochMs"].is_i64(), "{converted}");
+        assert_eq!(converted["epochMs"], json!(1_758_556_800_123_i64));
+        assert_eq!(converted["maxSafe"], json!(9_007_199_254_740_991_i64));
+        // Past 2^53 integers are no longer exact; keep the float rendering.
+        assert!(converted["beyondSafe"].is_f64(), "{converted}");
+        assert_eq!(converted["fraction"], json!(1.5));
+        assert_eq!(converted["negZero"], json!(0_i64));
+        assert!(converted["inf"].is_null(), "{converted}");
+        assert!(converted["nan"].is_null(), "{converted}");
+        assert_eq!(converted["nested"][0], json!(4_294_967_296_i64));
+        assert_eq!(converted["nested"][1]["ts"], json!(3_000_000_000_i64));
+
+        let stamped: Stamped = serde_json::from_value(json!({ "timestamp": converted["epochMs"] }))
+            .expect("integral float deserializes as i64");
+        assert_eq!(stamped.timestamp, 1_758_556_800_123);
+    }
+
+    /// Receipt name for `pi_bridge_js()`, which is not a virtual module.
+    const BRIDGE_RECEIPT: &str = "<bridge>";
+
+    /// Golden receipts for the compile-time-compressed JavaScript sources:
+    /// `(name, byte length, SHA-256 of the decompressed source)`.
+    ///
+    /// `compressed_js_literal!` LZSS-compresses each source literal at compile
+    /// time and `lzss_decompress` restores it on first use. Decompression
+    /// already enforces the *length* — `RAW_LEN` is derived from the same
+    /// literal, and a mismatch is a hard error — so the byte counts here
+    /// cannot catch a codec bug on their own. The SHA-256 is the assertion
+    /// that can: it is the only thing standing between a codec that decodes
+    /// the right number of wrong bytes and a silently corrupted bridge. The
+    /// lengths ride along because they turn "hash drift" into a readable
+    /// delta.
+    ///
+    /// The receipts are therefore change detectors: any deliberate edit to the
+    /// bridge or to a virtual module moves them and has to re-pin them in the
+    /// same commit. On drift the test prints the complete regenerated table,
+    /// so re-pinning is one copy-paste instead of one test run per receipt.
+    ///
+    /// Re-pinned 2026-09-09 (bridge): only `<bridge>` moved, 202_987 ->
+    /// 205_065 (+2_078 bytes, sha `fdfa107d…` -> `992b7def…`). `e0ce03b0d`
+    /// ("fix(extensions): chain `before_provider_request` handlers in load
+    /// order", gh #219) added a 35-line chaining branch to the bridge source
+    /// and changed nothing else: `git show e0ce03b0d -- src/extensions_js.rs`
+    /// adds exactly 2_078 bytes and removes none, which accounts for the whole
+    /// delta. Every virtual-module receipt is unchanged. The pin before this
+    /// one rotted the same way, so this drift is bridge edits landing without
+    /// the receipt update, not bundle corruption.
+    ///
+    /// Re-pinned 2026-09-09 (pi-coding-agent): only
+    /// `@mariozechner/pi-coding-agent` moved, 25_208 -> 27_280 (+2_072 bytes,
+    /// sha `f74b473e…` -> `61463384…`), from adding the `DefaultPackageManager`
+    /// shim export that gh #223 hits. Re-pinned in the same commit as the edit,
+    /// which is what this table exists to force.
+    const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
+        (
+            BRIDGE_RECEIPT,
+            205_300,
+            "0da93a4217162f652a4f99960a7393c241112a4f230a63feb354ac030cd6f9bb",
+        ),
+        (
+            "node:fs",
+            56_916,
+            "5007b4eba74659801fff93fdb60da9b6b83457049459cdb9882ee93550b0be48",
+        ),
+        (
+            "@mariozechner/pi-ai",
+            24_612,
+            "33423d306e358a879c8b9e763dfc7e9fddf628ea275855aa2a89d1e52411547a",
+        ),
+        (
+            "node:child_process",
+            20_034,
+            "4c32a5b1b6fbf1754d7b3f6baf6a6bb67532ad42c20c7a942ea8c73a6f4a3908",
+        ),
+        (
+            "node:stream",
+            17_837,
+            "86032256b40f9ffac34e111ec9246e317884bfdba49249198e9ef18edda29782",
+        ),
+        // Re-pinned for 99c07f823 (gh #178): compact() rejects a pre-aborted signal.
+        (
+            "@mariozechner/pi-coding-agent",
+            27_870,
+            "cec3aa92f03004f4e4ed5ddcecaec0da0061dc53569214a5f15d8f9c28a03f48",
+        ),
+        (
+            "@mariozechner/pi-tui",
+            8_395,
+            "e51cefc340ec148e6202c7cf8f57b429a34357559c504130e962a5c947f36a84",
+        ),
+        (
+            "typebox/compile",
+            8_189,
+            "a4b25b282d3a8d4dea5b22a12cb790975691a3202390827385680c2d9000652e",
+        ),
+        (
+            "node:module",
+            7_418,
+            "0f16b8ba098a98bf96d6ef19ff1222a7e29a820211ed7703a925157066144fd7",
+        ),
+        (
+            "jsonwebtoken",
+            6_806,
+            "ff82b2f65aace15593451d8dfa3e25e06131d7016bbf02b6bba5a8fa593fd80b",
+        ),
+        (
+            "node:net",
+            5_894,
+            "9fb7d79bf0118d8c57bbc8ac41fa1b99ce6bf6fcea05f71c20e068fe2eae49cd",
+        ),
+        (
+            "node:url",
+            5_637,
+            "c4b419ff37056fa9abdb446d0497e70841ba4df7572e8bbe80ada580cebf650c",
+        ),
+    ];
+
+    /// Render a byte length the way `JS_SOURCE_RECEIPTS` spells it, so the
+    /// table the test prints on drift is a literal copy-paste.
+    fn grouped_digits(value: usize) -> String {
+        let digits = value.to_string();
+        let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+        for (index, digit) in digits.char_indices() {
+            if index > 0 && (digits.len() - index).is_multiple_of(3) {
+                out.push('_');
+            }
+            out.push(digit);
+        }
+        out
+    }
+
+    /// Every embedded JavaScript source must decompress to exactly the bytes
+    /// pinned in [`JS_SOURCE_RECEIPTS`]; see that constant for what the
+    /// receipts do and do not prove, and how to re-pin them.
     #[test]
     fn compressed_javascript_sources_preserve_exact_bytes() {
         let bridge = pi_bridge_js();
         let modules = default_virtual_modules();
-        eprintln!(
-            "PiJS source receipt: bridge len={} sha256={}",
-            bridge.len(),
-            sha256_hex(bridge.as_bytes())
-        );
-        for name in [
-            "node:fs",
-            "@mariozechner/pi-ai",
-            "node:child_process",
-            "node:stream",
-            "@mariozechner/pi-coding-agent",
-            "@mariozechner/pi-tui",
-        ] {
-            let source = modules.get(name).expect("receipt module must exist");
-            eprintln!(
-                "PiJS source receipt: {name} len={} sha256={}",
-                source.len(),
-                sha256_hex(source.as_bytes())
-            );
-        }
-        // Receipts re-pinned 2026-09-01 after the 2026-08-25..27 bridge changes
-        // (context-overflow detection, SessionActionOrigin binding, MCP spec
-        // preservation) landed without updating them; the previous pin was
-        // 201_242 / 2e3cadbe… from dea48721.
-        assert_eq!(bridge.len(), 202_987);
-        assert_eq!(
-            sha256_hex(bridge.as_bytes()),
-            "fdfa107dc7d7d9edabba347886cf8be031fe6ee25c653ea840c29ae16f8d8980"
-        );
 
-        for (name, expected_len, expected_sha256) in [
-            (
-                "node:fs",
-                56_916,
-                "5007b4eba74659801fff93fdb60da9b6b83457049459cdb9882ee93550b0be48",
-            ),
-            (
-                "@mariozechner/pi-ai",
-                24_612,
-                "33423d306e358a879c8b9e763dfc7e9fddf628ea275855aa2a89d1e52411547a",
-            ),
-            (
-                "node:child_process",
-                20_034,
-                "4c32a5b1b6fbf1754d7b3f6baf6a6bb67532ad42c20c7a942ea8c73a6f4a3908",
-            ),
-            (
-                "node:stream",
-                17_837,
-                "86032256b40f9ffac34e111ec9246e317884bfdba49249198e9ef18edda29782",
-            ),
-            (
-                "@mariozechner/pi-coding-agent",
-                25_208,
-                "f74b473ecf0df9a826c21be3863c10a28f65b439b08c7dc49da43e2be7c6c4b5",
-            ),
-            (
-                "@mariozechner/pi-tui",
-                8_395,
-                "e51cefc340ec148e6202c7cf8f57b429a34357559c504130e962a5c947f36a84",
-            ),
-            (
-                "typebox/compile",
-                8_189,
-                "a4b25b282d3a8d4dea5b22a12cb790975691a3202390827385680c2d9000652e",
-            ),
-            (
-                "node:module",
-                7_418,
-                "0f16b8ba098a98bf96d6ef19ff1222a7e29a820211ed7703a925157066144fd7",
-            ),
-            (
-                "jsonwebtoken",
-                6_806,
-                "ff82b2f65aace15593451d8dfa3e25e06131d7016bbf02b6bba5a8fa593fd80b",
-            ),
-            (
-                "node:net",
-                5_894,
-                "9fb7d79bf0118d8c57bbc8ac41fa1b99ce6bf6fcea05f71c20e068fe2eae49cd",
-            ),
-            (
-                "node:url",
-                5_637,
-                "c4b419ff37056fa9abdb446d0497e70841ba4df7572e8bbe80ada580cebf650c",
-            ),
-        ] {
-            let source = modules
-                .get(name)
-                .unwrap_or_else(|| panic!("missing {name}"));
-            assert_eq!(source.len(), expected_len, "length drift for {name}");
-            assert_eq!(
-                sha256_hex(source.as_bytes()),
-                expected_sha256,
-                "content drift for {name}"
-            );
+        let mut regenerated = Vec::with_capacity(JS_SOURCE_RECEIPTS.len());
+        let mut drift = Vec::new();
+        for &(name, expected_len, expected_sha256) in JS_SOURCE_RECEIPTS {
+            let source: &str = if name == BRIDGE_RECEIPT {
+                bridge
+            } else {
+                modules
+                    .get(name)
+                    .unwrap_or_else(|| panic!("receipt module {name} must exist"))
+                    .as_str()
+            };
+            let len = source.len();
+            let sha256 = sha256_hex(source.as_bytes());
+            let name_literal = if name == BRIDGE_RECEIPT {
+                "BRIDGE_RECEIPT".to_string()
+            } else {
+                format!("{name:?}")
+            };
+            regenerated.push(format!(
+                "        (\n            {name_literal},\n            {},\n            {sha256:?},\n        ),",
+                grouped_digits(len)
+            ));
+            if len != expected_len || sha256 != expected_sha256 {
+                drift.push(format!(
+                    "  {name}: len {expected_len} -> {len}, sha256 {expected_sha256} -> {sha256}"
+                ));
+            }
         }
+
+        let regenerated = regenerated.join("\n");
+        eprintln!("PiJS source receipts:\n{regenerated}");
+        assert!(
+            drift.is_empty(),
+            "compressed JavaScript source receipts drifted:\n{}\n\n\
+             If the JavaScript really did change, review that diff and re-pin \
+             JS_SOURCE_RECEIPTS to:\n{regenerated}",
+            drift.join("\n")
+        );
     }
 
     #[test]
@@ -25675,6 +25912,63 @@ mod tests {
             // The explicit host payload model wins over sessionState.model;
             // with neither present, ctx.model is undefined (upstream parity).
             assert_eq!(probe["modelAbsent"], json!("undefined"));
+        });
+    }
+
+    /// gh #178: a signal that has already aborted, in either the options form
+    /// or the legacy fifth argument, rejects `compact()` with the abort reason
+    /// before any host compaction is requested.
+    #[test]
+    fn pi_coding_agent_compact_rejects_a_pre_aborted_signal_without_host_work() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.abortProbe = { done: 0, errors: [] };
+                    const record = (promise) => promise
+                        .then(() => { globalThis.abortProbe.errors.push('resolved'); })
+                        .catch((error) => {
+                            globalThis.abortProbe.errors.push(String((error && error.message) || error));
+                        })
+                        .finally(() => { globalThis.abortProbe.done += 1; });
+                    import('@mariozechner/pi-coding-agent').then((mod) => {
+                        const controller = new AbortController();
+                        controller.abort(new Error('stopped by caller'));
+                        record(mod.compact(
+                            { firstKeptEntryId: 'entry-1', tokensBefore: 10 },
+                            { strategy: 'openai-responses-native', request: {}, signal: controller.signal }));
+                        record(mod.compact(
+                            { firstKeptEntryId: 'entry-1', tokensBefore: 10 },
+                            undefined, undefined, undefined, AbortSignal.abort()));
+                    });
+                    ",
+                )
+                .await
+                .expect("invoke compact with aborted signals");
+
+            for _ in 0..32 {
+                drain_until_idle(&runtime, &clock).await;
+                assert!(
+                    runtime.drain_hostcall_requests().is_empty(),
+                    "an aborted compact() must not reach the host"
+                );
+                let probe = get_global_json(&runtime, "abortProbe").await;
+                if probe["done"] == json!(2) {
+                    break;
+                }
+            }
+            let probe = get_global_json(&runtime, "abortProbe").await;
+            assert_eq!(probe["done"], json!(2), "probe incomplete: {probe}");
+            assert_eq!(
+                probe["errors"],
+                json!(["stopped by caller", "This operation was aborted"]),
+                "probe: {probe}"
+            );
         });
     }
 
@@ -26345,6 +26639,102 @@ mod tests {
 
             // Corrupted parent chains terminate instead of hanging.
             assert_eq!(probe["cycleLen"], json!(2));
+        });
+    }
+
+    /// gh #223 / bd-fpaso: pin that an extension importing `DefaultPackageManager`
+    /// from `@mariozechner/pi-coding-agent` loads without export errors, read methods
+    /// are inert, and mutating methods (install/remove/update) throw named errors.
+    #[test]
+    fn default_package_manager_shim_exports_and_behavior() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.pmProbe = { done: false };
+                    (async () => {
+                        const mod = await import('@mariozechner/pi-coding-agent');
+                        if (typeof mod.DefaultPackageManager !== 'function') {
+                            throw new Error('DefaultPackageManager is not exported');
+                        }
+                        const pm = new mod.DefaultPackageManager({ cwd: '/test/cwd', agentDir: '/test/agent' });
+                        if (pm.cwd !== '/test/cwd' || pm.agentDir !== '/test/agent') {
+                            throw new Error('Constructor options not retained');
+                        }
+                        if (pm.getInstalledPath('foo', 'user') !== undefined) {
+                            throw new Error('getInstalledPath should return undefined');
+                        }
+                        const resolved = await pm.resolve();
+                        if (!Array.isArray(resolved.extensions) || !Array.isArray(resolved.skills)) {
+                            throw new Error('resolve should return empty arrays');
+                        }
+                        const resolvedExt = await pm.resolveExtensionSources(['foo']);
+                        if (!Array.isArray(resolvedExt.extensions) || !Array.isArray(resolvedExt.skills)) {
+                            throw new Error('resolveExtensionSources should return empty arrays');
+                        }
+                        let installThrew = false;
+                        try {
+                            await pm.install('test-pkg');
+                        } catch (err) {
+                            installThrew = true;
+                            if (!err.message.includes('DefaultPackageManager.install()')) {
+                                throw new Error('Unexpected install error message: ' + err.message);
+                            }
+                        }
+                        if (!installThrew) {
+                            throw new Error('install did not throw');
+                        }
+                        let removeThrew = false;
+                        try {
+                            await pm.remove('test-pkg');
+                        } catch (err) {
+                            removeThrew = true;
+                            if (!err.message.includes('DefaultPackageManager.remove()')) {
+                                throw new Error('Unexpected remove error message: ' + err.message);
+                            }
+                        }
+                        if (!removeThrew) {
+                            throw new Error('remove did not throw');
+                        }
+                        let updateThrew = false;
+                        try {
+                            await pm.update('test-pkg');
+                        } catch (err) {
+                            updateThrew = true;
+                            if (!err.message.includes('DefaultPackageManager.update()')) {
+                                throw new Error('Unexpected update error message: ' + err.message);
+                            }
+                        }
+                        if (!updateThrew) {
+                            throw new Error('update did not throw');
+                        }
+                        globalThis.pmProbe.ok = true;
+                    })()
+                    .catch((error) => {
+                        globalThis.pmProbe.error = String((error && error.stack) || error);
+                    })
+                    .finally(() => {
+                        globalThis.pmProbe.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval DefaultPackageManager probe");
+
+            drain_until_idle(&runtime, &clock).await;
+            let probe = get_global_json(&runtime, "pmProbe").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(
+                probe["error"],
+                serde_json::Value::Null,
+                "probe error: {probe}"
+            );
+            assert_eq!(probe["ok"], json!(true));
         });
     }
 
@@ -35504,6 +35894,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn pijs_exec_sync_throws_when_stdout_exceeds_max_buffer() {
         futures::executor::block_on(async {
@@ -35735,6 +36126,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn pijs_exec_file_sync_throws_when_stdout_exceeds_max_buffer() {
         futures::executor::block_on(async {

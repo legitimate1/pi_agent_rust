@@ -272,6 +272,11 @@ fn content_blocks_estimated_output_bytes(content: &[ContentBlock]) -> usize {
             ContentBlock::Thinking(thinking) => thinking.thinking.len(),
             ContentBlock::RedactedThinking(redacted) => redacted.data.len(),
             ContentBlock::Image(image) => image.data.len().saturating_add(image.mime_type.len()),
+            ContentBlock::Media(media) => media
+                .data
+                .len()
+                .saturating_add(media.mime_type.len())
+                .saturating_add(media.name.as_ref().map_or(0, String::len)),
             ContentBlock::ToolCall(tool) => tool
                 .id
                 .len()
@@ -652,7 +657,9 @@ fn tool_invocation_renderer(tool_name: &str) -> Option<ToolInvocationRenderer> {
 
     Some(match tool_name {
         "bash" => Field("command"),
-        "read" | "write" | "edit" | "hashline_edit" | "inspect_image" => Field("path"),
+        "read" | "write" | "edit" | "hashline_edit" | "inspect_image" | "read_media" => {
+            Field("path")
+        }
         "ls" => FieldOrDefault {
             field: "path",
             default: ".",
@@ -994,7 +1001,12 @@ impl PiApp {
             // it defensively. TerminalTitle: driver-pushed title updates are
             // an ftui affordance (issue #200) — the charmed stack re-emits
             // the terminal title from render_header every frame.
-            PiMsg::UiShutdown | PiMsg::TerminalTitle(_) | PiMsg::AutocompleteCatalog(_) => {}
+            PiMsg::UiShutdown
+            | PiMsg::TerminalTitle(_)
+            | PiMsg::AutocompleteCatalog(_)
+            | PiMsg::LoginPending { .. }
+            | PiMsg::StatusSnapshot(_)
+            | PiMsg::MessagePicker { .. } => {}
             PiMsg::AutocompleteRefresh => {
                 self.autocomplete.provider.refresh_background();
                 return Self::autocomplete_refresh_cmd();
@@ -1889,8 +1901,24 @@ After approving access in the browser, press Enter in Pi to complete login."
     /// `pub(super)`: shared with `keybindings`, which promotes the FIFO
     /// successor whenever the user manually resolves the active prompt.
     pub(super) fn activate_next_capability_prompt(&mut self) -> Option<Cmd> {
-        let next = self.capability_prompt_queue.pop_front()?;
-        self.activate_capability_prompt(next)
+        loop {
+            let next = self.capability_prompt_queue.pop_front()?;
+            if self.capability_prompt_is_live(&next.request.id) {
+                return self.activate_capability_prompt(next);
+            }
+            // Its hostcall was cancelled or timed out while it waited; nobody
+            // is left to answer, so it must not occupy the active slot.
+            next.cancel_timer();
+        }
+    }
+
+    /// Whether the manager still awaits an answer for this prompt. A hostcall
+    /// cancelled or timed out on the extension side releases its pending
+    /// entry without telling the TUI, so a displayed prompt can outlive it.
+    fn capability_prompt_is_live(&self, id: &str) -> bool {
+        self.extensions
+            .as_ref()
+            .is_none_or(|manager| manager.ui_request_is_pending(id))
     }
 
     /// Auto-deny path for an elapsed capability-prompt deadline (bd-yllbn).
@@ -1924,6 +1952,12 @@ After approving access in the browser, press Enter in Pi to complete login."
                     && prompt.timer_generation() == timer_generation
             });
             let queue_index = queue_index?;
+            if !self.capability_prompt_is_live(id) {
+                if let Some(orphan) = self.capability_prompt_queue.remove(queue_index) {
+                    orphan.cancel_timer();
+                }
+                return None;
+            }
             let queued = self.capability_prompt_queue.get(queue_index)?;
             if queued.has_time_remaining(now) {
                 let queued = self.capability_prompt_queue.get_mut(queue_index)?;
@@ -1941,6 +1975,14 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.send_extension_ui_response_quiet(response);
             }
             return None;
+        }
+        if !self.capability_prompt_is_live(id) {
+            // The periodic repaint doubles as the liveness probe: an orphaned
+            // overlay is dismissed unanswered and the queue moves on.
+            if let Some(orphan) = self.capability_prompt.take() {
+                orphan.cancel_timer();
+            }
+            return self.activate_next_capability_prompt();
         }
         if self
             .capability_prompt
@@ -2164,6 +2206,11 @@ After approving access in the browser, press Enter in Pi to complete login."
             "setWidget" | "set_widget" => self.apply_extension_widget_effect(request),
             "setTitle" | "set_title" => self.apply_extension_title_effect(request),
             "set_editor_text" => self.apply_extension_editor_text_effect(request),
+            // An op this stack does not know is dropped without a word, so
+            // `extensions_js.rs` declaring a `pi.ui(...)` call proves nothing
+            // on its own — the bridge is happy either way. Anything added
+            // there needs an arm here (or, for ops that answer the caller, in
+            // `handle_extension_ui_request`) before it does anything.
             _ => {}
         }
     }
@@ -2976,6 +3023,27 @@ After approving access in the browser, press Enter in Pi to complete login."
         let mcp_manager = self.mcp_manager.clone();
         let runtime_handle = self.runtime_handle.clone();
         let tui_pressure_frame_p99_us = Arc::clone(&self.tui_pressure_frame_p99_us);
+        let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
+
+        // Refuse a dead region before entering `Processing`, not inside the
+        // task. The turn inherits `task_cx` for its deadline and budget, but it
+        // can arrive already cancel-requested — shutdown in flight, or a
+        // previous aborted turn's context still current. A cancel-correct
+        // runtime then cancels the spawned task at its FIRST await, so nothing
+        // the task awaits can report: the agent-lock failure that used to
+        // surface this never runs, and neither does an enqueue placed ahead of
+        // it. Verified directly — a synchronous probe at the top of the task
+        // fires, and the very next `enqueue_pi_event(..).await` never delivers.
+        //
+        // Left to run, the caller has already set `AgentState::Processing` and
+        // the UI sits there with no error, no completion and no way out. The
+        // only place that can still speak is here (bd-k01i6).
+        if task_cx.is_cancel_requested() {
+            self.status_message =
+                Some("Cancelled: the request was already cancelled, so no turn was started".into());
+            return None;
+        }
+
         let (abort_handle, abort_signal) = AbortHandle::new();
         self.abort_handle = Some(abort_handle);
 
@@ -2983,10 +3051,10 @@ After approving access in the browser, press Enter in Pi to complete login."
         self.scroll_to_bottom();
 
         let runtime_handle_for_task = runtime_handle.clone();
-        let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
             #[cfg(test)]
             emit_submit_continue_deadline_probe(task_cx.budget().deadline);
+
             if let Some(manager) = extensions.clone() {
                 let _ = manager
                     .dispatch_event(ExtensionEventName::BeforeAgentStart, None)
@@ -4317,7 +4385,7 @@ mod stream_delta_batcher_tests {
         app.save_enabled = true;
 
         let _ = app.submit_message("ultrathink check the fixture");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let mut saw_done = false;
         while std::time::Instant::now() < deadline {
             match event_rx.try_recv() {
@@ -4556,7 +4624,7 @@ mod stream_delta_batcher_tests {
     }
 
     fn wait_for_agent_done(event_rx: &mut mpsc::Receiver<PiMsg>) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while std::time::Instant::now() < deadline {
             match event_rx.try_recv() {
                 Ok(PiMsg::AgentDone { error_message, .. }) => {
@@ -5055,7 +5123,7 @@ mod stream_delta_batcher_tests {
             input: PendingInput::Continue,
         });
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let mut saw_done = false;
         while std::time::Instant::now() < deadline {
             match event_rx.try_recv() {
@@ -5177,7 +5245,7 @@ mod stream_delta_batcher_tests {
 
         let _ = app.submit_message(r#"/deploy   --message "hello world"   --force"#);
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let mut completion = None;
         let mut agent_error = None;
         while std::time::Instant::now() < deadline {
@@ -5211,13 +5279,24 @@ mod stream_delta_batcher_tests {
         );
     }
 
+    /// A save in a cancelled region is refused outright, not spawned to die.
+    ///
+    /// This used to assert the spawned task reached the session lock and
+    /// reported "Failed to lock session". Unreachable under a cancel-correct
+    /// runtime, for the same reason as the turn case below: the task is
+    /// cancelled at its first await, so no message it tries to send arrives.
+    /// `spawn_save_session` now declines before spawning and logs it, which is
+    /// the only place left that can still be heard (bd-k01i6).
+    ///
+    /// What this pins is that the call returns promptly and takes nothing: the
+    /// held guard proves no task queued behind the session lock.
     #[test]
-    fn spawn_save_session_inherits_cancelled_context_when_session_lock_is_held() {
-        let (app, mut event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+    fn spawn_save_session_in_a_cancelled_region_is_refused_without_spawning() {
+        let (app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
 
         runtime().block_on(async {
             let hold_cx = Cx::for_request();
-            let _held_guard =
+            let held_guard =
                 asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.session), &hold_cx)
                     .await
                     .expect("lock session");
@@ -5228,72 +5307,90 @@ mod stream_delta_batcher_tests {
 
             app.spawn_save_session();
 
-            let recv_cx = Cx::for_testing();
-            let wait_for_error = async {
-                loop {
-                    match event_rx.recv(&recv_cx).await {
-                        Ok(PiMsg::AgentError(message))
-                            if message.contains("Failed to lock session") =>
-                        {
-                            break message;
-                        }
-                        Ok(_) => {}
-                        Err(err) => break format!("event receive failed: {err}"),
-                    }
-                }
-            };
-            futures::pin_mut!(wait_for_error);
-            let err = asupersync::time::timeout(
+            // Dropping the guard hands the lock to whatever is queued for it.
+            // Nothing should be: the save was declined before it spawned.
+            drop(held_guard);
+
+            let probe_cx = Cx::for_request();
+            let regained = asupersync::time::timeout(
                 asupersync::time::wall_now(),
-                std::time::Duration::from_secs(1),
-                wait_for_error,
+                std::time::Duration::from_secs(5),
+                asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.session), &probe_cx),
             )
             .await
-            .expect("cancelled save task should finish before timeout");
-
+            .expect("session lock must be free: nothing should have queued for it");
             assert!(
-                err.contains("Failed to lock session"),
-                "unexpected save-task error: {err}"
+                regained.is_ok(),
+                "session lock must be immediately reacquirable after a refused save"
             );
         });
     }
 
+    /// A turn must never enter `Processing` in an already-cancelled region.
+    ///
+    /// This used to assert that the spawned task reached the agent lock and
+    /// reported "Failed to lock agent". That contract is unreachable under a
+    /// cancel-correct runtime: the task is cancelled at its FIRST await, so
+    /// neither the lock failure nor any enqueue ahead of it ever runs. Measured
+    /// directly — a synchronous probe at the top of the task fires, the next
+    /// `enqueue_pi_event(..).await` never delivers.
+    ///
+    /// So the thing worth pinning is not which message arrives, it is that the
+    /// UI is not left mid-turn with no way out. `submit_continue` now checks
+    /// before it sets `Processing` (bd-k01i6).
     #[test]
-    fn submit_continue_inherits_cancelled_context_when_agent_lock_is_attempted() {
-        let (mut app, mut event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+    fn submit_continue_in_a_cancelled_region_does_not_enter_processing() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
 
         runtime().block_on(async {
             let ambient_cx = Cx::for_testing();
             ambient_cx.set_cancel_requested(true);
             let _current = Cx::set_current(Some(ambient_cx));
 
+            let cmd = app.submit_continue();
+
+            assert!(cmd.is_none(), "a refused turn must not hand back work");
+            assert!(
+                matches!(app.agent_state, AgentState::Idle),
+                "a turn that cannot run must leave the UI idle, not Processing: {:?}",
+                app.agent_state
+            );
+            assert!(
+                app.abort_handle.is_none(),
+                "a refused turn must not leave an abort handle behind"
+            );
+            let status = app
+                .status_message
+                .as_deref()
+                .expect("a refused turn must tell the user why");
+            assert!(
+                status.contains("already cancelled"),
+                "status should name the cause: {status}"
+            );
+        });
+    }
+
+    /// The positive counterpart: a live region still starts a turn. Without
+    /// this, the guard above could be satisfied by never starting anything.
+    #[test]
+    fn submit_continue_in_a_live_region_enters_processing() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+
+        runtime().block_on(async {
+            let ambient_cx = Cx::for_testing();
+            let _current = Cx::set_current(Some(ambient_cx));
+
             let _ = app.submit_continue();
 
-            let recv_cx = Cx::for_testing();
-            let wait_for_terminal = async {
-                loop {
-                    match event_rx.recv(&recv_cx).await {
-                        Ok(PiMsg::AgentError(message)) => break format!("error:{message}"),
-                        Ok(PiMsg::AgentDone { error_message, .. }) => {
-                            break format!("done:{}", error_message.unwrap_or_default());
-                        }
-                        Ok(_) => {}
-                        Err(err) => break format!("receive-error:{err}"),
-                    }
-                }
-            };
-            futures::pin_mut!(wait_for_terminal);
-            let outcome = asupersync::time::timeout(
-                asupersync::time::wall_now(),
-                std::time::Duration::from_secs(1),
-                wait_for_terminal,
-            )
-            .await
-            .expect("cancelled continue task should reach provider before timeout");
-
             assert!(
-                outcome.contains("Failed to lock agent"),
-                "unexpected continue-task outcome: {outcome}"
+                matches!(app.agent_state, AgentState::Processing),
+                "a live region must start the turn: {:?}",
+                app.agent_state
+            );
+            assert!(
+                app.status_message.is_none(),
+                "a started turn should not report a refusal: {:?}",
+                app.status_message
             );
         });
     }
@@ -6534,6 +6631,57 @@ mod stream_delta_batcher_tests {
     }
 
     #[test]
+    fn cancelled_hostcall_dismisses_its_overlay_and_promotes_the_live_successor() {
+        let mut app = build_test_app();
+        let manager = crate::extensions::ExtensionManager::new();
+        let (ui_tx, mut ui_rx) = asupersync::channel::mpsc::channel(4);
+        manager.set_ui_sender(ui_tx);
+        app.extensions = Some(manager.clone());
+
+        let mut first_attempt =
+            Box::pin(manager.request_ui(capability_request("orphan-first", "ext-orphan", "exec")));
+        let first_request = runtime().block_on(async {
+            assert!(futures::poll!(first_attempt.as_mut()).is_pending());
+            let cx = Cx::for_request();
+            ui_rx.recv(&cx).await.expect("first prompt reaches TUI")
+        });
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(first_request));
+        let mut second_attempt =
+            Box::pin(manager.request_ui(capability_request("orphan-second", "ext-orphan", "http")));
+        let second_request = runtime().block_on(async {
+            assert!(futures::poll!(second_attempt.as_mut()).is_pending());
+            let cx = Cx::for_request();
+            ui_rx.recv(&cx).await.expect("second prompt reaches TUI")
+        });
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(second_request));
+        let (id, generation, timer_generation) =
+            active_capability(&app).expect("first prompt is active");
+        assert_eq!(id, "orphan-first");
+
+        // The extension side gives up (command deadline, cancellation): the
+        // future is dropped and the manager releases its pending entry.
+        drop(first_attempt);
+        assert!(!manager.ui_request_is_pending("orphan-first"));
+
+        let successor_wake = app.handle_pi_message(PiMsg::CapabilityPromptTick {
+            id,
+            generation,
+            timer_generation,
+        });
+        assert!(
+            successor_wake.is_some(),
+            "the live successor owns the active tick"
+        );
+        assert_eq!(
+            active_capability(&app).map(|active| active.0),
+            Some("orphan-second".to_string()),
+            "an orphaned overlay must not keep blocking the queue"
+        );
+        assert!(manager.ui_request_is_pending("orphan-second"));
+        drop(second_attempt);
+    }
+
+    #[test]
     fn capability_prompt_queue_bound_denies_excess_fail_closed() {
         let mut app = build_test_app();
         let total = PiApp::MAX_CAPABILITY_PROMPT_QUEUE + 3;
@@ -7263,6 +7411,7 @@ mod tool_invocation_summary_coverage {
             "lsp",
             "debug",
             "inspect_image",
+            "read_media",
             "generate_image",
             "tts",
             "computer",

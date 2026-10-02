@@ -206,6 +206,14 @@ impl OpenAIResponsesProvider {
             include,
             reasoning,
             prompt_cache_key: options.prompt_cache_key.clone(),
+            service_tier: crate::provider::openai_service_tier(
+                if self.codex_mode {
+                    "openai-codex"
+                } else {
+                    &self.provider
+                },
+                options.service_tier.as_deref(),
+            ),
         }
     }
 }
@@ -1499,7 +1507,9 @@ where
                 ContentBlock::ToolCall(_) => {
                     Some(TerminalContentSnapshot::ToolCall { content_index })
                 }
-                ContentBlock::Image(_) | ContentBlock::RedactedThinking(_) => None,
+                ContentBlock::Image(_)
+                | ContentBlock::Media(_)
+                | ContentBlock::RedactedThinking(_) => None,
             })
             .collect()
     }
@@ -1669,6 +1679,10 @@ pub struct OpenAIResponsesRequest {
     /// `StreamOptions::prompt_cache_key`.
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<String>,
+    /// Processing tier (`/fast` → `priority`); OpenAI and Codex only. See
+    /// `provider::openai_service_tier`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2015,6 +2029,13 @@ fn convert_user_message_to_responses(content: &UserContent) -> OpenAIResponsesIn
                         let url = format!("data:{};base64,{}", img.mime_type, img.data);
                         parts.push(OpenAIResponsesUserContentPart::InputImage { image_url: url });
                     }
+                    // No `input_video`/`input_audio` part on this transport;
+                    // degrade to the text placeholder (gh #212).
+                    ContentBlock::Media(media) => {
+                        parts.push(OpenAIResponsesUserContentPart::InputText {
+                            text: media.placeholder(),
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -2331,6 +2352,40 @@ mod tests {
                 "codex_mode={codex_mode}"
             );
         }
+    }
+
+    #[test]
+    fn test_build_request_service_tier_for_openai_and_codex_only() {
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+        let fast = StreamOptions {
+            service_tier: Some("priority".to_string()),
+            ..Default::default()
+        };
+        for codex_mode in [false, true] {
+            let provider = OpenAIResponsesProvider::new("gpt-5.2").with_codex_mode(codex_mode);
+            let value = serde_json::to_value(provider.build_request(&context, &fast))
+                .expect("serialize request");
+            assert_eq!(value["service_tier"], "priority", "codex_mode={codex_mode}");
+            let value =
+                serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                    .expect("serialize request");
+            assert!(
+                value.get("service_tier").is_none(),
+                "codex_mode={codex_mode}"
+            );
+        }
+        // A third-party Responses backend never sees the field.
+        let provider = OpenAIResponsesProvider::new("m").with_provider_name("my-proxy");
+        let value = serde_json::to_value(provider.build_request(&context, &fast))
+            .expect("serialize request");
+        assert!(value.get("service_tier").is_none());
     }
 
     #[test]
@@ -4462,9 +4517,14 @@ mod tests {
 
         std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().expect("accept");
+            // 250ms is the POLLING interval; the deadline below is the budget.
+            // Treating a timed-out read as end-of-request truncated the buffer
+            // and the header scan then failed as a malformed request rather
+            // than a slow one (bd-eg6ng).
             socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_millis(250)))
                 .expect("set read timeout");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
 
             let mut bytes = Vec::new();
             let mut chunk = [0_u8; 4096];
@@ -4481,7 +4541,10 @@ mod tests {
                         if err.kind() == std::io::ErrorKind::WouldBlock
                             || err.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        break;
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fixture timed out waiting for the request"
+                        );
                     }
                     Err(err) => assert!(false, "request header read failed: {err}"),
                 }
@@ -4507,7 +4570,10 @@ mod tests {
                         if err.kind() == std::io::ErrorKind::WouldBlock
                             || err.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        break;
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fixture timed out waiting for the request"
+                        );
                     }
                     Err(err) => assert!(false, "request body read failed: {err}"),
                 }

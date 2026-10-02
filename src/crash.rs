@@ -32,10 +32,9 @@ pub const CRASHES_DIR_NAME: &str = "crashes";
 static RING: std::sync::Mutex<Option<VecDeque<String>>> = std::sync::Mutex::new(None);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 thread_local! {
-    /// Set while running code whose panics are recovered internally
-    /// (`catch_unwind` sites such as background compaction). The panic hook
-    /// skips bundle capture for these — a caught panic is not a crash.
-    static PANIC_SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Number of active synchronous recovery scopes on this thread. A count
+    /// keeps an inner guard from disabling an outer guard's suppression.
+    static PANIC_SUPPRESSION_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Marks the current thread's panics as expected-and-recovered.
@@ -44,12 +43,16 @@ thread_local! {
 /// must not produce "previous run crashed" bundles. Suppression holds for
 /// the guard's lifetime; the crash hook returns early (no bundle, no
 /// chained hook) because the recovery is intentional.
+///
+/// Keep this guard on its creating thread and within synchronous code. For
+/// async recovery, use [`suppress_panic_hook_for_future`] so suppression never
+/// remains active while the task is suspended.
 #[must_use]
 pub struct SuppressPanicHook;
 
 impl SuppressPanicHook {
     pub fn new() -> Self {
-        PANIC_SUPPRESSED.with(|flag| flag.set(true));
+        PANIC_SUPPRESSION_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
         Self
     }
 }
@@ -62,9 +65,25 @@ impl Default for SuppressPanicHook {
 
 impl Drop for SuppressPanicHook {
     fn drop(&mut self) {
-        PANIC_SUPPRESSED.with(|flag| flag.set(false));
+        PANIC_SUPPRESSION_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
     }
 }
+
+/// Suppress crash capture only while polling a future with a recovery boundary.
+///
+/// This does not catch panics itself. Pair it with `catch_unwind` at the
+/// recovery site. The guard is destroyed before every `Pending` or `Ready`
+/// return, and during unwinding, so unrelated tasks retain normal crash capture
+/// even when the wrapped future migrates between runtime threads.
+pub async fn suppress_panic_hook_for_future<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        let _guard = SuppressPanicHook::new();
+        std::future::Future::poll(future.as_mut(), cx)
+    })
+    .await
+}
+
 /// Record an operation into the redacted-at-capture recent-operations ring
 /// that crash bundles include as context. Cheap; capped at
 /// [`RING_CAPACITY`] entries.
@@ -239,11 +258,17 @@ pub fn install(agent_dir: &Path, session_path: Option<&Path>) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // Recovered-internal panics (catch_unwind sites) are not crashes.
-        if PANIC_SUPPRESSED.with(std::cell::Cell::get) {
+        if PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get) > 0 {
             return;
         }
+        // A reader that closed our stdout is not a crash, and must not be
+        // filed as one (bd-print-json-panics-on-closed-stdout).
+        let payload = payload_of(info);
+        if is_closed_stdout_panic(&payload) {
+            std::process::exit(EXIT_STDOUT_CLOSED);
+        }
         let (sha, ts) = build_metadata();
-        let message = redact_text(&payload_of(info));
+        let message = redact_text(&payload);
         let bundle = CrashBundle {
             schema: CRASH_SCHEMA.to_string(),
             kind: "panic".into(),
@@ -261,6 +286,41 @@ pub fn install(agent_dir: &Path, session_path: Option<&Path>) {
     spawn_signal_watcher(agent_dir, session_path_redacted);
 }
 
+/// Status for a run whose stdout reader closed the pipe first.
+///
+/// Zero, and matching `EXIT_CODE_STDOUT_CLOSED` in the binary: `head` asked for
+/// five lines, got five, and left. Kept in step deliberately — the two paths
+/// reach the same ending, one by checking the write and one by catching the
+/// panic that check did not cover.
+const EXIT_STDOUT_CLOSED: i32 = 0;
+
+/// Does this panic mean only that nobody is reading our stdout?
+///
+/// `println!` PANICS when the write fails, and Rust disables SIGPIPE at
+/// startup, so `pi ... | head` arrives at the panic hook as
+///
+///     failed printing to stdout: Broken pipe (os error 32)
+///
+/// Writing a crash bundle for that files the user's own pipeline as a pi crash,
+/// and the bundle then announces itself as "previous run crashed" on the next
+/// invocation — noise that outlives the run that caused it.
+///
+/// Print mode handles this at the write site instead
+/// (`write_print_line` in main.rs), which is better because it never enters the
+/// panic machinery at all. This is the net under everything else: the binary
+/// has roughly 250 other `println!` calls — `--list-models`, `--fetch-models`,
+/// help and export output — and every one of them is pipeable.
+///
+/// Matching on the message is unlovely, but a panic hook receives a payload,
+/// not the `io::Error`, so the text is the only signal there is. It is anchored
+/// at the start so an unrelated panic that merely quotes those words does not
+/// slip through.
+fn is_closed_stdout_panic(payload: &str) -> bool {
+    (payload.starts_with("failed printing to stdout")
+        || payload.starts_with("failed writing to stdout"))
+        && payload.contains("Broken pipe")
+}
+
 fn payload_of(info: &std::panic::PanicHookInfo<'_>) -> String {
     info.payload().downcast_ref::<&str>().map_or_else(
         || {
@@ -273,9 +333,19 @@ fn payload_of(info: &std::panic::PanicHookInfo<'_>) -> String {
     )
 }
 
+/// No fatal-signal watcher off Unix.
+///
+/// `signal_hook::iterator` is a Unix-only module and `SIGBUS` is not among the
+/// signals the C runtime defines on Windows, so there is nothing here to watch.
+/// Windows abnormal terminations that Rust can observe at all arrive as panics,
+/// which the hook installed above already captures.
+#[cfg(not(unix))]
+fn spawn_signal_watcher(_agent_dir: PathBuf, _session_path: Option<String>) {}
+
 /// Best-effort fatal-signal watcher: writes a minimal bundle naming the
 /// signal with redacted ring context. See module docs for the coverage
 /// caveat under `forbid(unsafe_code)`.
+#[cfg(unix)]
 fn spawn_signal_watcher(agent_dir: PathBuf, session_path: Option<String>) {
     // SIGSEGV/SIGILL/SIGFPE are forbidden by signal-hook's safe registry
     // (registration panics, not errors) — the module docs already scope
@@ -497,6 +567,102 @@ mod tests {
     }
 
     #[test]
+    fn nested_suppression_guards_can_drop_in_either_order() {
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+        let outer = SuppressPanicHook::new();
+        let inner = SuppressPanicHook::new();
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 2);
+        drop(inner);
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 1);
+        let inner = SuppressPanicHook::new();
+        drop(outer);
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 1);
+        drop(inner);
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn suppression_is_inactive_between_future_polls() {
+        use std::future::Future as _;
+        let mut first_poll = true;
+        let operation = std::future::poll_fn(move |_| {
+            assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 1);
+            if first_poll {
+                first_poll = false;
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(7)
+            }
+        });
+        let mut future = Box::pin(suppress_panic_hook_for_future(operation));
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+        assert_eq!(future.as_mut().poll(&mut cx), std::task::Poll::Ready(7));
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn dropping_pending_future_leaves_thread_unsuppressed() {
+        use std::future::Future as _;
+        let mut future = Box::pin(suppress_panic_hook_for_future(async {
+            assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 1);
+            std::future::pending::<()>().await;
+        }));
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+        drop(future);
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn suppression_is_restored_after_poll_unwinds() {
+        use std::future::Future as _;
+        let mut future = Box::pin(suppress_panic_hook_for_future(async {
+            let _inner = SuppressPanicHook::new();
+            assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 2);
+            panic!("recovered async panic");
+        }));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            let _ = future.as_mut().poll(&mut cx);
+        }));
+        assert!(result.is_err());
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn suppression_future_can_resume_on_another_thread() {
+        use std::future::Future as _;
+        let mut first_poll = true;
+        let operation = std::future::poll_fn(move |_| {
+            assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 1);
+            if first_poll {
+                first_poll = false;
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(())
+            }
+        });
+        let mut future = Box::pin(suppress_panic_hook_for_future(operation));
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+        std::thread::spawn(move || {
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+            assert!(future.as_mut().poll(&mut cx).is_ready());
+            assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+        })
+        .join()
+        .expect("resumed future");
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn suppressed_panics_do_not_write_bundles() {
         // bd-ajg8l #3: recovered-internal panics (catch_unwind sites such as
         // background compaction) must not produce "previous run crashed"
@@ -528,5 +694,32 @@ mod tests {
         let tail = ring_tail();
         assert_eq!(tail.len(), RING_CAPACITY);
         assert!(tail.last().unwrap().starts_with("op-1"), "newest kept");
+    }
+
+    /// bd-print-json-panics-on-closed-stdout: only the closed-pipe panic skips
+    /// the bundle, and it is recognised in the exact wording std produces.
+    #[test]
+    fn a_closed_stdout_pipe_is_the_only_panic_that_skips_the_bundle() {
+        assert!(is_closed_stdout_panic(
+            "failed printing to stdout: Broken pipe (os error 32)"
+        ));
+        assert!(is_closed_stdout_panic(
+            "failed writing to stdout: Broken pipe (os error 32)"
+        ));
+
+        for real_crash in [
+            // A full disk is a write failure too, and it IS a crash worth a bundle.
+            "failed printing to stdout: No space left on device (os error 28)",
+            // Same words, different origin: a model or a tool can say anything.
+            "tool output mentioned failed printing to stdout: Broken pipe",
+            "assertion failed: Broken pipe",
+            "index out of bounds: the len is 3 but the index is 7",
+            "unknown panic payload",
+        ] {
+            assert!(
+                !is_closed_stdout_panic(real_crash),
+                "{real_crash:?} must still produce a crash bundle"
+            );
+        }
     }
 }

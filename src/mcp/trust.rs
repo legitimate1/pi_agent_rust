@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::error::{Error, Result};
+#[cfg(windows)]
+use crate::file_identity::FileIdentity;
 
 /// Trust record format version.
 const TRUST_SCHEMA_VERSION: u32 = 2;
@@ -56,6 +58,15 @@ pub struct TrustAuditEntry {
     pub by: String,
     /// Fingerprint the action applied to.
     pub fingerprint: String,
+}
+
+/// Order used when a failed write must pick the safer of two states.
+const fn restrictiveness(state: TrustState) -> u8 {
+    match state {
+        TrustState::Acknowledged => 0,
+        TrustState::Pending => 1,
+        TrustState::Denied => 2,
+    }
 }
 
 /// One server's persisted record.
@@ -107,7 +118,9 @@ pub(crate) struct TrustWriteGuard {
 #[cfg(windows)]
 #[derive(Debug)]
 pub(crate) struct TrustWriteGuard {
-    _directories: Vec<WindowsTrustDirectoryGuard>,
+    /// Read back by `save` to re-verify each pinned parent before and after
+    /// the commit, so this is a live field and not an RAII-only hold.
+    directories: Vec<WindowsTrustDirectoryGuard>,
     _lock: crate::file_lock::DirLock,
 }
 
@@ -118,7 +131,7 @@ pub(crate) type TrustWriteGuard = crate::file_lock::DirLock;
 #[derive(Debug)]
 struct WindowsTrustDirectoryGuard {
     path: PathBuf,
-    identity: (u32, u64),
+    identity: FileIdentity,
     handle: std::fs::File,
 }
 
@@ -463,21 +476,6 @@ fn reject_windows_reparse_components(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn windows_file_identity(metadata: &std::fs::Metadata) -> std::io::Result<(u32, u64)> {
-    use std::os::windows::fs::MetadataExt as _;
-
-    metadata
-        .volume_serial_number()
-        .zip(metadata.file_index())
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Windows did not expose a stable MCP trust file identity",
-            )
-        })
-}
-
-#[cfg(windows)]
 fn validate_windows_trust_directory_guard(
     guard: &WindowsTrustDirectoryGuard,
 ) -> std::io::Result<()> {
@@ -487,8 +485,8 @@ fn validate_windows_trust_directory_guard(
         || !path_metadata.is_dir()
         || windows_metadata_is_reparse(&handle_metadata)
         || windows_metadata_is_reparse(&path_metadata)
-        || windows_file_identity(&handle_metadata)? != guard.identity
-        || windows_file_identity(&path_metadata)? != guard.identity
+        || FileIdentity::of_open_file(&guard.handle)? != guard.identity
+        || FileIdentity::of_path_nofollow(&guard.path)? != guard.identity
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -576,7 +574,7 @@ fn open_or_create_windows_trust_parent(
                 ),
             ));
         }
-        let identity = windows_file_identity(&initial_metadata)?;
+        let identity = FileIdentity::of_path_nofollow(&current)?;
         // Omitting FILE_SHARE_DELETE pins this component against rename or
         // replacement for the lifetime of the guard.
         let handle = std::fs::OpenOptions::new()
@@ -587,7 +585,7 @@ fn open_or_create_windows_trust_parent(
         let opened_metadata = handle.metadata()?;
         if !opened_metadata.is_dir()
             || windows_metadata_is_reparse(&opened_metadata)
-            || windows_file_identity(&opened_metadata)? != identity
+            || FileIdentity::of_open_file(&handle)? != identity
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -702,7 +700,11 @@ impl TrustStore {
         }
     }
 
+    // One linear TOCTOU sequence — pin the parents, identify the path, open it,
+    // re-identify the handle, read, re-verify — where every early return is a
+    // refusal. Splitting it would hide which refusal is reachable from where.
     #[cfg(windows)]
+    #[allow(clippy::too_many_lines)]
     fn read_content(path: &Path) -> Result<Option<String>> {
         use std::os::windows::fs::OpenOptionsExt as _;
 
@@ -756,7 +758,7 @@ impl TrustStore {
                 ),
             ));
         }
-        let expected_identity = windows_file_identity(&path_metadata).map_err(|err| {
+        let expected_identity = FileIdentity::of_path_nofollow(path).map_err(|err| {
             Error::tool(
                 "mcp",
                 format!("[MCP_TRUST_IO] cannot identify {}: {err}", path.display()),
@@ -781,7 +783,7 @@ impl TrustStore {
         if !opened_metadata.is_file()
             || windows_metadata_is_reparse(&opened_metadata)
             || opened_metadata.len() > MAX_TRUST_FILE_BYTES
-            || windows_file_identity(&opened_metadata).map_err(|err| {
+            || FileIdentity::of_open_file(&file).map_err(|err| {
                 Error::tool(
                     "mcp",
                     format!("[MCP_TRUST_IO] cannot identify {}: {err}", path.display()),
@@ -827,7 +829,7 @@ impl TrustStore {
             )
         })?;
         if windows_metadata_is_reparse(&current_metadata)
-            || windows_file_identity(&current_metadata).map_err(|err| {
+            || FileIdentity::of_path_nofollow(path).map_err(|err| {
                 Error::tool(
                     "mcp",
                     format!("[MCP_TRUST_IO] cannot re-identify trust file: {err}"),
@@ -1020,7 +1022,44 @@ impl TrustStore {
         action: &str,
         execution: Option<super::config::StoredExecutionIdentity>,
     ) -> Result<()> {
+        self.transition_execution_saving(
+            name,
+            fingerprint,
+            state,
+            by,
+            action,
+            execution,
+            Self::save,
+        )
+    }
+
+    /// [`Self::transition_execution`] with the durable write injectable, so
+    /// tests can fail it at the persistence seam.
+    ///
+    /// A failed save must not leave an undurable decision live in memory: the
+    /// store reverts to what the locked reload read from disk, except that the
+    /// record keeps the attempted state when it is more restrictive. A failure
+    /// after the rename commit point (directory sync) leaves the durable
+    /// outcome unknown, and even before it a failed deny is still the
+    /// operator's intent, so an I/O error can never make this process more
+    /// permissive than either outcome. The caller always receives the error.
+    #[allow(clippy::too_many_arguments)]
+    fn transition_execution_saving<F>(
+        &mut self,
+        name: &str,
+        fingerprint: &str,
+        state: TrustState,
+        by: &str,
+        action: &str,
+        execution: Option<super::config::StoredExecutionIdentity>,
+        save: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Self, &TrustWriteGuard) -> Result<()>,
+    {
         let file_guard = self.lock_and_reload()?;
+        let committed_schema = self.schema_version;
+        let committed_servers = self.servers.clone();
         self.migrate_schema_if_needed();
         let at = now_iso();
         let audit = TrustAuditEntry {
@@ -1054,7 +1093,19 @@ impl TrustStore {
             }
         }
         record.audit.push(audit);
-        self.save(&file_guard)
+        let attempted = record.clone();
+        let Err(error) = save(self, &file_guard) else {
+            return Ok(());
+        };
+        self.schema_version = committed_schema;
+        self.servers = committed_servers;
+        let keep_attempted = self.servers.get(name).is_none_or(|previous| {
+            restrictiveness(attempted.state) > restrictiveness(previous.state)
+        }) && attempted.state != TrustState::Acknowledged;
+        if keep_attempted {
+            self.servers.insert(name.to_string(), attempted);
+        }
+        Err(error)
     }
 
     /// Record an acknowledgement together with the canonical execution
@@ -1199,7 +1250,7 @@ impl TrustStore {
         self.schema_version = fresh.schema_version;
         self.servers = fresh.servers;
         Ok(TrustWriteGuard {
-            _directories: directories,
+            directories,
             _lock: lock,
         })
     }
@@ -1325,7 +1376,7 @@ impl TrustStore {
 
     #[cfg(windows)]
     fn save(&self, guard: &TrustWriteGuard) -> Result<()> {
-        validate_windows_trust_directory_guards(&guard._directories).map_err(|err| {
+        validate_windows_trust_directory_guards(&guard.directories).map_err(|err| {
             Error::tool(
                 "mcp",
                 format!("[MCP_TRUST_IO] trust parent changed before saving: {err}"),
@@ -1354,7 +1405,7 @@ impl TrustStore {
         temp.as_file()
             .sync_all()
             .map_err(|err| Error::tool("mcp", format!("[MCP_TRUST_IO] sync: {err}")))?;
-        validate_windows_trust_directory_guards(&guard._directories).map_err(|err| {
+        validate_windows_trust_directory_guards(&guard.directories).map_err(|err| {
             Error::tool(
                 "mcp",
                 format!("[MCP_TRUST_IO] trust parent changed before persistence: {err}"),
@@ -1362,7 +1413,7 @@ impl TrustStore {
         })?;
         temp.persist(&self.path)
             .map_err(|err| Error::tool("mcp", format!("[MCP_TRUST_IO] persist: {}", err.error)))?;
-        if validate_windows_trust_directory_guards(&guard._directories).is_err() {
+        if validate_windows_trust_directory_guards(&guard.directories).is_err() {
             tracing::warn!(
                 event = "pi.mcp.trust_parent_revalidation_failed_after_commit",
                 "MCP trust transition committed but its Windows parent handles could not be revalidated"
@@ -1778,6 +1829,101 @@ mod tests {
         assert!(
             !displaced.join("trust.json").exists(),
             "aborted write must not publish into the displaced directory"
+        );
+    }
+
+    #[cfg(unix)]
+    fn failing_persist(store: &TrustStore, guard: &TrustWriteGuard) -> Result<()> {
+        store.save_with_before_persist(guard, || {
+            Err(std::io::Error::other("injected sync failure"))
+        })
+    }
+
+    #[cfg(unix)]
+    fn trust_temp_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("read trust dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with(".mcp-trust.tmp-"))
+            .collect()
+    }
+
+    /// bd-qv95g: an acknowledgement whose write fails at the durability seam
+    /// is reported as an error and never becomes live, in memory or on disk.
+    #[cfg(unix)]
+    #[test]
+    fn failed_acknowledge_persist_leaves_the_durable_denial_in_force() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("trust.json");
+        let fingerprint = "a".repeat(64);
+        let mut store = TrustStore::load(&path).expect("load");
+        store
+            .deny("srv", &fingerprint, "operator")
+            .expect("durable deny");
+
+        let error = store
+            .transition_execution_saving(
+                "srv",
+                &fingerprint,
+                TrustState::Acknowledged,
+                "operator",
+                "acknowledged",
+                None,
+                failing_persist,
+            )
+            .expect_err("a failed persist must be reported");
+        assert!(error.to_string().contains("MCP_TRUST_IO"), "{error}");
+        assert_eq!(store.decision("srv", &fingerprint), TrustDecision::Denied);
+        assert_eq!(
+            TrustStore::load(&path)
+                .expect("reload")
+                .decision("srv", &fingerprint),
+            TrustDecision::Denied
+        );
+        assert!(
+            trust_temp_files(temp.path()).is_empty(),
+            "the aborted temporary file must not survive"
+        );
+    }
+
+    /// bd-qv95g: a denial whose write fails is reported, is not claimed as
+    /// durable, and still blocks in this process (fail closed).
+    #[cfg(unix)]
+    #[test]
+    fn failed_deny_persist_is_reported_and_still_blocks_in_process() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("trust.json");
+        let fingerprint = "b".repeat(64);
+        let mut store = TrustStore::load(&path).expect("load");
+        store
+            .acknowledge("srv", &fingerprint, "operator")
+            .expect("durable acknowledge");
+
+        let error = store
+            .transition_execution_saving(
+                "srv",
+                &fingerprint,
+                TrustState::Denied,
+                "operator",
+                "denied",
+                None,
+                failing_persist,
+            )
+            .expect_err("a failed persist must be reported");
+        assert!(error.to_string().contains("MCP_TRUST_IO"), "{error}");
+        assert_eq!(store.decision("srv", &fingerprint), TrustDecision::Denied);
+        assert_eq!(
+            TrustStore::load(&path)
+                .expect("reload")
+                .decision("srv", &fingerprint),
+            TrustDecision::Acknowledged,
+            "the disk was not changed, so the caller must not be told it was"
         );
     }
     /// bd-sp5o3: the acknowledged record persists its bound canonical

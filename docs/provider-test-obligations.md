@@ -324,22 +324,22 @@ cargo test openai
 cargo test gemini
 
 # Unit checklist only
-cargo test provider_unit_checklist
+cargo test --test provider_unit_checklist
 
 # Contract tests only
-cargo test provider_native_contract
+cargo test --test provider_native_contract
 
 # Error path tests only
-cargo test provider_error_paths
+cargo test --test provider_error_paths
 
 # Streaming conformance (VCR playback)
-cargo test provider_streaming
+cargo test --test provider_streaming
 
-# Streaming conformance for one provider
-cargo test provider_streaming::anthropic_
+# Streaming conformance for one provider (one module per provider)
+cargo test --test provider_streaming anthropic::
 
 # Record new VCR cassettes (requires API key)
-ANTHROPIC_API_KEY=sk-ant-... VCR_MODE=record cargo test provider_streaming::anthropic_
+ANTHROPIC_API_KEY=sk-ant-... VCR_MODE=record cargo test --test provider_streaming anthropic::
 ```
 
 ---

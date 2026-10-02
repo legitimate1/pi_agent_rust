@@ -6,20 +6,24 @@
 //! ids, and `memory_edit` updates/invalidates/forgets by id. Project-scoped
 //! by default: the bank for this repo stays with this repo.
 //!
+//! `retain` and `recall` also accept `scope: "session"` for exact-text shared
+//! keys. These use the host registry's live session identity, not tool input.
+//! Shared values survive compaction but never enter the project-fact index,
+//! startup mental model, or reflection corpus. See [`shared`] (bd-1i2pn).
+//!
 //! Store: per-project SQLite under the agent config dir
 //! (`<global_dir>/memory/<project-key>.sqlite`), project-key = SHA-256 of
 //! the canonicalized primary root path — the config dir is the stable
-//! anchor (session dirs are overridable). WAL + the session-index locking
-//! discipline. FTS5 via the `fsqlite/fts5` feature (spike: tests/fts5_spike.rs).
+//! anchor (session dirs are overridable). Mutations atomically commit the
+//! memory row, FTS5 index, and audit log under a SQLite writer reservation.
 //!
 //! Ranking is behind a small trait so a later hybrid semantic+keyword
 //! engine (frankensearch-style) can replace FTS scoring without tool-schema
 //! changes.
 //!
-//! Privacy: `retain` screens content through a dedicated secret screener.
-//! bd-cv653.7.9 (pattern vault + entropy rules) has not landed yet, so the
-//! in-module screener is the interim floor; TODO(.7.9): swap to the shared
-//! vault when it lands so one detector serves every surface.
+//! Privacy: project facts and tags are screened before retention. Shared
+//! session values preserve exact text and are only returned on explicit read
+//! or listing; they are not a secret vault. Errors never echo shared values.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,6 +32,13 @@ use serde::Serialize;
 
 use crate::error::{Error, Result};
 use crate::session_sqlite::{SqliteConnection, run_on_sqlite_thread};
+
+mod reflection;
+pub mod shared;
+#[cfg(test)]
+mod shared_tests;
+mod transactions;
+pub use reflection::ReflectTool;
 
 /// Tool-result schema tag for memory operations (stable audit contract).
 pub const MEMORY_SCHEMA: &str = "pi.memory.v1";
@@ -140,7 +151,7 @@ impl MemoryRanker for FtsRecencyRanker {
                  FROM memories_fts f \
                  JOIN memories m ON m.id = f.rowid \
                  WHERE memories_fts MATCH ?1 AND m.status = 'active' \
-                 ORDER BY m.updated_at_ms DESC \
+                 ORDER BY m.updated_at_ms DESC, m.id DESC \
                  LIMIT ?2",
                 &[
                     fsqlite::SqliteValue::Text(fts_query.into()),
@@ -207,10 +218,43 @@ fn row_to_memory(row: &fsqlite::Row) -> Result<Memory> {
     })
 }
 
+fn audit_mutation(conn: &SqliteConnection, id: i64, op: &str, at_ms: i64) -> Result<()> {
+    conn.execute_sync(
+        "INSERT INTO memory_audit (memory_id, op, at_ms) VALUES (?1, ?2, ?3)",
+        &[
+            fsqlite::SqliteValue::Integer(id),
+            fsqlite::SqliteValue::Text(op.to_string().into()),
+            fsqlite::SqliteValue::Integer(at_ms),
+        ],
+    )
+    .map_err(|error| Error::tool("memory", format!("audit write failed: {error}")))?;
+    Ok(())
+}
+
+fn reject_active_duplicate(conn: &SqliteConnection, content: &str, except_id: i64) -> Result<()> {
+    let rows = conn
+        .query_sync(
+            "SELECT COUNT(*) FROM memories WHERE content = ?1 AND status = 'active' AND id <> ?2",
+            &[
+                fsqlite::SqliteValue::Text(content.to_string().into()),
+                fsqlite::SqliteValue::Integer(except_id),
+            ],
+        )
+        .map_err(|error| Error::tool("memory", format!("dedupe check failed: {error}")))?;
+    if rows.first().map_or(Ok(0), |row| row_i64(row, 0))? > 0 {
+        return Err(Error::tool(
+            "memory",
+            "PI_MEMORY_DUPLICATE: an identical active memory already exists",
+        ));
+    }
+    Ok(())
+}
+
 /// Per-project memory store (SQLite + FTS5).
 pub struct MemoryStore {
     db_path: PathBuf,
     project_key: String,
+    project_root: PathBuf,
 }
 
 impl MemoryStore {
@@ -232,12 +276,19 @@ impl MemoryStore {
         Ok(Self {
             db_path: dir.join(format!("{short_key}.sqlite")),
             project_key: short_key,
+            project_root: canonical,
         })
     }
 
     #[must_use]
     pub fn project_key(&self) -> &str {
         &self.project_key
+    }
+
+    /// Root captured when the bank was opened, independent of later cwd changes.
+    #[must_use]
+    pub fn project_root(&self) -> &Path {
+        &self.project_root
     }
 
     fn with_conn<T: Send>(
@@ -250,7 +301,7 @@ impl MemoryStore {
                 .map_err(|e| Error::tool("memory", format!("SQLite open: {e}")))?;
             conn.execute_raw(
                 "PRAGMA journal_mode = WAL;
-                 PRAGMA synchronous = NORMAL;
+                 PRAGMA synchronous = FULL;
                  PRAGMA foreign_keys = ON;
                  CREATE TABLE IF NOT EXISTS memories (
                    id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -273,15 +324,32 @@ impl MemoryStore {
                  );",
             )
             .map_err(|e| Error::tool("memory", format!("schema init failed: {e}")))?;
-            let result = f(&conn)?;
-            conn.close()
-                .map_err(|e| Error::tool("memory", format!("SQLite close: {e}")))?;
-            Ok(result)
+            let result = f(&conn);
+            let closed = conn.close();
+            match result {
+                Ok(value) => {
+                    closed.map_err(|e| Error::tool("memory", format!("SQLite close: {e}")))?;
+                    Ok(value)
+                }
+                Err(error) => {
+                    if closed.is_err() {
+                        tracing::warn!("memory connection close failed after a rejected operation");
+                    }
+                    Err(error)
+                }
+            }
         })
     }
 
+    fn with_write_conn<T: Send>(
+        &self,
+        mut action: impl FnMut(&SqliteConnection) -> Result<T> + Send,
+    ) -> Result<T> {
+        self.with_conn(|conn| transactions::run(conn, &mut action))
+    }
+
     /// Insert a fact/lesson/preference/decision after dedupe + secret
-    /// screening. Returns the stored row (content may be redacted).
+    /// screening. Returns only after the row, FTS entry, and audit commit.
     ///
     /// # Errors
     /// Store errors; named `PI_MEMORY_DUPLICATE` for exact active dupes.
@@ -292,30 +360,69 @@ impl MemoryStore {
         tags: &[String],
         session_id: Option<&str>,
     ) -> Result<Memory> {
+        self.retain_inner(kind, content, tags, session_id, None)
+    }
+
+    /// Atomically replace an active fact with a new, linked memory. Historical
+    /// content remains in `list`, but recall and startup exclude the old row.
+    ///
+    /// # Errors
+    /// Unknown ids, stale/inactive predecessors, duplicates, or store failures.
+    pub fn supersede(
+        &self,
+        id: i64,
+        kind: MemoryKind,
+        content: &str,
+        tags: &[String],
+        session_id: Option<&str>,
+    ) -> Result<Memory> {
+        self.retain_inner(kind, content, tags, session_id, Some(id))
+    }
+
+    fn retain_inner(
+        &self,
+        kind: MemoryKind,
+        content: &str,
+        tags: &[String],
+        session_id: Option<&str>,
+        supersedes: Option<i64>,
+    ) -> Result<Memory> {
+        if content.trim().is_empty() {
+            return Err(Error::validation("retain requires non-empty content"));
+        }
         let content = screen_secrets(content);
-        let now = now_ms();
-        let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
+        let tags: Vec<String> = tags.iter().map(|tag| screen_secrets(tag)).collect();
+        let tags_json = serde_json::to_string(&tags)?;
         let session_id = session_id.map(str::to_string);
-        let kind_str = kind.as_str().to_string();
-        self.with_conn(move |conn| {
-            let dupes = conn
-                .query_sync(
-                    "SELECT COUNT(*) FROM memories WHERE content = ?1 AND status = 'active'",
-                    &[fsqlite::SqliteValue::Text(content.clone().into())],
-                )
-                .map_err(|e| Error::tool("memory", format!("dedupe check failed: {e}")))?;
-            let dupe_count = dupes.first().map_or(Ok(0), |row| row_i64(row, 0))?;
-            if dupe_count > 0 {
-                return Err(Error::tool(
-                    "memory",
-                    "PI_MEMORY_DUPLICATE: an identical active memory already exists".to_string(),
-                ));
+        self.with_write_conn(move |conn| {
+            let content = content.clone();
+            let tags = tags.clone();
+            let tags_json = tags_json.clone();
+            let session_id = session_id.clone();
+            let now = now_ms();
+            if let Some(id) = supersedes {
+                let rows = conn
+                    .query_sync(
+                        "SELECT status FROM memories WHERE id = ?1",
+                        &[fsqlite::SqliteValue::Integer(id)],
+                    )
+                    .map_err(|error| Error::tool("memory", format!("lookup failed: {error}")))?;
+                let row = rows.first().ok_or_else(|| {
+                    Error::tool("memory", format!("PI_MEMORY_UNKNOWN_ID: no memory with id {id}"))
+                })?;
+                if row_text(row, 0)? != "active" {
+                    return Err(Error::tool(
+                        "memory",
+                        "PI_MEMORY_SUPERSESSION_CONFLICT: predecessor is no longer active; recall the current memory before replacing it",
+                    ));
+                }
             }
+            reject_active_duplicate(conn, &content, 0)?;
             conn.execute_sync(
                 "INSERT INTO memories (kind, content, tags, created_at_ms, updated_at_ms, \
-                 session_id, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active')",
+                 session_id, status, supersedes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
                 &[
-                    fsqlite::SqliteValue::Text(kind_str.into()),
+                    fsqlite::SqliteValue::Text(kind.as_str().to_string().into()),
                     fsqlite::SqliteValue::Text(content.clone().into()),
                     fsqlite::SqliteValue::Text(tags_json.into()),
                     fsqlite::SqliteValue::Integer(now),
@@ -323,13 +430,19 @@ impl MemoryStore {
                     session_id.clone().map_or(fsqlite::SqliteValue::Null, |id| {
                         fsqlite::SqliteValue::Text(id.into())
                     }),
+                    supersedes.map_or(fsqlite::SqliteValue::Null, fsqlite::SqliteValue::Integer),
                 ],
             )
             .map_err(|e| Error::tool("memory", format!("retain insert failed: {e}")))?;
             let id_rows = conn
                 .query_sync("SELECT last_insert_rowid()", &[])
                 .map_err(|e| Error::tool("memory", format!("rowid lookup failed: {e}")))?;
-            let id = id_rows.first().map_or(Ok(0), |row| row_i64(row, 0))?;
+            let id = row_i64(
+                id_rows
+                    .first()
+                    .ok_or_else(|| Error::tool("memory", "missing inserted row id"))?,
+                0,
+            )?;
             conn.execute_sync(
                 "INSERT INTO memories_fts (rowid, content) VALUES (?1, ?2)",
                 &[
@@ -338,17 +451,29 @@ impl MemoryStore {
                 ],
             )
             .map_err(|e| Error::tool("memory", format!("fts index failed: {e}")))?;
+            if let Some(previous) = supersedes {
+                conn.execute_sync(
+                    "UPDATE memories SET status = 'superseded', updated_at_ms = ?1 WHERE id = ?2",
+                    &[
+                        fsqlite::SqliteValue::Integer(now),
+                        fsqlite::SqliteValue::Integer(previous),
+                    ],
+                )
+                .map_err(|e| Error::tool("memory", format!("supersession failed: {e}")))?;
+                audit_mutation(conn, previous, "supersede", now)?;
+            }
+            audit_mutation(conn, id, "retain", now)?;
             Ok(Memory {
                 schema: MEMORY_SCHEMA.to_string(),
                 id,
                 kind: kind.as_str().to_string(),
                 content,
-                tags: tags.to_vec(),
+                tags,
                 created_at_ms: now,
                 updated_at_ms: now,
                 session_id,
                 status: "active".to_string(),
-                supersedes: None,
+                supersedes,
             })
         })
     }
@@ -363,14 +488,20 @@ impl MemoryStore {
         self.with_conn(move |conn| FtsRecencyRanker.recall(conn, &query, limit))
     }
 
-    /// Apply an edit op (audit-logged).
+    /// Apply an edit op (audit-logged in the same transaction).
     ///
     /// # Errors
     /// Named `PI_MEMORY_UNKNOWN_ID` for unknown ids.
     pub fn edit(&self, id: i64, op: MemoryEditOp, content: Option<&str>) -> Result<()> {
-        let now = now_ms();
+        if op == MemoryEditOp::Update && content.is_none_or(|text| text.trim().is_empty()) {
+            return Err(Error::validation(
+                "memory_edit update requires non-empty content",
+            ));
+        }
         let new_content = content.map(screen_secrets);
-        self.with_conn(move |conn| {
+        self.with_write_conn(move |conn| {
+            let new_content = new_content.clone();
+            let now = now_ms();
             let exists = conn
                 .query_sync(
                     "SELECT COUNT(*) FROM memories WHERE id = ?1",
@@ -386,11 +517,10 @@ impl MemoryStore {
             }
             match op {
                 MemoryEditOp::Update => {
-                    let Some(new_content) = new_content.clone() else {
-                        return Err(Error::validation(
-                            "memory_edit update requires content".to_string(),
-                        ));
+                    let Some(new_content) = new_content else {
+                        return Err(Error::validation("memory_edit update requires content"));
                     };
+                    reject_active_duplicate(conn, &new_content, id)?;
                     conn.execute_sync(
                         "UPDATE memories SET content = ?1, updated_at_ms = ?2 WHERE id = ?3",
                         &[
@@ -400,11 +530,18 @@ impl MemoryStore {
                         ],
                     )
                     .map_err(|e| Error::tool("memory", format!("update failed: {e}")))?;
+                    // Rebuild rather than UPDATE: a missing legacy FTS row
+                    // must not turn a successful edit into unsearchable data.
                     conn.execute_sync(
-                        "UPDATE memories_fts SET content = ?1 WHERE rowid = ?2",
+                        "DELETE FROM memories_fts WHERE rowid = ?1",
+                        &[fsqlite::SqliteValue::Integer(id)],
+                    )
+                    .map_err(|e| Error::tool("memory", format!("fts update failed: {e}")))?;
+                    conn.execute_sync(
+                        "INSERT INTO memories_fts (rowid, content) VALUES (?1, ?2)",
                         &[
-                            fsqlite::SqliteValue::Text(new_content.into()),
                             fsqlite::SqliteValue::Integer(id),
+                            fsqlite::SqliteValue::Text(new_content.into()),
                         ],
                     )
                     .map_err(|e| Error::tool("memory", format!("fts update failed: {e}")))?;
@@ -433,23 +570,12 @@ impl MemoryStore {
                     .map_err(|e| Error::tool("memory", format!("fts forget failed: {e}")))?;
                 }
             }
-            conn.execute_sync(
-                "INSERT INTO memory_audit (memory_id, op, at_ms) VALUES (?1, ?2, ?3)",
-                &[
-                    fsqlite::SqliteValue::Integer(id),
-                    fsqlite::SqliteValue::Text(
-                        match op {
-                            MemoryEditOp::Update => "update",
-                            MemoryEditOp::Invalidate => "invalidate",
-                            MemoryEditOp::Forget => "forget",
-                        }
-                        .into(),
-                    ),
-                    fsqlite::SqliteValue::Integer(now),
-                ],
-            )
-            .map_err(|e| Error::tool("memory", format!("audit write failed: {e}")))?;
-            Ok(())
+            let operation = match op {
+                MemoryEditOp::Update => "update",
+                MemoryEditOp::Invalidate => "invalidate",
+                MemoryEditOp::Forget => "forget",
+            };
+            audit_mutation(conn, id, operation, now)
         })
     }
 
@@ -465,27 +591,23 @@ impl MemoryStore {
                     "SELECT id, kind, content, tags, created_at_ms, updated_at_ms, session_id, \
                             status, supersedes \
                      FROM memories WHERE status = 'active' \
-                     ORDER BY updated_at_ms DESC LIMIT 50",
+                     ORDER BY updated_at_ms DESC, id DESC LIMIT 50",
                     &[],
                 )
                 .map_err(|e| Error::tool("memory", format!("mental model query failed: {e}")))?;
             let mut block = String::from("<memory>\n");
-            let mut used = block.len();
+            let mut included = false;
             for row in &rows {
                 let memory = row_to_memory(row)?;
                 let line = format!("- [{}] ({}): {}\n", memory.id, memory.kind, memory.content);
-                if used + line.len() > MENTAL_MODEL_BUDGET {
-                    break;
+                if block.len() + line.len() + "</memory>".len() > MENTAL_MODEL_BUDGET {
+                    continue;
                 }
                 block.push_str(&line);
-                used += line.len();
+                included = true;
             }
             block.push_str("</memory>");
-            Ok(if rows.is_empty() {
-                String::new()
-            } else {
-                block
-            })
+            Ok(if included { block } else { String::new() })
         })
     }
 
@@ -499,7 +621,7 @@ impl MemoryStore {
                 .query_sync(
                     "SELECT id, kind, content, tags, created_at_ms, updated_at_ms, session_id, \
                             status, supersedes \
-                     FROM memories ORDER BY updated_at_ms DESC LIMIT ?1",
+                     FROM memories ORDER BY updated_at_ms DESC, id DESC LIMIT ?1",
                     &[fsqlite::SqliteValue::Integer(
                         i64::try_from(limit).unwrap_or(50),
                     )],
@@ -547,7 +669,7 @@ fn secret_patterns() -> &'static Vec<(regex::Regex, &'static str)> {
 }
 
 /// Replace any detected credential in `content` with a placeholder.
-/// Memories never store detected secrets.
+/// Project facts never store detected secrets; shared session values are exact.
 #[must_use]
 pub fn screen_secrets(content: &str) -> String {
     let mut screened = content.to_string();
@@ -561,10 +683,7 @@ pub fn screen_secrets(content: &str) -> String {
 // Tools
 // ---------------------------------------------------------------------------
 
-use futures::StreamExt as _;
-
 use crate::model::{ContentBlock, TextContent};
-use crate::provider::{Context, StreamEvent, StreamOptions};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
 
 fn text_output(text: String, details: serde_json::Value, is_error: bool) -> ToolOutput {
@@ -575,15 +694,19 @@ fn text_output(text: String, details: serde_json::Value, is_error: bool) -> Tool
     }
 }
 
-/// `retain`: queue a durable fact/lesson/preference/decision.
+/// `retain`: project facts by default, or exact shared session keys on request.
 pub struct RetainTool {
     store: Arc<MemoryStore>,
+    session_scope: Option<crate::jobs::JobSessionScope>,
 }
 
 impl RetainTool {
     #[must_use]
     pub const fn new(store: Arc<MemoryStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            session_scope: None,
+        }
     }
 }
 
@@ -593,6 +716,7 @@ struct RetainInput {
     content: String,
     kind: Option<String>,
     tags: Option<Vec<String>>,
+    supersedes: Option<i64>,
 }
 
 #[async_trait::async_trait]
@@ -607,25 +731,35 @@ impl Tool for RetainTool {
     }
 
     fn description(&self) -> &str {
-        "Queue a durable memory for this project (fact, lesson, preference, \
-         or decision) that survives across sessions. Secret-looking content \
-         is redacted before storage."
+        "Store a durable project fact, lesson, preference or decision (default scope: project). \
+         Set supersedes to atomically replace an active fact; project content and tags are screened for secrets. \
+         For agent coordination, use scope=session with key and exact-text content instead. Shared keys survive \
+         compaction, stay isolated from other sessions and project facts, and support expectedRevision \
+         ('absent' to create only, or a revision from recall to avoid overwriting newer work)."
     }
 
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "content": { "type": "string", "description": "The fact or lesson to remember" },
+                "content": { "type": "string", "description": "Project fact, or exact shared text (session values: at most 65536 UTF-8 bytes)" },
+                "scope": { "type": "string", "enum": ["project", "session"], "description": "Default project; session selects shared key-value storage using the host's current session" },
+                "key": { "type": "string", "maxLength": 128, "description": "Required for session scope; letters/digits first, then letters, digits, dot, underscore or hyphen" },
+                "expectedRevision": { "type": "string", "description": "Session scope only: current revision from recall, or absent for create-only. Omitted opts into last-writer-wins" },
                 "kind": {
                     "type": "string",
                     "enum": ["fact", "lesson", "preference", "decision"],
-                    "description": "Memory kind (default: fact)"
+                    "description": "Project scope only: memory kind (default fact)"
                 },
                 "tags": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional tags for later filtering"
+                    "description": "Project scope only: optional tags"
+                },
+                "supersedes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Project scope only: active memory id to replace atomically, preserving history"
                 }
             },
             "required": ["content"]
@@ -636,12 +770,24 @@ impl Tool for RetainTool {
         ToolEffects::write()
     }
 
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.session_scope = Some(scope);
+    }
+
     async fn execute(
         &self,
         _tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        if shared::session_requested(&input)? {
+            return shared::write_output(&self.store, self.session_scope.as_ref(), input).await;
+        }
+        if input.get("key").is_some() || input.get("expectedRevision").is_some() {
+            return Err(Error::validation(
+                "Shared keys and revisions require scope=session",
+            ));
+        }
         let input: RetainInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
         if input.content.trim().is_empty() {
@@ -654,16 +800,27 @@ impl Tool for RetainTool {
             .as_deref()
             .map_or(Ok(MemoryKind::Fact), MemoryKind::parse)?;
         let tags = input.tags.unwrap_or_default();
-        match self.store.retain(kind, &input.content, &tags, None) {
+        let result = match input.supersedes {
+            Some(id) => self.store.supersede(id, kind, &input.content, &tags, None),
+            None => self.store.retain(kind, &input.content, &tags, None),
+        };
+        match result {
             Ok(memory) => {
                 let details = serde_json::to_value(&memory)?;
-                let redaction_note = if memory.content.as_str() == input.content {
-                    ""
-                } else {
-                    " (secret redacted before storage)"
-                };
+                let redaction_note =
+                    if memory.content.as_str() == input.content && memory.tags == tags {
+                        ""
+                    } else {
+                        " (secret redacted before storage)"
+                    };
+                let replacement_note = memory
+                    .supersedes
+                    .map_or_else(String::new, |id| format!("; superseded [{id}]"));
                 Ok(text_output(
-                    format!("Remembered [{}] {}{redaction_note}", memory.id, memory.kind),
+                    format!(
+                        "Remembered [{}] {}{redaction_note}{replacement_note}",
+                        memory.id, memory.kind
+                    ),
                     details,
                     false,
                 ))
@@ -677,15 +834,19 @@ impl Tool for RetainTool {
     }
 }
 
-/// `recall`: search raw memories.
+/// `recall`: project search by default, or a shared-session key read/list.
 pub struct RecallTool {
     store: Arc<MemoryStore>,
+    session_scope: Option<crate::jobs::JobSessionScope>,
 }
 
 impl RecallTool {
     #[must_use]
     pub const fn new(store: Arc<MemoryStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            session_scope: None,
+        }
     }
 }
 
@@ -708,23 +869,36 @@ impl Tool for RecallTool {
     }
 
     fn description(&self) -> &str {
-        "Search this project's memories (full-text, ranked by recency). \
-         Returns matching memory ids, kinds, and content."
+        "Search project facts by query (default scope=project, full-text ranked by recency). \
+         With scope=session, provide key to read exact shared text and its revision, or omit key \
+         to list shared keys using optional prefix, after and limit. Session keys are isolated \
+         from project facts and other sessions; session identity cannot be chosen in arguments."
     }
 
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "Search text (FTS, AND across words)" },
-                "limit": { "type": "integer", "description": "Max results (default 10, max 100)" }
+                "scope": { "type": "string", "enum": ["project", "session"], "description": "Default project; session reads or lists the current session's shared keys" },
+                "query": { "type": "string", "description": "Required for project scope: search text (FTS, AND across words)" },
+                "key": { "type": "string", "maxLength": 128, "description": "Session scope only: exact key to read; cannot be combined with listing options" },
+                "prefix": { "type": "string", "description": "Session listing only: literal key prefix" },
+                "after": { "type": "string", "description": "Session listing only: nextCursor from the previous page" },
+                "limit": { "type": "integer", "minimum": 1, "description": "Project search: default 10/max 100; session listing: default 25/max 50" }
             },
-            "required": ["query"]
+            "anyOf": [
+                { "required": ["query"] },
+                { "required": ["scope"], "properties": { "scope": { "const": "session" } } }
+            ]
         })
     }
 
     fn effects(&self) -> ToolEffects {
         ToolEffects::read()
+    }
+
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.session_scope = Some(scope);
     }
 
     async fn execute(
@@ -733,6 +907,18 @@ impl Tool for RecallTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        if shared::session_requested(&input)? {
+            return shared::read_or_list_output(&self.store, self.session_scope.as_ref(), input)
+                .await;
+        }
+        if ["key", "prefix", "after"]
+            .iter()
+            .any(|key| input.get(*key).is_some())
+        {
+            return Err(Error::validation(
+                "Shared key and listing options require scope=session",
+            ));
+        }
         let input: RecallInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
         let memories = self.store.recall(&input.query, input.limit)?;
@@ -843,186 +1029,6 @@ impl Tool for MemoryEditTool {
                 true,
             )),
         }
-    }
-}
-
-/// `reflect`: synthesize an answer over the bank with citation ids.
-pub struct ReflectTool {
-    store: Arc<MemoryStore>,
-    /// Injectable provider for tests; when None the tool resolves the
-    /// session's default provider lazily.
-    provider: Option<Arc<dyn crate::provider::Provider>>,
-}
-
-impl ReflectTool {
-    #[must_use]
-    pub fn new(store: Arc<MemoryStore>) -> Self {
-        Self {
-            store,
-            provider: None,
-        }
-    }
-
-    /// Inject a provider (tests and scripted harnesses).
-    #[must_use]
-    pub fn with_provider(
-        store: Arc<MemoryStore>,
-        provider: Arc<dyn crate::provider::Provider>,
-    ) -> Self {
-        Self {
-            store,
-            provider: Some(provider),
-        }
-    }
-
-    /// Union recall over the question's tokens (frequency then recency),
-    /// capped — natural questions AND poorly against FTS.
-    fn gather(&self, question: &str, cap: usize) -> Result<Vec<Memory>> {
-        let mut hits: std::collections::HashMap<i64, (usize, Memory)> =
-            std::collections::HashMap::new();
-        for token in question.split_whitespace() {
-            let token = token.trim_matches(|c: char| !c.is_alphanumeric()); // ubs:ignore punctuation trim, not a secret
-            if token.len() < 2 {
-                continue;
-            }
-            for memory in self.store.recall(token, Some(cap))? {
-                hits.entry(memory.id)
-                    .and_modify(|(count, _)| *count += 1)
-                    .or_insert((1, memory));
-            }
-        }
-        let mut ranked: Vec<(usize, Memory)> = hits.into_values().collect();
-        ranked.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then(b.1.updated_at_ms.cmp(&a.1.updated_at_ms))
-        });
-        Ok(ranked
-            .into_iter()
-            .take(cap)
-            .map(|(_, memory)| memory)
-            .collect())
-    }
-
-    fn resolve_provider(&self) -> Result<Arc<dyn crate::provider::Provider>> {
-        if let Some(provider) = &self.provider {
-            return Ok(Arc::clone(provider));
-        }
-        // Lazy resolution (reflect calls are rare): load auth + the model
-        // registry and use the session-default (first) model entry, the
-        // same fallback the role resolver uses.
-        let auth_path = crate::config::Config::global_dir().join("auth.json");
-        let auth = crate::auth::AuthStorage::load(auth_path)
-            .map_err(|e| Error::tool("reflect", format!("auth load failed: {e}")))?;
-        let registry = crate::models::ModelRegistry::load(&auth, None);
-        let entry = registry.models().first().ok_or_else(|| {
-            Error::tool(
-                "reflect",
-                "no model available for synthesis (configure a default model)".to_string(),
-            )
-        })?;
-        crate::providers::create_provider(entry, None)
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReflectInput {
-    question: String,
-}
-
-#[async_trait::async_trait]
-#[allow(clippy::unnecessary_literal_bound)]
-impl Tool for ReflectTool {
-    fn name(&self) -> &str {
-        "reflect"
-    }
-
-    fn label(&self) -> &str {
-        "reflect"
-    }
-
-    fn description(&self) -> &str {
-        "Answer a question using this project's memories. Gathers the most \
-         relevant memories, synthesizes an answer with the session model, \
-         and cites the memory ids used."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "question": { "type": "string", "description": "The question to answer from memory" }
-            },
-            "required": ["question"]
-        })
-    }
-
-    fn effects(&self) -> ToolEffects {
-        ToolEffects::read()
-    }
-
-    async fn execute(
-        &self,
-        _tool_call_id: &str,
-        input: serde_json::Value,
-        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-    ) -> Result<ToolOutput> {
-        let input: ReflectInput =
-            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
-        // Gather top-K: natural questions AND poorly, so recall per token
-        // and union (frequency then recency), capped at 8.
-        let corpus = self.gather(&input.question, 8)?;
-        if corpus.is_empty() {
-            return Ok(text_output(
-                "No memories to reflect on yet — retain some facts first.".to_string(),
-                serde_json::json!({ "schema": MEMORY_SCHEMA, "citations": [] }),
-                false,
-            ));
-        }
-        let provider = self.resolve_provider()?;
-        let mut prompt = String::from(
-            "Answer the question using ONLY the memories below. Cite memory ids in \
-             square brackets (e.g. [3]) for every claim. If the memories do not \
-             answer the question, say so.\n\nMemories:\n",
-        );
-        for memory in &corpus {
-            let _ = std::fmt::Write::write_fmt(
-                &mut prompt,
-                format_args!("- [{}] ({}): {}\n", memory.id, memory.kind, memory.content),
-            );
-        }
-        let _ = std::fmt::Write::write_fmt(
-            &mut prompt,
-            format_args!("\nQuestion: {}\n", input.question),
-        );
-        let context = Context {
-            system_prompt: Some(std::borrow::Cow::Borrowed(
-                "You are a precise memory synthesizer. Cite memory ids for every claim.",
-            )),
-            messages: std::borrow::Cow::Owned(vec![crate::model::Message::User(
-                crate::model::UserMessage {
-                    content: crate::model::UserContent::Text(prompt),
-                    timestamp: now_ms(),
-                },
-            )]),
-            tools: std::borrow::Cow::Borrowed(&[]),
-        };
-        let options = StreamOptions::default();
-        let mut stream = provider.stream(&context, &options).await?;
-        let mut answer = String::new();
-        while let Some(event) = stream.next().await {
-            if let Ok(StreamEvent::TextDelta { delta, .. }) = event {
-                answer.push_str(&delta);
-            }
-        }
-        let citations: Vec<i64> = corpus.iter().map(|memory| memory.id).collect();
-        let details = serde_json::json!({
-            "schema": MEMORY_SCHEMA,
-            "question": input.question,
-            "citations": citations,
-            "memories": corpus,
-        });
-        Ok(text_output(answer, details, false))
     }
 }
 
@@ -1150,7 +1156,6 @@ mod tests {
                 .expect("retain")
                 .id
         };
-        // A fresh store instance (new session) sees the same bank.
         let store = MemoryStore::open(&root).expect("open second");
         let hits = store.recall("cargo check", None).expect("recall");
         assert!(

@@ -42,7 +42,7 @@ You want an AI coding assistant in your terminal, but existing tools are:
 
 ## The Solution
 
-**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Official release archives install the single end-user binary `pi`, with streaming responses and 35 built-in tools (19 in the default `--tools` list; 14 always in the model's schema, the rest reachable through the `xdev` dispatcher or enabled in settings).
+**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Official release archives install the single end-user binary `pi`, with streaming responses and 36 built-in tools (19 in the default `--tools` list; 14 always in the model's schema, the rest reachable through the `xdev` dispatcher or enabled in settings).
 
 ### Current product direction
 
@@ -207,8 +207,8 @@ If you want full details, see:
 | Feature | Pi (Rust) | Typical TS/Python CLI |
 |---------|-----------|----------------------|
 | **Startup** | Native single-binary path (Fresh `v0.3.0` measurement pending; pre-v0.3.0 criterion: ~5-7ms p95 version, ~12-15ms help; see `tests/perf/reports/budget_summary.json` `startup_version_p95` and `startup_full_agent_p95`) | Runtime-dependent |
-| **Binary size** | Size-budgeted release profile (LTO, strip, `opt-level = "z"`); the `binary_size_release` budget and its latest stripped-artifact measurement are reported in [Current Evidence State](#current-evidence-state-auto-generated), never promoted here until claim readiness is `ready` | Runtime-dependent |
-| **Memory (idle)** | Bounded-resource design; the `idle_memory_rss` budget and its latest release-binary measurement are reported in [Current Evidence State](#current-evidence-state-auto-generated) (`docs/perf-budgets-recipe.md` defines the canonical 5-measurement taxonomy) | Runtime-dependent |
+| **Binary size** | Size-budgeted release profile (LTO, strip, `opt-level = "z"`); the `binary_size_release` budget and its latest stripped-artifact measurement are reported in [Current Evidence State](#current-evidence-state), never promoted here until claim readiness is `ready` | Runtime-dependent |
+| **Memory (idle)** | Bounded-resource design; the `idle_memory_rss` budget and its latest release-binary measurement are reported in [Current Evidence State](#current-evidence-state) (`docs/perf-budgets-recipe.md` defines the canonical 5-measurement taxonomy) | Runtime-dependent |
 | **Streaming** | Native SSE parser | Library-dependent |
 | **Tool execution** | Process tree management | Basic subprocess |
 | **Sessions** | JSONL with branching | Varies |
@@ -392,7 +392,7 @@ pi "Write a quicksort implementation"
 
 Watch the response appear incrementally, with thinking blocks shown inline.
 
-### 35 Built-in Tools
+### 36 Built-in Tools
 
 Tools are tiered so the model's live schema stays small while everything
 remains reachable. The tier table lives in `src/xdev.rs`; the default
@@ -413,9 +413,10 @@ remains reachable. The tier table lives in `src/xdev.rs`; the default
 - **`--tools` opt-in extras**: `eval`, `github`, `security_scan`
 - **Settings-gated extras** (off until enabled in `settings.json`):
   `browser` (`browser.enableBrowser`), `computer`
-  (`computer.enableComputer`), and the media trio `inspect_image`,
+  (`computer.enableComputer`), the media trio `inspect_image`,
   `generate_image`, `tts` (`media.enableInspectImage` /
-  `media.enableGenerateImage` / `media.enableTts`)
+  `media.enableGenerateImage` / `media.enableTts`), and `read_media`
+  (`media.enableReadMedia`; inline video/audio for Gemini-family models)
 - **Opt-in only**: `subagent` (it can start additional coding-agent
   processes)
 
@@ -440,17 +441,18 @@ remains reachable. The tier table lives in `src/xdev.rs`; the default
 | `browser` | Headless Chromium automation over CDP (navigate, snapshot, click, type, screenshot) with a domain allowlist; settings-gated |
 | `computer` | Desktop automation (displays, windows, screenshots, mouse/keyboard, clipboard); mutating actions require approval; settings-gated |
 | `inspect_image` / `generate_image` / `tts` | Vision analysis of local images, image generation/editing, and text-to-speech through provider adapters; settings-gated |
+| `read_media` | Attaches a local video/audio file (mp4, webm, mov, mp3, wav, m4a, ogg, flac) as an inline media block. Gemini, Gemini CLI, and Vertex Gemini models receive it natively as `inline_data`; every other provider sees `[media omitted: <name>, <mime>, <size>]`. Hard cap 5 MiB per file (`media.maxBytes`); settings-gated |
 | `subagent` | Delegate isolated work to named Rust Pi child agents |
 
 All tools include automatic truncation for large outputs (2000 lines /
 1MB), detailed metadata in responses, and process-tree cleanup for bash.
-Background-job logs are preserved by default; when their dedicated directory
-cannot admit another 16 MiB artifact within its 256 MiB / 4096-entry budget,
-Pi refuses the new job instead of deleting history. Set
-`PI_JOBS_ARTIFACT_RETENTION=rotate` to opt into deleting the oldest unlocked
-artifacts while preserving active logs and at least eight recent logs. Job
-snapshots report the applied policy, removed-file count, and reclaimed bytes in
-`artifactCleanup`.
+Background-job logs live in a dedicated directory with a 256 MiB / 4096-entry
+budget. When it cannot admit another 16 MiB artifact, Pi deletes the oldest
+unlocked logs, only as many as needed, and always keeps active logs and at
+least eight recent ones. Set `PI_JOBS_ARTIFACT_RETENTION=preserve` to keep
+every log instead; Pi then refuses new background jobs once the budget is
+full. Job snapshots report the applied policy, removed-file count, and
+reclaimed bytes in `artifactCleanup`.
 Per-tool exposure is configurable via `tools.loadMode.<name>` set to
 `essential`, `discoverable`, or `off`; an explicit `--tools` list always
 wins:
@@ -562,6 +564,30 @@ Pi runs in four modes, each suited to different workflows:
 **Interactive mode** provides the full experience: a multi-line text editor with history, scrollable conversation viewport, model selector (`Ctrl+L`), scoped model cycling (`Ctrl+P`/`Ctrl+Shift+P`), session branch navigator (`/tree`), and real-time token/cost tracking. Since v0.4.0 the default interactive stack is the FrankenTUI (`ftui`) runtime; `pi --inline` keeps your shell scrollback by drawing the UI at the bottom of the screen instead of on the alternate screen, and `pi --classic` (aliases `--classic-tui`, `--charmed`, `--bubbletea`) selects the previous charmed_rust stack until it is removed.
 
 **Print mode** sends one message, streams the response to stdout, and exits. Useful for shell scripts and one-off queries.
+
+**Print mode and tool approval.** The approval mode defaults to `always-ask` on
+every surface, including `-p`. The absence of a terminal is not treated as
+consent, so Pi does not quietly auto-approve a scripted run. Print mode also has
+no way to prompt, which means a gated tool call in a default `-p` run is denied.
+Pass `--approval-mode yolo` (or `--yolo`) to auto-approve tool calls, or set
+`approval.mode` in `settings.json`:
+
+```bash
+echo "list the files here" | pi -p --mode json --yolo
+```
+
+When a run does end with tool calls denied for want of an approval surface, Pi
+exits **3** and explains why on stderr, rather than exiting 0 on a turn that
+silently did nothing. In `--mode json` and `--mode rpc` the same failure also
+arrives as the single machine-readable record described under `--mode`, with
+`"code": "approval.surface_unavailable"`. Exit 3 means specifically "the model
+could not use tools"; exit 1 remains an ordinary failure and exit 2 a usage
+error.
+
+This is a deliberate divergence from the Node Pi CLI, which auto-approves in
+print mode. Legacy Pi is historical context here, not a compatibility
+authority, and inheriting its default would silently grant `bash` and write
+access to any script that never opted in.
 
 **RPC mode** exposes a line-delimited JSON protocol for programmatic control. Clients send commands (`prompt`, `steer`, `follow-up`, `abort`, `get-state`, `compact`) and receive streaming events. This is how IDE extensions and custom frontends integrate with Pi. See [RPC Protocol](#rpc-protocol) for the wire format.
 
@@ -806,7 +832,7 @@ command -v legacy-pi && legacy-pi --version
 ### Source builds
 
 Repository builds are tested with the exact toolchain pinned in
-`rust-toolchain.toml` (`nightly-2026-07-05`). The locked dependency graph
+`rust-toolchain.toml` (`nightly-2026-08-31`). The locked dependency graph
 requires Rust 1.95 or newer. Project builds are DSR-only:
 
 ```bash
@@ -868,7 +894,7 @@ Interactive file references:
 | `--session-durability strict|balanced|throughput` | Tune persistence durability mode |
 | `--no-session` | Don't persist conversation |
 | `-p, --print` | Single response, no interaction |
-| `--mode text|json|rpc` | Output/protocol mode |
+| `--mode text|json|rpc` | Output/protocol mode. `json` streams one event per line; `message_update` records are delta-only (no cumulative `message` / `partial`), so stdout stays linear in the response length — read the full message from `message_end`. A fatal error in `json` or `rpc` mode prints exactly one `{"type":"error","phase":"startup","code":"<stable code>","message":"…","exit_code":N}` record on stdout before the non-zero exit (`phase` is `run` once the stream had opened) |
 | `--provider <NAME>` | Force provider for this run (aliases supported) |
 | `--model <MODEL>` | Model to use (auto-select fallback: `anthropic/claude-sonnet-4-6`, then `anthropic/claude-opus-4-7`, then `openai/gpt-5.1-codex`) |
 | `--thinking <LEVEL>` | Thinking level: off/minimal/low/medium/high/xhigh/max |
@@ -1004,9 +1030,15 @@ Resolution order for a request, first match wins:
 Ambient proxy variables are honored by default, the same as `git` and `curl`.
 Where they are set for some other tool — a capture proxy, a stale VPN helper —
 turn the inheritance off with `"http": { "ignore_env_proxy": true }` or
-`PI_HTTP_PROXY=off`; explicit settings and `PI_*_PROXY` still apply. An
-unusable ambient value (e.g. a `socks5://` `ALL_PROXY` — SOCKS is not
-supported) is skipped with a warning rather than failing requests.
+`PI_HTTP_PROXY=off`; explicit settings and `PI_*_PROXY` still apply. Proxy
+endpoints may be `http://`, `socks5://` (local DNS) or `socks5h://` (DNS on the
+proxy), with optional username/password authentication; SOCKS credentials are
+not encrypted on the hop to the proxy. There is no automatic loopback bypass:
+requests to local model servers (Ollama, LM Studio) go through the proxy too
+unless `localhost` and `127.0.0.1` are in `NO_PROXY` or `http.noProxy`. An
+unusable ambient value
+(e.g. an `https://` or `socks4://` endpoint) is skipped with a warning rather
+than failing requests.
 
 The resolved proxy is also injected into every process the `bash` tool spawns
 (as `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` and their lowercase spellings), so
@@ -1041,6 +1073,8 @@ When multiple resources share the same name, the first occurrence wins. Collisio
 
 `--no-skills` (and its siblings `--no-prompt-templates`, `--no-themes`, `--no-extensions`) disables tiers 2–4 **including** `skills` entries listed in `settings.json` — upstream-pi parity. Explicit CLI paths (tier 1) still load, so `pi --no-skills --skill /path/to/skill-a --skill /path/to/skill-b` is the way to run with an exact, isolated skill set (e.g. per-profile setups via shell aliases or wrapper scripts).
 
+Project context files are a separate switch. By default pi appends `AGENTS.md` / `CLAUDE.md` from `~/.pi/agent/`, the working directory, and every ancestor directory to the system prompt (plus imported foreign-format workspace rules). `--no-context-files` (or `PI_NO_CONTEXT_FILES=1`) disables that discovery entirely; `--no-skills` does not cover it. Hosts that compose the whole prompt with `--system-prompt` typically pass `--no-context-files --no-skills` together.
+
 **Prompt template expansion** supports positional arguments: `$1`, `$2`, `$@` (all args), and slice syntax `${@:start}`, `${@:start:length}`. For example, a template invoked as `/review src/main.rs --strict` receives `src/main.rs` as `$1` and `--strict` as `$2`.
 
 ### Environment Variables
@@ -1068,7 +1102,7 @@ When multiple resources share the same name, the first occurrence wins. Collisio
 | `PI_CONFIG_PATH` | Custom config file path |
 | `PI_CODING_AGENT_DIR` | Override the global config directory |
 | `PI_SUBAGENT_PI_BINARY` | Explicit Rust Pi executable for native child agents; defaults to the current executable |
-| `PI_JOBS_ARTIFACT_RETENTION` | Background-job artifact policy: `preserve` (default) or explicit opt-in `rotate` |
+| `PI_JOBS_ARTIFACT_RETENTION` | Background-job artifact policy: `rotate` (default, deletes the oldest unlocked logs when the budget is full) or `preserve` (keeps every log, refuses new jobs when full) |
 | `PI_PACKAGE_DIR` | Override the packages directory |
 | `PI_SESSIONS_DIR` | Custom sessions directory |
 
@@ -1841,6 +1875,14 @@ The RPC mode (`pi --mode rpc`) exposes a line-delimited JSON protocol over stdin
 {"type": "response", "id": "req-001", "command": "prompt", "success": true, "data": {"status": "ok"}}
 ```
 
+**Fatal errors** (JSON and RPC modes): a failure that ends the process — a bad config file, no credentials for the selected model, an unwritable state directory, a usage error — prints exactly one record on stdout before the non-zero exit, so a host never has to parse stderr prose:
+
+```json
+{"type": "error", "phase": "startup", "code": "auth.missing_api_key", "message": "No API key found for provider anthropic. Set env var or use --api-key.", "exit_code": 1}
+```
+
+`phase` is `startup` when nothing had been written to stdout yet (no session header, no RPC loop) and `run` otherwise. `code` is stable: the auth diagnostic codes (`auth.missing_api_key`, `auth.no_models_available`, `auth.invalid_api_key`, `auth.quota_exceeded`, `auth.oauth.token_refresh_failed`, …) when the failure classifies as one, else the family — `config`, `session`, `provider`, `auth`, `tool`, `usage` (argument/validation errors, exit code 2), `extension`, `io`, `json`, `state_store`, `aborted`, `api`, or `internal`. The human-readable diagnosis with hints still goes to stderr. Text mode prints nothing on stdout.
+
 **I/O architecture**: Two dedicated threads handle stdin reading and stdout writing, bridged to the async agent runtime via channels. The stdin thread retries on transient errors to prevent dropped input. The stdout thread flushes after every line to prevent buffering delays.
 
 **Message queuing**: While the agent is streaming a response, incoming messages are routed to one of two queues:
@@ -2140,17 +2182,16 @@ See `docs/testing-policy.md` and `docs/releasing.md` for normative policy detail
 
 Current checked-in performance evidence state:
 - Run output: `tests/perf/reports/` (budget_summary.json, PERF_BUDGETS.md)
-- Current strict budget summary (run `beige-evidence-refresh-20260823`, source
-  `2697f21d`): `19` declared budgets. Its per-budget `budget_results` rows
-  show `16` PASS and `3` FAIL (extension simple cold-load p95 over budget,
-  tool-call latency and throughput inputs missing, fail-closed); claim
-  readiness is `blocked` and performance claims are NOT authorized. The
-  artifact's aggregate header still reports `12` PASS, `5` FAIL, `2`
-  NO_DATA from before the 2026-08-28 idle-memory, binary-size,
-  complex-cold-load, and event-dispatch re-measurements, so the header and
-  the rows disagree until the summary is regenerated (bd-sog97.20).
+- Current budget summary (generated 2026-09-21 from source `9c887d33`; no run
+  id, no correlation id, `strict_mode` false): `19` declared budgets, of which
+  `0` PASS, `0` FAIL and `19` NO_DATA. Header and per-budget `budget_results`
+  rows now agree, and they agree on this: the tree carries no performance
+  measurements at all. Claim readiness is `blocked`,
+  `performance_claims_authorized` is false, and the blocking reason codes are
+  `budget_data_missing`, `ci_budget_data_missing`, `correlation_id_missing`,
+  `data_contract_failure`, `run_id_missing` and `strict_mode_disabled`.
   Counts are value-bound to the artifact:
-  *(from tests/perf/reports/budget_summary.json)*
+  *(from tests/perf/reports/budget_summary.json; no performance claim)*
 - Before spending time on a definitive refresh, run
   `python3 scripts/perf/preflight_budget_inputs.py` to list missing budget
   inputs, expected artifact paths, and RCH-only refresh commands.
@@ -2671,7 +2712,7 @@ Pi is honest about what it doesn't do:
 | **No GUI** | Terminal-only by design |
 | **Some extensions need npm stubs** | Common stubs are provided; unlisted npm packages still require a stub. See docs/planning/EXTENSIONS.md §8.1 |
 | **English-centric** | Works but not optimized for other languages |
-| **Pinned Rust toolchain** | Releases are validated with `nightly-2026-07-05`; locked dependencies require Rust 1.95+ |
+| **Pinned Rust toolchain** | Releases are validated with `nightly-2026-08-31`; locked dependencies require Rust 1.95+ |
 
 ---
 
@@ -2876,7 +2917,7 @@ A: Yes. Point any provider at a custom base URL via `models.json`. Pi normalizes
 | **Startup** | Fresh comparative measurement pending | Not measured here | Not measured here | Not measured here |
 | **Memory** | Fresh comparative measurement pending | Not measured here | Not measured here | Not measured here |
 | **Providers** | 11 native provider implementation modules + OpenAI-compatible presets | Anthropic | Many | Many |
-| **Tools** | 35 built-in (19 in the default `--tools` list) | Many | File-focused | IDE-integrated |
+| **Tools** | 36 built-in (19 in the default `--tools` list) | Many | File-focused | IDE-integrated |
 | **Sessions** | JSONL tree | Proprietary | Git-based | Proprietary |
 | **Open source** | Yes | Yes | Yes | No |
 
@@ -3094,40 +3135,97 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 
 ---
 
-## Current Evidence State (auto-generated)
+## Current Evidence State
 
-> **STATUS: PARTIAL** — `claim_readiness.status = "blocked"`, `performance_claims_authorized = false` (3 budgets still failing/no-data).
-> Four of the seven previously-failing budgets now have **fresh v0.3.0 measurements** (binary_size, idle_memory, ext_cold_load_complex, event_dispatch). The remaining items are: `ext_cold_load_simple_p95` (over 5ms budget; needs profile-driven optimization), `tool_call_latency_mean` and `tool_call_throughput_min` (need a pijs_workload binary), and the long-standing `ext_must_pass` marckrenn-pi-sub conformance gap.
-> See [`tests/perf/reports/budget_summary.json`](tests/perf/reports/budget_summary.json) for the current budget state and [`docs/perf-budgets-recipe.md`](docs/perf-budgets-recipe.md) for the recipe to regenerate.
+> **STATUS: UNMEASURED.** `claim_readiness.status = "blocked"`,
+> `performance_claims_authorized = false`. The checked-in budget summary was
+> regenerated on 2026-09-21 from source `9c887d33` and contains no
+> measurements whatsoever: of `19` declared budgets, `0` PASS, `0` FAIL and
+> `19` NO_DATA.
+> *(from tests/perf/reports/budget_summary.json; no performance claim)*
 
-| Budget | Status | Notes |
+Earlier revisions of this section reported four passing budgets — binary size,
+idle memory, complex extension cold-load, event dispatch — carried over from a
+v0.3.0 run. Those figures are not in the artifact this section cites, so they
+are not repeated here. Until a strict run lands, treat pi's performance as
+unmeasured rather than as good or bad.
+
+| Budget | Status | Why |
 |---|---|---|
-| `binary_size_release` | **PASS** (32.8 MB) | Fresh v0.3.0 measurement against stripped release binary; under 48 MB budget |
-| `idle_memory_rss` | **PASS** (8.0 MB) | Fresh v0.3.0 measurement against the user-facing release binary; under 50 MB target |
-| `tool_call_latency_mean` | **FAIL** | `pijs_workload` data missing; generator at `scripts/perf/run_pijs_workload.py` |
-| `tool_call_throughput_min` | **FAIL** | same as above |
-| `ext_cold_load_simple_p95` | **FAIL** (11.9ms) | over budget (5.0ms); profile-driven optimization pending |
-| `ext_cold_load_complex_p95` | **PASS** (38.3ms) | Fresh measurement; under 50ms budget |
-| `event_dispatch_p99` | **PASS** (766us) | Fresh measurement; under 5000us budget |
-| `ext_must_pass` | **fail** | 2/208 marckrenn-pi-sub extensions fail conformance (event-handler mismatch); triaged to upstream fix or de-scope, see `bd-marckrenn-pi-sub-triage-xd3gh` |
-| `evidence_bundle` | **partial** (was `insufficient`) | 0 invalid sections now; 18 present, 12 missing (optional) |
+| `startup_version_p95` | NO_DATA | benchmark lineage incomplete |
+| `startup_full_agent_p95` | NO_DATA | benchmark lineage incomplete |
+| `ext_cold_load_simple_p95` | NO_DATA | also fails its data contract: no measurement control captured |
+| `ext_cold_load_complex_p95` | NO_DATA | also fails its data contract: no measurement control captured |
+| `ext_load_60_total` | NO_DATA | benchmark lineage incomplete |
+| `tool_call_latency_mean` | NO_DATA | needs a `pijs_workload` run; generator at `scripts/perf/run_pijs_workload.py` |
+| `tool_call_throughput_min` | NO_DATA | same as above |
+| `event_dispatch_p99` | NO_DATA | benchmark lineage incomplete |
+| `context_graph_build_cold_p95` | NO_DATA | benchmark lineage incomplete |
+| `context_graph_build_warm_p95` | NO_DATA | benchmark lineage incomplete |
+| `context_incremental_update_p95` | NO_DATA | benchmark lineage incomplete |
+| `context_planning_p95` | NO_DATA | benchmark lineage incomplete |
+| `context_bundle_serialization_p95` | NO_DATA | benchmark lineage incomplete |
+| `context_bundle_estimated_bytes_max` | NO_DATA | benchmark lineage incomplete |
+| `policy_eval_p99` | NO_DATA | benchmark lineage incomplete |
+| `idle_memory_rss` | NO_DATA | also fails its data contract: no measurement control captured |
+| `sustained_load_rss_growth` | NO_DATA | benchmark lineage incomplete |
+| `binary_size_release` | NO_DATA | also fails its data contract: no measurement control captured |
+| `protocol_parse_p99` | NO_DATA | benchmark lineage incomplete |
+
+Of the 19, 14 are CI-enforced and none of those has data. Blocking reason
+codes: `budget_data_missing`, `ci_budget_data_missing`,
+`correlation_id_missing`, `data_contract_failure`, `run_id_missing`,
+`strict_mode_disabled`.
+
+Two adjacent gates, bound to their own artifacts rather than to the budget
+summary:
+
+| Gate | Status | Notes |
+|---|---|---|
+| `ext_must_pass` | fail | 2/208 marckrenn-pi-sub extensions fail conformance (event-handler mismatch); triaged to upstream fix or de-scope, see `bd-marckrenn-pi-sub-triage-xd3gh` |
+| `evidence_bundle` | partial | 0 invalid sections; 18 present, 12 missing (all optional) |
+
+Thresholds, categories, methodology and failing data contracts for every
+budget are in [`tests/perf/reports/PERF_BUDGETS.md`](tests/perf/reports/PERF_BUDGETS.md),
+which *is* generated from the summary. The recipe and its hidden contracts are
+in [`docs/perf-budgets-recipe.md`](docs/perf-budgets-recipe.md).
+
+### Keeping this section honest
+
+This table is written by hand. It previously carried an "(auto-generated)"
+label with no generator behind it, which is how it spent a month advertising
+four passing budgets that the artifact did not contain. The label is gone, and
+`scripts/check_readme_evidence_freshness.py` now binds every row above to the
+artifact's status for that budget and fails on any disagreement. Run it after
+any refresh:
 
 ```bash
-# 1. Verify the DSR perf recipe is ready
+# 1. Verify the DSR perf recipe is ready, and see what inputs are missing
+#    before spending a build on them
 bash scripts/perf/preflight_dsr_recipe.sh
+python3 scripts/perf/preflight_budget_inputs.py
 
-# 2. Build the release binary via DSR
-/Users/jemanuel/projects/doodlestein_self_releaser/dsr build pi_agent_rust
+# 2. Build the release binary via DSR (the only authorized build path)
+dsr build pi_agent_rust
 
-# 3. Generate the canonical evidence artifacts
+# 3. Generate the canonical measurement artifacts
 python3 scripts/perf/measure_idle_memory.py
 python3 scripts/perf/measure_binary_size.py --no-build
 python3 scripts/perf/run_ext_cold_load_complex.py
 python3 scripts/perf/run_event_dispatch_scenario.py
 
-# 4. Regenerate the evidence bundle and the markdown
+# 4. Regenerate budget_summary.json and PERF_BUDGETS.md. This is the
+#    generator; scripts/perf/render_perf_budgets_md.py is a stale duplicate
+#    that overwrites the same path with a different, lossier format --
+#    do not run it (bd-o9qzt).
+PI_GENERATE_PERF_BUDGET_REPORT=1 \
+  dsr quality --tool pi_agent_rust   # or the perf-budgets test under RCH
+
+# 5. Rebuild the evidence bundle, restate the table above, and verify
 python3 scripts/perf/rebuild_evidence_bundle.py
-python3 scripts/perf/render_perf_budgets_md.py
+python3 scripts/check_readme_evidence_freshness.py
 ```
 
-When `claim_readiness.status` flips from `blocked` to `ready` (or `ready_with_advisories`), the `Current Evidence State` section above will be re-rendered and the `Why Pi?` table numbers can be re-promoted to current.
+When `claim_readiness.status` flips from `blocked` to `ready` (or
+`ready_with_advisories`), restate the table above from the regenerated
+artifact; only then may the `Why Pi?` table numbers be promoted to current.

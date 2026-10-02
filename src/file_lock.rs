@@ -435,16 +435,13 @@ impl DirLock {
 /// component is itself a regular file some platforms surface `ENOTDIR`. Treat
 /// both as "already occupied" so the stale/heal path runs.
 fn is_already_exists(e: &io::Error) -> bool {
-    if e.kind() == io::ErrorKind::AlreadyExists {
-        return true;
-    }
     #[cfg(unix)]
     {
-        e.raw_os_error() == Some(ENOTDIR)
+        e.kind() == io::ErrorKind::AlreadyExists || e.raw_os_error() == Some(ENOTDIR)
     }
     #[cfg(not(unix))]
     {
-        false
+        e.kind() == io::ErrorKind::AlreadyExists
     }
 }
 
@@ -755,6 +752,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn reclaims_stale_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -778,6 +776,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 
+    #[cfg(unix)]
     #[test]
     fn heals_stale_leftover_regular_file() {
         // Simulates the poisoning artifact left by older flock-based pi_agent_rust.
@@ -934,6 +933,7 @@ mod tests {
     }
 
     // Minimal mtime setter (avoids adding a dev-dep); uses std `File::set_times`.
+    #[cfg(unix)]
     fn filetime_set(path: &Path, when: SystemTime) {
         let f = fs::File::open(path).expect("open for set_times");
         let times = fs::FileTimes::new().set_modified(when).set_accessed(when);

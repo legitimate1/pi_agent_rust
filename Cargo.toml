@@ -1,6 +1,6 @@
 [package]
 name = "pi_agent_rust"
-version = "0.4.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Native AI coding agent CLI - Rust port of Pi Agent"
@@ -154,6 +154,14 @@ required-features = ["ftui"]
 name = "pi_debug"
 path = "examples/pi_debug.rs"
 
+# Deliberately also declared as a [[bench]] below. Cargo warns on every
+# invocation that this path "is present in multiple build targets"; the warning
+# is expected and neither half is removable. `scripts/bench_extension_workloads.sh`
+# builds it with `--example pijs_workload` and times the binary at
+# `$profile/examples/pijs_workload` with hyperfine, while `tests/bench_schema.rs`
+# asserts the criterion regression gate invokes `cargo bench --bench
+# pijs_workload --profile perf`. Deleting either declaration to silence the
+# warning breaks one of those.
 [[example]]
 name = "pijs_workload"
 path = "examples/pijs_workload.rs"
@@ -208,7 +216,7 @@ clap = { version = "4.5.60", features = ["derive", "env", "string"] }
 clap_complete = "4.5.66"
 
 # Async runtime
-asupersync = { version = "0.4.4", default-features = false, features = ["tls-webpki-roots", "tls-native-roots", "test-internals"] }
+asupersync = { version = "0.5.0", default-features = false, features = ["tls-webpki-roots", "tls-native-roots", "test-internals"] }
 futures = "0.3"
 async-trait = "0.1"
 
@@ -243,7 +251,7 @@ rich_rust = { version = "0.2.2", features = ["markdown"] }
 # crossterm is the low-level terminal driver used exclusively by the
 # interactive front-end, so it is gated behind the `tui` feature.
 crossterm = { version = "0.29", optional = true }
-enable-ansi-support = "0.2"
+enable-ansi-support = "0.3"
 
 # Interactive TUI (charmed_rust - bubbletea/lipgloss/bubbles/glamour).
 # These are used exclusively by the interactive terminal front-end and are
@@ -252,7 +260,9 @@ enable-ansi-support = "0.2"
 bubbletea = { package = "charmed-bubbletea", version = "0.2.0", optional = true }
 lipgloss = { package = "charmed-lipgloss", version = "0.2.0", optional = true }
 bubbles = { package = "charmed-bubbles", version = "0.2.0", optional = true }
-glamour = { package = "charmed-glamour", version = "0.2.0", optional = true }
+# 0.2.4 is the first release that re-pads table cells truncated at a
+# wide-char boundary (charmed_rust 4150912, GH #195).
+glamour = { package = "charmed-glamour", version = "0.2.4", optional = true }
 # unicode-width / textwrap are TUI-layout helpers consumed only by the
 # interactive render code, so they are gated with the rest of the TUI stack.
 unicode-width = { version = "0.2", optional = true }
@@ -264,14 +274,14 @@ arboard = { version = "3.6.1", optional = true }
 # ported module by module; the bubbletea stack is deleted at cutover.
 # crossterm backend for now (pi already ships crossterm via `tui`); the Unix
 # native-backend (ftui-tty) switch is a later rollout step per the bead.
-ftui = { version = "0.5", default-features = false, features = ["runtime", "crossterm"], optional = true }
+ftui = { version = "0.7", default-features = false, features = ["runtime", "crossterm"], optional = true }
 # Markdown rendering for the ftui conversation view. Direct dep because the
 # facade's `extras` feature enables no ftui-extras features (markdown stays
 # off); default-features off keeps the heavy extras (charts, doom, ...) out.
-ftui-extras = { version = "0.5", default-features = false, features = ["markdown"], optional = true }
+ftui-extras = { version = "0.7", default-features = false, features = ["markdown"], optional = true }
 
 # Filesystem
-dirs = "6"
+dirs = "7"
 tempfile = "3.25.0"
 fs4 = "1.1"
 glob = "0.3"
@@ -281,7 +291,7 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 # Typed subagent results (bd-cv653.5.1): validate child yields against
 # per-task output schemas.
-jsonschema = { version = "0.42.0", default-features = false }
+jsonschema = { version = "0.58.4", default-features = false }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 crossbeam-queue = "0.3"
 # default-features off: pi's session storage needs only the core engine.
@@ -325,8 +335,8 @@ regex = "1.12.3"
 ring = "0.17.14"
 semver = "1.0.27"
 crc32c = "0.6"
-ast-grep-core = "0.40"
-ast-grep-language = { version = "0.40", default-features = false, features = [
+ast-grep-core = "0.45"
+ast-grep-language = { version = "0.45", default-features = false, features = [
     "tree-sitter-bash",
     "tree-sitter-python",
     "tree-sitter-javascript",
@@ -337,7 +347,7 @@ ast-grep-language = { version = "0.40", default-features = false, features = [
 ] }
 unicode-normalization = "0.1"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
-similar = "2"
+similar = "3"
 sysinfo = "0.39.6"
 # BPE token counting tables (bd-cv653.7.2.1); enabled via the `bpe-tokens`
 # feature.
@@ -373,16 +383,16 @@ image = { version = "0.25", optional = true, default-features = false, features 
 [build-dependencies]
 crc32c = "0.6.8"
 flate2 = "1.1.9"
-vergen-gix = { version = "9.1.0", features = ["build", "cargo", "rustc"] }
+vergen-gix = { version = "10.0.1", features = ["build", "cargo", "rustc"] }
 
 [dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }
 pretty_assertions = "1"
 insta = { version = "1", features = ["filters"] }
 tempfile = "3.25.0"
-asupersync = { version = "0.4.4", default-features = false, features = ["test-internals"] }
+asupersync = { version = "0.5.0", default-features = false, features = ["test-internals"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
-jsonschema = { version = "0.42.0", default-features = false }
+jsonschema = { version = "0.58.4", default-features = false }
 proptest = "1.10.0"
 wat = "1.255.0"
 toml = "1.0.3"
@@ -408,6 +418,8 @@ harness = false
 name = "semantic_context"
 harness = false
 
+# The other half of the deliberate duplication; see the [[example]] entry for
+# this same path above before removing either.
 [[bench]]
 name = "pijs_workload"
 path = "examples/pijs_workload.rs"
@@ -451,6 +463,11 @@ rquickjs = { version = "0.12.2", features = ["futures", "loader", "bindgen"] }
 # crate unsafe-free while encapsulating the Win32 FFI.
 [target.'cfg(windows)'.dependencies]
 win32job = "2.0.3"
+# `GetFileInformationByHandle` without `unsafe`: std's own accessors for the
+# volume serial number and file index are behind the unstable
+# `windows_by_handle` feature, which this crate cannot use because it also has
+# to build on stable. See `src/file_identity.rs`.
+winapi-util = "0.1.11"
 
 [features]
 default = ["sqlite-sessions", "tui", "bpe-tokens", "ftui"]
@@ -561,6 +578,38 @@ nursery = { level = "warn", priority = -1 }
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
+
+# Both of the following arrived with the nightly-2026-08-31 pin (e403485b3),
+# which was a fleet-wide housekeeping change that touched no source and, as
+# rust-toolchain.toml's own comment warns can happen, strengthened the
+# pedantic/nursery groups underneath us. Between them they were 294 of the 296
+# errors blocking `cargo clippy -- -D warnings`, i.e. the entire quality gate.
+# Decided deliberately rather than reverted (bd-39x9z).
+#
+# One deviation from bd-39x9z's acceptance, recorded rather than glossed: that
+# bead asked for per-module suppression rather than crate-wide if this route was
+# taken. The owner chose the allow directly, and per-module would mean an inner
+# attribute in each of the ~78 affected files, which scatters the reasoning
+# across the tree instead of stating it once where the lint policy lives. One
+# documented place is easier to revisit than 78 undocumented ones.
+
+# 288 hits, essentially all in test assertions. The lint wants
+#   assert_eq!(plan_tool_effect_batches(&effect_plan(&cases)), [] as [agent::ToolEffectBatch; 0])
+# in place of
+#   assert!(plan_tool_effect_batches(&effect_plan(&cases)).is_empty())
+# which needs the element type spelled out at every site, is longer, and reads
+# worse. Its real argument — that assert_eq! shows the value on failure — is
+# fair, but not worth 288 rewrites of that shape. Prefer assert_eq! in NEW
+# assertions where the value is cheap to render.
+assert_is_empty = "allow"
+
+# 6 hits. The lint wants f64::mul_add, which is a FUSED multiply-add with no
+# intermediate rounding, so applying it changes results bit-for-bit. The sites
+# are bandit loss/regret accumulation (src/extensions.rs) and risk calibration
+# (src/resource_governor.rs, src/provider.rs), with tests pinning values
+# downstream. Changing risk arithmetic to satisfy a micro-optimisation lint is
+# the wrong trade; a sibling project on the same build fleet allows it too.
+suboptimal_flops = "allow"
 
 # ---------------------------------------------------------------------------
 # Local development with sibling crates

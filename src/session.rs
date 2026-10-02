@@ -243,13 +243,26 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     std::fs::File::open(parent)?.sync_all()
 }
 
+// Every `cfg(not(unix))` arm in this file mirrors a Unix arm that really can
+// fail, so the fallible signature has to stay even though this one cannot —
+// hence `unnecessary_wraps` and `missing_const_for_fn` are expected here and
+// on each stub below.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Completed JSONL parent-directory syncs in this process, written into every
+/// JSONL failpoint marker so a checkpoint moved across the sync is visible
+/// (bd-yn7ud). A failpoint child performs exactly one save.
+#[cfg(feature = "internal-persistence-fault-injection")]
+static JSONL_PARENT_SYNCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn sync_jsonl_parent_dir_with_witness(path: &Path) -> std::io::Result<&'static str> {
     sync_parent_dir(path)?;
+    #[cfg(feature = "internal-persistence-fault-injection")]
+    JSONL_PARENT_SYNCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     #[cfg(unix)]
     {
         Ok("parent_sync_completed=unix_fsync")
@@ -447,6 +460,7 @@ pub(crate) fn ensure_session_directory_readable(path: &Path) -> std::io::Result<
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 pub(crate) fn ensure_session_directory_readable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -464,6 +478,7 @@ pub(crate) fn ensure_session_file_writable(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 pub(crate) fn ensure_session_file_writable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -481,6 +496,7 @@ pub(crate) fn ensure_session_file_read_write(path: &Path) -> std::io::Result<()>
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 pub(crate) fn ensure_session_file_read_write(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -508,6 +524,7 @@ pub(crate) fn ensure_session_parent_writable(path: &Path) -> std::io::Result<()>
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 pub(crate) fn ensure_session_parent_writable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -537,6 +554,7 @@ fn ensure_session_parent_durable_writable(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn ensure_session_parent_durable_writable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -585,6 +603,7 @@ pub(crate) fn ensure_session_directory_creation_access(path: &Path) -> std::io::
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 pub(crate) fn ensure_session_directory_creation_access(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -675,6 +694,7 @@ fn ensure_v2_sidecar_tree_access(root: &Path, writable: bool) -> std::io::Result
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn ensure_v2_sidecar_tree_access(_root: &Path, _writable: bool) -> std::io::Result<()> {
     Ok(())
 }
@@ -936,15 +956,19 @@ fn source_fingerprint_matches(jsonl_path: &Path, expected: &V2SourceFingerprint)
         Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    let metadata = file.metadata()?;
+    // Unix can settle this from `(dev, ino, len)` alone; every other platform
+    // falls through to re-hashing the file.
     #[cfg(unix)]
-    if expected.byte_length == metadata.len()
-        && expected
-            .file_identity
-            .as_ref()
-            .is_some_and(|identity| identity == &v2_source_file_identity(&metadata))
     {
-        return Ok(true);
+        let metadata = file.metadata()?;
+        if expected.byte_length == metadata.len()
+            && expected
+                .file_identity
+                .as_ref()
+                .is_some_and(|identity| identity == &v2_source_file_identity(&metadata))
+        {
+            return Ok(true);
+        }
     }
 
     let actual = fingerprint_open_session_source(file)?;
@@ -1049,7 +1073,11 @@ fn read_v2_source_state(v2_root: &Path) -> Result<Option<V2SourceStateValue>> {
 
 fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()> {
     let path = v2_source_state_path(v2_root);
-    let initial_metadata =
+    // `None` when the entry does not exist yet, which also selects the
+    // exclusive-create flag below. When it does exist, both platforms hold it
+    // to this identity across the open, so a same-name replacement landing in
+    // between is refused rather than silently written through.
+    let initial_identity =
         if session_path_entry_exists(&path).map_err(|err| Error::Io(Box::new(err)))? {
             let metadata = std::fs::symlink_metadata(&path)?;
             if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -1059,7 +1087,7 @@ fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()>
                 ));
             }
             ensure_session_file_writable(&path).map_err(|err| Error::Io(Box::new(err)))?;
-            Some(metadata)
+            Some(crate::file_identity::FileIdentity::of_path_nofollow(&path)?)
         } else {
             ensure_session_parent_writable(&path).map_err(|err| Error::Io(Box::new(err)))?;
             None
@@ -1070,8 +1098,6 @@ fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()>
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
-
         let directory = rustix::fs::open(
             v2_root,
             rustix::fs::OFlags::RDONLY
@@ -1081,7 +1107,7 @@ fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()>
             rustix::fs::Mode::empty(),
         )
         .map_err(std::io::Error::from)?;
-        let create_flags = if initial_metadata.is_some() {
+        let create_flags = if initial_identity.is_some() {
             rustix::fs::OFlags::empty()
         } else {
             rustix::fs::OFlags::EXCL
@@ -1099,10 +1125,9 @@ fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()>
         .map_err(std::io::Error::from)?;
         let mut file = std::fs::File::from(descriptor);
         let opened_metadata = file.metadata()?;
+        let opened_identity = crate::file_identity::FileIdentity::of_open_file(&file)?;
         if !opened_metadata.is_file()
-            || initial_metadata.as_ref().is_some_and(|initial| {
-                initial.dev() != opened_metadata.dev() || initial.ino() != opened_metadata.ino()
-            })
+            || initial_identity.is_some_and(|initial| initial != opened_identity)
         {
             return Err(invalid_v2_source_state(
                 &path,
@@ -1128,10 +1153,18 @@ fn write_v2_source_state(v2_root: &Path, document: &V2SourceState) -> Result<()>
             .write(true)
             .truncate(true)
             .open(&path)?;
-        if !file.metadata()?.is_file() {
+        let opened_identity = crate::file_identity::FileIdentity::of_open_file(&file)?;
+        // The same re-check the Unix arm performs: without it a same-name
+        // replacement landing between the validation above and this open was
+        // written through unnoticed (bd-vr2b8). A reparse point substituted
+        // here fails it too, because the recorded identity was read without
+        // following one while this open does.
+        if !file.metadata()?.is_file()
+            || initial_identity.is_some_and(|initial| initial != opened_identity)
+        {
             return Err(invalid_v2_source_state(
                 &path,
-                "opened state entry is not a regular file",
+                "state entry changed while it was being opened",
             ));
         }
         file.write_all(&encoded)?;
@@ -1325,6 +1358,10 @@ pub(crate) fn persistence_test_failpoint(
             if let Some(witness) = mutation_witness {
                 marker.write_all(witness.as_bytes())?;
                 marker.write_all(b"\n")?;
+            }
+            if point.starts_with("jsonl_") {
+                let syncs = JSONL_PARENT_SYNCS.load(std::sync::atomic::Ordering::SeqCst);
+                marker.write_all(format!("jsonl_parent_syncs={syncs}\n").as_bytes())?;
             }
             // File writes are visible to the parent after the child exits. Do
             // not fsync this diagnostic marker: on a shared filesystem that
@@ -1578,7 +1615,12 @@ fn append_jsonl_entries_blocking(
             mark_v2_sidecar_dirty_before_jsonl_mutation(path)?;
             let mut file = open_existing_session_file_for_append(path)?;
             file.write_all(&serialized_entries)?;
+            persistence_test_failpoint("jsonl_append_after_write_before_sync", None)?;
             file.sync_all().map_err(|e| crate::Error::Io(Box::new(e)))?;
+            persistence_test_failpoint(
+                "jsonl_append_after_sync",
+                Some("append_sync_completed=true"),
+            )?;
         }
         let mut persisted_entries = disk_session.entries.clone();
         persisted_entries.extend(entries_appended);
@@ -2416,14 +2458,36 @@ impl SessionStoreKind {
             #[cfg(not(feature = "sqlite-sessions"))]
             {
                 tracing::warn!(
+                    target: crate::config::USER_DIAGNOSTIC_TARGET,
                     "Config requests session_store=sqlite but binary lacks `sqlite-sessions`; falling back to jsonl"
                 );
                 return Self::Jsonl;
             }
         }
 
-        tracing::warn!("Unknown session_store `{value}`, falling back to jsonl");
+        tracing::warn!(
+            target: crate::config::USER_DIAGNOSTIC_TARGET,
+            "Unknown session_store `{value}`, falling back to jsonl"
+        );
         Self::Jsonl
+    }
+
+    pub(crate) fn from_path(path: &Path) -> Option<Self> {
+        let ext = path.extension()?.to_str()?;
+        if ext.eq_ignore_ascii_case("jsonl") {
+            Some(Self::Jsonl)
+        } else if ext.eq_ignore_ascii_case("sqlite") {
+            #[cfg(feature = "sqlite-sessions")]
+            {
+                Some(Self::Sqlite)
+            }
+            #[cfg(not(feature = "sqlite-sessions"))]
+            {
+                None
+            }
+        } else {
+            None
+        }
     }
 
     const fn extension(self) -> &'static str {
@@ -3213,10 +3277,29 @@ impl Session {
         }
 
         if let Some(path) = &cli.session {
-            let mut session = Self::open(path).await?;
-            session.session_dir = session_dir
+            let session_path = Path::new(path);
+            if session_path_try_exists(session_path).map_err(|err| Error::Io(Box::new(err)))? {
+                let mut session = Self::open(path).await?;
+                session.session_dir = session_dir
+                    .clone()
+                    .or_else(|| infer_session_root_from_path(session_path));
+                session.set_autosave_durability_mode(durability_mode);
+                return Ok(session);
+            }
+
+            let store_kind = SessionStoreKind::from_path(session_path)
+                .unwrap_or_else(|| SessionStoreKind::from_config(config));
+            let inferred_dir = session_dir
                 .clone()
-                .or_else(|| infer_session_root_from_path(Path::new(path)));
+                .or_else(|| infer_session_root_from_path(session_path));
+            let mut session = Self::create_with_dir_and_store(inferred_dir, store_kind);
+            if let Some(parent) = session_path.parent()
+                && !parent.as_os_str().is_empty()
+                && !parent.exists()
+            {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            session.path = Some(session_path.to_path_buf());
             session.set_autosave_durability_mode(durability_mode);
             return Ok(session);
         }
@@ -4082,12 +4165,48 @@ impl Session {
         })
     }
 
-    /// Continue the most recent session.
+    /// Continue the most recent session, or start a new one when there is
+    /// nothing in this directory to continue.
     pub async fn continue_recent_in_dir(
         override_dir: Option<&Path>,
         config: &Config,
     ) -> Result<Self> {
         let store_kind = SessionStoreKind::from_config(config);
+        let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
+        match Self::resolve_recent_session_in_dir(override_dir).await? {
+            Some((session, _)) => Ok(session),
+            None => Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind)),
+        }
+    }
+
+    /// The path `--continue` would reopen, or `None` when this directory has
+    /// nothing continuable.
+    ///
+    /// Surfaces that build a session from a PATH rather than from a `Session`
+    /// need this: the SDK's [`SessionOptions`](crate::sdk::SessionOptions) has
+    /// no "reopen the latest" concept, so the default FTUI stack silently
+    /// ignored `--continue` and handed the user a fresh session
+    /// (bd-ydz1t.3). Resolution goes through the same candidate scan,
+    /// index pruning and open-and-skip-unreadable walk as
+    /// [`Self::continue_recent_in_dir`], because answering "which session?"
+    /// differently from "open which session?" is how the two drift.
+    pub async fn recent_session_path_in_dir(
+        override_dir: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        Ok(Self::resolve_recent_session_in_dir(override_dir)
+            .await?
+            .map(|(_, path)| path))
+    }
+
+    /// The most recent openable session in this directory, with its path.
+    ///
+    /// `None` means there is nothing to continue: the project directory is
+    /// absent, or no candidate could be opened. Unreadable candidates are
+    /// pruned from the index on the way past, which is why this both selects
+    /// and opens rather than merely ranking paths.
+    async fn resolve_recent_session_in_dir(
+        override_dir: Option<&Path>,
+    ) -> Result<Option<(Self, PathBuf)>> {
         let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
         let cwd = std::env::current_dir()?;
         let cwd_display = cwd.display().to_string();
@@ -4132,7 +4251,7 @@ impl Session {
         }
 
         if project_session_dir_missing {
-            return Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind));
+            return Ok(None);
         }
 
         let scanned = scan_sessions_on_disk(&project_session_dir, indexed_sessions.clone()).await?;
@@ -4163,7 +4282,7 @@ impl Session {
             match Self::open(entry.path.to_string_lossy().as_ref()).await {
                 Ok(mut session) => {
                     session.session_dir = Some(base_dir.clone());
-                    return Ok(session);
+                    return Ok(Some((session, entry.path.clone())));
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -4180,7 +4299,7 @@ impl Session {
             }
         }
 
-        Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind))
+        Ok(None)
     }
 
     /// Save the session to disk.
@@ -4731,6 +4850,26 @@ impl Session {
         None
     }
 
+    /// Inspect the latest model change on the current active branch path to determine
+    /// if an unrestored failover cycle is in flight (bd-gm481.2).
+    ///
+    /// Returns `Some(&ModelChangeFailover)` only if the latest model change on the path
+    /// has `role == Some("failover")` and carries durable failover provenance. If the
+    /// latest model change is `primary_restore` or a user-initiated change (`None`),
+    /// this returns `None`.
+    #[must_use]
+    pub fn active_failover_provenance_for_current_path(&self) -> Option<&ModelChangeFailover> {
+        for entry in self.entries_for_current_path().iter().rev() {
+            if let SessionEntry::ModelChange(change) = entry {
+                if change.role.as_deref() == Some("failover") {
+                    return change.failover.as_ref();
+                }
+                return None;
+            }
+        }
+        None
+    }
+
     pub fn effective_model_for_current_path(&self) -> Option<(String, String)> {
         // If there's an explicit model change on the current path, use it
         if let Some(model) = self.latest_model_change_for_current_path() {
@@ -4957,6 +5096,18 @@ impl Session {
         model_id: String,
         role: Option<String>,
     ) -> String {
+        self.append_model_change_with_role_and_failover(provider, model_id, role, None)
+    }
+
+    /// Append a model change tagged with the role it applies to and optional
+    /// durable failover provenance (bd-gm481.2).
+    pub fn append_model_change_with_role_and_failover(
+        &mut self,
+        provider: String,
+        model_id: String,
+        role: Option<String>,
+        failover: Option<ModelChangeFailover>,
+    ) -> String {
         let id = self.next_entry_id();
         let base = EntryBase::new(self.leaf_id.clone(), id.clone());
         let entry = SessionEntry::ModelChange(ModelChangeEntry {
@@ -4964,6 +5115,7 @@ impl Session {
             provider,
             model_id,
             role,
+            failover,
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
@@ -6539,6 +6691,35 @@ impl From<Message> for SessionMessage {
     }
 }
 
+/// Durable failover provenance recorded on a `failover` role ModelChange entry (bd-gm481.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelChangeFailover {
+    /// The primary provider before the failover chain started.
+    pub primary_provider: String,
+    /// The primary model id before the failover chain started.
+    pub primary_model_id: String,
+    /// Requested thinking level of the primary model before any clamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_thinking_level: Option<String>,
+    /// The fallback provider installed by this swap.
+    pub fallback_provider: String,
+    /// The fallback model id installed by this swap.
+    pub fallback_model_id: String,
+    /// Chain position for resuming future walks in this cycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_position: Option<usize>,
+    /// Restart-safe cooldown deadline timestamp (RFC3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_deadline: Option<String>,
+    /// Configured cooldown duration in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_secs: Option<u64>,
+    /// Unique lifecycle ID identifying this failover cycle across hops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_id: Option<String>,
+}
+
 /// Model change entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -6552,6 +6733,9 @@ pub struct ModelChangeEntry {
     /// or require the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Durable failover provenance (bd-gm481.2). Present only when `role == Some("failover")`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover: Option<ModelChangeFailover>,
 }
 
 /// Thinking level change entry.
@@ -7192,6 +7376,13 @@ fn render_blocks(blocks: &[ContentBlock]) -> String {
                     escape_html(&image.data)
                 );
             }
+            ContentBlock::Media(media) => {
+                let _ = write!(
+                    html,
+                    "<p class=\"media\">{}</p>",
+                    escape_html(&media.placeholder())
+                );
+            }
             ContentBlock::ToolCall(tool_call) => {
                 let args = serde_json::to_string_pretty(&tool_call.arguments)
                     .unwrap_or_else(|_| tool_call.arguments.to_string());
@@ -7245,6 +7436,7 @@ fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
             ContentBlock::Image(image) => {
                 push_line(&mut output, &format!("[image: {}]", image.mime_type));
             }
+            ContentBlock::Media(media) => push_line(&mut output, &media.placeholder()),
             ContentBlock::Thinking(thinking_block) => {
                 push_line(&mut output, &thinking_block.thinking);
             }
@@ -8774,6 +8966,91 @@ mod tests {
     use std::future::Future;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    /// Run `emit` under a subscriber that keeps only `target` at WARN, and
+    /// return what it rendered.
+    ///
+    /// The point is the target rather than the text: a diagnostic on the wrong
+    /// target is emitted, formatted, and then dropped for every user who has
+    /// not set `RUST_LOG`, which is exactly the failure being pinned.
+    fn logged_on_target(target: &str, emit: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+        impl Buffer {
+            fn with<R>(&self, f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+                f(&mut self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner))
+            }
+        }
+
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.with(|bytes| bytes.extend_from_slice(buf));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = Buffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(format!("{target}=warn")))
+            .with_ansi(false)
+            .with_writer(captured.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        String::from_utf8(captured.with(|bytes| bytes.clone())).expect("utf-8")
+    }
+
+    #[test]
+    fn an_unknown_session_store_tells_the_user_on_the_target_they_can_see() {
+        let config = Config {
+            session_store: Some("sqlte".to_string()),
+            ..Config::default()
+        };
+
+        let seen = logged_on_target(crate::config::USER_DIAGNOSTIC_TARGET, || {
+            assert_eq!(
+                SessionStoreKind::from_config(&config),
+                SessionStoreKind::Jsonl,
+                "an unrecognised store must fall back to jsonl"
+            );
+        });
+
+        assert!(
+            seen.contains("Unknown session_store"),
+            "the fallback was silent on the user-visible target: {seen:?}"
+        );
+        assert!(seen.contains("sqlte"), "the warning should quote the value");
+    }
+
+    #[test]
+    fn a_recognised_session_store_says_nothing() {
+        let config = Config {
+            session_store: Some("jsonl".to_string()),
+            ..Config::default()
+        };
+        let seen = logged_on_target(crate::config::USER_DIAGNOSTIC_TARGET, || {
+            assert_eq!(
+                SessionStoreKind::from_config(&config),
+                SessionStoreKind::Jsonl
+            );
+        });
+        assert!(seen.is_empty(), "a correct setting must be quiet: {seen:?}");
+    }
 
     macro_rules! test_fail {
         ($message:literal $(,)?) => {
@@ -10412,6 +10689,42 @@ mod tests {
     }
 
     #[test]
+    fn test_session_new_with_explicit_new_session_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_file = temp_dir.path().join("new_session.jsonl");
+        let cli = crate::cli::Cli::parse_from([
+            "pi",
+            "--session",
+            session_file.to_str().expect("session file str"),
+        ]);
+        let config = Config::default();
+        let session =
+            run_async(async { Session::new(&cli, &config).await }).expect("create session");
+        assert_eq!(session.path, Some(session_file));
+        assert_eq!(session.store_kind, SessionStoreKind::Jsonl);
+    }
+
+    #[test]
+    fn test_session_new_with_explicit_existing_session_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_file = temp_dir.path().join("existing.jsonl");
+        let mut initial_session = Session::create();
+        initial_session.path = Some(session_file.clone());
+        run_async(async { initial_session.save().await }).expect("save initial session");
+
+        let cli = crate::cli::Cli::parse_from([
+            "pi",
+            "--session",
+            session_file.to_str().expect("session file str"),
+        ]);
+        let config = Config::default();
+        let session =
+            run_async(async { Session::new(&cli, &config).await }).expect("open existing session");
+        assert_eq!(session.path, Some(session_file));
+        assert_eq!(session.header.id, initial_session.header.id);
+    }
+
+    #[test]
     fn test_resolve_autosave_durability_mode_precedence() {
         assert_eq!(
             resolve_autosave_durability_mode(Some("strict"), Some("throughput"), Some("balanced")),
@@ -11866,6 +12179,102 @@ mod tests {
         } else {
             test_fail!("Expected ModelChange after round-trip");
         }
+    }
+
+    /// bd-gm481.2: durable failover provenance must serialize, deserialize, and be queryable
+    /// along the active branch path.
+    #[test]
+    fn test_model_change_failover_provenance_round_trip_and_path_lookup() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("Initial message"));
+
+        // 1. Appending a standard model change has no failover provenance and does not serialize "failover".
+        let mc1_id =
+            session.append_model_change("anthropic".to_string(), "claude-3-7-sonnet".to_string());
+        let mc1 = session.get_entry(&mc1_id).unwrap().clone();
+        let json1 = serde_json::to_string(&mc1).unwrap();
+        assert!(
+            !json1.contains("\"failover\""),
+            "standard model change must not have failover key: {json1}"
+        );
+        assert!(
+            session
+                .active_failover_provenance_for_current_path()
+                .is_none()
+        );
+
+        // 2. Appending a failover model change with durable provenance.
+        let failover_meta = ModelChangeFailover {
+            primary_provider: "anthropic".to_string(),
+            primary_model_id: "claude-3-7-sonnet".to_string(),
+            primary_thinking_level: Some("high".to_string()),
+            fallback_provider: "openai".to_string(),
+            fallback_model_id: "gpt-4o".to_string(),
+            chain_position: Some(1),
+            cooldown_deadline: Some("2026-09-18T20:00:00.000Z".to_string()),
+            cooldown_secs: Some(300),
+            lifecycle_id: Some("lifecycle-test-123".to_string()),
+        };
+
+        let mc2_id = session.append_model_change_with_role_and_failover(
+            "openai".to_string(),
+            "gpt-4o".to_string(),
+            Some("failover".to_string()),
+            Some(failover_meta.clone()),
+        );
+
+        let mc2 = session.get_entry(&mc2_id).unwrap().clone();
+        let json2 = serde_json::to_string(&mc2).unwrap();
+        assert!(
+            json2.contains("\"role\":\"failover\""),
+            "failover role must serialize: {json2}"
+        );
+        assert!(
+            json2.contains("\"primaryProvider\":\"anthropic\""),
+            "primaryProvider must serialize: {json2}"
+        );
+        assert!(
+            json2.contains("\"primaryModelId\":\"claude-3-7-sonnet\""),
+            "primaryModelId must serialize: {json2}"
+        );
+        assert!(
+            json2.contains("\"lifecycleId\":\"lifecycle-test-123\""),
+            "lifecycleId must serialize: {json2}"
+        );
+
+        // Deserializing matches original provenance exactly.
+        let parsed: SessionEntry = serde_json::from_str(&json2).unwrap();
+        if let SessionEntry::ModelChange(mc) = parsed {
+            assert_eq!(mc.failover, Some(failover_meta.clone()));
+        } else {
+            test_fail!("Expected ModelChange");
+        }
+
+        // Active failover query returns the provenance.
+        assert_eq!(
+            session.active_failover_provenance_for_current_path(),
+            Some(&failover_meta)
+        );
+
+        // 3. Appending intermediate message still returns the active failover provenance.
+        session.append_message(make_test_message("Intervening assistant response"));
+        assert_eq!(
+            session.active_failover_provenance_for_current_path(),
+            Some(&failover_meta)
+        );
+
+        // 4. Appending a primary_restore model change ends the failover.
+        session.append_model_change_with_role(
+            "anthropic".to_string(),
+            "claude-3-7-sonnet".to_string(),
+            Some("primary_restore".to_string()),
+        );
+        assert!(
+            session
+                .active_failover_provenance_for_current_path()
+                .is_none(),
+            "primary_restore must clear active failover provenance"
+        );
     }
 
     #[test]
@@ -13453,6 +13862,74 @@ mod tests {
         assert!(scanned.entries.is_empty());
         assert!(scanned.refreshed_entries.is_empty());
         assert_eq!(scanned.failed_paths, vec![path]);
+    }
+
+    /// `--continue` on a surface that builds from a PATH must land on exactly
+    /// the session `--continue` on a surface that builds from a `Session`
+    /// would open. The default FTUI stack is the former and silently ignored
+    /// the flag entirely (bd-ydz1t.3); answering "which session?" separately
+    /// from "open which session?" is how the two would drift apart again.
+    #[test]
+    fn recent_session_path_matches_what_continue_recent_opens() {
+        let _lock = current_dir_lock();
+        let process_cwd = tempfile::tempdir().unwrap();
+        let _guard = CurrentDirGuard::new(process_cwd.path());
+
+        let temp = tempfile::tempdir().unwrap();
+        // Two sessions, so "most recent" is a real choice rather than the only
+        // one available.
+        let mut older = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        older.append_message(make_test_message("older"));
+        run_async(async { older.save().await }).expect("save older session");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let mut newer = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        newer.append_message(make_test_message("newer"));
+        run_async(async { newer.save().await }).expect("save newer session");
+        let newer_path = newer.path.clone().expect("newer session path");
+
+        let resolved =
+            run_async(async { Session::recent_session_path_in_dir(Some(temp.path())).await })
+                .expect("resolve recent session path")
+                .expect("a saved session in this directory is continuable");
+        let opened = run_async(async {
+            Session::continue_recent_in_dir(Some(temp.path()), &Config::default()).await
+        })
+        .expect("continue recent");
+
+        assert_eq!(
+            resolved, newer_path,
+            "the newest session is the one to continue"
+        );
+        assert_eq!(
+            opened.path.as_ref(),
+            Some(&resolved),
+            "the path surfaces resolve must be the one continue_recent_in_dir opens"
+        );
+    }
+
+    /// Nothing to continue is not an error: the classic stack starts a new
+    /// session there, and a path-driven surface must be told `None` rather than
+    /// a path that does not exist.
+    #[test]
+    fn recent_session_path_is_absent_when_nothing_is_continuable() {
+        let _lock = current_dir_lock();
+        let process_cwd = tempfile::tempdir().unwrap();
+        let _guard = CurrentDirGuard::new(process_cwd.path());
+
+        let temp = tempfile::tempdir().unwrap();
+        let resolved =
+            run_async(async { Session::recent_session_path_in_dir(Some(temp.path())).await })
+                .expect("resolve recent session path");
+        assert_eq!(resolved, None);
+
+        let opened = run_async(async {
+            Session::continue_recent_in_dir(Some(temp.path()), &Config::default()).await
+        })
+        .expect("continue recent");
+        assert!(
+            opened.path.is_none(),
+            "the session-returning form starts a fresh unsaved session in the same case"
+        );
     }
 
     #[test]

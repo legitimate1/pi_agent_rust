@@ -28,12 +28,14 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-#[cfg(unix)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const DEFAULT_CLI_TIMEOUT_SECS: u64 = 120;
 const VCR_CLAUDE_SONNET_MAX_TOKENS: u32 = 64_000;
+// A `#!/bin/sh` stub written to disk and marked executable, so its only writer
+// is Unix-gated.
+#[cfg(unix)]
 const FAKE_NPM_SCRIPT: &str = r#"#!/bin/sh
 set -eu
 
@@ -410,6 +412,11 @@ fn canon(p: &Path) -> PathBuf {
 /// tests whose premise is "the process cannot read/write this path" skip
 /// under euid 0 instead of asserting a denial the kernel never produces.
 /// Remote gate workers run as root.
+///
+/// Both callers are themselves `cfg(unix)`, because a POSIX mode is the whole
+/// premise of each. Keep it that way: a non-Unix arm here would be dead code,
+/// and a caller that is not gated is a sign the skip has been copied somewhere
+/// it does not belong.
 #[cfg(unix)]
 fn running_as_root() -> bool {
     rustix::process::geteuid().is_root()
@@ -1185,6 +1192,46 @@ fn e2e_cli_fetch_models_is_a_standalone_stdout_command() {
     );
 }
 
+/// Drain one HTTP request's headers off a catalog fixture socket, patiently.
+///
+/// The three catalog fixtures below each had their own copy of this loop with a
+/// 5s read timeout and `.expect()` on the read (bd-eg6ng). macOS reports an
+/// expired read timeout as EAGAIN/`WouldBlock`, so on a loaded host "the CLI
+/// has not been scheduled yet" failed the test — and because the fixture thread
+/// then died without answering, the CLI saw a connection error and the failure
+/// pointed at the catalog fetch rather than at the clock.
+///
+/// The socket timeout is now a polling interval; the patience budget is the
+/// wall deadline, which only fires when the request really never arrives.
+fn read_catalog_request_headers(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .expect("bound catalog request poll");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        match stream.read(&mut chunk) {
+            Ok(0) => panic!("catalog request ended before its headers"),
+            Ok(count) => request.extend_from_slice(&chunk[..count]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "catalog fixture waited 30s for request headers and got {} bytes",
+                    request.len()
+                );
+            }
+            Err(error) => panic!("read catalog request: {error}"),
+        }
+    }
+    request
+}
+
 #[test]
 fn e2e_cli_fetch_models_uses_models_json_route_credentials_and_headers() {
     let harness =
@@ -1209,16 +1256,7 @@ fn e2e_cli_fetch_models_uses_models_json_route_credentials_and_headers() {
                 Err(error) => panic!("accept catalog request: {error}"),
             }
         };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("bound fixture request read");
-        let mut request = Vec::new();
-        let mut chunk = [0_u8; 1024];
-        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-            let count = stream.read(&mut chunk).expect("read catalog request");
-            assert!(count > 0, "catalog request ended before its headers");
-            request.extend_from_slice(&chunk[..count]);
-        }
+        let request = read_catalog_request_headers(&mut stream);
         let body = br#"{"data":[{"id":"z/model"},{"id":"a/model"}]}"#;
         write!(
             stream,
@@ -1313,16 +1351,7 @@ fn e2e_cli_fetch_models_custom_authorization_skips_held_auth_lock() {
                 Err(error) => panic!("accept catalog request: {error}"),
             }
         };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("bound fixture request read");
-        let mut request = Vec::new();
-        let mut chunk = [0_u8; 1024];
-        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-            let count = stream.read(&mut chunk).expect("read catalog request");
-            assert!(count > 0, "catalog request ended before its headers");
-            request.extend_from_slice(&chunk[..count]);
-        }
+        let request = read_catalog_request_headers(&mut stream);
         let body = br#"{"data":[{"id":"custom-auth-model"}]}"#;
         write!(
             stream,
@@ -1463,16 +1492,7 @@ fn e2e_cli_fetch_models_keyless_persist_updates_list_models_despite_held_auth_lo
                 Err(error) => panic!("accept catalog request: {error}"),
             }
         };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("bound catalog request read");
-        let mut request = Vec::new();
-        let mut chunk = [0_u8; 1024];
-        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-            let count = stream.read(&mut chunk).expect("read catalog request");
-            assert!(count > 0, "catalog request ended before headers");
-            request.extend_from_slice(&chunk[..count]);
-        }
+        let _request = read_catalog_request_headers(&mut stream);
         let body = br#"{"data":[{"id":"issue-150-live-model"}]}"#;
         write!(
             stream,
@@ -1607,6 +1627,78 @@ fn e2e_cli_fetch_models_rejects_unsafe_static_fallback_ids() {
     assert_exit_code(&harness.harness, &result, 1);
     assert!(result.stdout.is_empty());
     assert_contains(&harness.harness, &result.stderr, "not printable ASCII");
+}
+
+/// bd-print-json-panics-on-closed-stdout: `pi --print --mode json | head` must
+/// end quietly, not panic and file a crash report against the user.
+///
+/// `println!` panics when the write fails, and Rust disables SIGPIPE at
+/// startup, so a reader that closed the pipe used to arrive as EPIPE on every
+/// subsequent write and take the process down with
+/// "failed printing to stdout: Broken pipe". The crash bundle then announced
+/// itself as "previous run crashed" on the NEXT invocation, so the noise
+/// outlived the run that caused it.
+///
+/// The bundle directory is the assertion because it is the part a user sees.
+/// No provider credentials are configured here and none are needed: the
+/// `session` frame is written before any provider is touched, which is already
+/// past the write that used to panic.
+#[test]
+fn e2e_cli_print_json_ends_quietly_when_its_reader_closes_the_pipe() {
+    let harness = CliTestHarness::new("e2e_cli_print_json_ends_quietly_when_its_reader_closes");
+    let mut command = Command::new(&harness.binary_path);
+    command
+        .args(["--print", "--mode", "json", "hello"])
+        .envs(harness.env.clone())
+        .current_dir(harness.harness.temp_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().expect("spawn pi --print --mode json");
+
+    // Read one line, then drop the pipe — this is `| head -1`.
+    let stdout = child.stdout.take().expect("child stdout pipe");
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut first = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut first).expect("read the first frame");
+    assert!(
+        first.contains("\"type\":\"session\""),
+        "expected the session frame first, got {first:?}"
+    );
+    drop(reader);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if child.try_wait().expect("poll pi").is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pi did not exit after its stdout reader went away"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let crashes = PathBuf::from(
+        harness
+            .env
+            .get("PI_CODING_AGENT_DIR")
+            .expect("isolated agent dir"),
+    )
+    .join("crashes");
+    let bundles: Vec<String> = fs::read_dir(&crashes)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        bundles.is_empty(),
+        "a closed stdout pipe must not produce a crash bundle; found {bundles:?} in {}",
+        crashes.display()
+    );
 }
 
 #[test]
@@ -2025,15 +2117,18 @@ fn e2e_cli_config_show_lists_discovered_package_resources() {
 
 #[test]
 fn e2e_cli_startup_surfaces_configured_resource_failures() {
-    if running_as_root() {
-        eprintln!("skipping: an unreadable auth fixture is readable by root");
-        return;
-    }
     let mut harness = CliTestHarness::new("e2e_cli_startup_surfaces_configured_resource_failures");
     harness.env.remove("PI_CONFIG_PATH");
     harness
         .env
         .insert("PI_WORKSPACE_TRUST".to_string(), "trusted".to_string());
+    // `--list-models` alone short-circuits in main.rs long before resources are
+    // loaded, so it never reaches the diagnostic write and this asserted on an
+    // empty stderr. Compat scanning is the documented way to make that flag
+    // boot the normal startup path — which is the path this test is named for.
+    harness
+        .env
+        .insert("PI_EXT_COMPAT_SCAN".to_string(), "1".to_string());
 
     let package_root = harness.harness.create_dir("diagnostic-pkg");
     let skill = package_root.join("skills/oversized-skill/SKILL.md");
@@ -3514,6 +3609,26 @@ fn setup_vcr_anthropic_with_chunks(
     request_body: &serde_json::Value,
     chunks: &[String],
 ) {
+    setup_vcr_anthropic_response(
+        harness,
+        cassette_name,
+        request_body,
+        200,
+        "text/event-stream; charset=utf-8",
+        chunks,
+    );
+}
+
+/// Cassette with an arbitrary response status/content type, for replaying a
+/// provider failure (e.g. a 401 for a bad key) without touching the network.
+fn setup_vcr_anthropic_response(
+    harness: &mut CliTestHarness,
+    cassette_name: &str,
+    request_body: &serde_json::Value,
+    status: u16,
+    content_type: &str,
+    chunks: &[String],
+) {
     let mut request_body = request_body.clone();
     apply_prompt_cache_wire_shape(&mut request_body);
     let request_body = &request_body;
@@ -3537,9 +3652,9 @@ fn setup_vcr_anthropic_with_chunks(
                 "body": request_body
             },
             "response": {
-                "status": 200,
+                "status": status,
                 "headers": [
-                    ["Content-Type", "text/event-stream; charset=utf-8"]
+                    ["Content-Type", content_type]
                 ],
                 "body_chunks": chunks
             }
@@ -4229,6 +4344,203 @@ fn e2e_cli_json_mode_missing_api_key_fails_startup() {
     let result = harness.run(&args);
     assert_exit_code(&harness.harness, &result, 1);
     assert_contains(&harness.harness, &result.stderr, "No API key");
+
+    // gh #217: exactly one machine-readable record on stdout, nothing else.
+    let record = assert_single_fatal_error_record(&harness.harness, &result, "startup");
+    assert_eq!(record["code"], "auth.missing_api_key", "{record}");
+    assert!(
+        record["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("No API key")),
+        "{record}"
+    );
+}
+
+/// gh #217: parse stdout as exactly one `{"type":"error",…}` record and
+/// check the contract fields against the process exit code.
+fn assert_single_fatal_error_record(
+    harness: &TestHarness,
+    result: &CliResult,
+    expected_phase: &str,
+) -> serde_json::Value {
+    harness.assert_log("assert single fatal error record on stdout");
+    let lines = parse_json_mode_stdout_lines(&result.stdout);
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected exactly one stdout record, got {}:\n{}",
+        lines.len(),
+        result.stdout
+    );
+    let record = lines.into_iter().next().expect("one record");
+    assert_eq!(record["type"], "error", "{record}");
+    assert_eq!(record["phase"], expected_phase, "{record}");
+    assert!(
+        record["code"].as_str().is_some_and(|code| !code.is_empty()),
+        "{record}"
+    );
+    assert!(
+        record["message"].as_str().is_some_and(|m| !m.is_empty()),
+        "{record}"
+    );
+    assert_eq!(
+        record["exit_code"].as_i64(),
+        Some(i64::from(result.exit_code)),
+        "record exit_code must match the process exit code: {record}"
+    );
+    let mut keys = record
+        .as_object()
+        .expect("record object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(keys, ["code", "exit_code", "message", "phase", "type"]);
+    record
+}
+
+/// gh #217: the same record reaches an RPC host, since the loop never opened.
+#[test]
+fn e2e_cli_rpc_mode_missing_api_key_emits_startup_error_record() {
+    let harness =
+        CliTestHarness::new("e2e_cli_rpc_mode_missing_api_key_emits_startup_error_record");
+
+    let mut args: Vec<&str> = vec![
+        "--mode",
+        "rpc",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+    ];
+    args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+
+    let result = harness.run_with_stdin(&args, Some(b""));
+    assert_exit_code(&harness.harness, &result, 1);
+    let record = assert_single_fatal_error_record(&harness.harness, &result, "startup");
+    assert_eq!(record["code"], "auth.missing_api_key", "{record}");
+}
+
+/// gh #217: a usage error is a `usage` record with exit code 2.
+#[test]
+fn e2e_cli_json_mode_usage_error_emits_startup_error_record() {
+    let harness = CliTestHarness::new("e2e_cli_json_mode_usage_error_emits_startup_error_record");
+
+    // `--api-key` without a model is rejected before any startup work.
+    let mut args: Vec<&str> = vec!["--mode", "json", "--api-key", "k"];
+    args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+    args.push("hello");
+    let result = harness.run(&args);
+    assert_exit_code(&harness.harness, &result, 2);
+    let record = assert_single_fatal_error_record(&harness.harness, &result, "startup");
+    assert_eq!(record["code"], "usage", "{record}");
+    assert_eq!(record["exit_code"], 2, "{record}");
+}
+
+/// gh #217: the report's shape — read-only `~/.pi`, key on argv — no longer
+/// fails at startup (the store degrades), so the run reaches the provider;
+/// when that provider rejects the key, the JSON stream ends with a single
+/// `phase: "run"` record carrying the auth diagnostic code, after the
+/// regular lifecycle events, and the exit code is non-zero.
+#[cfg(unix)]
+#[test]
+fn e2e_cli_json_mode_read_only_state_dir_and_bad_api_key_emit_run_error_record() {
+    if running_as_root() {
+        eprintln!("skipping: a read-only directory is writable by root");
+        return;
+    }
+    let mut harness = CliTestHarness::new(
+        "e2e_cli_json_mode_read_only_state_dir_and_bad_api_key_emit_run_error_record",
+    );
+
+    let request_body = json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+        ],
+        "system": expected_system_prompt("Bad key test."),
+        "max_tokens": VCR_CLAUDE_SONNET_MAX_TOKENS,
+        "stream": true
+    });
+    setup_vcr_anthropic_response(
+        &mut harness,
+        "e2e_json_mode_bad_api_key",
+        &request_body,
+        401,
+        "application/json",
+        &[r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#
+            .to_string()],
+    );
+
+    // A read-only parent whose `agent` / `sessions` children do not exist yet.
+    let readonly_root = harness.harness.temp_path("readonly-home");
+    fs::create_dir_all(&readonly_root).expect("create readonly root");
+    let mut perms = fs::metadata(&readonly_root)
+        .expect("stat readonly root")
+        .permissions();
+    perms.set_mode(0o500);
+    fs::set_permissions(&readonly_root, perms).expect("set readonly perms");
+    harness.env.insert(
+        "PI_CODING_AGENT_DIR".to_string(),
+        readonly_root.join("agent").display().to_string(),
+    );
+    harness.env.insert(
+        "PI_SESSIONS_DIR".to_string(),
+        readonly_root.join("sessions").display().to_string(),
+    );
+
+    let mut args: Vec<&str> = vec![
+        "--mode",
+        "json",
+        "-p",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--api-key",
+        "test-vcr-key",
+    ];
+    args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+    args.extend_from_slice(&["--system-prompt", "Bad key test.", "hello"]);
+
+    let result = harness.run(&args);
+    harness
+        .harness
+        .log()
+        .info_ctx("verify", "read-only state dir + bad key", |ctx| {
+            ctx.push(("exit_code".into(), result.exit_code.to_string()));
+            ctx.push(("stdout".into(), result.stdout.clone()));
+            ctx.push(("stderr".into(), result.stderr.clone()));
+        });
+    assert_exit_code(&harness.harness, &result, 1);
+
+    let lines = parse_json_mode_stdout_lines(&result.stdout);
+    assert!(
+        lines.len() > 1,
+        "startup must succeed with a read-only state dir: {}",
+        result.stdout
+    );
+    assert_eq!(lines[0]["type"], "session", "{}", result.stdout);
+    let error_record_count = lines.iter().filter(|line| line["type"] == "error").count();
+    assert_eq!(
+        error_record_count, 1,
+        "exactly one fatal record: {}",
+        result.stdout
+    );
+    let record = lines.last().expect("last line");
+    assert_eq!(
+        record["type"], "error",
+        "record is the final line: {record}"
+    );
+    assert_eq!(record["phase"], "run", "{record}");
+    assert_eq!(record["code"], "auth.invalid_api_key", "{record}");
+    assert_eq!(record["exit_code"], 1, "{record}");
+    assert!(
+        record["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("401")),
+        "{record}"
+    );
 }
 
 #[test]
@@ -4537,6 +4849,12 @@ fn e2e_cli_missing_api_key_error() {
         "expected stderr to mention API key/auth issue, got:\n{}",
         result.stderr,
     );
+    // gh #217: the machine-readable record is gated on --mode json/rpc.
+    assert!(
+        result.stdout.trim().is_empty(),
+        "text mode must not print a fatal-error record on stdout, got:\n{}",
+        result.stdout
+    );
 }
 
 /// Invalid provider name produces a clear error and non-zero exit.
@@ -4824,6 +5142,280 @@ fn e2e_cli_no_tools_handles_tool_use_response_gracefully() {
         result.stdout,
     );
     assert_contains(&harness.harness, &result.stdout, "none are available");
+}
+
+/// SSE frames for an Anthropic response that calls one tool and stops with
+/// `stop_reason: "tool_use"`.
+fn build_anthropic_tool_use_chunks(tool_name: &str, tool_input: &serde_json::Value) -> Vec<String> {
+    let message_start = json!({
+        "type": "message_start",
+        "message": {
+            "model": "claude-sonnet-4-5",
+            "id": "msg_mock_tool_use_001",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 1,
+                "service_tier": "standard"
+            }
+        }
+    });
+    let content_start = json!({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+            "type": "tool_use",
+            "id": "toolu_mock_approval_001",
+            "name": tool_name,
+            "input": {}
+        }
+    });
+    let content_delta = json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {
+            "type": "input_json_delta",
+            "partial_json": serde_json::to_string(tool_input).expect("serialize tool input")
+        }
+    });
+    let message_delta = json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+        "usage": {
+            "input_tokens": 10,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 5
+        }
+    });
+
+    vec![
+        format!("event: message_start\ndata: {message_start}\n\n"),
+        format!("event: content_block_start\ndata: {content_start}\n\n"),
+        format!("event: content_block_delta\ndata: {content_delta}\n\n"),
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+            .to_string(),
+        format!("event: message_delta\ndata: {message_delta}\n\n"),
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+    ]
+}
+
+/// Cassette with several interactions replayed in order.
+///
+/// Request bodies are matched as templates (extra incoming keys are fine), so
+/// each entry only needs to pin the fields the test actually cares about.
+fn setup_vcr_anthropic_sequence(
+    harness: &mut CliTestHarness,
+    cassette_name: &str,
+    interactions: &[(serde_json::Value, Vec<String>)],
+) {
+    let cassette_dir = harness.harness.temp_path("vcr-cassettes");
+    fs::create_dir_all(&cassette_dir).expect("create cassette dir");
+    let recorded = interactions
+        .iter()
+        .map(|(request_body, chunks)| {
+            json!({
+                "request": {
+                    "method": "POST",
+                    "url": "https://api.anthropic.com/v1/messages",
+                    "headers": [
+                        ["Content-Type", "application/json"],
+                        ["Accept", "text/event-stream"]
+                    ],
+                    "body": request_body
+                },
+                "response": {
+                    "status": 200,
+                    "headers": [["Content-Type", "text/event-stream; charset=utf-8"]],
+                    "body_chunks": chunks
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let cassette = json!({
+        "version": "1.0",
+        "test_name": cassette_name,
+        "recorded_at": "2026-09-09T00:00:00.000Z",
+        "interactions": recorded
+    });
+    let cassette_path = cassette_dir.join(format!("{cassette_name}.json"));
+    fs::write(
+        &cassette_path,
+        serde_json::to_string_pretty(&cassette).expect("serialize cassette"),
+    )
+    .expect("write cassette");
+
+    harness
+        .env
+        .insert("VCR_MODE".to_string(), "playback".to_string());
+    harness.env.insert(
+        "VCR_CASSETTE_DIR".to_string(),
+        cassette_dir.display().to_string(),
+    );
+    harness
+        .env
+        .insert("PI_VCR_TEST_NAME".to_string(), cassette_name.to_string());
+    harness
+        .env
+        .insert("ANTHROPIC_API_KEY".to_string(), "test-vcr-key".to_string());
+    harness
+        .env
+        .insert("PI_TEST_MODE".to_string(), "1".to_string());
+    harness
+        .env
+        .insert("VCR_DEBUG_BODY".to_string(), "1".to_string());
+}
+
+/// gh #224: print mode has no surface that can grant approval, and the
+/// approval mode defaults to `always-ask`. A gated tool call is therefore
+/// denied, and the run used to finish with exit 0 and a normal stop reason —
+/// a silent, total loss of tool use for any script that did not pass
+/// `--approval-mode yolo`. It must now fail loudly instead.
+///
+/// Mutation sensitivity: dropping the `surface_was_unavailable` check at the
+/// end of `run_print_mode` returns this to exit 0 and fails the assertion.
+#[test]
+fn e2e_print_mode_default_approval_denies_tools_and_fails_loudly() {
+    let mut harness =
+        CliTestHarness::new("e2e_print_mode_default_approval_denies_tools_and_fails_loudly");
+
+    let first = json!({"model": "claude-sonnet-4-5", "stream": true});
+    let second = json!({"model": "claude-sonnet-4-5", "stream": true});
+    setup_vcr_anthropic_sequence(
+        &mut harness,
+        "e2e_print_approval_surface_unavailable",
+        &[
+            (
+                first,
+                build_anthropic_tool_use_chunks("bash", &json!({"command": "echo hi"})),
+            ),
+            (
+                second,
+                build_anthropic_response_chunks("I could not run that command."),
+            ),
+        ],
+    );
+
+    // Deliberately NOT PRINT_MODE_ISOLATION_FLAGS: that list contains
+    // `--no-tools`, which would disable the very tool this test needs to have
+    // gated. Same isolation otherwise, minus the tool switch.
+    let result = harness.run(&[
+        "-p",
+        "--mode",
+        "json",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "--tools",
+        "bash,ask",
+        "--system-prompt",
+        "You are a test harness model.",
+        "Run echo hi.",
+    ]);
+
+    harness
+        .harness
+        .log()
+        .info_ctx("verify", "approval surface unavailable", |ctx| {
+            ctx.push(("exit_code".into(), result.exit_code.to_string()));
+            ctx.push(("stderr".into(), result.stderr.clone()));
+            ctx.push(("stdout".into(), result.stdout.clone()));
+        });
+
+    assert_eq!(
+        result.exit_code, 3,
+        "a run whose tool calls were all denied for lack of an approval surface must exit 3, \
+         not 0.\nstderr:\n{}\nstdout:\n{}",
+        result.stderr, result.stdout
+    );
+    assert_contains_case_insensitive(&harness.harness, &result.stderr, "approval");
+    // The machine-readable record a JSON host reads instead of stderr prose.
+    let fatal = result
+        .stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value.get("type").and_then(|t| t.as_str()) == Some("error"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected one fatal-error record on stdout.\nstdout:\n{}",
+                result.stdout
+            )
+        });
+    assert_eq!(
+        fatal.get("code").and_then(|c| c.as_str()),
+        Some("approval.surface_unavailable"),
+        "fatal record must name the approval cause, got {fatal}"
+    );
+    assert_eq!(
+        fatal.get("exit_code").and_then(serde_json::Value::as_i64),
+        Some(3)
+    );
+}
+
+/// gh #224 control: the same run with `--yolo` auto-approves, so it must still
+/// exit 0. Without this, a fix that simply failed whenever a tool was gated
+/// would look correct.
+#[test]
+fn e2e_print_mode_yolo_approves_tools_and_exits_zero() {
+    let mut harness = CliTestHarness::new("e2e_print_mode_yolo_approves_tools_and_exits_zero");
+
+    setup_vcr_anthropic_sequence(
+        &mut harness,
+        "e2e_print_approval_yolo",
+        &[
+            (
+                json!({"model": "claude-sonnet-4-5", "stream": true}),
+                build_anthropic_tool_use_chunks("bash", &json!({"command": "echo hi"})),
+            ),
+            (
+                json!({"model": "claude-sonnet-4-5", "stream": true}),
+                build_anthropic_response_chunks("Done."),
+            ),
+        ],
+    );
+
+    // Same flag set as the failing case above, plus --yolo. See the comment
+    // there for why PRINT_MODE_ISOLATION_FLAGS is not used.
+    let result = harness.run(&[
+        "-p",
+        "--mode",
+        "json",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--yolo",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "--tools",
+        "bash,ask",
+        "--system-prompt",
+        "You are a test harness model.",
+        "Run echo hi.",
+    ]);
+
+    assert_eq!(
+        result.exit_code, 0,
+        "an auto-approved run must still exit 0.\nstderr:\n{}\nstdout:\n{}",
+        result.stderr, result.stdout
+    );
 }
 
 // ============================================================================

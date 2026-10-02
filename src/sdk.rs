@@ -19,6 +19,9 @@
 //! use pi::sdk::RpcSharedState;
 //! ```
 
+mod extension_bootstrap;
+mod recovery;
+
 use crate::app;
 use crate::auth::AuthStorage;
 use crate::cli::Cli;
@@ -32,8 +35,8 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub use crate::agent::{
     AbortHandle, AbortSignal, Agent, AgentConfig, AgentEvent, AgentSession, QueueMode,
@@ -292,6 +295,57 @@ pub struct McpSessionOptions {
     pub global_dir: Option<PathBuf>,
 }
 
+/// What a session needs to walk a configured fallback chain.
+///
+/// Print mode and the RPC server each resolve these from their own plumbing —
+/// `FailoverResolution` and `RpcOptions` respectively. An SDK session has
+/// neither, so an embedder supplies them here (bd-u2qv4).
+#[derive(Clone)]
+pub struct FailoverOptions {
+    /// `retry.fallbackChains`: a role name or exact `provider/model` spec
+    /// mapped to the ordered fallbacks that follow it.
+    pub chains: std::collections::HashMap<String, Vec<String>>,
+    /// Models a chain spec can resolve against. A well-formed spec that names
+    /// nothing here still resolves to an ad-hoc entry.
+    pub available_models: Vec<crate::models::ModelEntry>,
+    /// Credential store consulted per candidate. An entry with no usable
+    /// credential is skipped rather than installed: failing over into an auth
+    /// error is strictly worse than the quota error that started it.
+    pub auth: crate::auth::AuthStorage,
+    /// An explicit `--api-key` equivalent, which pins and never rotates.
+    pub cli_api_key: Option<String>,
+    /// Seconds before the primary may be used again after a swap.
+    pub cooldown_secs: u64,
+}
+
+impl FailoverOptions {
+    /// Read the chain configuration out of a [`Config`], with the models and
+    /// credentials the caller already has.
+    ///
+    /// `None` when no fallback chain is configured, which is the same condition
+    /// under which both existing surfaces decline to fail over.
+    #[must_use]
+    pub fn from_config(
+        config: &Config,
+        available_models: Vec<crate::models::ModelEntry>,
+        auth: crate::auth::AuthStorage,
+        cli_api_key: Option<String>,
+    ) -> Option<Self> {
+        let chains = config
+            .retry
+            .as_ref()
+            .and_then(|retry| retry.fallback_chains.as_ref())?
+            .clone();
+        Some(Self {
+            chains,
+            available_models,
+            auth,
+            cli_api_key,
+            cooldown_secs: config.failover_cooldown_secs(),
+        })
+    }
+}
+
 /// SDK session construction options.
 ///
 /// These options provide the programmatic equivalent of the core CLI startup
@@ -328,7 +382,41 @@ pub struct SessionOptions {
     /// after extension registration and before dependent startup bridges.
     pub extension_flags: Vec<crate::cli::ExtensionCliFlag>,
     pub include_cwd_in_prompt: bool,
+    /// The "available skills" block for the system prompt, as the CLI host
+    /// renders it from its resource loader (`--no-skills`, trust and the
+    /// read-tool rule applied). `None` lists no skills, which is what an
+    /// embedder that loads no skills gets.
+    pub skills_prompt: Option<String>,
+    /// `--no-context-files` (gh #216): the host owns the whole prompt, so no
+    /// AGENTS.md / CLAUDE.md and no foreign workspace rules are loaded.
+    pub no_context_files: bool,
     pub max_tool_iterations: usize,
+
+    /// Provider retry for turns driven through this session.
+    ///
+    /// `None` — the default — returns a transient provider failure to the
+    /// caller unchanged. `Some(policy)` applies to ordinary and abort-aware
+    /// prompts and continuations alike, including `SessionTransport::InProcess`.
+    ///
+    /// The shared policy in [`crate::failover`] is also used by print mode and
+    /// RPC. [`crate::failover::RetryPolicy::from_config`] reads it from
+    /// configuration and yields `None` when the user has turned retry off.
+    ///
+    /// Retry alone. Walking a configured fallback CHAIN additionally needs
+    /// [`SessionOptions::failover`].
+    pub retry: Option<crate::failover::RetryPolicy>,
+
+    /// Cross-model failover for turns driven through this session.
+    ///
+    /// `None` — the default — leaves a configured `retry.fallbackChains` inert,
+    /// which is what both interactive stacks did: the chain the user configured
+    /// never ran on the surface they configured it for, while the identical
+    /// request in print mode or over RPC walked it (bd-u2qv4).
+    ///
+    /// Requires [`SessionOptions::retry`] as well. Failover happens when the
+    /// same-provider retry budget is spent, so with no retry policy there is no
+    /// point at which the chain would be consulted.
+    pub failover: Option<FailoverOptions>,
 
     /// Opt in to MCP discovery for this SDK session.
     ///
@@ -337,6 +425,29 @@ pub struct SessionOptions {
     /// the single connect-and-mount pass. This avoids cross-wiring tools from
     /// a different, already-dropped session (bd-vjfol).
     pub mcp: Option<McpSessionOptions>,
+    /// The advisor (bd-cv653.3.3): a second model that reviews each turn.
+    /// `None` — the default — runs no advisor. Each session built from these
+    /// options gets its own runtime (fresh guard and failure count).
+    pub advisor: Option<crate::advisor::AdvisorOptions>,
+    /// Runtime this session dispatches background work on.
+    ///
+    /// Required for extension observation events to reach extensions at all:
+    /// `EventCoalescer` spawns its batched dispatch onto a runtime, so without
+    /// a handle the SDK path can build a coalescer that never fires. That was
+    /// bd-82331 — the default interactive stack delivered lifecycle events and
+    /// nothing else, silently, because no surface on this path supplied one.
+    ///
+    /// Omitting it while extensions are loaded makes
+    /// [`create_agent_session`] build a runtime for the session and say so at
+    /// debug on `pi::sdk`, so observation events still arrive (bd-8rvry). That
+    /// runtime lives on the returned handle and is shut down with it. Supply
+    /// one whenever the host already has a runtime: sharing it is cheaper than
+    /// the four worker threads the fallback starts, and it keeps extension
+    /// dispatch on the same executor as the rest of the host's work.
+    ///
+    /// Omitting it with no extensions loaded costs nothing and is the normal
+    /// case for an embedder that does not use them.
+    pub runtime_handle: Option<asupersync::runtime::RuntimeHandle>,
 
     /// Optional factory for the session's [`ToolRegistry`].
     ///
@@ -457,8 +568,14 @@ impl Default for SessionOptions {
             workspace: None,
             repair_policy: None,
             include_cwd_in_prompt: true,
+            skills_prompt: None,
+            no_context_files: false,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
+            retry: None,
+            failover: None,
             mcp: None,
+            advisor: None,
+            runtime_handle: None,
             on_event: None,
             on_tool_start: None,
             on_tool_end: None,
@@ -528,6 +645,25 @@ pub struct AgentSessionHandle {
     workspace: Option<crate::workspace::WorkspaceHandle>,
     /// MCP manager owned by this exact SDK session, when enabled.
     mcp_manager: Option<Arc<crate::mcp::McpManager>>,
+    /// Provider retry policy for turns driven through this handle, from
+    /// [`SessionOptions::retry`]. `None` is the historical behaviour: a
+    /// transient failure goes straight back to the caller.
+    retry: Option<crate::failover::RetryPolicy>,
+    /// Chain configuration for turns driven through this handle, from
+    /// [`SessionOptions::failover`]. Behind an `Arc` so a turn can hold it
+    /// while the session itself is mutated by a swap.
+    failover: Option<Arc<FailoverOptions>>,
+    /// Where the chain walk left off, what to return to, and when the cooldown
+    /// on returning started. Per-process, matching both existing surfaces.
+    failover_state: crate::failover::FailoverState,
+    /// Runtime this session built for itself because extensions were loaded and
+    /// the embedder supplied no [`SessionOptions::runtime_handle`] (bd-8rvry).
+    ///
+    /// Held only to keep it alive: the session uses it through the handle
+    /// installed on [`AgentSession`]. `None` is the common case — either the
+    /// embedder supplied a runtime, or no extension is loaded to observe with.
+    /// Dropping this handle shuts it down with everything else it owns.
+    event_runtime: Option<asupersync::runtime::Runtime>,
 }
 
 /// Snapshot of the current agent session state.
@@ -762,11 +898,62 @@ impl Default for RpcTransportOptions {
 }
 
 /// Subprocess-backed SDK transport for `pi --mode rpc`.
+const RPC_MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+const RPC_MAX_PRE_ACK_EVENTS: usize = 256;
+const RPC_MAX_PRE_ACK_BYTES: usize = 4 * 1024 * 1024;
+
 pub struct RpcTransportClient {
     child: Child,
-    stdin: BufWriter<ChildStdin>,
+    stdin: Arc<Mutex<BufWriter<ChildStdin>>>,
     stdout: BufReader<ChildStdout>,
-    next_request_id: u64,
+    next_request_id: Arc<AtomicU64>,
+}
+
+/// Write-only control lane for a running RPC prompt.
+///
+/// The prompt task remains the sole stdout reader. A cloned control handle may
+/// be used from another thread or from a live event callback to dispatch steer,
+/// follow-up, or abort requests while that prompt is still active. Dispatch
+/// success means the command was written and flushed, not that the subprocess
+/// acknowledged or completed it.
+#[derive(Clone)]
+pub struct RpcControlHandle {
+    stdin: Arc<Mutex<BufWriter<ChildStdin>>>,
+    next_request_id: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for RpcControlHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcControlHandle").finish_non_exhaustive()
+    }
+}
+
+impl RpcControlHandle {
+    fn send(&self, command: &str, payload: Map<String, Value>) -> Result<String> {
+        let request_id = next_rpc_request_id(&self.next_request_id)?;
+        let mut frame = Map::new();
+        frame.insert("type".to_string(), Value::String(command.to_string()));
+        frame.insert("id".to_string(), Value::String(request_id.clone()));
+        frame.extend(payload);
+        write_rpc_json_line(&self.stdin, &Value::Object(frame))?;
+        Ok(request_id)
+    }
+
+    pub fn steer(&self, message: impl Into<String>) -> Result<String> {
+        let mut payload = Map::new();
+        payload.insert("message".to_string(), Value::String(message.into()));
+        self.send("steer", payload)
+    }
+
+    pub fn follow_up(&self, message: impl Into<String>) -> Result<String> {
+        let mut payload = Map::new();
+        payload.insert("message".to_string(), Value::String(message.into()));
+        self.send("follow_up", payload)
+    }
+
+    pub fn abort(&self) -> Result<String> {
+        self.send("abort", Map::new())
+    }
 }
 
 /// Unified adapter over in-process and subprocess-backed session control.
@@ -825,10 +1012,12 @@ impl SessionTransport {
                 Ok(SessionPromptResult::InProcess(Box::new(assistant)))
             }
             Self::RpcSubprocess(client) => {
-                let events = client.prompt(input).await?;
-                for event in events.iter().cloned() {
-                    (on_event)(SessionTransportEvent::Rpc(event));
-                }
+                let callback = Arc::clone(&on_event);
+                let events = client
+                    .prompt_with_options_streaming(input, None, None, move |event| {
+                        (callback)(SessionTransportEvent::Rpc(event));
+                    })
+                    .await?;
                 Ok(SessionPromptResult::RpcEvents(events))
             }
         }
@@ -895,10 +1084,20 @@ impl RpcTransportClient {
 
         Ok(Self {
             child,
-            stdin: BufWriter::new(stdin),
+            stdin: Arc::new(Mutex::new(BufWriter::new(stdin))),
             stdout: BufReader::new(stdout),
-            next_request_id: 1,
+            next_request_id: Arc::new(AtomicU64::new(1)),
         })
+    }
+
+    /// Clone a write-only lane that remains usable while `prompt*` borrows
+    /// this client for its single stdout reader.
+    #[must_use]
+    pub fn control_handle(&self) -> RpcControlHandle {
+        RpcControlHandle {
+            stdin: Arc::clone(&self.stdin),
+            next_request_id: Arc::clone(&self.next_request_id),
+        }
     }
 
     #[allow(
@@ -906,7 +1105,12 @@ impl RpcTransportClient {
         reason = "SDK RPC transport keeps an async public API"
     )]
     pub async fn request(&mut self, command: &str, payload: Map<String, Value>) -> Result<Value> {
-        let request_id = self.next_request_id();
+        if payload.contains_key("type") || payload.contains_key("id") {
+            return Err(Error::validation(
+                "RPC request payload cannot override reserved type/id fields",
+            ));
+        }
+        let request_id = self.next_request_id()?;
         let mut command_payload = Map::new();
         command_payload.insert("type".to_string(), Value::String(command.to_string()));
         command_payload.insert("id".to_string(), Value::String(request_id.clone()));
@@ -1173,17 +1377,34 @@ impl RpcTransportClient {
         self.prompt_with_options(message, None, None).await
     }
 
-    #[allow(
-        clippy::unused_async,
-        reason = "SDK RPC transport keeps an async public API"
-    )]
     pub async fn prompt_with_options(
         &mut self,
         message: impl Into<String>,
         images: Option<Vec<ImageContent>>,
         streaming_behavior: Option<&str>,
     ) -> Result<Vec<Value>> {
-        let request_id = self.next_request_id();
+        self.prompt_with_options_streaming(message, images, streaming_behavior, |_| {})
+            .await
+    }
+
+    /// Run one RPC prompt while delivering raw events as soon as they are read.
+    ///
+    /// Some servers can emit lifecycle events before the prompt response is
+    /// flushed. Those events are retained under explicit count/byte bounds and
+    /// released in order once the matching success acknowledgement arrives.
+    /// A failed acknowledgement never leaks speculative events to the caller.
+    #[allow(
+        clippy::unused_async,
+        reason = "SDK RPC transport keeps an async public API"
+    )]
+    pub async fn prompt_with_options_streaming(
+        &mut self,
+        message: impl Into<String>,
+        images: Option<Vec<ImageContent>>,
+        streaming_behavior: Option<&str>,
+        mut on_event: impl FnMut(Value),
+    ) -> Result<Vec<Value>> {
+        let request_id = self.next_request_id()?;
         let mut payload = Map::new();
         payload.insert("type".to_string(), Value::String("prompt".to_string()));
         payload.insert("id".to_string(), Value::String(request_id.clone()));
@@ -1200,17 +1421,28 @@ impl RpcTransportClient {
                 Value::String(streaming_behavior.to_string()),
             );
         }
-        let payload = Value::Object(payload);
-        self.write_json_line(&payload)?;
+        self.write_json_line(&Value::Object(payload))?;
 
         let mut saw_ack = false;
         let mut events = Vec::new();
+        // Annotated, not inferred: the first USE of the element type is
+        // `event.get("type")` in the drain loop below, and the only thing that
+        // would constrain it is the `pre_ack.push(item)` further down. Method
+        // resolution does not wait, so without this the crate does not compile
+        // (E0282).
+        let mut pre_ack: Vec<Value> = Vec::new();
+        let mut pre_ack_bytes = 0usize;
         loop {
             let item = self.read_json_line()?;
             let item_type = item.get("type").and_then(Value::as_str);
             if item_type == Some("response") {
                 if item.get("id").and_then(Value::as_str) != Some(request_id.as_str()) {
                     continue;
+                }
+                if item.get("command").and_then(Value::as_str) != Some("prompt") {
+                    return Err(Error::api(
+                        "RPC prompt acknowledgement used the matching id with the wrong command",
+                    ));
                 }
                 let success = item
                     .get("success")
@@ -1219,16 +1451,46 @@ impl RpcTransportClient {
                 if !success {
                     return Err(rpc_error_from_response(&item, "prompt"));
                 }
+                if saw_ack {
+                    return Err(Error::api("RPC prompt sent a duplicate acknowledgement"));
+                }
                 saw_ack = true;
+                // `mem::take` rather than `drain(..)`: same result (the buffer
+                // is left empty and refilled by later iterations) and it is
+                // what `clippy::iter_with_drain` asks for.
+                for event in std::mem::take(&mut pre_ack) {
+                    let reached_end =
+                        event.get("type").and_then(Value::as_str) == Some("agent_end");
+                    on_event(event.clone());
+                    events.push(event);
+                    if reached_end {
+                        return Ok(events);
+                    }
+                }
                 continue;
             }
 
-            if saw_ack {
-                let reached_end = item_type == Some("agent_end");
-                events.push(item);
-                if reached_end {
-                    return Ok(events);
+            if !saw_ack {
+                let encoded_len = serde_json::to_vec(&item)
+                    .map_err(|err| Error::Json(Box::new(err)))?
+                    .len();
+                if pre_ack.len() >= RPC_MAX_PRE_ACK_EVENTS
+                    || encoded_len > RPC_MAX_PRE_ACK_BYTES.saturating_sub(pre_ack_bytes)
+                {
+                    return Err(Error::api(
+                        "RPC prompt emitted too many events before its acknowledgement",
+                    ));
                 }
+                pre_ack_bytes += encoded_len;
+                pre_ack.push(item);
+                continue;
+            }
+
+            let reached_end = item_type == Some("agent_end");
+            on_event(item.clone());
+            events.push(item);
+            if reached_end {
+                return Ok(events);
             }
         }
     }
@@ -1246,36 +1508,52 @@ impl RpcTransportClient {
         Ok(())
     }
 
-    fn next_request_id(&mut self) -> String {
-        let id = format!("rpc-{}", self.next_request_id);
-        self.next_request_id = self.next_request_id.saturating_add(1);
-        id
+    fn next_request_id(&self) -> Result<String> {
+        next_rpc_request_id(&self.next_request_id)
     }
 
-    fn write_json_line(&mut self, payload: &Value) -> Result<()> {
-        let encoded = serde_json::to_string(payload).map_err(|err| Error::Json(Box::new(err)))?;
-        self.stdin
-            .write_all(encoded.as_bytes())
-            .map_err(|err| Error::Io(Box::new(err)))?;
-        self.stdin
-            .write_all(b"\n")
-            .map_err(|err| Error::Io(Box::new(err)))?;
-        self.stdin.flush().map_err(|err| Error::Io(Box::new(err)))?;
-        Ok(())
+    fn write_json_line(&self, payload: &Value) -> Result<()> {
+        write_rpc_json_line(&self.stdin, payload)
     }
 
     fn read_json_line(&mut self) -> Result<Value> {
-        let mut line = String::new();
-        let read = self
-            .stdout
-            .read_line(&mut line)
-            .map_err(|err| Error::Io(Box::new(err)))?;
-        if read == 0 {
-            return Err(Error::api(
-                "RPC subprocess exited before sending a response",
-            ));
+        let mut line = Vec::new();
+        loop {
+            let available = self
+                .stdout
+                .fill_buf()
+                .map_err(|err| Error::Io(Box::new(err)))?;
+            if available.is_empty() {
+                if line.is_empty() {
+                    return Err(Error::api(
+                        "RPC subprocess exited before sending a response",
+                    ));
+                }
+                return Err(Error::api(
+                    "RPC subprocess ended in the middle of a JSON line",
+                ));
+            }
+            if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+                if newline > RPC_MAX_LINE_BYTES.saturating_sub(line.len()) {
+                    let _ = self.shutdown();
+                    return Err(Error::api("RPC subprocess JSON line exceeded 8 MiB"));
+                }
+                line.extend_from_slice(&available[..newline]);
+                self.stdout.consume(newline + 1);
+                break;
+            }
+            if available.len() > RPC_MAX_LINE_BYTES.saturating_sub(line.len()) {
+                let _ = self.shutdown();
+                return Err(Error::api("RPC subprocess JSON line exceeded 8 MiB"));
+            }
+            let available_len = available.len();
+            line.extend_from_slice(available);
+            self.stdout.consume(available_len);
         }
-        serde_json::from_str(line.trim_end()).map_err(|err| Error::Json(Box::new(err)))
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        serde_json::from_slice(&line).map_err(|err| Error::Json(Box::new(err)))
     }
 
     fn wait_for_response(&mut self, request_id: &str, command: &str) -> Result<Value> {
@@ -1304,6 +1582,29 @@ impl RpcTransportClient {
             return Err(rpc_error_from_response(&item, command));
         }
     }
+}
+
+fn next_rpc_request_id(counter: &AtomicU64) -> Result<String> {
+    let id = counter
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| Error::api("RPC request id space exhausted"))?;
+    Ok(format!("rpc-{id}"))
+}
+
+fn write_rpc_json_line(stdin: &Mutex<BufWriter<ChildStdin>>, payload: &Value) -> Result<()> {
+    let encoded = serde_json::to_string(payload).map_err(|err| Error::Json(Box::new(err)))?;
+    let mut stdin = stdin
+        .lock()
+        .map_err(|_| Error::api("RPC subprocess stdin writer lock poisoned"))?;
+    stdin
+        .write_all(encoded.as_bytes())
+        .map_err(|err| Error::Io(Box::new(err)))?;
+    stdin
+        .write_all(b"\n")
+        .map_err(|err| Error::Io(Box::new(err)))?;
+    stdin.flush().map_err(|err| Error::Io(Box::new(err)))
 }
 
 impl Drop for RpcTransportClient {
@@ -1337,7 +1638,7 @@ enum McpShutdownOutcome {
 
 /// Outcome of exhaustively stopping resources owned by one SDK session handle.
 #[derive(Debug, Default)]
-pub(crate) struct SessionResourceShutdown {
+pub struct SessionResourceShutdown {
     failures: Vec<String>,
     mcp: McpShutdownOutcome,
 }
@@ -1346,12 +1647,12 @@ const SESSION_MCP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::f
 
 impl SessionResourceShutdown {
     #[must_use]
-    pub(crate) const fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.failures.is_empty()
     }
 
     #[must_use]
-    pub(crate) const fn completed_cleanly(&self) -> bool {
+    pub const fn completed_cleanly(&self) -> bool {
         self.failures.is_empty()
     }
 
@@ -1365,11 +1666,11 @@ impl SessionResourceShutdown {
         )
     }
 
-    pub(crate) fn failures(&self) -> impl Iterator<Item = &str> {
+    pub fn failures(&self) -> impl Iterator<Item = &str> {
         self.failures.iter().map(String::as_str)
     }
 
-    pub(crate) fn messages(&self) -> impl Iterator<Item = &str> {
+    pub fn messages(&self) -> impl Iterator<Item = &str> {
         self.failures.iter().map(String::as_str)
     }
 
@@ -1383,6 +1684,12 @@ impl AgentSessionHandle {
     ///
     /// This is useful for tests and advanced embedding scenarios where
     /// the full `create_agent_session()` flow is not needed.
+    ///
+    /// No fallback event runtime is provisioned here, unlike
+    /// [`create_agent_session`]: the caller built the `AgentSession` itself and
+    /// owns the decision of what it dispatches on. If it carries extensions
+    /// that should observe, install a runtime on it with
+    /// `AgentSession::with_runtime_handle` first (bd-8rvry).
     pub const fn from_session_with_listeners(
         session: AgentSession,
         listeners: EventListeners,
@@ -1393,18 +1700,24 @@ impl AgentSessionHandle {
             ask_tool: None,
             workspace: None,
             mcp_manager: None,
+            // A handle built straight from a session has no options to read a
+            // policy from; the caller opts in through `create_agent_session`.
+            retry: None,
+            failover: None,
+            failover_state: crate::failover::FailoverState::new_empty(),
+            event_runtime: None,
         }
     }
 
-    /// Ask tool handle, when this session enabled the ask tool. Cloning is
-    /// cheap (shared state); hosts use it to install a picker surface via
-    /// `install_channel_ui` and resolve cards via `respond_ui`.
+    /// Host picker handle for sessions built through [`create_agent_session`].
+    /// Cloning is cheap shared state. It exists even when the model-facing
+    /// `ask` tool is disabled, so permission prompts remain reachable.
     #[must_use]
     pub fn ask_tool(&self) -> Option<crate::ask::AskTool> {
         self.ask_tool.clone()
     }
 
-    /// Multi-root workspace handle, when the session was created with one
+    /// Multi-root workspace handle when the session was created with one
     /// (bd-cv653.3.12). Clones share the live root set.
     #[must_use]
     pub fn workspace(&self) -> Option<crate::workspace::WorkspaceHandle> {
@@ -1553,7 +1866,7 @@ impl AgentSessionHandle {
     ///
     /// Final driver exit uses this exhaustive seam: persistence or ownership
     /// failures are reported, but they never skip later independent cleanup.
-    pub(crate) async fn shutdown_owned_resources(self) -> SessionResourceShutdown {
+    pub async fn shutdown_owned_resources(self) -> SessionResourceShutdown {
         let mut report = SessionResourceShutdown::default();
         let cx = crate::agent_cx::AgentCx::for_request();
         let owner_session_id = match asupersync::sync::OwnedMutexGuard::lock(
@@ -1639,68 +1952,27 @@ impl AgentSessionHandle {
             .await
     }
 
-    /// Send one user prompt through the agent loop.
+    /// The session store this handle drives, for the rare caller that needs
+    /// NON-BLOCKING access to it.
     ///
-    /// The `on_event` callback receives events for this prompt only.
-    /// Session-level listeners registered via [`Self::subscribe`] or
-    /// [`SessionOptions`] callbacks also fire for every event.
-    pub async fn prompt(
-        &mut self,
-        input: impl Into<String>,
-        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<AssistantMessage> {
-        self.sync_extension_mcp_registrations().await;
-        let combined = self.make_combined_callback(on_event);
-        self.session.run_text(input.into(), combined).await
+    /// `/share` is the reason this exists: exporting a session must report
+    /// "the session is busy, retry" rather than park a user-cancellable
+    /// subprocess flow behind a mutex another task is holding. Anything that
+    /// can afford to wait should use [`Self::with_session`] instead, which
+    /// cannot leave the lock held across a caller's await.
+    #[must_use]
+    pub fn session_store(&self) -> Arc<asupersync::sync::Mutex<crate::session::Session>> {
+        Arc::clone(&self.session.session)
     }
 
-    /// Send one user prompt through the agent loop with an explicit abort signal.
-    pub async fn prompt_with_abort(
-        &mut self,
-        input: impl Into<String>,
-        abort_signal: AbortSignal,
-        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<AssistantMessage> {
-        self.sync_extension_mcp_registrations().await;
-        let combined = self.make_combined_callback(on_event);
-        self.session
-            .run_text_with_abort(input.into(), Some(abort_signal), combined)
-            .await
-    }
-
-    /// Continue the current agent loop without adding a new user prompt.
+    /// Whether a tool of this name is installed on the live agent.
     ///
-    /// This is useful for retry/continuation flows where session history or
-    /// injected messages should drive the next turn without synthesizing a new
-    /// user message through [`Self::prompt`].
-    pub async fn continue_turn(
-        &mut self,
-        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<AssistantMessage> {
-        let combined = self.make_combined_callback(on_event);
-        self.session
-            .sync_runtime_selection_from_session_header()
-            .await?;
-        self.session
-            .agent
-            .run_continue_with_abort(None, combined)
-            .await
-    }
-
-    /// Continue the current agent loop with an explicit abort signal.
-    pub async fn continue_turn_with_abort(
-        &mut self,
-        abort_signal: AbortSignal,
-        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<AssistantMessage> {
-        let combined = self.make_combined_callback(on_event);
-        self.session
-            .sync_runtime_selection_from_session_header()
-            .await?;
-        self.session
-            .agent
-            .run_continue_with_abort(Some(abort_signal), combined)
-            .await
+    /// `/tan` is the caller this exists for: the `subagent` tool is opt-in, so
+    /// a session without it has to say so plainly rather than fail somewhere
+    /// inside the child launch (bd-ydz1t.2).
+    #[must_use]
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.session.agent.has_tool(name)
     }
 
     /// Create a new abort handle/signal pair for prompt cancellation.
@@ -1808,6 +2080,45 @@ impl AgentSessionHandle {
         self.session.set_thinking_level(level).await
     }
 
+    /// Step the thinking level one place through the levels the running model
+    /// actually offers, wrapping past the last one back to the first.
+    ///
+    /// Returns the level now in force, or `None` when there is nothing to
+    /// cycle through: a non-reasoning model offers only `Off`, and a model the
+    /// registry cannot resolve offers nothing at all. `None` is not an error —
+    /// the caller reports it as "this model does not support thinking", the
+    /// same as the charmed stack and the `cycle_thinking_level` RPC.
+    ///
+    /// The level list comes from [`ModelEntry::available_thinking_levels`],
+    /// which is the single definition of that policy, and the write goes
+    /// through [`Self::set_thinking_level`], so clamping, history dedupe and
+    /// persistence behave exactly as they do for an explicit `/thinking`.
+    pub async fn cycle_thinking_level(&mut self) -> Result<Option<crate::model::ThinkingLevel>> {
+        let Some(entry) = self.session.current_model_entry() else {
+            return Ok(None);
+        };
+        let levels = entry.available_thinking_levels();
+        if levels.len() <= 1 {
+            return Ok(None);
+        }
+        let current = self.thinking_level().unwrap_or_default();
+        // An unknown current level starts the cycle at the beginning rather
+        // than failing: a level clamped away by a model switch must not strand
+        // the key.
+        let index = levels
+            .iter()
+            .position(|level| *level == current)
+            .unwrap_or(0);
+        // `cycle` supplies the wrap, so this reads the same as indexing at
+        // `(index + 1) % len` without an index that has to be proven in range.
+        // The list is non-empty here, so `nth` always yields.
+        let Some(next) = levels.iter().copied().cycle().nth(index + 1) else {
+            return Ok(None);
+        };
+        self.set_thinking_level(next).await?;
+        Ok(Some(next))
+    }
+
     /// Update the persisted session display name.
     ///
     /// Records a `SessionInfo` entry with the new name on the leaf path and
@@ -1826,6 +2137,186 @@ impl AgentSessionHandle {
             guard.append_session_info(Some(name));
         }
         self.session.persist_session().await
+    }
+
+    /// OMP `/fresh`: reset provider stream state without touching the
+    /// transcript. Stream options are rebound to a new session id (which
+    /// re-derives the prompt cache key), and a `fresh` custom entry records
+    /// the reset. Returns the new id.
+    pub async fn fresh_stream_state(&mut self) -> Result<String> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let new_id = {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            crate::checkpoint::fresh_stream_state(&mut self.session.agent, &mut guard)
+        };
+        self.session.persist_session().await?;
+        Ok(new_id)
+    }
+
+    /// Record an approval-mode change (`/approval`) in the session, as the
+    /// classic stack does, so the transition is auditable after the fact.
+    pub async fn record_approval_mode(
+        &mut self,
+        mode: crate::approval::ApprovalMode,
+    ) -> Result<()> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            guard.append_custom_entry(
+                "approval_mode".to_string(),
+                Some(serde_json::json!({"mode": mode.as_str()})),
+            );
+        }
+        self.session.persist_session().await
+    }
+
+    /// `/checkpoint [name] [note]` (bd-cv653.3.7): mark the active context so
+    /// a later [`Self::rewind_to_checkpoint`] can collapse everything after it.
+    pub async fn mark_checkpoint(
+        &mut self,
+        name: &str,
+        note: Option<&str>,
+    ) -> Result<crate::checkpoint::Checkpoint> {
+        let messages = self.session.agent.messages().to_vec();
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let checkpoint = {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            crate::checkpoint::mark_checkpoint(&mut guard, name, note, &messages)
+        };
+        self.session.persist_session().await?;
+        Ok(checkpoint)
+    }
+
+    /// `/rewind [name]` (bd-cv653.3.7): collapse the active context since the
+    /// named (default: latest) checkpoint into one summarized report. The
+    /// session tree keeps every original entry; the rewind is recorded in it.
+    pub async fn rewind_to_checkpoint(
+        &mut self,
+        name: Option<&str>,
+    ) -> Result<crate::checkpoint::RewindOutcome> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let checkpoint = {
+            let guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            crate::checkpoint::find_checkpoint(&guard, name)
+        }
+        .ok_or_else(|| {
+            Error::session(name.map_or_else(
+                || String::from("No checkpoints yet — mark one with /checkpoint"),
+                |name| format!("No checkpoint named '{name}'"),
+            ))
+        })?;
+        let agent = &self.session.agent;
+        let span =
+            agent.messages()[checkpoint.message_count.min(agent.messages().len())..].to_vec();
+        if span.is_empty() {
+            return Err(Error::session(format!(
+                "Nothing to rewind — the active context is already at '{}'.",
+                checkpoint.name
+            )));
+        }
+        // Keyless providers (replay/test/local) summarize fine without a key.
+        let api_key = agent.stream_options().api_key.clone().unwrap_or_default();
+        let settings = crate::compaction::ResolvedCompactionSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        let summary =
+            crate::checkpoint::summarize_span(&span, agent.provider(), &api_key, &settings)
+                .await
+                .unwrap_or_else(|err| {
+                    format!(
+                        "(summarization failed: {err}; the span was collapsed without a report)"
+                    )
+                });
+        let outcome = crate::checkpoint::apply_rewind_to_active(
+            &mut self.session.agent,
+            &checkpoint,
+            summary,
+        );
+        {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            guard.append_custom_entry(
+                "rewind".to_string(),
+                Some(serde_json::to_value(&outcome).unwrap_or_default()),
+            );
+        }
+        self.session.persist_session().await?;
+        Ok(outcome)
+    }
+
+    /// OMP `/retry`: move the session leaf to the parent of the last
+    /// retryable user turn, so re-sending its text (returned) lands as a
+    /// SIBLING branch. The abandoned turn stays in the tree for `/tree`. The
+    /// agent's context is rebuilt from the new path before this returns.
+    pub async fn prepare_retry(&mut self) -> Result<String> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let (text, messages) = {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            let prepared = crate::checkpoint::prepare_retry_branch(&mut guard)
+                .ok_or_else(|| Error::session("No user turn to retry".to_string()))?;
+            (prepared.text, guard.to_messages_for_current_path())
+        };
+        self.session.agent.replace_messages(messages);
+        self.session.persist_session().await?;
+        Ok(text)
+    }
+
+    /// OMP `/branch` and double-Esc rewind: move the session leaf to just
+    /// before the user message `entry_id`, so the next prompt lands as its
+    /// sibling while the old path stays in the tree. Returns the message
+    /// for the editor. The agent's context is rebuilt from the new path and
+    /// the move persisted before this returns.
+    pub async fn rewind_to_user_message(
+        &mut self,
+        entry_id: &str,
+    ) -> Result<crate::checkpoint::RewindPreparation> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let (prepared, messages) = {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            let prepared = crate::checkpoint::rewind_to_user_entry(&mut guard, entry_id)
+                .ok_or_else(|| {
+                    Error::session(format!("No user message {entry_id} on this branch"))
+                })?;
+            (prepared, guard.to_messages_for_current_path())
+        };
+        self.session.agent.replace_messages(messages);
+        self.session.persist_session().await?;
+        Ok(prepared)
     }
 
     /// Read the per-prompt `max_tokens` cap currently configured on the
@@ -1976,6 +2467,15 @@ impl AgentSessionHandle {
         self.session.compact_now(on_event).await
     }
 
+    /// OMP `/shake`: compaction that drops bulky tool output from the older
+    /// span instead of summarizing it with the model (no provider request).
+    pub async fn shake(
+        &mut self,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.session.shake_now(on_event).await
+    }
+
     /// Access the underlying `AgentSession`.
     pub const fn session(&self) -> &AgentSession {
         &self.session
@@ -1998,6 +2498,45 @@ impl AgentSessionHandle {
         per_prompt: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> impl Fn(AgentEvent) + Send + Sync + 'static {
         let listeners = self.listeners.clone();
+        // Extension observation events (bd-82331). Lifecycle events reach
+        // extensions from inside the agent loop, but message_* and
+        // tool_execution_* only arrive if the surface routes them through a
+        // coalescer. Print, RPC and the classic stack each install one; this
+        // path did not, so every extension running under the default
+        // interactive stack — which is the SDK path since v0.4.0 — silently
+        // observed nothing.
+        //
+        // Installing it here rather than in `interactive_ftui` is deliberate:
+        // this is the single fan-out point every SDK event travels through, so
+        // a future SDK-based surface inherits the routing instead of having to
+        // remember it.
+        //
+        // Construction is deliberately unconditional when extensions exist.
+        // Gating it on `has_any_event_hooks()` here would save four `Arc`
+        // allocations per prompt and would be wrong: that answer is computed
+        // once, at the start of the turn, while an extension may register a
+        // handler part-way through it. The correct fast path is the per-event
+        // `has_hook_for` check inside `dispatch_agent_event_lazy`, which
+        // re-reads the manager's lock-free snapshot on every event and returns
+        // before serializing when nothing is listening. That is where the
+        // "subscribes to nothing costs nothing" guarantee actually lives.
+        let coalescer = self
+            .extension_manager()
+            .map(|manager| crate::extensions::EventCoalescer::new(manager.clone()));
+        let event_runtime = self.session.runtime_handle().cloned();
+        if coalescer.is_some() && event_runtime.is_none() {
+            // Nothing to spawn onto: the routing cannot work and would fail
+            // silently, which is the exact shape of the bug this fixes. Emitted
+            // per prompt rather than once, deliberately — a single line at
+            // startup is easy to scroll past, and the condition is static, so
+            // repeating it costs nothing and makes it findable from any point
+            // in a session transcript.
+            tracing::debug!(
+                target: "pi::sdk",
+                "extensions are loaded but this session has no runtime handle; \
+                 message and tool-execution events will not reach them"
+            );
+        }
         move |event: AgentEvent| {
             // Typed tool hooks — fire before generic listeners.
             match &event {
@@ -2031,6 +2570,15 @@ impl AgentSessionHandle {
 
             // Session-level generic subscribers.
             listeners.notify(&event);
+
+            // Extension observation events, batched with lazy serialization.
+            // The coalescer skips lifecycle events (already dispatched
+            // in-loop) and returns before serializing when no extension has a
+            // hook for this event kind, so a session whose extensions
+            // subscribe to nothing pays nothing here (bd-82331).
+            if let (Some(coal), Some(runtime)) = (coalescer.as_ref(), event_runtime.as_ref()) {
+                coal.dispatch_agent_event_lazy(&event, runtime);
+            }
 
             // Per-prompt callback.
             per_prompt(event);
@@ -2237,6 +2785,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     cli.system_prompt = options.system_prompt.clone();
     cli.append_system_prompt = options.append_system_prompt.clone();
     cli.hide_cwd_in_prompt = !options.include_cwd_in_prompt;
+    cli.no_context_files = options.no_context_files;
     cli.thinking = options.thinking.map(|t| t.to_string());
     cli.session = resolved_session_path
         .as_ref()
@@ -2261,9 +2810,32 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         config_override.as_deref(),
         options.workspace_trusted,
     )?;
-
-    let mut auth = AuthStorage::load_async(Config::auth_path()).await?;
-    auth.refresh_expired_oauth_tokens().await?;
+    let auth_path = Config::auth_path();
+    let auth_result = AuthStorage::load_async(auth_path.clone()).await;
+    let mut auth = match auth_result {
+        Ok(auth) => auth,
+        Err(err)
+            if options
+                .api_key
+                .as_deref()
+                .is_some_and(|k| !k.trim().is_empty()) =>
+        {
+            tracing::warn!(
+                "stored credentials are unavailable ({err}); continuing with explicit api_key only"
+            );
+            AuthStorage::empty_at(auth_path)
+        }
+        Err(err) => return Err(err),
+    };
+    // gh #218: refresh per provider; only a failure for the provider this
+    // session actually selects is an error (checked after selection below).
+    let oauth_refresh = auth.refresh_expired_oauth_tokens_report().await;
+    if !oauth_refresh.failed.is_empty() {
+        tracing::warn!(
+            providers = ?oauth_refresh.failed_provider_ids(),
+            "stored OAuth credentials could not be refreshed; ignored unless the session selects one of them"
+        );
+    }
 
     let raw_package_dir = options
         .package_dir
@@ -2273,7 +2845,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     // never the ambient process cwd — before prompt discovery sees them.
     let package_dir = crate::app::stable_package_dir(&raw_package_dir, Some(&cwd));
     let models_path = default_models_path(&global_dir);
-    let model_registry = ModelRegistry::load(&auth, Some(models_path));
+    let mut model_registry = ModelRegistry::load(&auth, Some(models_path));
 
     let mut session = Session::new(&cli, &config).await?;
     if resolved_session_path.is_none() {
@@ -2290,16 +2862,26 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         app::resolve_model_scope(&scoped_patterns, &model_registry, cli.api_key.is_some())
     };
 
-    let selection = app::select_model_and_thinking(
-        &cli,
-        &config,
-        &session,
-        &model_registry,
-        &scoped_models,
-        &global_dir,
-    )
-    .map_err(|err| Error::validation(err.to_string()))?;
-    app::update_session_for_selection(&mut session, &selection);
+    // The session owns the extension runtime, so registration must precede
+    // final provider selection. Do not persist a provisional model: resumed
+    // extension identities and explicit selectors must survive registration.
+    let has_extensions = !options.extension_paths.is_empty();
+    let selection = if has_extensions {
+        extension_bootstrap::provisional_selection(&model_registry)?
+    } else {
+        app::select_model_and_thinking(
+            &cli,
+            &config,
+            &session,
+            &model_registry,
+            &scoped_models,
+            &global_dir,
+        )
+        .map_err(|err| Error::validation(err.to_string()))?
+    };
+    if !has_extensions {
+        app::update_session_for_selection(&mut session, &selection);
+    }
 
     let enabled_tools_owned = cli
         .enabled_tools()
@@ -2314,7 +2896,8 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     let sdk_test_mode = std::env::var_os("PI_TEST_MODE").is_some();
     // Foreign-format workspace rules (bd-cv653.6.2), shared with the agent's
     // scoped-rule activation below.
-    let foreign_rules = if config.foreign_rules_enabled() && !sdk_test_mode {
+    let foreign_rules = if config.foreign_rules_enabled() && !sdk_test_mode && !cli.no_context_files
+    {
         crate::context_files::discover_foreign_rules(&cwd)
     } else {
         crate::context_files::ForeignRules::default()
@@ -2323,7 +2906,10 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         &cli,
         &cwd,
         &enabled_tools,
-        None,
+        options
+            .skills_prompt
+            .as_deref()
+            .filter(|block| !block.is_empty()),
         &global_dir,
         &package_dir,
         sdk_test_mode,
@@ -2336,8 +2922,21 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     let provider = providers::create_provider(&selection.model_entry, None)
         .map_err(|e| Error::provider("sdk", e.to_string()))?;
 
-    let api_key = app::resolve_api_key(&auth, &cli, &selection.model_entry)
-        .map_err(|err| Error::validation(err.to_string()))?;
+    let api_key = if has_extensions {
+        None
+    } else {
+        app::resolve_api_key(&auth, &cli, &selection.model_entry)
+            .map_err(|err| Error::validation(err.to_string()))?
+    };
+    if !has_extensions
+        && cli.api_key.is_none()
+        && let Some(failure) = oauth_refresh.failure_for(&selection.model_entry.model.provider)
+    {
+        return Err(Error::auth(format!(
+            "OAuth token refresh failed for: {} ({})",
+            failure.provider, failure.error
+        )));
+    }
 
     let stream_options =
         build_stream_options_with_optional_key(&config, api_key, &selection, &session);
@@ -2359,7 +2958,11 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         turn_recovery: config.turn_recovery_mode(),
         approval_state: options.approval_state.clone(),
         bash_settings: config.bash.clone(),
-        secrets: None,
+        // The configured vault mode and patterns. `None` meant the built-in
+        // obfuscate default whatever was set, so on the default (SDK-built)
+        // stack `block` quietly became `obfuscate`, `off` was ignored and
+        // user `extra_patterns` never applied.
+        secrets: config.secrets.clone(),
     };
 
     let tools = options.tool_factory.as_ref().map_or_else(
@@ -2378,6 +2981,9 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         },
         |factory| factory.create_tool_registry(&enabled_tools, &cwd, &config),
     );
+    // Permission prompts belong to the host, not to the model-facing ask
+    // capability. Every registry owns one picker even when "ask" is disabled.
+    let host_ask = tools.host_ask_tool();
     let session_arc = Arc::new(asupersync::sync::Mutex::new(session));
 
     let compaction_settings = options.compaction_settings.clone().unwrap_or_else(|| {
@@ -2402,7 +3008,19 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         !cli.no_session,
         compaction_settings,
     );
+    if let Some(handle) = options.runtime_handle.clone() {
+        agent_session = agent_session.with_runtime_handle(handle);
+    }
+    // settings.json `steeringMode` / `followUpMode`. The classic UI and RPC
+    // apply them to their own agents; without this every SDK-built session,
+    // the default FTUI included, delivered queued messages one at a time
+    // whatever was configured. Extensions enabled below copy these modes.
+    agent_session.set_queue_modes(config.steering_queue_mode(), config.follow_up_queue_mode());
     agent_session.set_api_key_override(options.api_key.clone());
+    agent_session.advisor = options
+        .advisor
+        .as_ref()
+        .map(crate::advisor::AdvisorOptions::runtime);
     if foreign_rules.scoped_rules().next().is_some() {
         agent_session
             .agent
@@ -2416,35 +3034,29 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             Box::new(crate::todo::TodoTool::new(todo_session)) as Box<dyn crate::tools::Tool>
         ]);
     }
-    // Ask tool (opt-in): without a host-installed picker surface it resolves
-    // via ask_policy (recommended auto-answer by default, bd-cv653.3.8). A
-    // clone is kept on the returned handle so embedders (e.g. the ftui launch
-    // path) can install a channel UI and pair respond_ui replies.
-    let mut ask_tool_handle = None;
+    // The host picker always exists. Enabling "ask" grants the model the
+    // structured-question tool by exposing this same shared handle in the
+    // schema; disabling it does not remove the host's authorization surface.
+    let ask_tool_handle = Some(host_ask.clone());
     if enabled_tools.contains(&"ask") {
-        let ask = crate::ask::AskTool::new(crate::ask::AskPolicy::from_config(
-            config.ask_policy.as_deref(),
-        ));
-        ask_tool_handle = Some(ask.clone());
-        agent_session
-            .agent
-            .extend_tools(vec![Box::new(ask) as Box<dyn crate::tools::Tool>]);
+        agent_session.agent.extend_tools(vec![
+            Box::new(host_ask.clone()) as Box<dyn crate::tools::Tool>
+        ]);
     }
-    // Approval prompts (issue #196): when this session gates tool calls and
-    // the embedder supplied no explicit handler, bridge approval requests
-    // through the ask surface the host installs (`install_channel_ui`). The
-    // bridge never auto-answers — with no surface installed it denies with an
-    // explicit reason instead of prompting nobody and denying silently.
-    if options.approval_state.is_some()
+    // Approval prompts bridge through the host picker whether or not the
+    // model-facing ask tool is enabled.
+    if let Some(approval_state) = &options.approval_state
         && options.tool_approval.is_none()
-        && let Some(ask) = &ask_tool_handle
     {
         agent_session
             .agent
-            .set_tool_approval(Some(crate::ask::approval_handler_via_ask(ask.clone())));
+            .set_tool_approval(Some(crate::ask::approval_handler_via_ask(
+                host_ask,
+                approval_state.clone(),
+            )));
     }
 
-    if !options.extension_paths.is_empty() {
+    if has_extensions {
         let extension_paths = options
             .extension_paths
             .iter()
@@ -2471,11 +3083,66 @@ pub(crate) async fn create_agent_session_deferred_mcp(
                 },
             )
             .await?;
+        extension_bootstrap::finish_selection(
+            &mut agent_session,
+            &mut model_registry,
+            &mut auth,
+            extension_bootstrap::SelectionInputs {
+                cli: &cli,
+                config: &config,
+                scoped_patterns: &scoped_patterns,
+                global_dir: &global_dir,
+                oauth_refresh: &oauth_refresh,
+                preserve_compaction_window: options.compaction_settings.is_some(),
+            },
+        )
+        .await?;
     }
+
+    // Extensions observe through a coalescer that spawns onto a runtime
+    // (bd-82331). Every surface in this repo now supplies one, but an embedder
+    // that loads extensions and omits `runtime_handle` would still get the four
+    // lifecycle events and nothing else, with no error — the exact failure
+    // bd-82331 existed to remove. Build one rather than leave the trap set for
+    // everyone outside this tree, and say so at debug: four worker threads
+    // appearing because you loaded an extension should not be a surprise
+    // (bd-8rvry).
+    //
+    // Gated on extensions actually being loaded, so a session that will never
+    // dispatch an observation event allocates nothing.
+    let event_runtime = if options.runtime_handle.is_none() && agent_session.extensions.is_some() {
+        match asupersync::runtime::RuntimeBuilder::new().build() {
+            Ok(runtime) => {
+                agent_session = agent_session.with_runtime_handle(runtime.handle());
+                tracing::debug!(
+                    target: "pi::sdk",
+                    "extensions are loaded and no runtime handle was supplied; built one so \
+                     message and tool-execution events reach them"
+                );
+                Some(runtime)
+            }
+            Err(err) => {
+                // Deliberately not fatal. Everything except extension
+                // observation still works, and refusing to create the session
+                // would be a worse trade than the degradation it replaces —
+                // but it is a warning, not a debug line, because the events
+                // really are being dropped.
+                tracing::warn!(
+                    target: "pi::sdk",
+                    error = %err,
+                    "extensions are loaded but no runtime could be built for them; message and \
+                     tool-execution events will not reach extensions on this session"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let mcp_manager = if let Some(mcp) = &options.mcp {
         let global_dir = mcp.global_dir.clone().unwrap_or_else(Config::global_dir);
-        let manager = Arc::new(crate::mcp::bootstrap_with_project_trust(
+        let manager = Arc::new(crate::mcp::McpManager::bootstrap(
             &cwd,
             &global_dir,
             &mcp.config_paths,
@@ -2520,17 +3187,40 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     listeners.on_tool_start = options.on_tool_start;
     listeners.on_tool_end = options.on_tool_end;
     listeners.on_stream_event = options.on_stream_event;
+    let failover_state = match options.failover.as_ref() {
+        None => crate::failover::FailoverState::new_empty(),
+        Some(failover) => {
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let inner = agent_session.session.lock(cx.cx()).await.ok();
+            inner.as_deref().map_or_else(
+                || crate::failover::FailoverState::with_cooldown_secs(failover.cooldown_secs),
+                |s| {
+                    crate::failover::FailoverState::reconstruct_from_session(
+                        s,
+                        failover.cooldown_secs,
+                        chrono::Utc::now(),
+                    )
+                },
+            )
+        }
+    };
     Ok(AgentSessionHandle {
         session: agent_session,
         listeners,
         ask_tool: ask_tool_handle,
         workspace: options.workspace.clone(),
         mcp_manager,
+        retry: options.retry,
+        failover_state,
+        failover: options.failover.map(Arc::new),
+        event_runtime,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    mod recovery;
+
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::runtime::reactor::create_reactor;
@@ -2539,6 +3229,24 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
+    /// Drives `future` to completion on a `current_thread` runtime.
+    ///
+    /// Note that this polls on the CALLING thread, which is the libtest thread,
+    /// so the frames land on whatever stack libtest gave it. These session
+    /// builds do not fit the 2 MiB default in a debug build, and a stack
+    /// overflow ABORTS the process rather than failing one test, so the whole
+    /// binary reports nothing — not a tally with one failure in it.
+    ///
+    /// Boxing the future is enough on its own: every one of the 66 `sdk::`
+    /// tests passes on an unmodified libtest thread with it, and overflows
+    /// without it. The builder-level `thread_stack_size` that rescued
+    /// `sdk_unit` and `sdk_integration` (bd-79qxb) cannot help here, and
+    /// neither can moving the work to a reserved thread: several of these
+    /// futures hold an `asupersync::sync::MutexGuard` across an await and so
+    /// are not `Send`. `RUST_MIN_STACK` in `.cargo/config.toml` also covers
+    /// this, but only for a process cargo launches; boxing additionally covers
+    /// running the built test binary directly, which cargo's `[env]` never
+    /// reaches.
     fn run_async<F>(future: F) -> F::Output
     where
         F: std::future::Future,
@@ -2548,11 +3256,833 @@ mod tests {
             .with_reactor(reactor)
             .build()
             .expect("build runtime");
-        runtime.block_on(future)
+        runtime.block_on(Box::pin(future))
     }
 
     fn current_dir_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_current_dir_lock()
+    }
+
+    /// Fails its first `failures` calls with a retryable provider error, then
+    /// answers normally. Counts calls so a test can prove how many were made.
+    struct FlakyThenOkProvider {
+        failures: usize,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        /// Identity this double reports. The retry tests use a synthetic one;
+        /// the restoration tests need a REAL provider id, because restoring
+        /// reconstructs the primary through `providers::create_provider` and a
+        /// synthetic id has no route to reconstruct.
+        name: String,
+        model: String,
+        /// Provider-reported usage for silent context-overflow regressions.
+        input_tokens: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::Provider for FlakyThenOkProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            &self.model
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut partial = crate::model::AssistantMessage {
+                content: Vec::new(),
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: crate::model::Usage {
+                    input: self.input_tokens,
+                    ..crate::model::Usage::default()
+                },
+                stop_reason: crate::model::StopReason::Error,
+                stop_details: None,
+                error_message: Some("503 service unavailable".to_string()),
+                timestamp: 0,
+            };
+            if call < self.failures {
+                let events = vec![
+                    Ok(crate::model::StreamEvent::Start {
+                        partial: partial.clone(),
+                    }),
+                    Ok(crate::model::StreamEvent::Error {
+                        reason: crate::model::StopReason::Error,
+                        error: partial,
+                    }),
+                ];
+                return Ok(Box::pin(futures::stream::iter(events)));
+            }
+            partial.stop_reason = crate::model::StopReason::Stop;
+            partial.error_message = None;
+            let events = vec![
+                Ok(crate::model::StreamEvent::Start {
+                    partial: partial.clone(),
+                }),
+                Ok(crate::model::StreamEvent::Done {
+                    reason: crate::model::StopReason::Stop,
+                    message: partial,
+                }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    fn flaky_handle(failures: usize) -> (AgentSessionHandle, Arc<std::sync::atomic::AtomicUsize>) {
+        flaky_handle_as(failures, "test-provider", "test-model")
+    }
+
+    /// A handle over a SAVING, on-disk session, for tests that care what
+    /// reaches the file rather than what reaches memory. The other helpers here
+    /// build an in-memory session with saving off, which cannot distinguish a
+    /// turn that persisted from one that did not.
+    fn saving_handle(dir: &Path) -> AgentSessionHandle {
+        let provider = Arc::new(FlakyThenOkProvider {
+            failures: 0,
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            name: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            input_tokens: 0,
+        });
+        let agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(&[], Path::new("."), None),
+            crate::agent::AgentConfig::default(),
+        );
+        let session = AgentSession::new(
+            agent,
+            Arc::new(AsyncMutex::new(crate::session::Session::create_with_dir(
+                Some(dir.to_path_buf()),
+            ))),
+            true,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        AgentSessionHandle::from_session_with_listeners(session, EventListeners::default())
+    }
+
+    fn flaky_handle_as(
+        failures: usize,
+        name: &str,
+        model: &str,
+    ) -> (AgentSessionHandle, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Arc::new(FlakyThenOkProvider {
+            failures,
+            calls: Arc::clone(&calls),
+            name: name.to_string(),
+            model: model.to_string(),
+            input_tokens: 0,
+        });
+        let agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(&[], Path::new("."), None),
+            crate::agent::AgentConfig::default(),
+        );
+        let session = AgentSession::new(
+            agent,
+            Arc::new(AsyncMutex::new(crate::session::Session::in_memory())),
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        (
+            AgentSessionHandle::from_session_with_listeners(session, EventListeners::default()),
+            calls,
+        )
+    }
+
+    /// Install a failover policy whose chain names `spec`, with no credential
+    /// requirement, so the walk reaches provider construction.
+    fn with_chain(handle: AgentSessionHandle, spec: &str) -> AgentSessionHandle {
+        with_chain_cooldown(handle, spec, 300)
+    }
+
+    /// A loopback HTTP endpoint that answers every request with a 401, the
+    /// non-retryable response a real provider gives the tests' fake key.
+    fn spawn_unauthorized_stub() -> String {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let address = listener.local_addr().expect("stub address");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = [0_u8; 8192];
+                let _ = stream.read(&mut request);
+                let body = r#"{"error":{"message":"Incorrect API key provided","type":"invalid_request_error","code":"invalid_api_key"}}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://{address}/v1")
+    }
+
+    /// [`with_chain`] with an explicit cooldown. Zero means the primary is
+    /// restorable the moment it is captured, which is how the restoration path
+    /// is exercised without a sleep.
+    fn with_chain_cooldown(
+        handle: AgentSessionHandle,
+        spec: &str,
+        cooldown_secs: u64,
+    ) -> AgentSessionHandle {
+        let auth_path = tempdir().expect("tempdir").path().join("auth.json");
+        let auth = crate::auth::AuthStorage::load(auth_path).expect("auth load");
+        // The fallback must not reach the real provider: with `test-key` the
+        // live endpoint answers 401 on a networked host but a firewalled or
+        // saturated one gets a retryable connection error instead, which adds
+        // a retry cycle and makes the event order host-dependent. Serve the
+        // same deterministic 401 locally.
+        let (provider, model_id) =
+            crate::provider_metadata::split_provider_model_spec(spec).expect("chain spec");
+        let mut fallback =
+            crate::models::ad_hoc_model_entry(provider, model_id).expect("fallback entry");
+        fallback.model.base_url = spawn_unauthorized_stub();
+        handle.with_failover(Some(FailoverOptions {
+            chains: std::collections::HashMap::from([(
+                "default".to_string(),
+                vec![spec.to_string()],
+            )]),
+            available_models: vec![fallback],
+            auth,
+            cli_api_key: Some("test-key".to_string()),
+            cooldown_secs,
+        }))
+    }
+
+    /// Run one turn that fails over, and report the handle sitting on the
+    /// fallback with the primary captured.
+    fn handle_after_one_failover(cooldown_secs: u64) -> AgentSessionHandle {
+        // A real primary identity: restoring RECONSTRUCTS it through
+        // `providers::create_provider`, so a synthetic id would decline there
+        // and the test would pass for the wrong reason.
+        let (handle, _calls) = flaky_handle_as(usize::MAX, "anthropic", "claude-3-5-haiku-latest");
+        let mut handle = with_chain_cooldown(
+            handle.with_retry(Some(crate::failover::RetryPolicy {
+                max_retries: 1,
+                max_failovers_per_turn: 1,
+                base_delay_ms: 1,
+                max_delay_ms: 1,
+            })),
+            "openai/gpt-4o-mini",
+            cooldown_secs,
+        );
+        let (_abort_handle, abort_signal) = AgentSessionHandle::new_abort_handle();
+        let _ = run_async(handle.prompt_with_abort("hello", abort_signal, |_| {}));
+        assert_eq!(
+            handle.session.agent.provider().model_id(),
+            "gpt-4o-mini",
+            "the setup turn must have installed the fallback"
+        );
+        handle
+    }
+
+    /// Record every `FailoverEnd` as `(restored_primary, model)`.
+    type RestoreLog = Arc<Mutex<Vec<(bool, String)>>>;
+    fn restore_recorder() -> (RestoreLog, Arc<dyn Fn(AgentEvent) + Send + Sync>) {
+        let seen: RestoreLog = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let shared: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(move |event| {
+            if let AgentEvent::FailoverEnd {
+                restored_primary,
+                model,
+                ..
+            } = event
+            {
+                recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((restored_primary, model));
+            }
+        });
+        (seen, shared)
+    }
+
+    fn fast_retry_policy(max_retries: u32) -> crate::failover::RetryPolicy {
+        crate::failover::RetryPolicy {
+            max_retries,
+            max_failovers_per_turn: 0,
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+        }
+    }
+
+    /// The gap bd-u2qv4 names: a transient provider failure is a hard error on
+    /// the surfaces most people use, while print mode and RPC retry and finish.
+    /// With a policy installed, the SDK path — which the default FTUI drives —
+    /// now resumes the turn and completes it.
+    #[test]
+    fn a_configured_retry_policy_resumes_a_transient_failure() {
+        let (handle, calls) = flaky_handle(1);
+        let mut handle = handle.with_retry(Some(fast_retry_policy(3)));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorder = Arc::clone(&seen);
+
+        let (_abort_handle, abort_signal) = AgentSessionHandle::new_abort_handle();
+        let message = run_async(
+            handle.prompt_with_abort("hello", abort_signal, move |event| {
+                let name = match &event {
+                    AgentEvent::AutoRetryStart { .. } => Some("auto_retry_start"),
+                    AgentEvent::AutoRetryEnd { .. } => Some("auto_retry_end"),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    recorder
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(name.to_string());
+                }
+            }),
+        )
+        .expect("the retried turn must complete");
+
+        assert_eq!(
+            message.stop_reason,
+            crate::model::StopReason::Stop,
+            "the turn must finish on the retry, not surface the 503"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one failed attempt plus one retry"
+        );
+        let events = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let start = events.iter().position(|name| name == "auto_retry_start");
+        let end = events.iter().position(|name| name == "auto_retry_end");
+        assert!(
+            start.is_some() && end.is_some() && start < end,
+            "the host must see the retry, in order: {events:?}"
+        );
+    }
+
+    /// The planted negative, and the compatibility guarantee: with no policy —
+    /// the default for every embedder that existed before this — the identical
+    /// failure comes straight back, unretried.
+    #[test]
+    fn without_a_policy_a_transient_failure_is_returned_unchanged() {
+        let (mut handle, calls) = flaky_handle(1);
+        let (_abort_handle, abort_signal) = AgentSessionHandle::new_abort_handle();
+        let message = run_async(handle.prompt_with_abort("hello", abort_signal, |_| {}))
+            .expect("the turn returns its errored message rather than failing the call");
+
+        assert_eq!(
+            message.stop_reason,
+            crate::model::StopReason::Error,
+            "no policy means no retry"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one provider call"
+        );
+    }
+
+    /// The other half of bd-u2qv4: a configured fallback CHAIN was inert on
+    /// this surface. With one installed, a provider that never recovers is left
+    /// behind for the next chain entry once the retry budget is spent, and the
+    /// host sees the failover lifecycle it already knows how to render.
+    #[test]
+    fn a_configured_chain_is_walked_once_the_retry_budget_is_spent() {
+        let (handle, calls) = flaky_handle(usize::MAX);
+        let mut handle = with_chain(
+            handle.with_retry(Some(crate::failover::RetryPolicy {
+                max_retries: 1,
+                max_failovers_per_turn: 1,
+                base_delay_ms: 1,
+                max_delay_ms: 1,
+            })),
+            "openai/gpt-4o-mini",
+        );
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorder = Arc::clone(&seen);
+
+        let (_abort_handle, abort_signal) = AgentSessionHandle::new_abort_handle();
+        let _ = run_async(
+            handle.prompt_with_abort("hello", abort_signal, move |event| {
+                // Retry events are recorded too, because the ORDER of the two
+                // lifecycles is the thing under test (bd-2vmu6): a host that
+                // sees `FailoverStart` before the `AutoRetryEnd` it supersedes
+                // cannot tell which lifecycle the later events belong to.
+                let name = match &event {
+                    AgentEvent::AutoRetryStart { attempt, .. } => {
+                        Some(format!("auto_retry_start:{attempt}"))
+                    }
+                    AgentEvent::AutoRetryEnd { attempt, .. } => {
+                        Some(format!("auto_retry_end:{attempt}"))
+                    }
+                    AgentEvent::FailoverStart { to_provider, .. } => {
+                        Some(format!("failover_start:{to_provider}"))
+                    }
+                    AgentEvent::FailoverEnd { .. } => Some("failover_end".to_string()),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    recorder
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(name);
+                }
+            }),
+        );
+
+        let events = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            events,
+            vec![
+                "auto_retry_start:1".to_string(),
+                "auto_retry_end:1".to_string(),
+                "failover_start:openai".to_string(),
+                "failover_end".to_string()
+            ],
+            "every Start must be closed before the next opens, in this exact \
+             order: {events:?}"
+        );
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the failing provider was called at least once before the swap"
+        );
+    }
+
+    /// bd-9o9i2: `continue_turn_with_abort` drove the inner `Agent` directly,
+    /// and the raw loop persists nothing — everything that writes a turn to the
+    /// session lives on `AgentSession`. So a continuation ran a full turn,
+    /// streamed its events, returned its assistant message, and wrote nothing.
+    ///
+    /// The asymmetry was inside one type and, after the retry work, inside one
+    /// call: a turn that failed and was RETRIED persisted correctly, because
+    /// the retry went through `AgentSession`, while the same turn succeeding
+    /// first time did not.
+    ///
+    /// Asserted against the session REOPENED FROM DISK rather than the live
+    /// handle, because the live `Session` would show the entry even if it were
+    /// never flushed.
+    #[test]
+    fn a_continuation_persists_its_turn_to_the_reopened_session() {
+        let dir = tempdir().expect("tempdir");
+        let mut handle = saving_handle(dir.path());
+
+        let message = run_async(handle.continue_turn(|_| {})).expect("continuation completes");
+        assert_eq!(
+            message.stop_reason,
+            crate::model::StopReason::Stop,
+            "the provider double completes on the first attempt"
+        );
+
+        let path = run_async(async {
+            let store = handle.session_store();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let inner = store.lock(cx.cx()).await.expect("session lock");
+            inner.path.clone()
+        })
+        .expect("a persisted continuation gives the session a path on disk");
+
+        let reopened = run_async(crate::session::Session::open(&path.display().to_string()))
+            .expect("reopen the session file");
+        assert!(
+            !reopened.to_messages_for_current_path().is_empty(),
+            "a continuation must write its turn to the session file; the raw \
+             Agent loop persists nothing (bd-9o9i2)"
+        );
+    }
+
+    /// OMP `/fresh`: the stream is rebound to a new id each time (two calls
+    /// never share one) and the reset is recorded in the session FILE, while
+    /// the conversation itself is left alone.
+    #[test]
+    fn fresh_stream_state_rebinds_the_stream_and_records_the_reset_on_disk() {
+        let dir = tempdir().expect("tempdir");
+        let mut handle = saving_handle(dir.path());
+        let before = handle.session.agent.stream_options().session_id.clone();
+
+        let first = run_async(handle.fresh_stream_state()).expect("fresh");
+        let second = run_async(handle.fresh_stream_state()).expect("fresh again");
+        assert_ne!(first, second, "each /fresh gets its own id");
+        assert_ne!(before.as_deref(), Some(second.as_str()));
+        assert_eq!(
+            handle.session.agent.stream_options().session_id.as_deref(),
+            Some(second.as_str()),
+            "the live stream options carry the newest id"
+        );
+        assert!(
+            handle.session.agent.messages().is_empty(),
+            "no transcript change"
+        );
+
+        let path = run_async(async {
+            let store = handle.session_store();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let inner = store.lock(cx.cx()).await.expect("session lock");
+            inner.path.clone()
+        })
+        .expect("the reset is persisted");
+        let reopened = run_async(crate::session::Session::open(&path.display().to_string()))
+            .expect("reopen the session file");
+        let recorded: Vec<String> = reopened
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::session::SessionEntry::Custom(custom) if custom.custom_type == "fresh" => {
+                    custom
+                        .data
+                        .as_ref()
+                        .and_then(|data| data["newSessionId"].as_str())
+                        .map(str::to_string)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recorded, vec![first, second]);
+    }
+
+    /// OMP `/shake`: the older span is compacted by dropping bulky content,
+    /// recorded as a `shake` compaction, and the provider is never called.
+    #[test]
+    fn shake_compacts_without_a_provider_request() {
+        let dir = tempdir().expect("tempdir");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Arc::new(FlakyThenOkProvider {
+            failures: 0,
+            calls: Arc::clone(&calls),
+            name: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            input_tokens: 0,
+        });
+        let agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(&[], Path::new("."), None),
+            crate::agent::AgentConfig::default(),
+        );
+        // A small window so ~3k tokens of history crosses the threshold.
+        let settings = crate::compaction::ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 2_000,
+            reserve_tokens: 1_000,
+            keep_recent_tokens: 1,
+            ..Default::default()
+        };
+        let session = AgentSession::new(
+            agent,
+            Arc::new(AsyncMutex::new(crate::session::Session::create_with_dir(
+                Some(dir.path().to_path_buf()),
+            ))),
+            true,
+            settings,
+        );
+        let mut handle =
+            AgentSessionHandle::from_session_with_listeners(session, EventListeners::default());
+        let bulky = "history ".repeat(200);
+        run_async(async {
+            let store = handle.session_store();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let mut session = store.lock(cx.cx()).await.expect("session lock");
+            for i in 0..4 {
+                session.append_message(crate::session::SessionMessage::User {
+                    content: crate::model::UserContent::Text(format!("user-{i} {bulky}")),
+                    timestamp: Some(i),
+                });
+                session.append_message(crate::session::SessionMessage::Assistant {
+                    message: crate::model::AssistantMessage {
+                        content: vec![crate::model::ContentBlock::Text(
+                            crate::model::TextContent::new(format!("assistant-{i} {bulky}")),
+                        )],
+                        ..Default::default()
+                    },
+                });
+            }
+        });
+
+        run_async(handle.shake(|_| {})).expect("shake");
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "shake must not reach the provider"
+        );
+        let mode = run_async(handle.with_session(|session| {
+            session.entries.iter().find_map(|entry| match entry {
+                crate::session::SessionEntry::Compaction(compaction) => compaction
+                    .details
+                    .as_ref()
+                    .and_then(|details| details["mode"].as_str().map(str::to_string)),
+                _ => None,
+            })
+        }))
+        .expect("session");
+        assert_eq!(mode.as_deref(), Some("shake"));
+    }
+
+    /// `/checkpoint` then `/rewind`: the turn after the checkpoint collapses
+    /// out of the agent's context, and the rewind is recorded in the file.
+    /// Planted negatives: no checkpoint, a wrong name, and nothing to rewind.
+    #[test]
+    fn rewind_collapses_the_span_after_a_checkpoint() {
+        let dir = tempdir().expect("tempdir");
+        let mut handle = saving_handle(dir.path());
+        let no_checkpoint = run_async(handle.rewind_to_checkpoint(None)).unwrap_err();
+        assert!(no_checkpoint.to_string().contains("No checkpoints yet"));
+
+        let checkpoint = run_async(handle.mark_checkpoint("start", None)).expect("mark");
+        assert_eq!(
+            (checkpoint.name.as_str(), checkpoint.message_count),
+            ("start", 0)
+        );
+        let nothing = run_async(handle.rewind_to_checkpoint(None)).unwrap_err();
+        assert!(
+            nothing.to_string().contains("Nothing to rewind"),
+            "{nothing}"
+        );
+
+        let (_abort, signal) = AgentSessionHandle::new_abort_handle();
+        run_async(handle.prompt_with_abort("explore something", signal, |_| {})).expect("turn");
+        let turn_len = handle.session.agent.messages().len();
+        assert!(turn_len >= 2, "user + assistant");
+        let wrong = run_async(handle.rewind_to_checkpoint(Some("nope"))).unwrap_err();
+        assert!(wrong.to_string().contains("No checkpoint named 'nope'"));
+
+        let outcome = run_async(handle.rewind_to_checkpoint(Some("start"))).expect("rewind");
+        assert_eq!(outcome.collapsed_messages, turn_len);
+        assert!(
+            handle.session.agent.messages().len() <= 1,
+            "at most the rewind report remains in context"
+        );
+
+        let path = run_async(async {
+            let store = handle.session_store();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let inner = store.lock(cx.cx()).await.expect("session lock");
+            inner.path.clone()
+        })
+        .expect("persisted");
+        let reopened = run_async(crate::session::Session::open(&path.display().to_string()))
+            .expect("reopen the session file");
+        assert!(reopened.entries.iter().any(|entry| matches!(
+            entry,
+            crate::session::SessionEntry::Custom(custom) if custom.custom_type == "rewind"
+        )));
+    }
+
+    /// OMP `/retry`: the re-sent turn is a sibling of the abandoned one. On
+    /// disk both user entries exist; the active path holds only the retry.
+    /// Planted negative: an empty session has nothing to retry.
+    #[test]
+    fn prepare_retry_branches_the_last_turn_and_the_file_keeps_both() {
+        let dir = tempdir().expect("tempdir");
+        let mut handle = saving_handle(dir.path());
+        assert!(
+            run_async(handle.prepare_retry()).is_err(),
+            "nothing to retry yet"
+        );
+
+        let (_abort, signal) = AgentSessionHandle::new_abort_handle();
+        run_async(handle.prompt_with_abort("hello", signal, |_| {})).expect("first turn");
+        let text = run_async(handle.prepare_retry()).expect("retry plan");
+        assert_eq!(text, "hello");
+        assert!(
+            handle.session.agent.messages().is_empty(),
+            "the agent's context no longer holds the abandoned turn"
+        );
+        let (_abort, signal) = AgentSessionHandle::new_abort_handle();
+        run_async(handle.prompt_with_abort(text, signal, |_| {})).expect("retried turn");
+
+        let path = run_async(async {
+            let store = handle.session_store();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let inner = store.lock(cx.cx()).await.expect("session lock");
+            inner.path.clone()
+        })
+        .expect("persisted");
+        let reopened = run_async(crate::session::Session::open(&path.display().to_string()))
+            .expect("reopen the session file");
+        let users_in_file = reopened
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    crate::session::SessionEntry::Message(message)
+                        if matches!(message.message, crate::session::SessionMessage::User { .. })
+                )
+            })
+            .count();
+        assert_eq!(users_in_file, 2, "the abandoned turn stays in the tree");
+        let users_on_path = reopened
+            .to_messages_for_current_path()
+            .iter()
+            .filter(|message| matches!(message, crate::model::Message::User(_)))
+            .count();
+        assert_eq!(users_on_path, 1, "the active path holds only the retry");
+    }
+
+    /// bd-9o9i2 criterion 3, and the half that matters for safety rather than
+    /// bookkeeping: the raw `Agent` loop does not consult the provider
+    /// admission gate, so a continuation could issue against a provider that
+    /// had been quarantined — re-billing work against a session record nobody
+    /// can describe, which is the exact failure the gate exists to prevent.
+    ///
+    /// Asserted on the CALL COUNT, not just the error: a continuation that
+    /// returned an error after reaching the provider would still have done the
+    /// damage.
+    #[test]
+    fn a_continuation_cannot_issue_against_a_quarantined_provider() {
+        let (handle, calls) = flaky_handle(0);
+        let mut handle = handle;
+        handle
+            .session
+            .provider_admission_gate()
+            .block("quarantined for this test".to_string());
+
+        let result = run_async(handle.continue_turn(|_| {}));
+
+        assert!(
+            result.is_err(),
+            "a quarantined provider must refuse the continuation"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the provider must never be reached at all"
+        );
+    }
+
+    /// The half of the policy nothing on this stack had: going BACK. Print mode
+    /// and RPC both reinstall the captured primary once its cooldown expires;
+    /// without it a session that took a single 429 stays pinned to the fallback
+    /// for as long as it runs, which on an interactive surface is hours
+    /// (bd-gm481). With a zero cooldown the next prompt restores.
+    #[test]
+    fn the_captured_primary_is_restored_once_its_cooldown_expires() {
+        let mut handle = handle_after_one_failover(0);
+        let captured = handle
+            .failover_state
+            .primary()
+            .cloned()
+            .expect("a swap records the primary it left");
+        assert_eq!(captured.model_id, "claude-3-5-haiku-latest");
+
+        let (seen, shared) = restore_recorder();
+        run_async(handle.maybe_restore_primary(&shared)).expect("restore primary");
+
+        assert_eq!(
+            handle.session.agent.provider().model_id(),
+            "claude-3-5-haiku-latest",
+            "the cooldown expired, so the primary must be live again"
+        );
+        assert!(
+            handle.failover_state.primary().is_none(),
+            "a restored primary clears the chain state, so a later failure walks the chain from \
+             the top instead of resuming past entries it never used"
+        );
+        let events = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            events,
+            vec![(true, "claude-3-5-haiku-latest".to_string())],
+            "the host must be told the primary is back, or the model indicator lies: {events:?}"
+        );
+    }
+
+    /// The planted negative for the restoration half: while the cooldown is
+    /// still live the fallback stays installed. Restoring early would send the
+    /// next prompt straight back into the error that caused the failover, which
+    /// is worse than running on a model that works.
+    #[test]
+    fn a_live_cooldown_keeps_the_fallback_installed() {
+        let mut handle = handle_after_one_failover(300);
+
+        let (seen, shared) = restore_recorder();
+        run_async(handle.maybe_restore_primary(&shared)).expect("cooldown check");
+
+        assert_eq!(
+            handle.session.agent.provider().model_id(),
+            "gpt-4o-mini",
+            "the cooldown is live, so the fallback must stay installed"
+        );
+        assert!(
+            handle.failover_state.primary().is_some(),
+            "the primary must stay captured for a later restoration"
+        );
+        assert!(
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "nothing was restored, so no restoration must be reported"
+        );
+    }
+
+    /// The planted negative for the chain half: with no FailoverOptions the
+    /// same failure never consults a chain, which is what every embedder had
+    /// before and what both interactive stacks did.
+    #[test]
+    fn without_failover_options_no_chain_is_consulted() {
+        let (handle, _calls) = flaky_handle(usize::MAX);
+        let mut handle = handle.with_retry(Some(fast_retry_policy(1)));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorder = Arc::clone(&seen);
+
+        let (_abort_handle, abort_signal) = AgentSessionHandle::new_abort_handle();
+        let _ = run_async(
+            handle.prompt_with_abort("hello", abort_signal, move |event| {
+                if matches!(event, AgentEvent::FailoverStart { .. }) {
+                    recorder
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push("failover_start".to_string());
+                }
+            }),
+        );
+
+        assert!(
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "no chain configured means no failover"
+        );
+    }
+
+    /// A retry budget bounds the attempts rather than looping on a provider
+    /// that never recovers.
+    #[test]
+    fn the_retry_budget_bounds_a_provider_that_never_recovers() {
+        let (handle, calls) = flaky_handle(usize::MAX);
+        let mut handle = handle.with_retry(Some(fast_retry_policy(2)));
+        let (_abort_handle, abort_signal) = AgentSessionHandle::new_abort_handle();
+        let message = run_async(handle.prompt_with_abort("hello", abort_signal, |_| {}))
+            .expect("the exhausted turn still returns its message");
+
+        assert_eq!(message.stop_reason, crate::model::StopReason::Error);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the first attempt plus max_retries, and no more"
+        );
     }
 
     struct CurrentDirGuard {
@@ -2609,6 +4139,200 @@ mod tests {
         let trusted =
             load_session_config(&cwd, &global_dir, None, true).expect("load trusted config");
         assert_eq!(trusted.default_thinking_level.as_deref(), Some("high"));
+    }
+
+    /// Configured secrets settings govern an SDK-built session (the default
+    /// FTUI stack): user patterns are obfuscated and block mode refuses,
+    /// where the session used to run the built-in default regardless.
+    #[test]
+    fn sessions_apply_the_configured_secrets_settings() {
+        let session_with = |settings: &str| {
+            let tmp = tempdir().expect("tempdir");
+            std::fs::create_dir_all(tmp.path().join(".pi")).expect("create project config dir");
+            std::fs::write(tmp.path().join(".pi/settings.json"), settings)
+                .expect("write project settings");
+            let mut options = hermetic_session_options(tmp.path());
+            options.workspace_trusted = true;
+            (
+                tmp,
+                run_async(create_agent_session(options)).expect("create session"),
+            )
+        };
+
+        let (_tmp, mut handle) =
+            session_with(r#"{"secrets":{"extra_patterns":["ACME-[0-9]{6}"]}}"#);
+        let out = handle
+            .session_mut()
+            .agent
+            .secrets_transform_outbound_text("token ACME-123456 here")
+            .expect("obfuscate mode");
+        assert!(!out.contains("ACME-123456"), "user pattern applied: {out}");
+
+        let (_tmp, mut handle) =
+            session_with(r#"{"secrets":{"mode":"block","extra_patterns":["ACME-[0-9]{6}"]}}"#);
+        assert!(
+            handle
+                .session_mut()
+                .agent
+                .secrets_transform_outbound_text("token ACME-123456 here")
+                .is_err(),
+            "block mode refuses"
+        );
+    }
+
+    /// `--no-context-files` (gh #216) reaches SDK-built sessions: the
+    /// project's AGENTS.md is left out when it is set and read when not.
+    #[test]
+    fn no_context_files_keeps_agents_md_out_of_the_prompt() {
+        let prompt_with = |no_context_files: bool| {
+            let tmp = tempdir().expect("tempdir");
+            std::fs::write(
+                tmp.path().join("AGENTS.md"),
+                "gh216-context-marker: follow the house style",
+            )
+            .expect("write AGENTS.md");
+            let mut options = hermetic_session_options(tmp.path());
+            options.workspace_trusted = true;
+            options.no_context_files = no_context_files;
+            let handle = run_async(create_agent_session(options)).expect("create session");
+            handle
+                .session()
+                .agent
+                .system_prompt()
+                .unwrap_or_default()
+                .to_string()
+        };
+        if std::env::var_os("PI_TEST_MODE").is_none() {
+            assert!(prompt_with(false).contains("gh216-context-marker"));
+        }
+        assert!(!prompt_with(true).contains("gh216-context-marker"));
+    }
+
+    /// The host's skills block reaches the session's system prompt; without
+    /// one (an embedder that loads no skills) nothing is listed.
+    #[test]
+    fn sessions_list_the_host_provided_skills() {
+        let block =
+            "\n\n<available_skills>\n  <skill><name>demo-skill</name></skill>\n</available_skills>";
+        let prompt_with = |skills_prompt: Option<String>| {
+            let tmp = tempdir().expect("tempdir");
+            let mut options = hermetic_session_options(tmp.path());
+            options.skills_prompt = skills_prompt;
+            let handle = run_async(create_agent_session(options)).expect("create session");
+            handle
+                .session()
+                .agent
+                .system_prompt()
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(prompt_with(Some(block.to_string())).contains("demo-skill"));
+        assert!(!prompt_with(None).contains("available_skills"));
+    }
+
+    #[test]
+    fn sessions_use_the_configured_queue_modes() {
+        let modes_for = |mode: &str| {
+            let tmp = tempdir().expect("tempdir");
+            std::fs::create_dir_all(tmp.path().join(".pi")).expect("create project config dir");
+            std::fs::write(
+                tmp.path().join(".pi/settings.json"),
+                format!(r#"{{"steeringMode":"{mode}","followUpMode":"{mode}"}}"#),
+            )
+            .expect("write project settings");
+            let mut options = hermetic_session_options(tmp.path());
+            options.workspace_trusted = true;
+            let handle = run_async(create_agent_session(options)).expect("create session");
+            handle.session().agent.queue_modes()
+        };
+        assert_eq!(modes_for("all"), (QueueMode::All, QueueMode::All));
+        assert_eq!(
+            modes_for("one-at-a-time"),
+            (QueueMode::OneAtATime, QueueMode::OneAtATime)
+        );
+    }
+
+    /// A fixture extension that observes and does nothing else.
+    fn observing_extension(dir: &Path) -> PathBuf {
+        let path = dir.join("observe.mjs");
+        std::fs::write(
+            &path,
+            "export default function (pi) {\n  pi.on(\"message_update\", async () => {});\n}\n",
+        )
+        .expect("write fixture extension");
+        path
+    }
+
+    /// An embedder that loads extensions and supplies no runtime gets one
+    /// built for the session (bd-8rvry).
+    ///
+    /// Without it the session works and its extensions observe nothing: the
+    /// coalescer `make_combined_callback` installs has nothing to spawn onto,
+    /// so `message_*` and `tool_execution_*` are never delivered, with no error
+    /// anywhere. That is bd-82331's failure moved from the in-tree surfaces,
+    /// which all supply a runtime now, to everyone outside this repo.
+    #[test]
+    fn extensions_without_a_supplied_runtime_get_one_built_for_them() {
+        let tmp = tempdir().expect("tempdir");
+        let mut options = hermetic_session_options(tmp.path());
+        options.extension_paths = vec![observing_extension(tmp.path())];
+
+        let handle = run_async(create_agent_session(options)).expect("create session");
+
+        assert!(
+            handle.session.extensions.is_some(),
+            "the fixture extension must load, or this test is asserting nothing"
+        );
+        assert!(
+            handle.event_runtime.is_some(),
+            "a session that loads extensions and was given no runtime must build one and own it"
+        );
+        assert!(
+            handle.session.runtime_handle().is_some(),
+            "the built runtime must be installed on the session, not merely held: the coalescer \
+             reads it from there"
+        );
+    }
+
+    /// A supplied runtime is used as-is; no second one appears (bd-8rvry).
+    #[test]
+    fn a_supplied_runtime_is_not_replaced_by_a_built_one() {
+        let tmp = tempdir().expect("tempdir");
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .build()
+            .expect("runtime for handle");
+        let mut options = hermetic_session_options(tmp.path());
+        options.extension_paths = vec![observing_extension(tmp.path())];
+        options.runtime_handle = Some(runtime.handle());
+
+        let handle = run_async(create_agent_session(options)).expect("create session");
+
+        assert!(
+            handle.event_runtime.is_none(),
+            "an embedder that supplied a runtime must not have a second one started behind its \
+             back: four worker threads appearing unasked is worse than the problem it solves"
+        );
+        assert!(
+            handle.session.runtime_handle().is_some(),
+            "the supplied handle must still be installed"
+        );
+    }
+
+    /// No extensions, no runtime, nothing allocated (bd-8rvry).
+    #[test]
+    fn a_session_without_extensions_builds_no_runtime() {
+        let tmp = tempdir().expect("tempdir");
+        let handle = run_async(create_agent_session(hermetic_session_options(tmp.path())))
+            .expect("create session");
+
+        assert!(
+            handle.session.extensions.is_none(),
+            "the hermetic options must not load extensions, or this test asserts nothing"
+        );
+        assert!(
+            handle.event_runtime.is_none(),
+            "a session with nothing to observe must not start worker threads for observation"
+        );
     }
 
     #[test]
@@ -2953,6 +4677,87 @@ mod tests {
                 .count()
         });
         assert_eq!(thinking_changes, 1);
+    }
+
+    #[test]
+    fn cycle_thinking_level_walks_the_models_own_levels_and_wraps() {
+        let tmp = tempdir().expect("tempdir");
+        let options = SessionOptions {
+            provider: Some("anthropic".to_string()),
+            model: Some("claude-sonnet-4-6".to_string()),
+            api_key: Some("dummy-key".to_string()),
+            working_directory: Some(tmp.path().to_path_buf()),
+            no_session: true,
+            ..SessionOptions::default()
+        };
+        let mut handle = run_async(create_agent_session(options)).expect("create session");
+        let levels = handle
+            .session()
+            .current_model_entry()
+            .expect("registry resolves the fixture model")
+            .available_thinking_levels();
+        assert!(
+            levels.len() > 1,
+            "fixture must be a reasoning model, got {levels:?}"
+        );
+
+        let start = handle.thinking_level().unwrap_or_default();
+        let start_index = levels
+            .iter()
+            .position(|level| *level == start)
+            .expect("starting level is one the model offers");
+
+        // The levels a full lap should visit, in order, starting one past the
+        // current one and wrapping back around to it.
+        let lap = levels
+            .iter()
+            .copied()
+            .cycle()
+            .skip(start_index + 1)
+            .take(levels.len())
+            .collect::<Vec<_>>();
+        assert_eq!(lap.len(), levels.len());
+
+        // Every step lands on the next level in the model's own list, the last
+        // wraps to the first, and the runtime agrees each time.
+        for (step, expected) in lap.into_iter().enumerate() {
+            let reported = run_async(handle.cycle_thinking_level()).expect("cycle");
+            assert_eq!(reported, Some(expected), "step {step}");
+            assert_eq!(handle.thinking_level(), Some(expected), "step {step}");
+        }
+        assert_eq!(
+            handle.thinking_level(),
+            Some(start),
+            "a full lap must return to where it started"
+        );
+    }
+
+    #[test]
+    fn cycle_thinking_level_reports_nothing_to_cycle_rather_than_moving() {
+        // gpt-4o does not reason, so `Off` is the only level it offers. The
+        // caller has to be able to tell that apart from a successful cycle —
+        // the UI prints "does not support thinking" on `None` — so this must
+        // not silently no-op and report a level.
+        let tmp = tempdir().expect("tempdir");
+        let options = SessionOptions {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4o".to_string()),
+            api_key: Some("dummy-key".to_string()),
+            working_directory: Some(tmp.path().to_path_buf()),
+            no_session: true,
+            ..SessionOptions::default()
+        };
+        let mut handle = run_async(create_agent_session(options)).expect("create session");
+
+        assert_eq!(
+            run_async(handle.cycle_thinking_level()).expect("cycle"),
+            None
+        );
+        assert_eq!(
+            handle.session().agent.stream_options().thinking_level,
+            Some(crate::model::ThinkingLevel::Off),
+            "a model with nothing to cycle must be left where it was"
+        );
     }
 
     #[test]
@@ -3827,5 +5632,14 @@ export default function init(pi) {
         // Embedders can still fall back to the provider default explicitly.
         handle.set_max_tokens(None);
         assert_eq!(handle.max_tokens(), None);
+    }
+    #[test]
+    fn session_without_model_ask_still_exposes_host_picker() {
+        let tmp = tempdir().expect("tempdir");
+        let mut options = hermetic_session_options(tmp.path());
+        options.enabled_tools = Some(vec!["read".to_string()]);
+        let handle = run_async(create_agent_session(options)).expect("create session");
+        assert!(!handle.has_tool("ask"));
+        assert!(handle.ask_tool().is_some());
     }
 }

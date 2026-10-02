@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; asupersync 0.5.0 nests its runtime future types deeply
+// enough that proving `Send` exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! E2E: Long-run soak tests with stability metrics (bd-1f42.3.5).
 //!
 //! Deterministic soak scenarios that exercise prolonged sessions, repeated tool

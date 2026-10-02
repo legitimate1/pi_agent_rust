@@ -145,6 +145,7 @@ fn model_change_entry(
         provider: provider.to_string(),
         model_id: model_id.to_string(),
         role: None,
+        failover: None,
     })
 }
 
@@ -324,6 +325,7 @@ fn describe_entry(entry: &SessionEntry) -> String {
                         ContentBlock::Thinking(_) => "thinking",
                         ContentBlock::RedactedThinking(_) => "redacted_thinking",
                         ContentBlock::Image(_) => "image",
+                        ContentBlock::Media(_) => "media",
                         ContentBlock::ToolCall(_) => "tool_call",
                     })
                     .collect::<Vec<_>>()

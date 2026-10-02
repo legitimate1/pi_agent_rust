@@ -101,8 +101,12 @@ Legacy aliases: `steeringMode`, `followUpMode`.
 
 ### Interactive UX / editor
 
-- `double_escape_action` (string): `tree`, `fork`, or `none` (default `tree`).
-  Alias: `doubleEscapeAction`. Use `none` to disable the double-escape shortcut.
+- `double_escape_action` (string): what Esc Esc does on an idle, empty editor.
+  `rewind` (pick an earlier message, rewind to just before it and put it back
+  in the editor; the old path stays as a branch, like `/branch`), `fork` (pick
+  a message to fork a new session from), `tree`, or `none`. The default
+  interactive UI defaults to `rewind`, as OMP does; `--classic` defaults to
+  `tree` and has no `rewind`. Alias: `doubleEscapeAction`.
 - `editor_padding_x` (u32): Horizontal editor padding (clamped to 0–3). Default `0`.
 - `autocomplete_max_visible` (u32): Max autocomplete rows (clamped 3–20). Default `5`.
 - `session_picker_input` (u32): Non-interactive session picker selection (1-based).
@@ -249,6 +253,8 @@ Accessor defaults:
 - `media.tts_voice` (string): Voice identifier (e.g. `"alloy"`, `"rachel"`).
 - `media.image_gen_provider` (string): Default `"gemini"`. Supported: `"gemini"`, `"dall-e-3"`.
 - `media.output_dir` (string): Destination folder for generated media artifacts.
+- `media.enable_read_media` / `media.enableReadMedia` (bool): Default `false`. When `true`, activates `read_media`, which attaches a local video/audio file (mp4, webm, mov, mp3, wav, m4a, ogg, flac) as an inline media block. Only Gemini-family models consume it natively; other providers see `[media omitted: <name>, <mime>, <size>]`.
+- `media.max_bytes` / `media.maxBytes` (integer): Default `5242880` (5 MiB). Hard cap on one `read_media` file in bytes; larger files are rejected with an error naming the cap. The payload is base64-inlined into the session file and re-sent every turn until compaction, so keep this small.
 
 ### Computer (desktop automation)
 

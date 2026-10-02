@@ -119,7 +119,17 @@ struct ArtifactException {
 #[allow(clippy::too_many_lines)]
 fn provenance_verification_evidence_log() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let artifacts_root = repo_root.join("tests/ext_conformance/artifacts");
+    let artifacts_root = std::env::var("PI_TEST_ARTIFACTS_ROOT").map_or_else(
+        |_| repo_root.join("tests/ext_conformance/artifacts"),
+        std::path::PathBuf::from,
+    );
+
+    // Verify tree completeness first (bd-s7hzz)
+    pi::conformance::snapshot::verify_tree_completeness(
+        repo_root,
+        "tests/ext_conformance/artifacts",
+    )
+    .expect("Tree completeness check failed");
 
     // Load master catalog
     let master_path = repo_root.join("docs/extension-master-catalog.json");
@@ -314,8 +324,10 @@ fn provenance_verification_evidence_log() {
     };
 
     let evidence_json = serde_json::to_string_pretty(&evidence).expect("serialize evidence log");
-    let output_path =
-        repo_root.join("tests/ext_conformance/artifacts/PROVENANCE_VERIFICATION.json");
+    let output_path = std::env::var("PI_TEST_PROVENANCE_OUTPUT_PATH").map_or_else(
+        |_| repo_root.join("tests/ext_conformance/artifacts/PROVENANCE_VERIFICATION.json"),
+        std::path::PathBuf::from,
+    );
 
     // Collect failure details before touching the committed evidence. A failed
     // verification must never overwrite the last reviewed PASS artifact.
@@ -338,6 +350,12 @@ fn provenance_verification_evidence_log() {
         Ok("1")
     );
     if generate {
+        // Enforce tree completeness before writing the evidence log (bd-s7hzz)
+        pi::conformance::snapshot::verify_tree_completeness(
+            repo_root,
+            "tests/ext_conformance/artifacts",
+        )
+        .expect("tree completeness verification failed: refusing to generate provenance verification against truncated tree");
         fs::write(&output_path, format!("{evidence_json}\n")).expect("write evidence log");
     } else {
         let committed_json = fs::read_to_string(&output_path)

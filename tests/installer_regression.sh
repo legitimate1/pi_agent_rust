@@ -5,12 +5,30 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALLER="${ROOT}/install.sh"
 UNINSTALLER="${ROOT}/uninstall.sh"
 SKILL_SMOKE="${ROOT}/scripts/skill-smoke.sh"
-WORK_ROOT="${TMPDIR:-/tmp}/pi-installer-regression-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+# Strip a trailing slash before composing, because macOS sets TMPDIR with one
+# (/var/folders/.../T/) while Linux does not. Without this, WORK_ROOT contains
+# a `//` and every path derived from it inherits the doubled separator — which
+# install.sh's own lock-directory validator correctly rejects as unsafe
+# (`*//*` in validate_options), so test_installer_retain_temp_mode_preserves_
+# owned_scratch and test_stale_lock_recovery_preserves_the_old_lock_receipt
+# both failed with "PI_INSTALLER_LOCK_DIR is unsafe" on darwin and passed on
+# linux. The installer was right; the harness was building the bad path.
+INSTALLER_REGRESSION_TMPDIR="${TMPDIR:-/tmp}"
+WORK_ROOT="${INSTALLER_REGRESSION_TMPDIR%/}/pi-installer-regression-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 PASS_COUNT=0
 FAIL_COUNT=0
+SKIP_COUNT=0
 
 mkdir -p "${WORK_ROOT}"
+# Resolve to the physical path. macOS symlinks /var to /private/var, so TMPDIR
+# hands back /var/folders/... while install.sh reports and installs under the
+# resolved /private/var/folders/.... Any test that compares an expected path
+# against installer output then fails on darwin and passes on linux — e.g.
+# test_installer_creates_rpi_alias_when_available asserts
+# "Alias:     installed (rpi -> ${install_bin})". Canonicalising once here
+# fixes every derived path at the source rather than per assertion.
+WORK_ROOT="$(cd "${WORK_ROOT}" && pwd -P)"
 
 usage() {
   cat <<'USAGE'
@@ -43,7 +61,30 @@ case_dir() {
   local name="$1"
   local dir="${WORK_ROOT}/${name}"
   mkdir -p "$dir/home" "$dir/state" "$dir/data" "$dir/config" "$dir/dest" "$dir/fixtures" "$dir/fakebin"
+  provide_host_xz "$dir"
   printf '%s\n' "$dir"
+}
+
+# Make an `xz` visible inside the case sandbox when the host has one.
+#
+# Cases run with PATH restricted to "<case>/fakebin:/usr/bin:/bin", and
+# install.sh checks `command -v xz` before extracting a .tar.xz. Linux ships xz
+# in /usr/bin so the restricted PATH finds it; macOS does not, and Homebrew's
+# copy in /opt/homebrew/bin is outside that PATH. Eight cases build .tar.xz
+# fixtures, so without this the suite tests a different code path on each
+# platform. Linking the host binary keeps the sandbox restricted while giving
+# the installer the tool it legitimately requires. If the host has no xz at all
+# the link is simply absent and the affected cases fail with install.sh's own
+# "xz is not available" message, which is the honest outcome.
+provide_host_xz() {
+  local dir="$1" host_xz
+  if [ -x /usr/bin/xz ] || [ -x /bin/xz ]; then
+    return 0
+  fi
+  host_xz="$(command -v xz 2>/dev/null || true)"
+  if [ -n "$host_xz" ]; then
+    ln -sf "$host_xz" "${dir}/fakebin/xz"
+  fi
 }
 
 write_existing_pi_stub() {
@@ -619,10 +660,27 @@ run_test() {
   if [ "$status" -eq 0 ]; then
     PASS_COUNT=$((PASS_COUNT + 1))
     echo "[PASS] ${name}"
+  elif [ "$status" -eq 77 ]; then
+    # 77 is the autotools convention for "skipped". Used for cases that can
+    # only be meaningful on one platform, so they report honestly instead of
+    # failing on the others or being silently deleted.
+    SKIP_COUNT=$((SKIP_COUNT + 1))
+    echo "[SKIP] ${name}"
   else
     FAIL_COUNT=$((FAIL_COUNT + 1))
     echo "[FAIL] ${name}"
   fi
+}
+
+# Report a case as skipped rather than passed or failed. Callers use it as
+# `require_linux || return $?` so the reason is stated once, at the top of the
+# case, next to the condition that makes it platform-specific.
+require_linux() {
+  if [ "$(uname -s)" = "Linux" ]; then
+    return 0
+  fi
+  echo "skipping: requires Linux (running on $(uname -s))" >&2
+  return 77
 }
 
 test_help_lists_installer_flags() {
@@ -1013,6 +1071,10 @@ test_rosetta_prefers_arm64_artifact_naming() {
 
 test_wsl_detection_warning_is_emitted() {
   local dir artifact artifact_url checksum
+  # install.sh only probes for WSL inside `if [ "$OS" = "linux" ]`, so
+  # PI_INSTALLER_TEST_FORCE_WSL is inert on darwin and the warning can never be
+  # emitted there. Forcing this case to "pass" off Linux would assert nothing.
+  require_linux || return $?
   dir="$(case_dir "wsl-detection-warning")"
   write_existing_pi_stub "$dir"
 
@@ -2944,6 +3006,7 @@ main() {
   echo "work dir: ${WORK_ROOT}"
   echo "passed:   ${PASS_COUNT}"
   echo "failed:   ${FAIL_COUNT}"
+  echo "skipped:  ${SKIP_COUNT}"
 
   if [ "${FAIL_COUNT}" -gt 0 ]; then
     exit 1

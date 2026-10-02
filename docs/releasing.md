@@ -41,9 +41,43 @@ dsr quality --tool pi_agent_rust
 ```
 
 Per-check logs land under `~/.local/state/dsr/quality-logs/pi_agent_rust/`.
-Cross-platform builds and releases additionally need the build authority file
-`~/.config/dsr/repos.d/pi_agent_rust.yaml` on the release operator's machine;
-keys that appear in both files must stay identical (`dsr repos validate`).
+
+### Registering the build authority on a new host
+
+`dsr quality` needs only the registry entry above. `dsr build` and
+`dsr release` read the cross-platform target inventory, per-host build
+routing, artifact naming, and the fail-closed release contract from a second
+file, `~/.config/dsr/repos.d/pi_agent_rust.yaml`, and from nowhere else. That
+file is checked in at `.dsr/repos.d/pi_agent_rust.yaml` (bd-ikl7j), so any
+host can validate and reproduce the cross-platform recipe:
+
+```bash
+mkdir -p ~/.config/dsr/repos.d
+cp .dsr/repos.d/pi_agent_rust.yaml ~/.config/dsr/repos.d/pi_agent_rust.yaml
+dsr repos validate --repo pi_agent_rust
+dsr build pi_agent_rust --dry-run          # expect the five-target plan
+```
+
+`dsr repos validate` compares the two files key by key and fails when they
+disagree, reporting `repos.yaml and repos.d/pi_agent_rust.yaml disagree on:
+<key> (repos.d wins for builds; align the two files)`. `local_path` is
+included in that comparison, so it is not a per-host escape hatch: both
+checked-in files ship `/data/projects/pi_agent_rust`, and a host whose
+checkout lives elsewhere must re-point **both** of them in one edit
+(`local_path` in the authority file, `tools.pi_agent_rust.local_path` in the
+registry). `host_paths` is the separate per-host map naming each SSH build
+host's checkout and does not need editing.
+
+`release_contract.minisign_public_key_file` is deliberately absent until
+bd-yj126 provisions a real repo-owned public key; a placeholder there would
+let the fail-closed contract pass against key material the project does not
+pin.
+
+Two gates run before per-target planning and are expected to fail outside a
+release: the strict contract requires a completely clean tree (tracked **and**
+untracked) and requires `HEAD` to equal the peeled local tag for the detected
+version. A shared multi-agent checkout satisfies neither, so validate planning
+from a clean clone checked out at the tag rather than from the working tree.
 
 The Cargo source package also retains the internal `pi_legacy_capture`
 conformance utility because integration tests execute it through
@@ -279,6 +313,21 @@ release objective.
 2) **Update version** in `Cargo.toml` (`[package].version`).
 3) **Run the configured DSR quality gate**:
    - `dsr quality --tool pi_agent_rust`
+3b) **Check the Windows target, before the release commit exists** (bd-o6hte):
+   - `scripts/check_windows_target.sh <commit>` — the commit must already be
+     pushed; the Windows host fetches it.
+   - This runs `cargo check --all-targets` and `cargo clippy --all-targets --
+     -D warnings` for `x86_64-pc-windows-msvc`. The DSR gate does **not**: it
+     builds only the rch worker's own triple, and this repository runs no CI,
+     so nothing else notices when Windows stops compiling.
+   - It has stopped compiling before and gone unnoticed for two minor
+     versions. v0.5.0 found the crate had not built for Windows since some
+     point after v0.3.0 — discovered at the release build, after the release
+     commit and tag already existed, which cost a full rebuild of all five
+     platforms and a re-tag. v0.5.1 then found the target still broken under
+     `--all-targets`, along with three real Windows defects.
+   - Budget ~25 minutes warm, over an hour cold. Do this **before** step 5 so
+     a failure costs a commit rather than a release.
 4) **Update changelog**:
    - `br changelog --since-tag vX.Y.Z` (or use `--since YYYY-MM-DD` if no prior tags)
    - paste the output into `CHANGELOG.md` under a new version heading

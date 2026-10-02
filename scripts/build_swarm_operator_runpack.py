@@ -1984,6 +1984,7 @@ def capture_command(
     cwd: Path,
     timeout_seconds: int,
     stdout_path: Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], str]:
     result: dict[str, Any] = {
         "id": command_id,
@@ -1999,6 +2000,7 @@ def capture_command(
         completed = subprocess.run(
             command,
             cwd=cwd,
+            env=env,
             text=True,
             capture_output=True,
             timeout=timeout_seconds,
@@ -10157,6 +10159,8 @@ def is_temp_artifact_path(path: str) -> bool:
     return (
         lowered.startswith("/data/tmp/")
         or lowered.startswith("/tmp/")
+        # macOS: /tmp is a symlink to /private/tmp, so resolved paths land here.
+        or lowered.startswith("/private/tmp/")
         or "/.rch-target" in lowered
         or "/.rch-tmp" in lowered
         or "clean-worktree" in lowered
@@ -15580,6 +15584,12 @@ def canonicalize_for_golden(value: Any, workspace: Path) -> Any:
         for key, item in value.items():
             if key == "sha256" and isinstance(item, str):
                 canonicalized[key] = "[SHA256]"
+            elif key in {"entry_id", "ledger_id"} and isinstance(item, str) and (
+                item.startswith("rvpe-") or item.startswith("rvpl-")
+            ):
+                # Content hashes over the raw command cwd (the checkout path)
+                # and entries; they differ per checkout location, like sha256.
+                canonicalized[key] = "[ENTRY_ID]" if key == "entry_id" else "[LEDGER_ID]"
             elif key == "size_bytes" and workspace_scoped_path:
                 canonicalized[key] = "[SIZE_BYTES]"
             elif key in GOLDEN_DURATION_KEYS and isinstance(item, (int, float)):
@@ -16507,11 +16517,22 @@ def capture_autopilot_e2e_command(
     cwd: Path,
     timeout_seconds: int,
 ) -> str:
+    env = None
+    if command and command[0] == "br":
+        # Every autopilot br call runs in its own scenario workspace. Pin the
+        # database there: br versions that auto-discover an ancestor tracker
+        # would otherwise attach to whatever .beads sits above the temp dir
+        # (on rch workers TMPDIR is inside the project checkout).
+        env = dict(os.environ)
+        for key in ("BEADS_DIR", "BD_DB", "BD_DATABASE", "BEADS_WORKSPACE", "BEADS_CONFIG"):
+            env.pop(key, None)
+        env["BEADS_DB"] = str(cwd / ".beads" / "beads.db")
     result, stdout = capture_command(
         command_id,
         command,
         cwd=cwd,
         timeout_seconds=timeout_seconds,
+        env=env,
     )
     commands.append(result)
     if result.get("status") != "ok":
@@ -34108,7 +34129,18 @@ def write_ninth_wave_closeout_gate_output(
 
 
 def run_self_test() -> int:
-    workspace = Path(tempfile.mkdtemp(prefix="pi_swarm_runpack_"))
+    # The temp-artifact inventory keeps only temp-looking paths
+    # (is_temp_artifact_path), so a workspace under macOS's /var/folders
+    # TMPDIR would silently drop entries the golden expects. /tmp qualifies
+    # on every Unix host.
+    # Resolved, because the autopilot scenarios resolve their directories and
+    # the golden scrubbing matches the workspace prefix textually.
+    workspace = Path(
+        tempfile.mkdtemp(
+            prefix="pi_swarm_runpack_",
+            dir="/tmp" if os.name == "posix" and Path("/tmp").is_dir() else None,
+        )
+    ).resolve()
     generated_at = "2026-05-09T09:00:00+00:00"
     accepted_preflight = {
         "schema": HOST_PREFLIGHT_SCHEMA,
@@ -37877,17 +37909,34 @@ def run_self_test() -> int:
             real_beads_workspace = workspace / "real-beads-workspace"
             real_beads_workspace.mkdir()
 
+            beads_env = dict(os.environ)
+            for key in (
+                "BEADS_DB",
+                "BEADS_DIR",
+                "BD_DB",
+                "BD_DATABASE",
+                "BEADS_WORKSPACE",
+                "BEADS_CONFIG",
+            ):
+                beads_env.pop(key, None)
+            # Pin the database to this workspace. Without it, br versions
+            # that auto-discover an ancestor tracker attach to whatever
+            # .beads sits above the temp dir (on rch workers TMPDIR is inside
+            # the project checkout) and refuse on its schema.
+            beads_env["BEADS_DB"] = str(real_beads_workspace / ".beads" / "beads.db")
+
             def run_real_br(*command: str) -> str:
                 completed = subprocess.run(
                     ["br", *command],
                     cwd=real_beads_workspace,
+                    env=beads_env,
                     text=True,
                     capture_output=True,
                     check=False,
                 )
                 if completed.returncode != 0:
                     raise AssertionError(
-                        f"br {' '.join(command)} failed: {completed.stderr}"
+                        f"br {' '.join(command)} failed (code {completed.returncode}): stdout={completed.stdout!r} stderr={completed.stderr!r}"
                     )
                 return completed.stdout
 

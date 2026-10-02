@@ -665,14 +665,37 @@ fn approval_arguments_preview(arguments: &serde_json::Value) -> String {
 /// timeout, or no surface installed at all — fails closed to a deny with an
 /// explicit reason the model can relay.
 #[must_use]
-pub fn approval_handler_via_ask(ask: AskTool) -> crate::agent::ToolApprovalHandler {
+pub fn approval_handler_via_ask(
+    ask: AskTool,
+    approval: crate::approval::ApprovalState,
+) -> crate::agent::ToolApprovalHandler {
     Arc::new(move |request: crate::agent::ToolApprovalRequest| {
         let ask = ask.clone();
+        let approval = approval.clone();
         Box::pin(async move {
             use crate::agent::ToolApprovalDecision;
 
+            // No surface installed is categorically different from a user
+            // saying no: the session could never have approved anything, so
+            // every gated call in the run is doomed (gh #224). Record it so a
+            // non-interactive host can fail loudly at the end instead of
+            // exiting zero on a turn that silently did nothing, and answer
+            // with a reason that names the cause rather than a prompt failure.
+            if ask.handler().is_none() {
+                approval.mark_surface_unavailable();
+                return ToolApprovalDecision::deny(format!(
+                    "approval required for `{}` but this session has no approval surface; \
+                     re-run with --approval-mode yolo to auto-approve, \
+                     or use an interactive session",
+                    request.tool_name
+                ));
+            }
+
+            // Fresh identity prevents a delayed reply for an earlier invocation
+            // from authorizing a later call that reuses the same tool-call id.
+            let question_id = format!("approval:{}", uuid::Uuid::new_v4());
             let question = AskQuestion {
-                id: Some(format!("approval:{}", request.tool_call_id)),
+                id: Some(question_id.clone()),
                 question: format!(
                     "Allow the `{}` tool to run?\n{}",
                     request.tool_name,
@@ -705,13 +728,13 @@ pub fn approval_handler_via_ask(ask: AskTool) -> crate::agent::ToolApprovalHandl
                             request.tool_name
                         ));
                     }
-                    let allowed = response.answers.first().is_some_and(|answer| {
-                        answer.other.is_none()
-                            && answer
-                                .selected
-                                .iter()
-                                .any(|label| label.eq_ignore_ascii_case(APPROVAL_ALLOW_LABEL))
-                    });
+                    let allowed = response.answers.len() == 1
+                        && response.answers.first().is_some_and(|answer| {
+                            answer.question_id == question_id
+                                && answer.other.is_none()
+                                && answer.selected.len() == 1
+                                && answer.selected[0].eq_ignore_ascii_case(APPROVAL_ALLOW_LABEL)
+                        });
                     if allowed {
                         ToolApprovalDecision::Allow
                     } else {
@@ -1207,9 +1230,14 @@ mod tests {
                         true
                     })
                 );
+                // What is asserted is that the receiver observes a disconnect,
+                // not how fast. A closed channel reports it on the first poll,
+                // so this deadline is a hang guard whose budget is only spent
+                // on the way to a failure — and twenty milliseconds of it is
+                // not survivable on a loaded gate worker (bd-0mts7).
                 let closed = asupersync::time::timeout(
                     asupersync::time::wall_now(),
-                    std::time::Duration::from_millis(20),
+                    std::time::Duration::from_secs(5),
                     rx.recv(cx.cx()),
                 )
                 .await
@@ -1367,7 +1395,8 @@ mod tests {
             // Allow selection approves.
             let tool = AskTool::new(AskPolicy::Recommended);
             install_canned_reply(&tool, vec![APPROVAL_ALLOW_LABEL], None);
-            let handler = approval_handler_via_ask(tool.clone());
+            let handler =
+                approval_handler_via_ask(tool.clone(), crate::approval::ApprovalState::default());
             assert_eq!(
                 handler(approval_request("bash")).await,
                 ToolApprovalDecision::Allow
@@ -1375,7 +1404,8 @@ mod tests {
 
             // Deny selection denies.
             install_canned_reply(&tool, vec![APPROVAL_DENY_LABEL], None);
-            let handler = approval_handler_via_ask(tool.clone());
+            let handler =
+                approval_handler_via_ask(tool.clone(), crate::approval::ApprovalState::default());
             let decision = handler(approval_request("bash")).await;
             assert!(
                 matches!(decision, ToolApprovalDecision::Deny { ref reason } if reason.contains("denied")),
@@ -1385,7 +1415,8 @@ mod tests {
             // A free-text "Other" answer is not an approval, even when it
             // happens to spell out "Allow".
             install_canned_reply(&tool, vec![], Some("Allow"));
-            let handler = approval_handler_via_ask(tool.clone());
+            let handler =
+                approval_handler_via_ask(tool.clone(), crate::approval::ApprovalState::default());
             assert!(matches!(
                 handler(approval_request("bash")).await,
                 ToolApprovalDecision::Deny { .. }
@@ -1400,7 +1431,8 @@ mod tests {
                     })
                 })
             }));
-            let handler = approval_handler_via_ask(tool.clone());
+            let handler =
+                approval_handler_via_ask(tool.clone(), crate::approval::ApprovalState::default());
             let decision = handler(approval_request("write")).await;
             assert!(
                 matches!(decision, ToolApprovalDecision::Deny { ref reason } if reason.contains("dismissed")),
@@ -1412,21 +1444,61 @@ mod tests {
     /// Issue #196: with no interactive picker surface installed the bridge
     /// must deny with an explicit reason — never auto-answer via
     /// `AskPolicy::Recommended`, which would silently self-approve.
+    ///
+    /// gh #224: that denial must also be distinguishable from a user saying
+    /// no. It is recorded on the shared approval state, which is how a
+    /// non-interactive host learns the run could never have used tools and
+    /// ends with a real error instead of exit 0.
     #[test]
     fn approval_bridge_without_surface_denies_and_never_auto_answers() {
         asupersync::test_utils::run_test(|| async {
             use crate::agent::ToolApprovalDecision;
 
             let tool = AskTool::new(AskPolicy::Recommended);
-            let handler = approval_handler_via_ask(tool);
+            let approval = crate::approval::ApprovalState::default();
+            assert!(
+                !approval.surface_was_unavailable(),
+                "nothing has been denied yet"
+            );
+
+            let handler = approval_handler_via_ask(tool, approval.clone());
             let decision = handler(approval_request("bash")).await;
             assert!(
                 matches!(
                     decision,
                     ToolApprovalDecision::Deny { ref reason }
-                        if reason.contains("could not be completed")
+                        if reason.contains("no approval surface")
                 ),
                 "no surface must fail closed with an explicit reason, got {decision:?}"
+            );
+            assert!(
+                approval.surface_was_unavailable(),
+                "a no-surface denial must be recorded for the host to act on"
+            );
+        });
+    }
+
+    /// gh #224: a denial the user actually made must NOT set the no-surface
+    /// flag. Otherwise a print-mode run would fail with "no approval surface"
+    /// on an ordinary rejection, and the exit code would stop meaning anything.
+    #[test]
+    fn user_denial_does_not_mark_the_surface_unavailable() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::agent::ToolApprovalDecision;
+
+            let tool = AskTool::new(AskPolicy::Recommended);
+            install_canned_reply(&tool, vec![APPROVAL_DENY_LABEL], None);
+            let approval = crate::approval::ApprovalState::default();
+
+            let handler = approval_handler_via_ask(tool, approval.clone());
+            let decision = handler(approval_request("bash")).await;
+            assert!(
+                matches!(decision, ToolApprovalDecision::Deny { .. }),
+                "an explicit deny still denies, got {decision:?}"
+            );
+            assert!(
+                !approval.surface_was_unavailable(),
+                "a surface answered, so the run is not surface-less"
             );
         });
     }
@@ -1443,5 +1515,90 @@ mod tests {
             approval_arguments_preview(&serde_json::json!({"path": "a.txt", "content": huge}));
         assert!(bounded.chars().count() < 800);
         assert!(bounded.contains("truncated"));
+    }
+    #[test]
+    fn approval_bridge_rejects_mismatched_or_ambiguous_replies() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::agent::ToolApprovalDecision;
+            let tool = AskTool::new(AskPolicy::Error);
+            tool.set_handler(Arc::new(|_request: AskRequest| {
+                Box::pin(async {
+                    Ok(AskResponse {
+                        answers: vec![AskAnswer {
+                            question_id: "approval:stale".into(),
+                            selected: vec![APPROVAL_ALLOW_LABEL.into()],
+                            other: None,
+                        }],
+                        dismissed: false,
+                    })
+                })
+            }));
+            let decision = approval_handler_via_ask(
+                tool.clone(),
+                crate::approval::ApprovalState::default(),
+            )(approval_request("bash"))
+            .await;
+            assert!(matches!(decision, ToolApprovalDecision::Deny { .. }));
+
+            tool.set_handler(Arc::new(|request: AskRequest| {
+                Box::pin(async move {
+                    Ok(AskResponse {
+                        answers: vec![AskAnswer {
+                            question_id: effective_question_id(&request.questions[0], 0),
+                            selected: vec![APPROVAL_ALLOW_LABEL.into(), APPROVAL_DENY_LABEL.into()],
+                            other: None,
+                        }],
+                        dismissed: false,
+                    })
+                })
+            }));
+            let decision = approval_handler_via_ask(
+                tool,
+                crate::approval::ApprovalState::default(),
+            )(approval_request("bash"))
+            .await;
+            assert!(matches!(decision, ToolApprovalDecision::Deny { .. }));
+        });
+    }
+
+    #[test]
+    fn approval_bridge_uses_a_fresh_question_id_for_each_invocation() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::agent::ToolApprovalDecision;
+            let ids = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let seen = Arc::clone(&ids);
+            let tool = AskTool::new(AskPolicy::Error);
+            tool.set_handler(Arc::new(move |request: AskRequest| {
+                let seen = Arc::clone(&seen);
+                Box::pin(async move {
+                    let question_id = effective_question_id(&request.questions[0], 0);
+                    seen.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(question_id.clone());
+                    Ok(AskResponse {
+                        answers: vec![AskAnswer {
+                            question_id,
+                            selected: vec![APPROVAL_ALLOW_LABEL.into()],
+                            other: None,
+                        }],
+                        dismissed: false,
+                    })
+                })
+            }));
+            let handler = approval_handler_via_ask(tool, crate::approval::ApprovalState::default());
+            assert_eq!(
+                handler(approval_request("bash")).await,
+                ToolApprovalDecision::Allow
+            );
+            assert_eq!(
+                handler(approval_request("bash")).await,
+                ToolApprovalDecision::Allow
+            );
+            let ids = ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(ids.len(), 2);
+            assert_ne!(ids[0], ids[1]);
+        });
     }
 }

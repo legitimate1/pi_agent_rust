@@ -664,6 +664,58 @@ fn coalescer_recording_payload(
     }))
 }
 
+/// Gate a burst so every dispatch is enqueued before the first one resolves.
+///
+/// The coalescing count is only "the first and the latest" when the whole
+/// burst lands while that first dispatch is still in flight. Left to wall
+/// time, a loaded machine completes the in-flight crossing partway through
+/// and picks up intermediate payloads — which is a property of the scheduler,
+/// not of the contract, and made this test flaky on the gate workers
+/// (bd-d158o). Holding resolution on an explicit gate makes the window a fact
+/// rather than a race.
+///
+/// The wait is bounded so a scheduling model that resolves inline degrades to
+/// the old timing-dependent behaviour instead of hanging the suite.
+fn coalescer_gated_recording_payload(
+    sequence: usize,
+    resolved: &Arc<Mutex<Vec<usize>>>,
+    gate: &Arc<(Mutex<bool>, std::sync::Condvar)>,
+) -> CoalescedPayload {
+    let resolved = Arc::clone(resolved);
+    let gate = Arc::clone(gate);
+    CoalescedPayload::Lazy(Box::new(move || {
+        let (open_lock, opened) = &*gate;
+        let mut open = open_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*open {
+            let (guard, timeout) = opened
+                .wait_timeout(open, Duration::from_secs(10))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            open = guard;
+            if timeout.timed_out() {
+                break;
+            }
+        }
+        drop(open);
+
+        resolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(sequence);
+        Some(json!({ "sequence": sequence }))
+    }))
+}
+
+/// Release a gate created for [`coalescer_gated_recording_payload`].
+fn open_coalescer_gate(gate: &Arc<(Mutex<bool>, std::sync::Condvar)>) {
+    let (open_lock, opened) = &**gate;
+    *open_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    opened.notify_all();
+}
+
 fn assert_coalescer_idle(coalescer: &EventCoalescer) {
     assert!(
         coalescer
@@ -681,69 +733,6 @@ fn assert_coalescer_idle(coalescer: &EventCoalescer) {
             .is_empty(),
         "completed dispatch must release its in-flight marker"
     );
-}
-
-#[test]
-fn event_coalescer_characterization_replacement_keeps_first_and_latest_payload() {
-    let runtime = RuntimeBuilder::current_thread()
-        .build()
-        .expect("runtime build");
-    let handle = runtime.handle();
-    let manager = coalescer_test_manager_with_hooks(&[ExtensionEventName::MessageUpdate]);
-    let coalescer = EventCoalescer::new(manager);
-    let resolved = Arc::new(Mutex::new(Vec::new()));
-
-    for sequence in 1..=3 {
-        coalescer.dispatch_fire_and_forget(
-            ExtensionEventName::MessageUpdate,
-            coalescer_recording_payload(sequence, &resolved),
-            &handle,
-        );
-    }
-
-    assert!(
-        resolved
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty(),
-        "lazy payloads must not resolve before the runtime drives the task"
-    );
-    assert_eq!(
-        coalescer
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len(),
-        1,
-        "only the latest replacement may remain pending"
-    );
-
-    runtime.block_on(async {
-        // Deadline-based: see the handoff test below — yield-only budgets
-        // flake on loaded hosts when OS threads are involved.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if coalescer
-                .in_flight
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty()
-            {
-                return;
-            }
-            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(2)).await;
-        }
-        panic!("coalesced dispatch did not become idle");
-    });
-
-    assert_eq!(
-        *resolved
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        vec![1, 3],
-        "the superseded middle payload must never be resolved"
-    );
-    assert_coalescer_idle(&coalescer);
 }
 
 #[test]
@@ -1344,6 +1333,10 @@ mod proptest_dispatch {
             offset in 0u32..4096,
             limit in 1u32..2048,
         ) {
+            // Held for the same reason as the two arena cases below: each
+            // `marshal` appends to the process-wide superinstruction trace
+            // window, and a proptest marshals hundreds of times.
+            let _guard = superinstruction_test_lock();
             let mut input_a = serde_json::Map::new();
             input_a.insert("path".to_string(), json!(path));
             input_a.insert("offset".to_string(), json!(offset));
@@ -2458,6 +2451,12 @@ mod hostcall_protocol_equivalence {
 
     #[test]
     fn arena_without_opcode_uses_canonical_generic_path() {
+        // `marshal` feeds the process-wide superinstruction trace window, so
+        // every caller has to take this lock even when it does not care about
+        // superinstructions: otherwise it interleaves foreign traces into the
+        // window `reactor.rs`'s warmup tests are measuring support over, and
+        // those fail only under parallel load (bd-d158o).
+        let _guard = superinstruction_test_lock();
         let params = serde_json::json!({ "url": "https://example.invalid/pick" });
         let artifacts = HostcallPayloadArena::new("http", &params, None).marshal();
         assert_eq!(
@@ -2474,6 +2473,8 @@ mod hostcall_protocol_equivalence {
 
     #[test]
     fn arena_shape_miss_falls_back_to_canonical_with_reason() {
+        // See the note above: any `marshal` caller must hold this.
+        let _guard = superinstruction_test_lock();
         // The ToolRead fast path requires exactly {"name", "input"}; anything
         // else must miss the shape and fall back without hashing divergence.
         let params = serde_json::json!({ "unexpected": true });
@@ -2496,4 +2497,242 @@ mod hostcall_protocol_equivalence {
         assert_eq!(artifacts.params_hash, again.params_hash);
         assert_eq!(artifacts.args_shape_hash, again.args_shape_hash);
     }
+}
+
+// ========================================================================
+// Coalescer cost and batching contract (bd-82331)
+// ========================================================================
+
+/// An extension that subscribes to nothing costs nothing.
+///
+/// This is the guarantee bd-82331 rests on when it makes coalescer
+/// construction unconditional on every surface: the per-event `has_hook_for`
+/// check must return before any work happens. "Costs nothing" is checked by the
+/// only thing that can be observed from outside — the lazy payload is never
+/// resolved, so nothing is serialized — plus the coalescer never taking an
+/// in-flight marker or buffering, which is what a spawn would require.
+///
+/// Written as a burst rather than one event because the cost that matters is
+/// per-event: a streaming turn emits `message_update` continuously, and the
+/// question is whether each one is free, not whether the first one is.
+#[test]
+fn event_coalescer_without_a_subscriber_resolves_nothing_and_never_spawns() {
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime build");
+    let handle = runtime.handle();
+    // Registered, but hooked to a DIFFERENT event: the realistic shape of "an
+    // extension is loaded and does not observe this", which an empty manager
+    // would not exercise.
+    let manager = coalescer_test_manager_with_hooks(&[ExtensionEventName::SessionStart]);
+    let coalescer = EventCoalescer::new(manager);
+    let resolved = Arc::new(Mutex::new(Vec::new()));
+
+    for sequence in 1..=64 {
+        coalescer.dispatch_fire_and_forget(
+            ExtensionEventName::MessageUpdate,
+            coalescer_recording_payload(sequence, &resolved),
+            &handle,
+        );
+        coalescer.dispatch_fire_and_forget(
+            ExtensionEventName::MessageStart,
+            coalescer_recording_payload(sequence, &resolved),
+            &handle,
+        );
+    }
+
+    assert!(
+        resolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "no payload may be serialized for an event nothing subscribes to; a non-empty list here \
+         means every streaming token is paying for a listener that does not exist"
+    );
+    assert!(
+        coalescer
+            .batch_buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "an unsubscribed event must not be buffered for a batch drain"
+    );
+    assert_coalescer_idle(&coalescer);
+}
+
+/// A burst of updates dispatches the first and the latest, and nothing else.
+///
+/// The batching contract bd-82331 must not change: coalescing exists so a
+/// streaming turn does not cross the JS bridge once per token. This pins both
+/// halves of it — the count (two, not sixty-four) and the identity (the first,
+/// because it starts immediately, and the last, because it supersedes every
+/// payload queued behind it).
+#[test]
+fn event_coalescer_burst_resolves_only_the_first_and_the_latest_payload() {
+    const BURST: usize = 64;
+
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime build");
+    let handle = runtime.handle();
+    let manager = coalescer_test_manager_with_hooks(&[ExtensionEventName::MessageUpdate]);
+    let coalescer = EventCoalescer::new(manager);
+    let resolved = Arc::new(Mutex::new(Vec::new()));
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
+    for sequence in 1..=BURST {
+        coalescer.dispatch_fire_and_forget(
+            ExtensionEventName::MessageUpdate,
+            coalescer_gated_recording_payload(sequence, &resolved, &gate),
+            &handle,
+        );
+    }
+    // Every dispatch is now either in flight or the single surviving pending
+    // payload, so what resolves from here is the contract and not a race.
+    open_coalescer_gate(&gate);
+
+    runtime.block_on(async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if coalescer
+                .in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+            {
+                return;
+            }
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(2)).await;
+        }
+        panic!("coalesced dispatch did not become idle");
+    });
+
+    let resolved = resolved
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(
+        resolved,
+        vec![1, BURST],
+        "a burst of {BURST} updates must cross the bridge twice — the first and the latest — and \
+         the {} superseded payloads in between must never be serialized",
+        BURST - 2
+    );
+    assert_coalescer_idle(&coalescer);
+}
+
+/// COST (bd-82331): routing costs nothing per token when nobody subscribes.
+///
+/// bd-82331 made every surface build a coalescer and hand it every agent event,
+/// including one `message_update` per streamed token. That is only acceptable
+/// if an event nothing subscribes to is genuinely free, so this measures it
+/// rather than asserting it in a comment.
+///
+/// ## Why an absolute ceiling rather than a ratio
+///
+/// Two ratio versions were measured and both were the wrong instrument. The
+/// first compared whole loops and asserted 4x; the real numbers were 521 and
+/// 1398 ns/event, because both loops build a `CoalescedPayload` — an `Arc`
+/// clone and a boxed closure — and that shared cost compressed the ratio.
+/// Subtracting a payload-construction baseline fixed that and gave clean
+/// marginals of 446 ns unsubscribed against 900 ns subscribed: a ratio of 2.0,
+/// not the 3x that version asserted. The reason is structural, not a tuning
+/// problem — the subscribed path only BUFFERS and schedules a drain inside the
+/// measured loop; the expensive part, serialization, happens later on the
+/// spawned task. The two are inherently close, so no ratio between them is both
+/// meaningful and stable.
+///
+/// What is stable is the absolute marginal cost of the fast path, and what
+/// makes it a useful bound is the size of the gap to the failure being guarded
+/// against. The fast path is one lock-free snapshot read and one string-hash
+/// lookup: 446 ns/event on a loaded debug build worker. Serializing an event
+/// payload instead is tens of microseconds. A 5 µs ceiling therefore sits ~11x
+/// above a healthy debug run and roughly an order of magnitude below the
+/// cheapest version of the regression, which is as much daylight as this
+/// measurement can be given on either side.
+///
+/// The structural half of "costs nothing" — nothing serialized, buffered, or
+/// spawned — is asserted separately, by
+/// `event_coalescer_without_a_subscriber_resolves_nothing_and_never_spawns`.
+/// This test is only the timing half.
+#[test]
+fn event_coalescer_unsubscribed_dispatch_is_far_cheaper_than_subscribed() {
+    const EVENTS: usize = 20_000;
+    /// Measured at 446ns/event on a loaded debug build worker; see the doc
+    /// above for why the headroom is this wide in both directions.
+    const UNSUBSCRIBED_DISPATCH_CEILING_NS: u128 = 5_000;
+
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime build");
+    let handle = runtime.handle();
+
+    // Baseline: everything both loops below do EXCEPT the dispatch call.
+    let discarded = Arc::new(Mutex::new(Vec::new()));
+    let baseline_start = std::time::Instant::now();
+    for sequence in 1..=EVENTS {
+        drop(coalescer_recording_payload(sequence, &discarded));
+    }
+    let baseline_ns = baseline_start.elapsed().as_nanos();
+
+    // Subscribed: every event buffers a payload and schedules a drain.
+    let subscribed = EventCoalescer::new(coalescer_test_manager_with_hooks(&[
+        ExtensionEventName::MessageStart,
+    ]));
+    let resolved = Arc::new(Mutex::new(Vec::new()));
+    let subscribed_start = std::time::Instant::now();
+    for sequence in 1..=EVENTS {
+        subscribed.dispatch_fire_and_forget(
+            ExtensionEventName::MessageStart,
+            coalescer_recording_payload(sequence, &resolved),
+            &handle,
+        );
+    }
+    let subscribed_ns = subscribed_start.elapsed().as_nanos();
+
+    // Unsubscribed: an extension is loaded, hooked to something else.
+    let unsubscribed = EventCoalescer::new(coalescer_test_manager_with_hooks(&[
+        ExtensionEventName::SessionStart,
+    ]));
+    let untouched = Arc::new(Mutex::new(Vec::new()));
+    let unsubscribed_start = std::time::Instant::now();
+    for sequence in 1..=EVENTS {
+        unsubscribed.dispatch_fire_and_forget(
+            ExtensionEventName::MessageStart,
+            coalescer_recording_payload(sequence, &untouched),
+            &handle,
+        );
+    }
+    let unsubscribed_ns = unsubscribed_start.elapsed().as_nanos();
+
+    assert!(
+        untouched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "the unsubscribed path must not resolve a single payload"
+    );
+
+    // `saturating_sub` because a marginal can measure at or below the baseline
+    // on a noisy host, which is not a failure.
+    let events = EVENTS as u128;
+    let subscribed_marginal = subscribed_ns.saturating_sub(baseline_ns) / events;
+    let unsubscribed_marginal = unsubscribed_ns.saturating_sub(baseline_ns) / events;
+    eprintln!(
+        "coalescer dispatch cost over {EVENTS} events: payload baseline {}ns/event, \
+         unsubscribed {}ns/event total ({unsubscribed_marginal}ns/event marginal), \
+         subscribed {}ns/event total ({subscribed_marginal}ns/event marginal)",
+        baseline_ns / events,
+        unsubscribed_ns / events,
+        subscribed_ns / events,
+    );
+    assert!(
+        unsubscribed_marginal < UNSUBSCRIBED_DISPATCH_CEILING_NS,
+        "dispatching an event nothing subscribes to took {unsubscribed_marginal}ns, over the \
+         {UNSUBSCRIBED_DISPATCH_CEILING_NS}ns ceiling. Either the fast path started doing real \
+         work — serializing, allocating per event, or spawning — or this host is more than an \
+         order of magnitude slower than the one the ceiling was measured on. Check the \
+         subscribed figure ({subscribed_marginal}ns/event marginal): if the two are close, it is \
+         the first. bd-82331 hands every surface one of these per streamed token."
+    );
 }

@@ -124,8 +124,44 @@ impl ModelEntry {
                 | "gpt-5.3-codex"
                 | "gpt-5.3-codex-spark"
         ) || self.is_deepseek_reasoning_model()
+            || self.is_openrouter_reasoning_model()
             || self.is_anthropic_xhigh_effort_model()
             || self.thinking_level_map_declares("xhigh")
+    }
+
+    /// Whether this model's thinking level is forwarded as OpenRouter's
+    /// normalized `reasoning: {effort}` object (gh #220).
+    ///
+    /// The gateway accepts every pi level name as an `effort` value and
+    /// translates it for models that take a token budget, so `xhigh`/`max`
+    /// must not be clamped away before `OpenAIProvider::build_request` runs.
+    /// Mirrors `OpenAIProvider::reasoning_style` on the `openai-completions`
+    /// transport: the OpenRouter gateway (canonical provider id or an
+    /// `openrouter.ai` base URL) with either no declared
+    /// `compat.thinkingFormat` or an explicit `"openrouter"`, or any other
+    /// provider that explicitly declares `"openrouter"`.
+    fn is_openrouter_reasoning_model(&self) -> bool {
+        // Only the chat-completions transport implements the dialect.
+        if !self.model.reasoning || self.model.api != "openai-completions" {
+            return false;
+        }
+        let declared = self
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.thinking_format.as_deref())
+            .map(str::trim)
+            .filter(|format| !format.is_empty());
+        let transport_is_openrouter = canonical_provider_id(&self.model.provider)
+            .is_some_and(|canonical| canonical == "openrouter")
+            || self.model.provider.eq_ignore_ascii_case("openrouter")
+            || self
+                .model
+                .base_url
+                .to_ascii_lowercase()
+                .contains("openrouter.ai");
+        declared.map_or(transport_is_openrouter, |format| {
+            format.eq_ignore_ascii_case("openrouter")
+        })
     }
 
     /// Whether the catalog's per-model `thinkingLevelMap` declares a mapping
@@ -194,6 +230,7 @@ impl ModelEntry {
             self.model.id.as_str(),
             "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
         ) || self.is_deepseek_reasoning_model()
+            || self.is_openrouter_reasoning_model()
             || self.is_anthropic_max_effort_model()
             || self.thinking_level_map_declares("max")
     }
@@ -896,6 +933,31 @@ pub struct ProviderConfig {
     pub auth_header: Option<bool>,
     pub compat: Option<CompatConfig>,
     pub models: Option<Vec<ModelConfig>>,
+    /// Per-model patches keyed by model id (gh #220), upstream pi's
+    /// `modelOverrides`. Unlike `models`, they never replace the provider's
+    /// catalog: a known id is patched in place, an unknown id under a
+    /// bundled provider is added from the provider's ad-hoc defaults. This
+    /// is how a built-in gateway model gets `compat.openRouterRouting` (or a
+    /// larger `maxTokens`) without redefining the whole provider.
+    pub model_overrides: Option<HashMap<String, ModelOverrideConfig>>,
+}
+
+/// One `modelOverrides` entry: every [`ModelConfig`] field except `id`, all
+/// optional; only the fields present are applied.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverrideConfig {
+    pub name: Option<String>,
+    pub api: Option<String>,
+    pub reasoning: Option<bool>,
+    pub input: Option<Vec<String>>,
+    pub cost: Option<ModelCost>,
+    pub context_window: Option<u32>,
+    pub max_tokens: Option<u32>,
+    pub headers: Option<HashMap<String, String>>,
+    pub compat: Option<CompatConfig>,
+    pub dialect: Option<crate::dialects::Dialect>,
+    pub thinking_level_map: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1076,15 +1138,47 @@ fn api_fallback_base_url(api: &str) -> Option<&'static str> {
     }
 }
 
+/// Parse catalog / `models.json` `input` labels. Unknown labels are dropped
+/// with a warning instead of silently (gh #212) so a typo such as `"vidoe"`
+/// is visible in the log.
 fn parse_input_types(input: &[String]) -> Vec<InputType> {
-    input
-        .iter()
-        .filter_map(|value| match value.as_str() {
-            "text" => Some(InputType::Text),
-            "image" => Some(InputType::Image),
-            _ => None,
-        })
-        .collect()
+    let mut parsed = Vec::with_capacity(input.len());
+    for value in input {
+        if let Some(input_type) = InputType::parse(value) {
+            if !parsed.contains(&input_type) {
+                parsed.push(input_type);
+            }
+        } else {
+            tracing::warn!(
+                input = %value,
+                "Ignoring unknown model input type (known: text, image, video, audio)"
+            );
+        }
+    }
+    parsed
+}
+
+/// Gemini-family transports accept inline video and audio on every model
+/// that accepts images (gh #212; https://ai.google.dev/gemini-api/docs/video-understanding,
+/// https://ai.google.dev/gemini-api/docs/audio). The bundled catalog only
+/// spells `["text", "image"]`, so the capability is added here for the
+/// Gemini models routed through the three Gemini converters.
+fn augment_gemini_media_inputs(api: &str, model_id: &str, input: &mut Vec<InputType>) {
+    let gemini_transport = matches!(
+        api,
+        "google-generative-ai" | "google-gemini-cli" | "google-vertex"
+    );
+    if !gemini_transport
+        || !model_id.to_ascii_lowercase().contains("gemini")
+        || !input.contains(&InputType::Image)
+    {
+        return;
+    }
+    for media in [InputType::Video, InputType::Audio] {
+        if !input.contains(&media) {
+            input.push(media);
+        }
+    }
 }
 
 fn legacy_generated_models_cache_path() -> Option<PathBuf> {
@@ -2421,12 +2515,14 @@ fn built_in_models(
 
         let input = {
             let parsed = parse_input_types(&legacy.input);
-            if parsed.is_empty() {
+            let mut input = if parsed.is_empty() {
                 routing_defaults
                     .map_or_else(|| vec![InputType::Text], |defaults| defaults.input.to_vec())
             } else {
                 parsed
-            }
+            };
+            augment_gemini_media_inputs(api_string.as_str(), &legacy.id, &mut input);
+            input
         };
 
         let auth_header = match api_string.as_str() {
@@ -3251,6 +3347,15 @@ fn apply_custom_models_with_provider_headers(
         let is_override = !has_models;
 
         if is_override {
+            // gh #220: ids named only in `modelOverrides` join the catalog
+            // first so the provider-level overrides below apply to them too.
+            let synthesized = missing_model_override_entries(
+                models,
+                provider_id,
+                provider_cfg,
+                &provider_matches,
+            );
+            models.extend(synthesized);
             for entry in models
                 .iter_mut()
                 .filter(|m| provider_matches(&m.model.provider))
@@ -3276,6 +3381,13 @@ fn apply_custom_models_with_provider_headers(
                     entry.auth_header = auth_header;
                 }
             }
+            apply_model_override_patches(
+                models,
+                provider_id,
+                provider_cfg,
+                &provider_matches,
+                base_dir,
+            );
             continue;
         }
 
@@ -3390,6 +3502,171 @@ fn apply_custom_models_with_provider_headers(
                 oauth_config: None,
             });
         }
+        // gh #220: ids named only in `modelOverrides` are built from the
+        // provider's ad-hoc defaults and take the same provider-level
+        // transport/credential settings as the listed models.
+        for mut entry in
+            missing_model_override_entries(models, provider_id, provider_cfg, &provider_matches)
+        {
+            entry.model.base_url.clone_from(&provider_base);
+            entry.model.api.clone_from(&provider_api_string);
+            entry.headers.clone_from(&provider_headers);
+            entry.api_key.clone_from(&provider_key);
+            entry.auth_header = auth_header;
+            entry.compat.clone_from(&provider_cfg.compat);
+            models.push(entry);
+        }
+        apply_model_override_patches(
+            models,
+            provider_id,
+            provider_cfg,
+            &provider_matches,
+            base_dir,
+        );
+    }
+}
+
+/// `modelOverrides` ids in deterministic (sorted) order with their
+/// provider-normalized model id, skipping ids that normalize to nothing.
+fn sorted_model_overrides<'a>(
+    provider_id: &str,
+    provider_cfg: &'a ProviderConfig,
+) -> Vec<(String, &'a ModelOverrideConfig)> {
+    let Some(overrides) = provider_cfg.model_overrides.as_ref() else {
+        return Vec::new();
+    };
+    let mut ordered: Vec<(String, &ModelOverrideConfig)> = overrides
+        .iter()
+        .filter_map(|(raw_id, override_cfg)| {
+            let model_id = canonicalize_model_id_for_provider(provider_id, raw_id);
+            if model_id.is_empty() {
+                tracing::warn!(
+                    provider = %provider_id,
+                    model_id = %raw_id,
+                    "Skipping modelOverrides entry with empty normalized id"
+                );
+                return None;
+            }
+            Some((model_id, override_cfg))
+        })
+        .collect();
+    ordered.sort_by_cached_key(|(model_id, _)| model_id.to_ascii_lowercase());
+    ordered.dedup_by(|left, right| left.0.eq_ignore_ascii_case(&right.0));
+    ordered
+}
+
+/// Entries for `modelOverrides` ids that are not in `models` yet (gh #220),
+/// built the way `--model provider/id` would build them. Ids that are neither
+/// in the catalog nor resolvable ad hoc (a custom provider's unlisted model)
+/// are ignored with a warning rather than fabricated.
+fn missing_model_override_entries(
+    models: &[ModelEntry],
+    provider_id: &str,
+    provider_cfg: &ProviderConfig,
+    provider_matches: &dyn Fn(&str) -> bool,
+) -> Vec<ModelEntry> {
+    let mut synthesized = Vec::new();
+    for (model_id, _) in sorted_model_overrides(provider_id, provider_cfg) {
+        let present = models.iter().chain(synthesized.iter()).any(|entry| {
+            provider_matches(&entry.model.provider)
+                && entry.model.id.eq_ignore_ascii_case(&model_id)
+        });
+        if present {
+            continue;
+        }
+        if let Some(entry) = ad_hoc_model_entry_with_sap_resolver(provider_id, &model_id, || None) {
+            synthesized.push(entry);
+        } else {
+            tracing::warn!(
+                provider = %provider_id,
+                model_id = %model_id,
+                "modelOverrides names a model that is neither in the catalog nor resolvable ad hoc; ignoring"
+            );
+        }
+    }
+    synthesized
+}
+
+/// Patch every entry of this provider named in `modelOverrides` (gh #220).
+fn apply_model_override_patches(
+    models: &mut [ModelEntry],
+    provider_id: &str,
+    provider_cfg: &ProviderConfig,
+    provider_matches: &dyn Fn(&str) -> bool,
+    base_dir: Option<&Path>,
+) {
+    for (model_id, override_cfg) in sorted_model_overrides(provider_id, provider_cfg) {
+        for entry in models.iter_mut().filter(|entry| {
+            provider_matches(&entry.model.provider)
+                && entry.model.id.eq_ignore_ascii_case(&model_id)
+        }) {
+            apply_model_override(entry, override_cfg, base_dir);
+        }
+    }
+}
+
+/// Patch one catalog entry with the fields present in a `modelOverrides`
+/// entry. `compat` merges on top of the entry's existing compat (override
+/// wins per field); headers merge key-by-key.
+fn apply_model_override(
+    entry: &mut ModelEntry,
+    override_cfg: &ModelOverrideConfig,
+    base_dir: Option<&Path>,
+) {
+    if let Some(name) = &override_cfg.name {
+        entry.model.name.clone_from(name);
+    }
+    if let Some(api) = override_cfg.api.as_deref() {
+        entry.model.api = api
+            .parse::<Api>()
+            .unwrap_or_else(|_| Api::Custom(api.to_string()))
+            .to_string();
+    }
+    if let Some(reasoning) = override_cfg.reasoning {
+        entry.model.reasoning = reasoning;
+    }
+    if let Some(input) = &override_cfg.input {
+        let parsed: Vec<InputType> = input
+            .iter()
+            .filter_map(|value| match value.as_str() {
+                "text" => Some(InputType::Text),
+                "image" => Some(InputType::Image),
+                _ => None,
+            })
+            .collect();
+        if !parsed.is_empty() {
+            entry.model.input = parsed;
+        }
+    }
+    if let Some(cost) = &override_cfg.cost {
+        entry.model.cost = cost.clone();
+    }
+    if let Some(context_window) = override_cfg.context_window {
+        entry.model.context_window = context_window;
+    }
+    if let Some(max_tokens) = override_cfg.max_tokens {
+        entry.model.max_tokens = max_tokens;
+    }
+    if override_cfg.headers.is_some() {
+        entry.headers = merge_headers(
+            &entry.headers,
+            resolve_headers_with_base(override_cfg.headers.as_ref(), base_dir),
+        );
+    }
+    if override_cfg.compat.is_some() {
+        entry.compat = merge_compat(entry.compat.as_ref(), override_cfg.compat.as_ref());
+    }
+    if let Some(map) = override_cfg.thinking_level_map.clone() {
+        entry
+            .compat
+            .get_or_insert_with(CompatConfig::default)
+            .thinking_level_map = Some(map);
+    }
+    if let Some(dialect) = override_cfg.dialect {
+        entry
+            .compat
+            .get_or_insert_with(CompatConfig::default)
+            .tool_call_dialect = Some(dialect);
     }
 }
 
@@ -4047,13 +4324,14 @@ fn ensure_model_catalog_persistence_access_for_platform(
     path: &Path,
     target_metadata: Option<&fs::Metadata>,
 ) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
     if target_metadata.is_none() {
         return Ok(());
     }
 
-    use std::os::windows::fs::OpenOptionsExt as _;
-
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -4964,6 +5242,89 @@ mod tests {
         );
     }
 
+    /// gh #212: `input` labels parse case-insensitively, dedupe, and drop
+    /// unknown labels instead of panicking; Gemini-family entries pick up
+    /// video/audio while everything else keeps the catalog's spelling.
+    #[test]
+    fn parse_input_types_accepts_video_and_audio() {
+        let parsed = parse_input_types(&[
+            "text".to_string(),
+            "Image".to_string(),
+            "video".to_string(),
+            "audio".to_string(),
+            "video".to_string(),
+            "hologram".to_string(),
+        ]);
+        assert_eq!(
+            parsed,
+            vec![
+                InputType::Text,
+                InputType::Image,
+                InputType::Video,
+                InputType::Audio
+            ]
+        );
+        assert_eq!(parse_input_types(&["hologram".to_string()]), Vec::new());
+    }
+
+    #[test]
+    fn gemini_transports_gain_video_and_audio_inputs() {
+        let mut gemini = vec![InputType::Text, InputType::Image];
+        augment_gemini_media_inputs("google-generative-ai", "gemini-2.5-pro", &mut gemini);
+        assert_eq!(
+            gemini,
+            vec![
+                InputType::Text,
+                InputType::Image,
+                InputType::Video,
+                InputType::Audio
+            ]
+        );
+        // Idempotent.
+        augment_gemini_media_inputs("google-vertex", "gemini-2.5-pro", &mut gemini);
+        assert_eq!(gemini.len(), 4);
+
+        // Text-only, non-Gemini ids, and non-Gemini transports are untouched.
+        let mut text_only = vec![InputType::Text];
+        augment_gemini_media_inputs("google-gemini-cli", "gemini-2.5-pro", &mut text_only);
+        assert_eq!(text_only, vec![InputType::Text]);
+        let mut claude_on_vertex = vec![InputType::Text, InputType::Image];
+        augment_gemini_media_inputs("google-vertex", "claude-sonnet-4-6", &mut claude_on_vertex);
+        assert_eq!(claude_on_vertex, vec![InputType::Text, InputType::Image]);
+        let mut copilot = vec![InputType::Text, InputType::Image];
+        augment_gemini_media_inputs("openai-completions", "gemini-2.5-pro", &mut copilot);
+        assert_eq!(copilot, vec![InputType::Text, InputType::Image]);
+    }
+
+    #[test]
+    fn built_in_gemini_models_declare_video_and_audio() {
+        let (_dir, auth) = test_auth_storage();
+        let models = built_in_models(&auth, ModelRegistryLoadMode::Full);
+        for (provider, id) in [
+            ("google", "gemini-2.5-pro"),
+            ("google-gemini-cli", "gemini-2.5-pro"),
+            ("google-vertex", "gemini-2.5-flash"),
+        ] {
+            let entry = models
+                .iter()
+                .find(|m| m.model.provider == provider && m.model.id == id)
+                .unwrap_or_else(|| panic!("{provider}/{id} missing from bundled catalog"));
+            assert!(
+                entry.model.input.contains(&InputType::Video)
+                    && entry.model.input.contains(&InputType::Audio),
+                "{provider}/{id} input = {:?}",
+                entry.model.input
+            );
+        }
+        // The same Gemini id served over OpenAI-compatible gateways stays
+        // image-only: those transports have no media part.
+        let copilot = models
+            .iter()
+            .find(|m| m.model.provider == "github-copilot" && m.model.id == "gemini-2.5-pro")
+            .expect("github-copilot/gemini-2.5-pro present");
+        assert!(!copilot.model.input.contains(&InputType::Video));
+    }
+
     #[test]
     fn built_in_models_include_core_provider_entries() {
         let (_dir, auth) = test_auth_storage();
@@ -5256,6 +5617,7 @@ mod tests {
                         ..CompatConfig::default()
                     }),
                     models: None,
+                    model_overrides: None,
                 },
             )]),
         };
@@ -5498,6 +5860,153 @@ mod tests {
             normalize_openai_base(&default_entry.model.base_url),
             "https://api.openai.com/v1/chat/completions"
         );
+    }
+
+    /// gh #220: `modelOverrides` on a bundled provider patches a catalog
+    /// model in place and adds an unknown gateway id from the provider's
+    /// ad-hoc defaults, leaving every other bundled model untouched.
+    #[test]
+    fn model_overrides_patch_built_in_and_add_unknown_gateway_model() {
+        let (_dir, auth) = test_auth_storage();
+        let mut models = built_in_models(&auth, ModelRegistryLoadMode::Full);
+        let openrouter_before = models
+            .iter()
+            .filter(|m| m.model.provider == "openrouter")
+            .count();
+        assert!(
+            openrouter_before > 1,
+            "fixture needs bundled openrouter models"
+        );
+        let routing = serde_json::json!({
+            "provider": { "only": ["deepseek"], "allow_fallbacks": false }
+        });
+        let config: ModelsConfig = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "openrouter": {
+                    "modelOverrides": {
+                        "anthropic/claude-sonnet-4": {
+                            "maxTokens": 65536,
+                            "compat": { "openRouterRouting": { "route": "fallback" } }
+                        },
+                        "deepseek/deepseek-v4-pro": {
+                            "maxTokens": 32000,
+                            "compat": { "openRouterRouting": routing }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("modelOverrides deserializes with upstream spelling");
+
+        apply_custom_models(&auth, &mut models, &config, None);
+
+        let patched = models
+            .iter()
+            .find(|m| m.model.provider == "openrouter" && m.model.id == "anthropic/claude-sonnet-4")
+            .expect("patched bundled model is still present");
+        assert_eq!(patched.model.max_tokens, 65536);
+        assert_eq!(
+            patched
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.open_router_routing.as_ref())
+                .and_then(|routing| routing.get("route"))
+                .and_then(serde_json::Value::as_str),
+            Some("fallback")
+        );
+
+        let added = models
+            .iter()
+            .find(|m| m.model.provider == "openrouter" && m.model.id == "deepseek/deepseek-v4-pro")
+            .expect("unknown gateway id is synthesized from openrouter defaults");
+        assert_eq!(added.model.api, "openai-completions");
+        assert_eq!(added.model.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(added.model.max_tokens, 32000);
+        assert_eq!(
+            added
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.open_router_routing.clone()),
+            Some(routing)
+        );
+        assert_eq!(
+            models
+                .iter()
+                .filter(|m| m.model.provider == "openrouter")
+                .count(),
+            openrouter_before + 1,
+            "overrides must not drop or duplicate bundled models"
+        );
+    }
+
+    /// gh #220: overrides compose with a custom `models` list (patch wins per
+    /// field, provider compat is kept) and an id that is neither listed nor
+    /// resolvable ad hoc is ignored rather than fabricated.
+    #[test]
+    fn model_overrides_apply_to_custom_model_list_and_ignore_unresolvable_ids() {
+        let (_dir, auth) = test_auth_storage();
+        let mut models = Vec::new();
+        let config = ModelsConfig {
+            providers: HashMap::from([(
+                "custom-openai".to_string(),
+                ProviderConfig {
+                    api: Some("openai-completions".to_string()),
+                    base_url: Some("https://compat.example/v1".to_string()),
+                    compat: Some(CompatConfig {
+                        supports_tools: Some(false),
+                        ..CompatConfig::default()
+                    }),
+                    models: Some(vec![ModelConfig {
+                        id: "custom-model".to_string(),
+                        max_tokens: Some(4096),
+                        ..ModelConfig::default()
+                    }]),
+                    model_overrides: Some(HashMap::from([
+                        (
+                            "custom-model".to_string(),
+                            ModelOverrideConfig {
+                                max_tokens: Some(8192),
+                                headers: Some(HashMap::from([(
+                                    "x-override".to_string(),
+                                    "yes".to_string(),
+                                )])),
+                                compat: Some(CompatConfig {
+                                    system_role_name: Some("developer".to_string()),
+                                    ..CompatConfig::default()
+                                }),
+                                ..ModelOverrideConfig::default()
+                            },
+                        ),
+                        (
+                            "never-listed".to_string(),
+                            ModelOverrideConfig {
+                                max_tokens: Some(1),
+                                ..ModelOverrideConfig::default()
+                            },
+                        ),
+                    ])),
+                    ..ProviderConfig::default()
+                },
+            )]),
+        };
+
+        apply_custom_models(&auth, &mut models, &config, None);
+
+        assert_eq!(
+            models.len(),
+            1,
+            "unresolvable override ids are not fabricated"
+        );
+        let entry = &models[0];
+        assert_eq!(entry.model.id, "custom-model");
+        assert_eq!(entry.model.max_tokens, 8192);
+        assert_eq!(
+            entry.headers.get("x-override").map(String::as_str),
+            Some("yes")
+        );
+        let compat = entry.compat.as_ref().expect("merged compat");
+        assert_eq!(compat.supports_tools, Some(false), "provider compat kept");
+        assert_eq!(compat.system_role_name.as_deref(), Some("developer"));
     }
 
     #[test]
@@ -8087,6 +8596,101 @@ mod tests {
     /// gh #165: a catalog `thinkingLevelMap` declaring `xhigh`/`max` marks the
     /// tier as supported, so custom models outside the hard-coded id lists are
     /// not silently clamped down.
+    /// gh #220: OpenRouter forwards every pi level as `reasoning.effort`, so
+    /// the registry must not clamp `xhigh`/`max` for reasoning models on that
+    /// transport — by provider id, alias, base URL, or an explicit
+    /// `thinkingFormat: "openrouter"` on a custom proxy. A declared non-OpenRouter
+    /// format opts out, and non-reasoning models stay `Off`.
+    #[test]
+    fn openrouter_reasoning_models_keep_xhigh_and_max() {
+        use crate::model::ThinkingLevel;
+        let make = |id: &str, reasoning: bool, provider: &str, base_url: &str| {
+            let mut entry = make_model_entry_with_provider(id, reasoning, provider, base_url);
+            entry.model.api = "openai-completions".to_string();
+            entry
+        };
+        let mut other_api = make_model_entry_with_provider(
+            "deepseek/deepseek-v4-pro",
+            true,
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+        );
+        other_api.model.api = "openai-responses".to_string();
+        assert!(
+            !other_api.supports_xhigh(),
+            "only the chat-completions transport implements the dialect"
+        );
+
+        let by_provider = make(
+            "deepseek/deepseek-v4-pro",
+            true,
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+        );
+        assert!(by_provider.supports_xhigh());
+        assert!(by_provider.supports_max());
+        assert_eq!(
+            by_provider.clamp_thinking_level(ThinkingLevel::Max),
+            ThinkingLevel::Max
+        );
+        assert_eq!(
+            by_provider.available_thinking_levels().last(),
+            Some(&ThinkingLevel::Max)
+        );
+
+        let by_url = make(
+            "x/y",
+            true,
+            "custom-or",
+            "https://openrouter.ai/api/v1/chat/completions",
+        );
+        assert!(by_url.supports_xhigh() && by_url.supports_max());
+
+        let mut proxy = make(
+            "some/model",
+            true,
+            "my-gateway",
+            "https://gateway.example.com/v1",
+        );
+        assert!(
+            !proxy.supports_xhigh(),
+            "plain custom provider still clamps"
+        );
+        proxy.compat = Some(CompatConfig {
+            thinking_format: Some("openrouter".to_string()),
+            ..Default::default()
+        });
+        assert!(proxy.supports_xhigh() && proxy.supports_max());
+
+        let mut opted_out = make(
+            "deepseek/deepseek-v4-pro",
+            true,
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+        );
+        opted_out.compat = Some(CompatConfig {
+            thinking_format: Some("openai".to_string()),
+            ..Default::default()
+        });
+        assert!(!opted_out.supports_xhigh());
+        assert_eq!(
+            opted_out.clamp_thinking_level(ThinkingLevel::Max),
+            ThinkingLevel::High
+        );
+
+        let non_reasoning = make(
+            "openai/gpt-4o",
+            false,
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+        );
+        assert!(!non_reasoning.supports_xhigh());
+        assert_eq!(
+            non_reasoning.clamp_thinking_level(ThinkingLevel::High),
+            ThinkingLevel::Off
+        );
+    }
+
     #[test]
     fn thinking_level_map_prevents_xhigh_and_max_clamping() {
         use crate::model::ThinkingLevel;

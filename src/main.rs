@@ -6,6 +6,10 @@
 //! - Distribution through one supported end-user binary in official release archives
 
 #![forbid(unsafe_code)]
+// The binary is its own crate, so src/lib.rs's `recursion_limit` does not
+// reach it; asupersync 0.5.0 nests its runtime future types deeply enough that
+// proving `Send` for `run()` exceeds the default 128.
+#![recursion_limit = "256"]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -41,6 +45,7 @@ use pi::extensions::{
     resolve_extension_load_spec,
 };
 use pi::extensions_js::PiJsRuntimeConfig;
+use pi::file_identity::FileIdentity;
 use pi::model::{AssistantMessage, ContentBlock, StopReason, ThinkingLevel};
 use pi::models::{
     ExtensionProviderBinding, ModelEntry, ModelRegistry, default_models_path,
@@ -82,6 +87,67 @@ use tracing_subscriber::EnvFilter;
 
 const EXIT_CODE_FAILURE: i32 = 1;
 const EXIT_CODE_USAGE: i32 = 2;
+
+/// A print-mode run whose stdout reader closed the pipe first, e.g.
+/// `pi --print --mode json ... | head -5`.
+///
+/// Zero, because this is not a failure: `head` asked for five lines, got five
+/// lines, and left. The exit status a shell reports for that pipeline is the
+/// reader's anyway. What matters is that the run STOPS here rather than
+/// panicking on every subsequent write (bd-print-json-panics-on-closed-stdout).
+const EXIT_CODE_STDOUT_CLOSED: i32 = 0;
+/// A non-interactive run in which every gated tool call was denied for lack of
+/// an approval surface (gh #224). Distinct from a provider or usage failure so
+/// a script can tell "the model could not use tools" from "the request broke".
+const EXIT_CODE_APPROVAL_UNAVAILABLE: i32 = 3;
+
+/// Raised at the end of a print-mode run that needed approval it could never
+/// obtain (gh #224).
+///
+/// The approval default is `always-ask` on every surface, deliberately: the
+/// absence of a TTY is not consent. But a `-p` run has no way to prompt, so
+/// each gated call is denied, the model gives up, and the process used to exit
+/// zero with a normal stop reason — a silent, total loss of tool use for any
+/// script that did not pass `--approval-mode yolo`. Failing here turns that
+/// into a signal a caller can actually see.
+#[derive(Debug)]
+struct ApprovalSurfaceUnavailable;
+
+impl std::fmt::Display for ApprovalSurfaceUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "tool calls were denied because this session has no approval surface. \
+             Print mode cannot prompt, and the approval mode is `always-ask`. \
+             Re-run with --approval-mode yolo to auto-approve tool calls, \
+             set approval.mode in settings.json, or use an interactive session.",
+        )
+    }
+}
+
+impl std::error::Error for ApprovalSurfaceUnavailable {}
+
+/// Startup failure due to configured skills/prompts/themes/extensions being
+/// unreadable, invalid, or referencing unreachable packages (gh #223).
+/// Distinct from general runtime failure so callers can identify configuration
+/// and resource loading issues without parsing stderr.
+const EXIT_CODE_RESOURCE_LOAD_FAILED: i32 = 4;
+
+/// Raised when configured skills, prompts, themes, or extensions fail to load (gh #223).
+#[derive(Debug)]
+struct ConfiguredResourceLoadFailed(String);
+
+impl std::fmt::Display for ConfiguredResourceLoadFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to load configured skills/prompts/themes/extensions: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ConfiguredResourceLoadFailed {}
+
 const USAGE_ERROR_PATTERNS: &[&str] = &[
     "@file arguments are not supported in rpc mode",
     "--api-key requires a model to be specified via --provider/--model or --models",
@@ -171,10 +237,144 @@ fn main() {
     }
 
     if let Err(err) = result {
-        let exit_code = exit_code_for_error(&err);
-        print_error_with_hints(&err);
-        std::process::exit(exit_code);
+        report_fatal_error_and_exit(&err);
     }
+}
+
+/// Which machine-readable output mode this process was started in, recorded
+/// as soon as the CLI is parsed (gh #217). `None` for text/interactive runs.
+static MACHINE_OUTPUT_MODE: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+
+/// Whether the JSON session header (print mode) or the RPC loop has already
+/// written to stdout. Decides the `phase` of a fatal-error record.
+static MACHINE_STREAM_OPENED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn note_machine_output_mode(mode: Option<&str>) {
+    let mode = match mode {
+        Some("json") => Some("json"),
+        Some("rpc") => Some("rpc"),
+        _ => None,
+    };
+    let _ = MACHINE_OUTPUT_MODE.set(mode);
+}
+
+fn note_machine_stream_opened() {
+    MACHINE_STREAM_OPENED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Best-effort `--mode` recovery for failures that happen before clap has
+/// produced a `Cli` (argument errors): only `--mode json`, `--mode=json`,
+/// `--mode rpc`, `--mode=rpc`, and `--rpc` count. Anything after `--` is
+/// positional and ignored.
+fn machine_output_mode_from_args(args: &[String]) -> Option<&'static str> {
+    let mut mode = None;
+    let mut iter = args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            break;
+        }
+        let value = if arg == "--mode" {
+            iter.next().map(String::as_str)
+        } else if let Some(value) = arg.strip_prefix("--mode=") {
+            Some(value)
+        } else if arg == "--rpc" {
+            Some("rpc")
+        } else {
+            None
+        };
+        match value {
+            Some("json") => mode = Some("json"),
+            Some("rpc") => mode = Some("rpc"),
+            Some(_) => mode = None,
+            None => {}
+        }
+    }
+    mode
+}
+
+/// Stable `code` for a fatal error: the `pi::error::Error` (or startup
+/// error) in the chain classifies it; a clap error is `usage`; anything else
+/// is `internal`.
+fn fatal_error_code(err: &anyhow::Error) -> &'static str {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<ConfiguredResourceLoadFailed>()
+            .is_some()
+    }) {
+        return "resource.load_failed";
+    }
+    if let Some(pi_error) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<pi::error::Error>())
+    {
+        return pi::error_hints::error_code(pi_error);
+    }
+    if let Some(startup) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<StartupError>())
+    {
+        return match startup {
+            StartupError::MissingApiKey { .. } => "auth.missing_api_key",
+            StartupError::NoModelsAvailable { .. } => "auth.no_models_available",
+        };
+    }
+    if err
+        .chain()
+        .any(|cause| cause.downcast_ref::<ApprovalSurfaceUnavailable>().is_some())
+    {
+        return "approval.surface_unavailable";
+    }
+    if err
+        .chain()
+        .any(|cause| cause.downcast_ref::<clap::Error>().is_some())
+    {
+        return "usage";
+    }
+    if is_usage_error(err) {
+        return "usage";
+    }
+    "internal"
+}
+
+/// The one stdout line a `--mode json` / `--mode rpc` host gets before a
+/// non-zero exit (gh #217), or `None` in text/interactive modes.
+fn fatal_error_record_line(err: &anyhow::Error, exit_code: i32) -> Option<String> {
+    let mode = MACHINE_OUTPUT_MODE
+        .get()
+        .copied()
+        .unwrap_or_else(|| machine_output_mode_from_args(&std::env::args().collect::<Vec<_>>()));
+    mode?;
+    let phase = if MACHINE_STREAM_OPENED.load(std::sync::atomic::Ordering::SeqCst) {
+        pi::error_hints::FATAL_ERROR_PHASE_RUN
+    } else {
+        pi::error_hints::FATAL_ERROR_PHASE_STARTUP
+    };
+    // `{err:#}` joins the context chain ("Failed to load configuration:
+    // Configuration error: …"), which is what the stderr diagnosis shows too.
+    Some(
+        pi::error_hints::fatal_error_record(
+            fatal_error_code(err),
+            phase,
+            &format!("{err:#}"),
+            exit_code,
+        )
+        .to_string(),
+    )
+}
+
+/// Terminal error path shared by every exit: the machine-readable record on
+/// stdout when a JSON/RPC host is listening, the human diagnosis with hints on
+/// stderr, then the classified exit code.
+fn report_fatal_error_and_exit(err: &anyhow::Error) -> ! {
+    let exit_code = exit_code_for_error(err);
+    if let Some(line) = fatal_error_record_line(err, exit_code) {
+        let mut stdout = io::stdout().lock();
+        let _ = writeln!(stdout, "{line}");
+        let _ = stdout.flush();
+    }
+    print_error_with_hints(err);
+    std::process::exit(exit_code);
 }
 
 fn parse_cli_args(raw_args: Vec<String>) -> Result<Option<(cli::Cli, Vec<cli::ExtensionCliFlag>)>> {
@@ -474,15 +674,41 @@ fn build_extension_bootstrap_selection(
     })
 }
 
+/// Print mode's entry to the shared reader. RPC had a byte-alike copy of this
+/// that logged nothing; both now call the one definition (bd-u2qv4).
 fn context_window_tokens_for_entry(entry: &ModelEntry) -> u32 {
-    if entry.model.context_window.eq(&0) {
-        tracing::warn!(
-            "Model {} reported context_window=0; falling back to default compaction window",
-            entry.model.id
-        );
-        ResolvedCompactionSettings::default().context_window_tokens
-    } else {
-        entry.model.context_window
+    pi::agent::context_window_tokens_for_entry(entry)
+}
+
+/// The tracing filter to install when the user has not asked for one.
+///
+/// `EnvFilter::from_default_env()` with `RUST_LOG` unset enables nothing above
+/// `ERROR`, which meant every diagnostic telling a user their own config was
+/// wrong — an unrecognised settings key, an unparseable queue mode, a
+/// `session_store` nobody recognises, a `keybindings.json` naming an action
+/// that does not exist — was emitted and then dropped on the floor. Nobody
+/// sets `RUST_LOG` to discover that their settings file has a typo in it, so
+/// the default turns on [`pi::config::USER_DIAGNOSTIC_TARGET`], which those
+/// messages share, and leaves every module exactly as quiet as it was.
+///
+/// Setting `RUST_LOG` still replaces this wholesale, including to silence it.
+fn default_log_filter() -> EnvFilter {
+    default_log_filter_for(std::env::var("RUST_LOG").ok().as_deref())
+}
+
+/// [`default_log_filter`] with `RUST_LOG` supplied, so it can be tested without
+/// mutating the environment of a parallel test binary. `None` means unset;
+/// `Some("")` is `RUST_LOG=`, which has always meant "no directives".
+fn default_log_filter_for(rust_log: Option<&str>) -> EnvFilter {
+    let filter = EnvFilter::new(rust_log.unwrap_or_default());
+    if rust_log.is_some() {
+        return filter;
+    }
+    match format!("{}=warn", pi::config::USER_DIAGNOSTIC_TARGET).parse() {
+        Ok(directive) => filter.add_directive(directive),
+        // A module path and a level always parse. If that ever stops being
+        // true, losing the settings warnings beats refusing to start.
+        Err(_) => filter,
     }
 }
 
@@ -529,6 +755,7 @@ fn main_impl() -> Result<()> {
     if cli.rpc && cli.mode.is_none() {
         cli.mode = Some("rpc".to_string());
     }
+    note_machine_output_mode(cli.mode.as_deref());
 
     let package_subcommand_trust = cli
         .command
@@ -817,7 +1044,7 @@ fn main_impl() -> Result<()> {
     // terminal, so tracing output (e.g. RUST_LOG=info) can never be painted
     // into the alt-screen transcript (bd-trkef).
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(default_log_filter())
         .with_target(false)
         .with_writer(|| pi::tui::TuiAwareLogWriter)
         .init();
@@ -840,11 +1067,7 @@ fn main_impl() -> Result<()> {
     pi::hub::kill_session_services();
     match result {
         Ok(()) => std::process::exit(0),
-        Err(err) => {
-            let exit_code = exit_code_for_error(&err);
-            print_error_with_hints(&err);
-            std::process::exit(exit_code);
-        }
+        Err(err) => report_fatal_error_and_exit(&err),
     }
 }
 
@@ -869,6 +1092,19 @@ fn format_error_with_hints(err: &anyhow::Error) -> String {
 }
 
 fn exit_code_for_error(err: &anyhow::Error) -> i32 {
+    if err
+        .chain()
+        .any(|cause| cause.downcast_ref::<ApprovalSurfaceUnavailable>().is_some())
+    {
+        return EXIT_CODE_APPROVAL_UNAVAILABLE;
+    }
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<ConfiguredResourceLoadFailed>()
+            .is_some()
+    }) {
+        return EXIT_CODE_RESOURCE_LOAD_FAILED;
+    }
     if is_usage_error(err) {
         EXIT_CODE_USAGE
     } else {
@@ -1151,6 +1387,47 @@ fn print_resolved_repair_policy(resolved: &pi::config::ResolvedRepairPolicy) -> 
     Ok(())
 }
 
+/// The advisor (bd-cv653.3.3), for either interactive stack: only when the
+/// advisor role resolves a model AND its credentials exist. Otherwise `None`,
+/// and the turn hook never runs (zero-overhead rule).
+fn advisor_options(
+    cli: &cli::Cli,
+    config: &Config,
+    model_registry: &ModelRegistry,
+    auth: &AuthStorage,
+) -> Option<pi::advisor::AdvisorOptions> {
+    if !config.advisor_enabled() {
+        return None;
+    }
+    let entry =
+        pi::app::resolve_role_model(pi::models::ModelRole::Advisor, cli, config, model_registry)?
+            .model_entry;
+    let key = pi::models::resolve_model_key(cli.api_key.as_deref(), auth, &entry);
+    if pi::models::model_requires_configured_credential(&entry) && key.is_none() {
+        tracing::info!(
+            event = "pi.advisor.no_credentials",
+            "advisor role configured but credentials missing; advisor disabled"
+        );
+        return None;
+    }
+    match pi::providers::create_provider(&entry, None) {
+        Ok(provider) => Some(pi::advisor::AdvisorOptions {
+            provider,
+            label: format!("{}/{}", entry.model.provider, entry.model.id),
+            timeout: Duration::from_secs(config.advisor_timeout_secs()),
+            api_key: key,
+        }),
+        Err(err) => {
+            tracing::warn!(
+                event = "pi.advisor.provider_failed",
+                error = %err,
+                "advisor provider construction failed; advisor disabled"
+            );
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run(
     mut cli: cli::Cli,
@@ -1330,11 +1607,13 @@ async fn run(
     let mut resources = match resources_result {
         Ok(resources) => resources,
         Err(err) => {
+            eprintln!("Warning: Failed to load skills/prompts/themes/extensions: {err}");
             if resource_cli.has_explicit_paths() {
                 return Err(anyhow::Error::new(err));
             }
-            eprintln!("Warning: Failed to load skills/prompts/themes/extensions: {err}");
-            ResourceLoader::empty(config.enable_skill_commands())
+            return Err(anyhow::Error::new(ConfiguredResourceLoadFailed(
+                err.to_string(),
+            )));
         }
     };
     let _ = write_resource_diagnostics_since(
@@ -1403,8 +1682,13 @@ async fn run(
     // this function (provider/model flags, resources, workspace trust, approval
     // state, enabled tools) is threaded through `SessionOptions`, and the SDK
     // session cannot reach extension-provided providers or models anyway.
+    // `cli.ftui` is redundant with `!cli.classic` while the two are declared
+    // `conflicts_with` each other, and it is named here on purpose: it was the
+    // one Cli field nothing in the crate read, so `--ftui` was a documented
+    // flag that did nothing and three e2e suites passed it believing it chose
+    // the stack. Reading it keeps that honest if the conflict is ever relaxed.
     #[cfg(feature = "ftui")]
-    let ftui_requested = is_interactive && !cli.classic;
+    let ftui_requested = is_interactive && (cli.ftui || !cli.classic);
     #[cfg(not(feature = "ftui"))]
     let ftui_requested = false;
 
@@ -1419,6 +1703,32 @@ async fn run(
     // undo/workspace policy and see tools mounted after boot (extension
     // wrappers, MCP tools, plan tools).
     let shared_enabled_tools = cli.enabled_tools();
+    // A name the registry does not know is dropped without a word, so
+    // `--tools read,bsah,edit` hands the model two tools and reports three.
+    let unknown_tools = pi::tools::unknown_tool_names(&shared_enabled_tools);
+    if !unknown_tools.is_empty() {
+        for name in &unknown_tools {
+            eprintln!("Warning: --tools: \"{name}\" is not a tool pi provides; it is ignored");
+        }
+        // The constants group registry-built names ahead of host-coupled ones,
+        // which is the right order to read the code in and the wrong one to
+        // scan for a name.
+        let mut provided = ToolRegistry::KNOWN_TOOL_NAMES.to_vec();
+        provided.extend(
+            ToolRegistry::TOOLS_NOT_SELECTED_BY_FLAG
+                .iter()
+                .map(|(name, _)| *name),
+        );
+        provided.sort_unstable();
+        eprintln!("Warning: --tools: pi provides {}", provided.join(", "));
+    }
+    // A real tool the flag has no say over. Saying nothing invites the user to
+    // conclude the tool is missing; saying "not a tool pi provides" — which is
+    // what this printed before — tells them something false about a tool they
+    // can actually have.
+    for (name, how) in pi::tools::unselectable_tool_names(&shared_enabled_tools) {
+        eprintln!("Warning: --tools: \"{name}\" is not selected with --tools; {how}");
+    }
     let shared_tools = pi::tools::SharedToolRegistry::new(ToolRegistry::with_mutation_recorder(
         &shared_enabled_tools,
         &cwd,
@@ -1512,8 +1822,38 @@ async fn run(
             ))
         };
 
-    let mut auth = auth_result?;
-    auth.refresh_expired_oauth_tokens().await?;
+    // gh #217: an explicit `--api-key` makes the stored credentials optional,
+    // so an unreadable auth store degrades to "no stored credentials" instead
+    // of aborting a run that never needed them.
+    let mut auth = match auth_result {
+        Ok(auth) => auth,
+        Err(err) if has_cli_api_key_override(cli.api_key.as_deref()) => {
+            eprintln!(
+                "Warning: stored credentials are unavailable ({err}); continuing with the explicit --api-key only"
+            );
+            AuthStorage::empty_at(Config::auth_path())
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    // gh #218: refresh stored OAuth credentials without letting an unrelated
+    // provider's stale login abort the run. An explicit `--api-key` for an
+    // explicit provider/model needs nothing from the store, so the pass is
+    // skipped entirely; otherwise every expiring credential is refreshed
+    // independently and only a failure for the *selected* provider becomes
+    // an error (checked once the model is known, below).
+    let startup_oauth_refresh = if startup_oauth_refresh_required(&cli) {
+        let report = auth.refresh_expired_oauth_tokens_report().await;
+        if !report.failed.is_empty() {
+            eprintln!(
+                "Warning: OAuth token refresh failed for: {} (stale credentials for providers this run does not use are ignored; run `pi auth login <provider>` to renew them)",
+                report.failed_provider_ids().join(", ")
+            );
+        }
+        report
+    } else {
+        pi::auth::OAuthRefreshReport::default()
+    };
 
     // Prune stale credentials that are well past expiry and lack refresh metadata.
     // 7-day cutoff (in milliseconds).
@@ -1523,7 +1863,11 @@ async fn run(
             pruned_providers = ?pruned,
             "Pruned stale credentials during startup"
         );
-        auth.save()?;
+        // A read-only store (gh #217) cannot persist the prune; the in-memory
+        // view is already clean, so this is not worth failing startup over.
+        if let Err(err) = auth.save() {
+            tracing::warn!(error = %err, "could not persist pruned credentials");
+        }
     }
 
     let global_dir = Config::global_dir();
@@ -1550,6 +1894,9 @@ async fn run(
             auth: auth.clone(),
             runtime_handle: runtime_handle.clone(),
             session_dir: cli.session_dir.as_ref().map(PathBuf::from),
+            // ACP sessions always carry the read tool, so skills are listed
+            // as on the terminal stacks.
+            skills_prompt: Some(resources.format_skills_for_prompt()),
         };
         return run_acp_mode(acp_options).await;
     }
@@ -1596,7 +1943,11 @@ async fn run(
         }
     });
     let is_print_mode = mode.eq("text") || mode.eq("json");
-    if is_print_mode {
+    // `pi::app::normalize_cli` has already applied this for `--print`; this
+    // covers `--mode text|json` without `-p`, and keeps the policy stated at
+    // the point of use. The two conditions must stay identical, which is why
+    // both call the same predicate (bd-print-session-path-persists-nothing).
+    if is_print_mode && !pi::app::requested_a_session(&cli) {
         cli.no_session = true;
     }
     if mode.eq("text") && initial.is_none() && messages.is_empty() {
@@ -1699,8 +2050,270 @@ async fn run(
             }
         }
     };
+    // gh #218: now that the model is known, a failed refresh matters only if
+    // this run would actually send that provider's stale OAuth token.
+    if !has_cli_api_key_override(cli.api_key.as_deref())
+        && let Some(failure) =
+            startup_oauth_refresh.failure_for(&selection.model_entry.model.provider)
+    {
+        return Err(anyhow::Error::new(pi::error::Error::auth(format!(
+            "OAuth token refresh failed for: {} ({}) — run `pi auth login {}` to renew it",
+            failure.provider, failure.error, failure.provider
+        ))));
+    }
 
     let enabled_tools = cli.enabled_tools();
+    // CLI flag wins; fall back to PI_MAX_TOOL_ITERATIONS env, then default.
+    // `clamp_max_tool_iterations` keeps invalid values out of the loop and
+    // emits a warning instead of failing the run.
+    let max_tool_iterations = if cli.max_tool_iterations.is_some() {
+        pi::agent::clamp_max_tool_iterations(cli.max_tool_iterations)
+    } else {
+        pi::agent::resolved_max_tool_iterations_default()
+    };
+    // Approval mode (bd-cv653.3.19): CLI flags override config.
+    let approval_mode = if cli.yolo {
+        pi::approval::ApprovalMode::Yolo
+    } else if let Some(ref m) = cli.approval_mode {
+        pi::approval::ApprovalMode::from_setting(Some(m))
+    } else {
+        config.approval_mode()
+    };
+    let dual_confirm_classes = config.approval_dual_confirm_classes();
+    let approval_state = pi::approval::ApprovalState::new(
+        approval_mode,
+        cli.plan_yolo || config.plan_auto_approve(),
+        dual_confirm_classes,
+    );
+
+    // The default FrankenTUI stack runs one SDK session that builds its own
+    // provider, tools, system prompt and extension runtime (bd-2crrf). Launch
+    // it here, before the classic stack constructs any of those, so a single
+    // launch never initializes a second agent session and then discards it.
+    // Everything above stays shared: the bootstrap Session restores the
+    // persisted workspace roots handed over below, and model selection is
+    // the setup/auth gate.
+    #[cfg(feature = "ftui")]
+    if ftui_requested {
+        // The SDK opens its own session; release this bootstrap one first so
+        // nothing holds its resources while the frontend runs. It was never
+        // written.
+        drop(session);
+        let ftui_enabled_tools = enabled_tools
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        // `--continue` (bd-ydz1t.3). The classic stack resolves it inside
+        // Session::from_cli, which this path does not use; SessionOptions
+        // has no "reopen the latest" concept, so the flag was silently
+        // dropped and the user got a fresh session instead of their last
+        // one. Resolve it to a concrete path here, through the same lookup
+        // the classic stack uses, and hand it over as `session_path`.
+        //
+        // `--session` still wins, and `--no-session` short-circuits below,
+        // which is Session::from_cli's own precedence. `None` means this
+        // directory has nothing continuable, and a new session is exactly
+        // what the classic stack produces there too.
+        let continue_session_path = if cli.r#continue && cli.session.is_none() {
+            pi::session::Session::recent_session_path_in_dir(
+                cli.session_dir.as_ref().map(Path::new),
+            )
+            .await?
+        } else {
+            None
+        };
+        let options = pi::sdk::SessionOptions {
+            provider: cli.provider.clone(),
+            model: cli.model.clone(),
+            api_key: cli.api_key.clone(),
+            working_directory: Some(cwd.clone()),
+            workspace_trusted,
+            // Session persistence honors the same flags as the default
+            // stack: saved by default, --no-session for ephemeral,
+            // --session/--session-dir for explicit paths. The SDK path
+            // creates its own session file; the bootstrap session was
+            // dropped above without writing anything.
+            no_session: cli.no_session,
+            session_path: cli
+                .session
+                .as_ref()
+                .map(PathBuf::from)
+                .or(continue_session_path),
+            session_dir: cli.session_dir.as_ref().map(PathBuf::from),
+            workspace: Some(workspace.clone()),
+            // Extensions load with UI prompts bridged (bd-1eoh4): the
+            // ResourceLoader's set, which already folds in explicit -e
+            // paths and honors trust/policy filtering. `--no-extensions`
+            // only turns off discovery there, so `-e` still loads (as on
+            // the classic stack); emptying the list here dropped `-e` too.
+            extension_paths: resources.extensions().to_vec(),
+            extension_policy: cli.extension_policy.clone(),
+            repair_policy: cli.repair_policy.clone(),
+            extension_flags: extension_flags.clone(),
+            // Prompt/tool/thinking flags flow through so deterministic
+            // harnesses (VCR body matching) and users get the same
+            // behavior as the default stack.
+            system_prompt: cli.system_prompt.clone(),
+            append_system_prompt: cli.append_system_prompt.clone(),
+            enabled_tools: Some(ftui_enabled_tools),
+            thinking: cli.thinking.as_deref().and_then(|t| t.parse().ok()),
+            include_cwd_in_prompt: !cli.hide_cwd_in_prompt,
+            // The model learns which skills exist from this block, as on
+            // the classic stack (listed only when it can `read` them). The
+            // SDK loads no resources itself, so without it the default
+            // stack never told the model about any skill.
+            no_context_files: cli.no_context_files,
+            skills_prompt: enabled_tools
+                .contains(&"read")
+                .then(|| resources.format_skills_for_prompt()),
+            max_tool_iterations,
+            package_dir: Some(package_dir.clone()),
+            mcp: Some(pi::sdk::McpSessionOptions {
+                config_paths: cli.mcp_config.clone(),
+                global_dir: Some(pi::config::Config::global_dir()),
+            }),
+            // Approval gating (issue #196): the ftui stack previously
+            // dropped the approval mode entirely; thread the same state
+            // the classic stack uses so `ask`/`write` modes gate here
+            // too, prompting through the ask-card bridge.
+            approval_state: Some(approval_state.clone()),
+            // The advisor was built only on the classic stack; the role
+            // the user configured never reviewed a turn on this one.
+            advisor: advisor_options(&cli, &config, &model_registry, &auth),
+            // Provider retry (bd-u2qv4). Until now a 429 or a 529 was a
+            // hard error on this stack while the same request in print
+            // mode or over RPC retried and completed, and this is the
+            // stack most people run. `from_config` returns None when the
+            // user has set `retry.enabled = false`, so turning it off
+            // still means nobody re-enters the provider on their behalf.
+            // The retry events it emits already render here as system
+            // notes.
+            retry: pi::failover::RetryPolicy::from_config(&config),
+            // Cross-model failover (bd-u2qv4). A configured
+            // `retry.fallbackChains` used to be inert on this stack: the
+            // chain the user set up never ran on the surface they set it
+            // up for, while the identical request in print mode or over
+            // RPC walked it. `from_config` yields None when no chain is
+            // configured, which is the same condition under which the
+            // other surfaces decline.
+            failover: pi::sdk::FailoverOptions::from_config(
+                &config,
+                model_registry.get_available(),
+                auth.clone(),
+                cli.api_key.clone(),
+            ),
+            ..Default::default()
+        };
+        let theme = pi::theme::Theme::resolve(&config, &cwd);
+        // Same `disabledProviders` filter the classic stack applies when it
+        // builds its model list: without it the setting was silently
+        // ignored on this frontend and every catalog provider still
+        // appeared in the picker.
+        let ftui_models = model_registry
+            .get_available()
+            .into_iter()
+            .filter(|entry| {
+                !pi::failover::provider_is_disabled(
+                    &disabled_providers,
+                    scope_override,
+                    &entry.model.provider,
+                )
+            })
+            .map(|entry| {
+                (
+                    format!("{}/{}", entry.model.provider, entry.model.id),
+                    entry.model.name,
+                )
+            })
+            .collect::<Vec<_>>();
+        // The picker shows each model's display name beside its identity
+        // (GH #214); switching still uses the identity.
+        let ftui_model_names = ftui_models
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashMap<_, _>>();
+        let ftui_models = ftui_models
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        // /resume picker entries: this cwd's saved sessions, newest first
+        // (same index the session picker uses). Failures degrade to an
+        // empty list — /resume then reports "no saved sessions".
+        // Sessions pinned with /pin come first, marked (OMP). /resume
+        // re-reads the index itself; this is the initial list.
+        let ftui_sessions = pi::interactive_ftui::session_pins::resume_entries(
+            &cwd.display().to_string(),
+            &Config::global_dir(),
+        );
+        return pi::interactive_ftui::run(
+            options,
+            &theme,
+            cli.inline,
+            ftui_models,
+            ftui_sessions,
+            pi::interactive_ftui::FtuiSettings {
+                markdown_spacing: config.markdown_spacing(),
+                // Resolved exactly as the classic stack resolves it; the
+                // `--no-mouse-capture` flag has already been folded into
+                // `config.disable_mouse_capture` above.
+                disable_mouse_capture: config.disable_mouse_capture.unwrap_or_else(|| {
+                    std::env::var("PI_NO_MOUSE_CAPTURE").is_ok_and(|val| val == "1")
+                }),
+                // `/share` on this stack (bd-ydz1t.1) runs the same gh flow
+                // the classic stack does, so it reads the same setting.
+                gh_path: config.gh_path.clone(),
+                hide_thinking_block: config.hide_thinking_block.unwrap_or(false),
+                model_names: ftui_model_names,
+                start_in_plan_mode: cli.plan_mode,
+                double_escape_action: pi::interactive_ftui::DoubleEscapeAction::from_setting(
+                    config.double_escape_action.as_deref(),
+                ),
+                // `/tan` (bd-ydz1t.2) resolves its child model exactly as
+                // the classic stack does: the `task` role, falling back to
+                // `smol`.
+                subagent_role_spec: pi::app::subagent_role_spec(&config),
+                // /btw answers with the smol role model, resolved exactly as
+                // the classic stack resolves it; `None` without credentials.
+                btw_client: pi::app::resolve_role_model(
+                    pi::models::ModelRole::Smol,
+                    &cli,
+                    &config,
+                    &model_registry,
+                )
+                .and_then(|resolution| {
+                    pi::btw::BtwClient::for_model_entry(
+                        &resolution.model_entry,
+                        cli.api_key.as_deref(),
+                        &auth,
+                    )
+                }),
+                // ctrl+p cycles the same resolved scope the classic stack
+                // cycles; empty falls back to every available model.
+                cycle_models: scoped_models
+                    .iter()
+                    .map(|scoped| {
+                        format!("{}/{}", scoped.model.model.provider, scoped.model.model.id)
+                    })
+                    .collect(),
+            },
+            pi::interactive_ftui::AutocompleteLaunch {
+                catalog: pi::autocomplete::AutocompleteCatalog::from_resources(&resources),
+                resources: Some(resources.clone()),
+                resource_source: Some(pi::interactive_ftui::ResourceSource {
+                    package_manager: package_manager.clone(),
+                    config: config.clone(),
+                    cli: resource_cli.clone(),
+                }),
+                cwd: cwd.clone(),
+                max_visible: config
+                    .autocomplete_max_visible
+                    .and_then(|n| usize::try_from(n.clamp(3, 20)).ok())
+                    .unwrap_or(5),
+            },
+        )
+        .map_err(Into::into);
+    }
+
     let skills_prompt = if enabled_tools.contains(&"read") {
         resources.format_skills_for_prompt()
     } else {
@@ -1709,8 +2322,9 @@ async fn run(
     let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
     // Foreign-format workspace rules (bd-cv653.6.2): discovered once here,
     // shared by the system prompt (always-apply block) and the agent
-    // (scoped-rule activation).
-    let foreign_rules = if config.foreign_rules_enabled() && !test_mode {
+    // (scoped-rule activation). `--no-context-files` (gh #216) disables the
+    // import too: they are ambient project instructions like AGENTS.md.
+    let foreign_rules = if config.foreign_rules_enabled() && !test_mode && !cli.no_context_files {
         pi::context_files::discover_foreign_rules(&cwd)
     } else {
         pi::context_files::ForeignRules::default()
@@ -1735,28 +2349,6 @@ async fn run(
         providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;
     let stream_options =
         pi::app::build_stream_options(&config, resolved_key.clone(), &selection, &session);
-    // CLI flag wins; fall back to PI_MAX_TOOL_ITERATIONS env, then default.
-    // `clamp_max_tool_iterations` keeps invalid values out of the loop and
-    // emits a warning instead of failing the run.
-    let max_tool_iterations = if cli.max_tool_iterations.is_some() {
-        pi::agent::clamp_max_tool_iterations(cli.max_tool_iterations)
-    } else {
-        pi::agent::resolved_max_tool_iterations_default()
-    };
-    // Approval mode (bd-cv653.3.19): CLI flags override config.
-    let approval_mode = if cli.yolo {
-        pi::approval::ApprovalMode::Yolo
-    } else if let Some(ref m) = cli.approval_mode {
-        pi::approval::ApprovalMode::from_setting(Some(m))
-    } else {
-        config.approval_mode()
-    };
-    let dual_confirm_classes = config.approval_dual_confirm_classes();
-    let approval_state = pi::approval::ApprovalState::new(
-        approval_mode,
-        cli.plan_yolo || config.plan_auto_approve(),
-        dual_confirm_classes,
-    );
 
     let agent_config = AgentConfig {
         system_prompt: Some(system_prompt),
@@ -1832,66 +2424,33 @@ async fn run(
             }
         }
     }
-    // The advisor (bd-cv653.3.3): build the runtime only when the advisor
-    // role resolves a model AND its credentials exist — otherwise the session
-    // carries None and the hook never runs (zero-overhead rule).
-    if let Some(resolution) = pi::app::resolve_role_model(
-        pi::models::ModelRole::Advisor,
-        &cli,
-        &config,
-        &model_registry,
-    )
-    .filter(|_| config.advisor_enabled())
+    agent_session.advisor = advisor_options(&cli, &config, &model_registry, &auth)
+        .as_ref()
+        .map(pi::advisor::AdvisorOptions::runtime);
+    // Host authorization must not depend on granting the model the ask tool.
+    // The registry picker is always handed to interactive/RPC hosts; only this
+    // conditional extend adds ask to the provider-visible schema.
+    let ask_tool = Some(shared_tools.snapshot().host_ask_tool());
+    if enabled_tools.contains(&"ask")
+        && let Some(ask) = &ask_tool
     {
-        let entry = resolution.model_entry;
-        let key = pi::models::resolve_model_key(cli.api_key.as_deref(), &auth, &entry);
-        let credentialed =
-            !pi::models::model_requires_configured_credential(&entry) || key.is_some();
-        if credentialed {
-            let label = format!("{}/{}", entry.model.provider, entry.model.id);
-            match pi::providers::create_provider(&entry, None) {
-                Ok(advisor_provider) => {
-                    agent_session.advisor = Some(
-                        pi::advisor::AdvisorRuntime::new(advisor_provider, label)
-                            .with_timeout(std::time::Duration::from_secs(
-                                config.advisor_timeout_secs(),
-                            ))
-                            .with_api_key(key),
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        event = "pi.advisor.provider_failed",
-                        error = %err,
-                        "advisor provider construction failed; advisor disabled"
-                    );
-                }
-            }
-        } else {
-            tracing::info!(
-                event = "pi.advisor.no_credentials",
-                "advisor role configured but credentials missing; advisor disabled"
-            );
-        }
-    }
-    let ask_tool = enabled_tools.contains(&"ask").then(|| {
-        let tool = pi::ask::AskTool::new(pi::ask::AskPolicy::from_config(
-            config.ask_policy.as_deref(),
-        ));
         agent_session
             .agent
-            .extend_tools(vec![Box::new(tool.clone()) as Box<dyn pi::tools::Tool>]);
-        tool
-    });
+            .extend_tools(vec![Box::new(ask.clone()) as Box<dyn pi::tools::Tool>]);
+    }
     // Approval prompts (issue #196): route calls the approval mode gates
     // through the ask surface the interactive/RPC hosts install, instead of
     // silently denying because no `tool_approval` handler existed. Surfaces
-    // that never install an ask UI (print/JSON mode) still fail closed, now
-    // with an explicit "prompt unavailable" reason.
+    // that never install an ask UI (print/JSON mode) still fail closed, and
+    // record that on the shared approval state so the print driver can end the
+    // run with a real error instead of exit 0 (gh #224).
     if let Some(ask) = &ask_tool {
         agent_session
             .agent
-            .set_tool_approval(Some(pi::ask::approval_handler_via_ask(ask.clone())));
+            .set_tool_approval(Some(pi::ask::approval_handler_via_ask(
+                ask.clone(),
+                approval_state.clone(),
+            )));
     }
 
     // The /btw side-question client (bd-cv653.3.16): bound to the smol
@@ -1920,22 +2479,17 @@ async fn run(
     // servers under a bounded global budget, and mount their tools as
     // first-class mcp__<server>__<tool> tools. Pending/denied servers are
     // never spawned; /mcp shows provenance + health for everything. The
-    // default FTUI constructs the manager owned by its actual SDK session,
-    // so do not discover and populate a second manager that will be dropped.
-    let mcp_manager = if ftui_requested {
-        None
-    } else {
-        Some(std::sync::Arc::new(pi::mcp::bootstrap_with_project_trust(
-            &cwd,
-            &pi::config::Config::global_dir(),
-            &cli.mcp_config,
-            workspace_trusted,
-        )?))
-    };
+    // default FTUI launched above owns its manager through its SDK session.
+    let mcp_manager = std::sync::Arc::new(pi::mcp::McpManager::bootstrap(
+        &cwd,
+        &pi::config::Config::global_dir(),
+        &cli.mcp_config,
+        workspace_trusted,
+    )?);
     let mut extension_bindings = Vec::new();
     let mut extension_model_entries = Vec::new();
 
-    if !ftui_requested && !resources.extensions().is_empty() {
+    if !resources.extensions().is_empty() {
         // Await the pre-warmed extension runtime (spawned earlier to overlap with
         // auth refresh, model selection, and session creation).
         let pre_warmed = if let Some((mgr, tools, join_handle)) = extension_prewarm_handle {
@@ -2008,16 +2562,14 @@ async fn run(
             // Bridge extension-registered MCP servers into the unified MCP
             // client registry (bd-cv653.6.1): same spawn path, same trust
             // gate, provenance=extension in /mcp.
-            if let Some(mcp_manager) = &mcp_manager {
-                for spec in region.manager().extension_mcp_servers() {
-                    let name = spec
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    if !name.is_empty() {
-                        mcp_manager.register_extension_server(&name, &spec);
-                    }
+            for spec in region.manager().extension_mcp_servers() {
+                let name = spec
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if !name.is_empty() {
+                    mcp_manager.register_extension_server(&name, &spec);
                 }
             }
             extension_bindings =
@@ -2096,7 +2648,7 @@ async fn run(
                 }
             }
         }
-    } else if !ftui_requested && !extension_flags.is_empty() {
+    } else if !extension_flags.is_empty() {
         let rendered = extension_flags
             .iter()
             .map(pi::cli::ExtensionCliFlag::display_name)
@@ -2109,23 +2661,15 @@ async fn run(
         );
     }
 
-    // The classic/RPC session owns this manager. FTUI constructs its actual
-    // Agent through the SDK below, so its SDK-owned manager performs the one
-    // connect-and-mount pass after that session's extensions load (bd-vjfol).
-    if let Some(mcp_manager) = &mcp_manager {
-        let mcp_wrappers = pi::mcp::connect_trusted_and_mount_tools(mcp_manager).await;
-        if !mcp_wrappers.is_empty() {
-            agent_session.agent.extend_tools(mcp_wrappers);
-        }
+    // The classic/RPC session owns this manager; FTUI's SDK-owned manager
+    // performs its own connect-and-mount pass after that session's
+    // extensions load (bd-vjfol).
+    let mcp_wrappers = pi::mcp::connect_trusted_and_mount_tools(&mcp_manager).await;
+    if !mcp_wrappers.is_empty() {
+        agent_session.agent.extend_tools(mcp_wrappers);
     }
 
-    #[cfg(feature = "ftui")]
-    let ftui_enabled_tools = enabled_tools
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect::<Vec<_>>();
-
-    if has_extensions && !ftui_requested {
+    if has_extensions {
         let session_snapshot = {
             let cx = pi::agent_cx::AgentCx::for_request();
             let session = agent_session
@@ -2247,9 +2791,7 @@ async fn run(
         // owns the MCP manager: servers extensions register after startup are
         // synced into the session at the next prompt (bd-1wr1n).
         let mut agent_session = agent_session;
-        if let Some(manager) = mcp_manager.clone() {
-            agent_session.set_mcp_manager(manager);
-        }
+        agent_session.set_mcp_manager(mcp_manager.clone());
         // Boxed: this future is large (clippy::large_futures); boxing keeps the
         // enclosing future small.
         Box::pin(run_rpc_mode(
@@ -2264,107 +2806,6 @@ async fn run(
             ask_tool,
         ))
         .await
-    } else if ftui_requested {
-        // FrankenTUI preview stack (bd-cv653.9.1): experimental, runs an
-        // ephemeral SDK session on its own driver runtime; the charmed
-        // stack stays the default until parity is proven. Drop the default
-        // stack's session first so nothing holds its resources while the
-        // preview runs.
-        drop(agent_session);
-        #[cfg(feature = "ftui")]
-        {
-            let options = pi::sdk::SessionOptions {
-                provider: cli.provider.clone(),
-                model: cli.model.clone(),
-                api_key: cli.api_key.clone(),
-                working_directory: Some(cwd.clone()),
-                workspace_trusted,
-                // Session persistence honors the same flags as the default
-                // stack: saved by default, --no-session for ephemeral,
-                // --session/--session-dir for explicit paths. The SDK path
-                // creates its own session file; the default stack's early
-                // session was dropped above without writing anything.
-                no_session: cli.no_session,
-                session_path: cli.session.as_ref().map(PathBuf::from),
-                session_dir: cli.session_dir.as_ref().map(PathBuf::from),
-                // Explicit -e extension files load with UI prompts bridged
-                workspace: Some(workspace.clone()),
-                // (bd-1eoh4). Workspace/package-discovered extensions are a
-                // ResourceLoader integration follow-up.
-                // Extensions load with UI prompts bridged (bd-1eoh4): the
-                // ResourceLoader's discovered set (workspace/package/global)
-                // — which already folds in explicit -e paths and honors
-                // trust/policy filtering — plus nothing else.
-                extension_paths: if cli.no_extensions {
-                    Vec::new()
-                } else {
-                    resources.extensions().to_vec()
-                },
-                extension_policy: cli.extension_policy.clone(),
-                repair_policy: cli.repair_policy.clone(),
-                extension_flags: extension_flags.clone(),
-                // Prompt/tool/thinking flags flow through so deterministic
-                // harnesses (VCR body matching) and users get the same
-                // behavior as the default stack.
-                system_prompt: cli.system_prompt.clone(),
-                append_system_prompt: cli.append_system_prompt.clone(),
-                enabled_tools: Some(ftui_enabled_tools),
-                thinking: cli.thinking.as_deref().and_then(|t| t.parse().ok()),
-                include_cwd_in_prompt: !cli.hide_cwd_in_prompt,
-                max_tool_iterations,
-                package_dir: Some(package_dir.clone()),
-                mcp: Some(pi::sdk::McpSessionOptions {
-                    config_paths: cli.mcp_config.clone(),
-                    global_dir: Some(pi::config::Config::global_dir()),
-                }),
-                // Approval gating (issue #196): the ftui stack previously
-                // dropped the approval mode entirely; thread the same state
-                // the classic stack uses so `ask`/`write` modes gate here
-                // too, prompting through the ask-card bridge.
-                approval_state: Some(approval_state.clone()),
-                ..Default::default()
-            };
-            let theme = pi::theme::Theme::resolve(&config, &cwd);
-            let ftui_models = model_registry
-                .get_available()
-                .into_iter()
-                .map(|entry| format!("{}/{}", entry.model.provider, entry.model.id))
-                .collect::<Vec<_>>();
-            // /resume picker entries: this cwd's saved sessions, newest first
-            // (same index the session picker uses). Failures degrade to an
-            // empty list — /resume then reports "no saved sessions".
-            let ftui_sessions = pi::session_index::SessionIndex::new()
-                .list_sessions(Some(&cwd.display().to_string()))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|meta| {
-                    let label = match &meta.name {
-                        Some(name) => format!("{name} · {} msgs", meta.message_count),
-                        None => format!("{} · {} msgs", meta.id, meta.message_count),
-                    };
-                    (label, meta.path)
-                })
-                .collect::<Vec<_>>();
-            pi::interactive_ftui::run(
-                options,
-                &theme,
-                cli.inline,
-                ftui_models,
-                ftui_sessions,
-                config.markdown_spacing(),
-                pi::interactive_ftui::AutocompleteLaunch {
-                    catalog: pi::autocomplete::AutocompleteCatalog::from_resources(&resources),
-                    cwd: cwd.clone(),
-                    max_visible: config
-                        .autocomplete_max_visible
-                        .and_then(|n| usize::try_from(n.clamp(3, 20)).ok())
-                        .unwrap_or(5),
-                },
-            )
-            .map_err(Into::into)
-        }
-        #[cfg(not(feature = "ftui"))]
-        unreachable!("ftui_requested is false without the ftui feature")
     } else if is_interactive {
         let model_scope = selection
             .scoped_models
@@ -2403,7 +2844,7 @@ async fn run(
             ask_tool,
             btw_client,
             Some(btw_factory),
-            mcp_manager,
+            Some(mcp_manager),
         ))
         .await
     } else {
@@ -2445,6 +2886,7 @@ async fn run(
             &resources,
             runtime_handle.clone(),
             &config,
+            &approval_state,
             Some(FailoverResolution {
                 available_models: &model_registry.get_available(),
                 auth: &auth,
@@ -2464,10 +2906,8 @@ async fn run(
 
     // Best-effort autosave flush on shutdown. OwnedMutexGuard: the guard is
     // held across the flush await, and the borrowed MutexGuard is !Send
-    // (clippy::future_not_send). FTUI owns and flushes a different SDK
-    // session; flushing this throwaway bootstrap session afterward could make
-    // stale state the last writer to the same session path.
-    if !cli.no_session && !ftui_requested {
+    // (clippy::future_not_send).
+    if !cli.no_session {
         let cx = pi::agent_cx::AgentCx::for_request();
         if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session_handle), &cx).await
             && let Err(e) = guard.flush_autosave_on_shutdown().await
@@ -6957,11 +7397,21 @@ fn handle_doctor(
     Ok(())
 }
 
+/// How much of the commit sha `--version` shows.
+///
+/// `VERGEN_GIT_SHA` is the full 40 characters because the perf evidence records
+/// that carry provenance are rejected by their own gate without it (build.rs).
+/// Nobody wants to read forty characters in a version banner, so the display
+/// abbreviates to git's own default width; every consumer that cares about
+/// provenance reads the environment variable, not this line.
+const VERSION_SHA_WIDTH: usize = 9;
+
 fn print_version() {
+    let sha = option_env!("VERGEN_GIT_SHA").unwrap_or("unknown");
     println!(
         "pi {} ({} {})",
         env!("CARGO_PKG_VERSION"),
-        option_env!("VERGEN_GIT_SHA").unwrap_or("unknown"),
+        &sha[..sha.len().min(VERSION_SHA_WIDTH)],
         option_env!("VERGEN_BUILD_TIMESTAMP").unwrap_or(""),
     );
 }
@@ -7076,20 +7526,24 @@ fn open_fingerprint_file(path: &Path) -> io::Result<fs::File> {
     Ok(fs::File::from(descriptor))
 }
 
-#[cfg(not(unix))]
+/// Windows counterpart to the Unix `O_NOFOLLOW` open above: a final reparse
+/// point must not be traversed, or the fingerprint would describe a file other
+/// than the one at `path`.
+#[cfg(windows)]
+fn open_fingerprint_file(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn open_fingerprint_file(path: &Path) -> io::Result<fs::File> {
     fs::File::open(path)
-}
-
-#[cfg(unix)]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(unix))]
-fn same_file_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
-    true
 }
 
 fn append_file_fingerprint(hasher: &mut Sha256, path: &Path) -> bool {
@@ -7111,6 +7565,10 @@ fn append_file_fingerprint(hasher: &mut Sha256, path: &Path) -> bool {
                 hasher.update(duration.as_secs().to_le_bytes());
                 hasher.update(duration.subsec_nanos().to_le_bytes());
             }
+            let Ok(before_identity) = FileIdentity::of_path_nofollow(path) else {
+                hasher.update([3]);
+                return false;
+            };
             let Ok(file) = open_fingerprint_file(path) else {
                 hasher.update([3]);
                 return false;
@@ -7132,16 +7590,24 @@ fn append_file_fingerprint(hasher: &mut Sha256, path: &Path) -> bool {
                 hasher.update([6]);
                 return false;
             };
+            let Ok(opened_identity) = FileIdentity::of_open_file(limited.get_ref()) else {
+                hasher.update([6]);
+                return false;
+            };
             let Ok(after) = fs::symlink_metadata(path) else {
                 hasher.update([6]);
                 return false;
             };
+            let Ok(after_identity) = FileIdentity::of_path_nofollow(path) else {
+                hasher.update([6]);
+                return false;
+            };
             if !opened_after.file_type().is_file()
-                || !same_file_identity(&meta, &opened_after)
+                || before_identity != opened_identity
                 || opened_after.len() != meta.len()
                 || opened_after.modified().ok() != modified
                 || !after.file_type().is_file()
-                || !same_file_identity(&opened_after, &after)
+                || opened_identity != after_identity
                 || after.len() != meta.len()
                 || after.modified().ok() != modified
             {
@@ -8305,6 +8771,19 @@ fn has_cli_api_key_override(api_key: Option<&str>) -> bool {
     api_key.is_some_and(|value| !value.trim().is_empty())
 }
 
+/// Whether startup should touch the stored OAuth credentials at all (gh #218).
+///
+/// An explicit `--api-key` for an explicit `--provider`/`--model` satisfies
+/// the run's only credential need, so the store is left alone: no refresh
+/// requests for providers the invocation never selected, and no dependence
+/// on whatever a person logged into on this machine. Every other shape
+/// (interactive default model, config-selected model, `--models` scopes)
+/// may resolve a stored OAuth credential later, so it is refreshed up front.
+fn startup_oauth_refresh_required(cli: &cli::Cli) -> bool {
+    !(has_cli_api_key_override(cli.api_key.as_deref())
+        && (cli.provider.is_some() || cli.model.is_some()))
+}
+
 fn rpc_available_models(registry: &ModelRegistry, cli_api_key: Option<&str>) -> Vec<ModelEntry> {
     if has_cli_api_key_override(cli_api_key) {
         registry.models().to_vec()
@@ -8334,6 +8813,9 @@ async fn run_rpc_mode(
     }) {
         eprintln!("Warning: Failed to install Ctrl+C handler for RPC mode: {err}");
     }
+    // From here on the RPC loop owns stdout; a later fatal error is a
+    // run-phase record, not a startup one (gh #217).
+    note_machine_stream_opened();
     let rpc_task = pi::rpc::run_stdio(
         session,
         pi::rpc::RpcOptions {
@@ -8409,6 +8891,7 @@ async fn run_print_mode(
     resources: &ResourceLoader,
     runtime_handle: RuntimeHandle,
     config: &Config,
+    approval_state: &pi::approval::ApprovalState,
     failover_ctx: Option<FailoverResolution<'_>>,
 ) -> Result<()> {
     if mode.ne("text") && mode.ne("json") {
@@ -8422,11 +8905,12 @@ async fn run_print_mode(
             .lock(cx.cx())
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        println!("{}", serde_json::to_string(&session.header)?);
+        write_print_line(&serde_json::to_string(&session.header)?);
+        note_machine_stream_opened();
     }
     if initial.is_none() && messages.is_empty() {
         if mode.eq("json") {
-            io::stdout().flush()?;
+            flush_stdout()?;
             return Ok(());
         }
         bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
@@ -8447,9 +8931,7 @@ async fn run_print_mode(
             .map(|m| pi::extensions::EventCoalescer::new(m.clone()));
         move |event: AgentEvent| {
             if emit_json_events {
-                if let Ok(serialized) = serde_json::to_string(&event) {
-                    println!("{serialized}");
-                }
+                emit_json_event(&event);
             } else if stream_text_events
                 && let Some(delta) = streamed_text_delta(&event)
                 && emit_text_delta(delta).is_ok()
@@ -8496,7 +8978,7 @@ async fn run_print_mode(
 
     if initial.is_none() && messages.is_empty() {
         if mode.eq("json") {
-            io::stdout().flush()?;
+            flush_stdout()?;
             return Ok(());
         }
         bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
@@ -8506,6 +8988,26 @@ async fn run_print_mode(
     let max_retries = config.retry_max_retries();
     let is_json = mode.eq("json");
     let mut sent_prompts = 0usize;
+    // Lives across every prompt in this process (bd-gm481.1): what the chain
+    // started from, what is installed now, when the cooldown began, and where
+    // the walk left off. Previously all of this was per-prompt, so a sequence
+    // that failed over never came back and restarted the chain each time.
+    let mut failover_state = {
+        let cx = pi::agent_cx::AgentCx::for_request();
+        let inner = session.session.lock(cx.cx()).await.ok();
+        inner.as_deref().map_or_else(
+            || PrintFailoverState::new(config),
+            |s| {
+                PrintFailoverState::reconstruct_from_session(
+                    s,
+                    config.failover_cooldown_secs(),
+                    chrono::Utc::now(),
+                )
+            },
+        )
+    };
+
+    let _ = maybe_restore_print_primary(session, &mut failover_state, failover_ctx, is_json).await;
 
     if let Some(initial) = initial {
         let content = pi::app::build_initial_content(&initial);
@@ -8524,6 +9026,7 @@ async fn run_print_mode(
                 keyword_scan_source: Some(initial.keyword_scan_source),
             },
             failover_ctx,
+            &mut failover_state,
         )
         .await?;
         sent_prompts = sent_prompts.saturating_add(1);
@@ -8537,6 +9040,19 @@ async fn run_print_mode(
     }
 
     for (message, keyword_scan_source) in messages {
+        // Cooldown restoration (bd-gm481.1) is a between-prompt lifecycle: the
+        // previous prompt's turn is finished and its `FailoverEnd
+        // { restoredPrimary: false }` already closed, so this can open and
+        // close its own `restoredPrimary: true` without interleaving.
+        //
+        // The result is deliberately unused here. Every refusal leaves the
+        // fallback installed and the next prompt simply runs on it, which is
+        // the correct outcome and not something this loop can improve on; the
+        // `FailoverEnd` event is the report when a restoration does happen.
+        // `print_failover_walk_skips_current_keyless_and_duplicate_entries`
+        // covers the refusals, which is where the return value earns its keep.
+        let _restored =
+            maybe_restore_print_primary(session, &mut failover_state, failover_ctx, is_json).await;
         reset_print_text_stream_state(&text_stream_state);
         let response = run_print_prompt_with_retry(
             session,
@@ -8552,6 +9068,7 @@ async fn run_print_mode(
                 keyword_scan_source: Some(keyword_scan_source),
             },
             failover_ctx,
+            &mut failover_state,
         )
         .await?;
         sent_prompts = sent_prompts.saturating_add(1);
@@ -8566,13 +9083,21 @@ async fn run_print_mode(
 
     if sent_prompts.eq(&0) {
         if mode.eq("json") {
-            io::stdout().flush()?;
+            flush_stdout()?;
             return Ok(());
         }
         bail!("No messages were sent");
     }
 
-    io::stdout().flush()?;
+    flush_stdout()?;
+    // gh #224: the turn may have "completed" having had every tool call denied
+    // for want of a surface that could approve it. Flush the stream first so a
+    // JSON host still receives the whole transcript, then fail: the caller gets
+    // a distinct exit code, a stderr explanation, and the machine-readable
+    // error record, instead of an exit-0 run that quietly did nothing.
+    if approval_state.surface_was_unavailable() {
+        return Err(anyhow::Error::new(ApprovalSurfaceUnavailable));
+    }
     Ok(())
 }
 
@@ -8614,11 +9139,27 @@ const fn streamed_text_delta(event: &AgentEvent) -> Option<&str> {
     }
 }
 
+/// End the run quietly when the failure is only that nobody is reading.
+///
+/// The text half of what [`write_print_line`] does for `--mode json`: a reader
+/// that closed the pipe (`pi -p "..." | head -1`) is not an error, and pi must
+/// not turn it into one. Every other I/O failure is left to the caller.
+fn exit_if_stdout_closed(err: &io::Error) {
+    if err.kind() == io::ErrorKind::BrokenPipe {
+        std::process::exit(EXIT_CODE_STDOUT_CLOSED);
+    }
+}
+
+fn flush_stdout() -> io::Result<()> {
+    io::stdout().flush().inspect_err(exit_if_stdout_closed)
+}
+
 fn emit_text_delta(delta: &str) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    out.write_all(delta.as_bytes())?;
-    out.flush()
+    out.write_all(delta.as_bytes())
+        .and_then(|()| out.flush())
+        .inspect_err(exit_if_stdout_closed)
 }
 
 fn emit_trailing_print_newline(state: PrintTextStreamState) -> io::Result<()> {
@@ -8627,8 +9168,9 @@ fn emit_trailing_print_newline(state: PrintTextStreamState) -> io::Result<()> {
     }
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    out.write_all(b"\n")?;
-    out.flush()
+    out.write_all(b"\n")
+        .and_then(|()| out.flush())
+        .inspect_err(exit_if_stdout_closed)
 }
 
 fn snapshot_print_text_stream_state(
@@ -8701,14 +9243,16 @@ enum PromptInput {
     },
 }
 
-/// Compute retry delay with exponential backoff (mirrors RPC mode logic).
-fn print_mode_retry_delay_ms(config: &Config, attempt: u32) -> u32 {
-    let base = u64::from(config.retry_base_delay_ms());
-    let max = u64::from(config.retry_max_delay_ms());
-    let shift = attempt.saturating_sub(1);
-    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
-    let delay = base.saturating_mul(multiplier).min(max);
-    u32::try_from(delay).unwrap_or(u32::MAX)
+/// Print mode's retry limits, read out of config in exactly one place so the
+/// turn loop and its tests cannot disagree about which keys feed the shared
+/// policy in `pi::failover` (bd-u2qv4).
+fn print_mode_retry_policy(config: &Config, max_retries: u32) -> pi::failover::RetryPolicy {
+    pi::failover::RetryPolicy {
+        max_retries,
+        max_failovers_per_turn: config.max_failovers_per_turn(),
+        base_delay_ms: config.retry_base_delay_ms(),
+        max_delay_ms: config.retry_max_delay_ms(),
+    }
 }
 
 async fn sleep_with_current_timer(duration: Duration) {
@@ -8720,10 +9264,69 @@ async fn sleep_with_current_timer(duration: Duration) {
 
 /// Emit a JSON-serialized [`AgentEvent`] to stdout (for JSON print mode).
 fn emit_json_event(event: &AgentEvent) {
-    if let Ok(serialized) = serde_json::to_string(event) {
-        println!("{serialized}");
+    if let Ok(serialized) = print_mode_json_record(event) {
+        write_print_line(&serialized);
     }
 }
+
+/// Write one print-mode record to stdout, ending the run quietly if the reader
+/// has gone away.
+///
+/// `println!` PANICS when the write fails, so `pi --print --mode json | head`
+/// used to end in
+///
+///     panic: failed printing to stdout: Broken pipe (os error 32)
+///
+/// plus a crash bundle, which then announced itself as "previous run crashed"
+/// on the next invocation. Piping structured output into `head`, `jq`,
+/// `grep -m1` or a pager is the normal way to read a stream and every one of
+/// those closes the pipe on purpose; Rust disables SIGPIPE at startup, so the
+/// closed reader arrives here as EPIPE on every later write instead of ending
+/// the process the way it would for any other CLI.
+///
+/// A broken pipe is therefore not an error: the consumer got what it asked for
+/// and there is nobody left to tell. Any OTHER write failure — a full disk on
+/// `pi -p > out.json`, say — is a real failure and must not be reported as
+/// success, so it is named on stderr and exits non-zero.
+fn write_print_line(line: &str) {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let written = out
+        .write_all(line.as_bytes())
+        .and_then(|()| out.write_all(b"\n"))
+        .and_then(|()| out.flush());
+    if let Err(err) = written {
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            std::process::exit(EXIT_CODE_STDOUT_CLOSED);
+        }
+        eprintln!("pi: failed writing to stdout: {err}");
+        std::process::exit(EXIT_CODE_FAILURE);
+    }
+}
+
+/// Serialize one `--mode json` stdout record (gh #222): delta-only
+/// `message_update` records, everything else verbatim. See
+/// [`AgentEvent::to_json_stream_line`].
+fn print_mode_json_record(event: &AgentEvent) -> serde_json::Result<String> {
+    event.to_json_stream_line()
+}
+
+/// Cross-prompt failover state for print mode (bd-gm481.1).
+///
+/// Print had nowhere to put this, and three things were wrong at once as a
+/// result. A `--message` sequence that failed over stayed pinned to the
+/// fallback for every later prompt with no path back. The chain cursor was a
+/// per-prompt local, so prompt two restarted its walk at entry zero and could
+/// reinstall the fallback it was already on. And nothing recorded what the
+/// primary had been, so even an attempt to restore had no identity to return
+/// to.
+///
+/// The state itself is `pi::failover::FailoverState`, shared so the interactive
+/// stacks can adopt failover without a third copy of the same four fields and
+/// the same "record the primary only on the FIRST swap" rule (bd-u2qv4). RPC
+/// keeps its equivalent inline on `RpcSharedState` and has not been re-pointed.
+type PrintFailoverState = pi::failover::FailoverState;
+type PrintFailoverPrimary = pi::failover::FailoverPrimary;
 
 /// Failover lifecycle (bd-2vmu6.1): a turn that swapped to a fallback chain
 /// entry closes its `FailoverStart` before the turn's terminal output,
@@ -8747,69 +9350,18 @@ fn emit_print_failover_end(
     });
 }
 
-/// Terminal marker check (bd-8188r): a session-persistence failure means
-/// provider/tool side effects may already have happened while the durable
-/// record is missing or stale. Re-entering the provider (retry, credential
-/// rotation, model failover) could repeat those effects, so callers must
-/// treat this as final regardless of what the wrapped prose looks like.
-fn message_marks_session_persistence(error_text: &str) -> bool {
-    // `contains`, not `starts_with`: the flattened Display form embeds the
-    // marker after thiserror's own "Session error: " prefix. A false
-    // positive here merely refuses a retry — the safe direction.
-    error_text.contains(pi::error::Error::SESSION_PERSISTENCE_PREFIX)
-}
-
-/// Check whether a prompt result is a retryable error.
-///
-/// Session-persistence failures are never retryable, even when their wrapped
-/// message contains transient-looking phrases ("connection reset", "500"):
-/// the flattening loses the typed boundary, so the stable prefix is checked
-/// first.
-fn is_retryable_prompt_result(msg: &AssistantMessage) -> bool {
-    if !matches!(msg.stop_reason, StopReason::Error) {
-        return false;
-    }
-    let err_msg = msg.error_message.as_deref().unwrap_or("Request error");
-    if message_marks_session_persistence(err_msg) {
-        return false;
-    }
-    pi::error::is_retryable_error(err_msg, Some(msg.usage.input), None)
-}
-
+/// Print mode's entry to the shared retry-tail restoration on `AgentSession`
+/// (bd-u2qv4). RPC calls the same primitive inside its provider-admission
+/// transition; print mode has no such gate and needs none.
 async fn restore_print_retry_tail(
     session: &mut AgentSession,
     require_incomplete_tail: bool,
 ) -> Result<()> {
     let cx = pi::agent_cx::AgentCx::for_request();
-    let mut inner = OwnedMutexGuard::lock(Arc::clone(&session.session), &cx)
+    session
+        .restore_retry_tail(&cx, require_incomplete_tail)
         .await
-        .map_err(|err| anyhow::anyhow!("retry restoration session lock failed: {err}"))?;
-    let mut candidate = inner.clone();
-    let reverted = candidate.revert_incomplete_response();
-    if require_incomplete_tail && !reverted {
-        bail!(
-            "retry restoration invariant failed: the completed error response had no incomplete assistant tail"
-        );
-    }
-    if !reverted {
-        return Ok(());
-    }
-
-    let restored_messages = candidate.to_messages_for_current_path();
-    if session.save_enabled()
-        && let Err(first_err) = candidate.save().await
-        && let Err(retry_err) = candidate.save().await
-    {
-        return Err(anyhow::Error::new(pi::error::Error::session_persistence(
-            format!(
-                "retry restoration persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-            ),
-        )));
-    }
-
-    *inner = candidate;
-    session.agent.replace_messages(restored_messages);
-    Ok(())
+        .map_err(anyhow::Error::new)
 }
 
 fn emit_print_restore_failure(is_json: bool, retry_count: u32, error: &anyhow::Error) {
@@ -8822,6 +9374,78 @@ fn emit_print_restore_failure(is_json: bool, retry_count: u32, error: &anyhow::E
     }
 }
 
+/// Print-mode primary restoration after cooldown (bd-gm481.1).
+///
+/// Called before each prompt. If a fallback is installed and its cooldown has
+/// elapsed, swap back to the recorded primary and close that lifecycle with
+/// `FailoverEnd { restoredPrimary: true }`. Before this existed, print mode had
+/// no way back: a `--message` sequence that failed over ran every later prompt
+/// on the temporary fallback.
+///
+/// The invariants are RPC's, for RPC's reason — the recorded fallback must
+/// still be what is actually installed, in both the live agent and the Session
+/// path. If either has moved, something other than this failover changed the
+/// model and undoing it is not ours to do. Unlike RPC, a broken invariant here
+/// does not quarantine the session: print has no admission gate to block, and
+/// the honest response is to leave the fallback in place and say so.
+///
+/// Returns `true` when the primary was restored.
+///
+/// Long on purpose, like `try_print_failover` beside it: this is one linear
+/// transition — gate, resolve, validate, build a candidate, persist, install —
+/// and every early return is a refusal that leaves the fallback in place.
+/// Splitting it would hide which refusals are reachable from which state.
+#[allow(clippy::too_many_lines)]
+async fn maybe_restore_print_primary(
+    session: &mut AgentSession,
+    state: &mut PrintFailoverState,
+    failover_ctx: Option<FailoverResolution<'_>>,
+    is_json: bool,
+) -> bool {
+    let Some(ctx) = failover_ctx else {
+        return false;
+    };
+    let Some(active) = state.active().cloned() else {
+        return false;
+    };
+    let Some(primary) = state.primary().cloned() else {
+        return false;
+    };
+
+    // The persisted transition is `AgentSession::restore_primary`, shared with
+    // RPC and the SDK (bd-u2qv4, bd-gm481). What stays here is what is actually
+    // print's: no admission gate, so a record that no longer describes the live
+    // session declines and the next prompt runs on the fallback rather than
+    // failing the call, and the `FailoverEnd` is emitted as a json event.
+    let request = pi::agent::PrimaryRestoreRequest {
+        primary: &primary,
+        active: &active,
+        cooldown_elapsed: state.should_restore_primary(std::time::Instant::now()),
+        available_models: ctx.available_models,
+        auth: ctx.auth,
+        cli_api_key: ctx.cli_api_key,
+        strict_invariants: false,
+        // Print discards an in-flight background compaction across primary restoration,
+        // matching RPC and the SDK (bd-uyqkk).
+        invalidate_background_compaction: true,
+    };
+    let cx = pi::agent_cx::AgentCx::for_request();
+    let Ok(Some(restored)) = session.restore_primary(&cx, &request).await else {
+        return false;
+    };
+    state.clear();
+
+    if is_json {
+        emit_json_event(&AgentEvent::FailoverEnd {
+            success: true,
+            provider: restored.provider,
+            model: restored.model,
+            restored_primary: true,
+        });
+    }
+    true
+}
+
 /// Print-mode failover swap (bd-cv653.3.2): classify the terminal error; if
 /// eligible, resolve the next chain entry, swap the agent's provider, emit
 /// `FailoverStart` (json mode), and record the session audit + `ModelChange`.
@@ -8832,11 +9456,12 @@ async fn try_print_failover(
     session: &mut AgentSession,
     config: &Config,
     failover_ctx: Option<FailoverResolution<'_>>,
-    position: &mut usize,
+    failover_state: &mut PrintFailoverState,
     error_text: Option<&str>,
     is_json: bool,
     require_incomplete_tail: bool,
     retry_attempt_to_end: Option<u32>,
+    swaps_so_far: u32,
 ) -> Result<Option<(String, String)>> {
     let Some(ctx) = failover_ctx else {
         return Ok(None);
@@ -8860,172 +9485,111 @@ async fn try_print_failover(
         current_provider.name().to_string(),
         current_provider.model_id().to_string(),
     );
-    let Some(chain) = pi::failover::chain_for(chains, "default", &from_provider, &from_model)
+    // The identity the CHAIN started from, which equals the live model only on
+    // the first hop. From the second hop onwards the live model is itself a
+    // fallback, and resolving from it was two bugs at once:
+    //
+    //   * the thinking level clamped against whatever the previous hop allowed,
+    //     so it ratcheted down through the worst model the chain touched and
+    //     never recovered — for the turn and, because the level is written into
+    //     the session header, for the session (bd-jk057); and
+    //   * an exact `provider/model`-keyed chain stopped resolving at all, since
+    //     the key names the primary and the live model is no longer it, so hop
+    //     two never ran.
+    //
+    // RPC has always resolved both from the recorded primary; this is print
+    // adopting that, not a new rule. `primary_for_swap` returns the recorded
+    // primary when a chain is in flight and the live identity otherwise, so the
+    // first hop is unchanged (bd-gm481.1, bd-oqo03.1).
+    let primary = failover_state.primary_for_swap(PrintFailoverPrimary {
+        provider: from_provider.clone(),
+        model_id: from_model.clone(),
+        requested_thinking_level: session
+            .agent
+            .stream_options()
+            .thinking_level
+            .unwrap_or_default(),
+    });
+    let Some(chain) =
+        pi::failover::chain_for(chains, "default", &primary.provider, &primary.model_id)
     else {
         return Ok(None);
     };
-    let mut cursor = *position;
+    // The walk, the credential check, the provider construction and the
+    // persisted transition are all `AgentSession::try_failover_swap`, shared
+    // with RPC (bd-u2qv4). What stays here is print mode's own: classification
+    // above, its JSON events below, and its cross-prompt bookkeeping.
+    let cx = pi::agent_cx::AgentCx::for_request();
+    let attempt = pi::agent::FailoverSwapAttempt {
+        chain: &chain,
+        start_position: failover_state.chain_position(),
+        available_models: ctx.available_models,
+        auth: ctx.auth,
+        cli_api_key: ctx.cli_api_key,
+        class,
+        // The level originally requested, not the live one (bd-jk057). A clamp
+        // exists to respect a MODEL's limit, never to make one model's limit
+        // sticky across models.
+        thinking_level_to_clamp: primary.requested_thinking_level,
+        require_incomplete_tail,
+        primary: Some(&primary),
+        cooldown_secs: Some(config.failover_cooldown_secs()),
+        lifecycle_id: failover_state.lifecycle_id(),
+    };
+    let outcome = session.try_failover(&cx, &attempt).await?;
+    let Some(committed) = outcome.committed else {
+        // An exhausted walk records NOTHING (bd-gr6fk). Entries are rejected
+        // for five reasons and they are not alike: a malformed spec, a
+        // duplicate, and the live model itself are permanent, but a missing
+        // credential and a failed provider construction are TRANSIENT — a key
+        // can be added or an OAuth token refreshed mid-session. Recording the
+        // exhausted position made those two permanent for the life of the
+        // process, silently shrinking the chain the user configured. The skip
+        // checks are pure and cheap (a string compare, a registry lookup, a key
+        // lookup), so re-walking next prompt costs nothing measurable.
+        //
+        // RPC and the SDK have always behaved this way; print was the outlier.
+        return Ok(None);
+    };
+    if failover_state.lifecycle_id().is_none() {
+        failover_state.set_lifecycle_id(Some(uuid::Uuid::new_v4().to_string()));
+    }
+    // Only a committed swap advances the cursor, so a later prompt resumes past
+    // the entry it actually installed.
+    failover_state.set_chain_position(outcome.next_position);
 
-    // The walk is bounded by the chain, not by `max_failovers_per_turn`: the
-    // caller counts successful swaps against that cap (bd-oqo03.1). Bounding
-    // the cursor by the cap let malformed, uncredentialed, unconstructible,
-    // current, or duplicate entries consume the budget and hide a later valid
-    // entry.
-    while cursor < chain.entries.len() {
-        let spec = &chain.entries[cursor];
-        let is_current = pi::provider_metadata::split_provider_model_spec(spec).is_some_and(
-            |(provider, model_id)| {
-                pi::provider_metadata::provider_ids_match(&from_provider, provider)
-                    && from_model.eq_ignore_ascii_case(model_id)
-            },
-        );
-        let is_duplicate = chain.entries[..cursor]
-            .iter()
-            .any(|earlier| earlier.eq_ignore_ascii_case(spec));
-        if is_current || is_duplicate {
-            cursor += 1;
-            continue;
-        }
-        let candidate = (|| {
-            let (provider, model_id) = pi::provider_metadata::split_provider_model_spec(spec)?;
-            ctx.available_models
-                .iter()
-                .find(|m| {
-                    pi::provider_metadata::provider_ids_match(&m.model.provider, provider)
-                        && m.model.id.eq_ignore_ascii_case(model_id)
-                })
-                .cloned()
-                .or_else(|| pi::models::ad_hoc_model_entry(provider, model_id))
-        })();
-        cursor += 1;
-        let Some(entry) = candidate else { continue };
-        let key = pi::models::resolve_model_key(ctx.cli_api_key, ctx.auth, &entry);
-        if pi::models::model_requires_configured_credential(&entry) && key.is_none() {
-            continue; // never fail over into an auth error
-        }
+    // Cross-prompt record (bd-gm481.1): what to return to, and when the
+    // cooldown on doing so started. The primary is only captured on the first
+    // swap of a chain — a second hop moves away from a fallback, and the
+    // identity to restore is still the model the chain started from.
+    failover_state.record_swap(
+        primary,
+        (committed.to_provider.clone(), committed.to_model.clone()),
+        std::time::Instant::now(),
+    );
 
-        let Ok(provider_impl) = providers::create_provider(
-            &entry,
-            session.extensions.as_ref().map(ExtensionRegion::manager),
-        ) else {
-            continue;
-        };
-
-        // Build and persist the complete transition on a private Session
-        // candidate. The live transcript and provider/options stay untouched
-        // if restoration, the inner lock, or persistence fails.
-        let session_store = Arc::clone(&session.session);
-        let cx = pi::agent_cx::AgentCx::for_request();
-        let mut inner = OwnedMutexGuard::lock(session_store, &cx)
-            .await
-            .map_err(|err| anyhow::anyhow!("failover session lock failed: {err}"))?;
-        let mut candidate = inner.clone();
-        let reverted = candidate.revert_incomplete_response();
-        if require_incomplete_tail && !reverted {
-            bail!(
-                "failover restoration invariant failed: the completed error response had no incomplete assistant tail"
-            );
-        }
-        let restored_messages = candidate.to_messages_for_current_path();
-        let to_provider = entry.model.provider.clone();
-        let to_model = entry.model.id.clone();
-        let target_thinking = entry.clamp_thinking_level(
-            session
-                .agent
-                .stream_options()
-                .thinking_level
-                .unwrap_or_default(),
-        );
-        let target_thinking_text = target_thinking.to_string();
-        let thinking_changed = candidate
-            .effective_thinking_level_for_current_path()
-            .as_deref()
-            != Some(target_thinking_text.as_str());
-        candidate.set_model_header(
-            Some(to_provider.clone()),
-            Some(to_model.clone()),
-            Some(target_thinking_text.clone()),
-        );
-        candidate.append_custom_entry(
-            "failover".to_string(),
-            Some(serde_json::json!({
-                "from": format!("{from_provider}/{from_model}"),
-                "to": format!("{to_provider}/{to_model}"),
-                "class": format!("{class:?}").to_ascii_lowercase(),
-                "attempt": cursor,
-            })),
-        );
-        candidate.append_model_change_with_role(
-            to_provider.clone(),
-            to_model.clone(),
-            Some("failover".to_string()),
-        );
-        if thinking_changed {
-            candidate.append_thinking_level_change(target_thinking_text);
-        }
-        if session.save_enabled()
-            && let Err(first_err) = candidate.save().await
-            && let Err(retry_err) = candidate.save().await
-        {
-            return Err(anyhow::Error::new(pi::error::Error::session_persistence(
-                format!(
-                    "failover Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-                ),
-            )));
-        }
-
-        // No fallible operation remains after installing the candidate.
-        *inner = candidate;
-        session.agent.replace_messages(restored_messages);
-        session.agent.set_provider(provider_impl);
-        session.agent.set_keyword_max_thinking_level(
-            entry.clamp_thinking_level(pi::model::ThinkingLevel::Max),
-        );
-        session
-            .agent
-            .set_tool_call_dialect(entry.tool_call_dialect());
-        session
-            .agent
-            .set_model_accepts_images(entry.model.input.contains(&InputType::Image));
-        {
-            let stream_options = session.agent.stream_options_mut();
-            stream_options.api_key.clone_from(&key);
-            stream_options.headers.clone_from(&entry.headers);
-            stream_options.max_tokens = Some(entry.model.max_tokens);
-            stream_options.thinking_level = Some(target_thinking);
-        }
-        session.set_compaction_context_window(context_window_tokens_for_entry(&entry));
-        session.refresh_extension_completion_host_state();
-        if let Some(region) = &session.extensions {
-            region
-                .manager()
-                .set_current_model(Some(to_provider.clone()), Some(to_model.clone()));
-        }
-        *position = cursor;
-        drop(inner);
-
-        if is_json {
-            if let Some(attempt) = retry_attempt_to_end {
-                emit_json_event(&AgentEvent::AutoRetryEnd {
-                    success: false,
-                    attempt,
-                    final_error: Some(error_text.to_string()),
-                });
-            }
-            emit_json_event(&AgentEvent::FailoverStart {
-                from_provider: from_provider.clone(),
-                from_model: from_model.clone(),
-                to_provider: to_provider.clone(),
-                to_model: to_model.clone(),
-                class: format!("{class:?}").to_ascii_lowercase(),
-                attempt: u32::try_from(cursor).unwrap_or(u32::MAX),
+    if is_json {
+        if let Some(attempt) = retry_attempt_to_end {
+            emit_json_event(&AgentEvent::AutoRetryEnd {
+                success: false,
+                attempt,
+                final_error: Some(error_text.to_string()),
             });
         }
-
-        return Ok(Some((to_provider, to_model)));
+        emit_json_event(&AgentEvent::FailoverStart {
+            from_provider: committed.from_provider.clone(),
+            from_model: committed.from_model.clone(),
+            to_provider: committed.to_provider.clone(),
+            to_model: committed.to_model.clone(),
+            class: format!("{class:?}").to_ascii_lowercase(),
+            // Budget position, not chain position: this swap is the
+            // (swaps_so_far + 1)-th of `retry.maxFailoversPerTurn` (bd-oqo03).
+            attempt: swaps_so_far.saturating_add(1),
+            chain_index: u32::try_from(committed.entry_index).unwrap_or(u32::MAX),
+        });
     }
-    *position = cursor;
-    Ok(None)
+
+    Ok(Some((committed.to_provider, committed.to_model)))
 }
 
 /// Execute a single prompt with automatic retry and `AutoRetryStart`/`AutoRetryEnd`
@@ -9042,6 +9606,7 @@ async fn run_print_prompt_with_retry<H, EH>(
     text_stream_state: &Arc<StdMutex<PrintTextStreamState>>,
     input: PromptInput,
     failover_ctx: Option<FailoverResolution<'_>>,
+    failover_state: &mut PrintFailoverState,
 ) -> Result<AssistantMessage>
 where
     H: Fn() -> EH + Sync,
@@ -9087,7 +9652,6 @@ where
     }
 
     let mut retry_count: u32 = 0;
-    let mut failover_position: usize = 0;
     // Set once a fallback chain entry has been installed for this turn; every
     // exit below then closes the failover lifecycle before returning.
     let mut failed_over = false;
@@ -9097,8 +9661,47 @@ where
     let mut current_result = first_result;
 
     loop {
+        // One policy, shared with RPC and available to the interactive stacks
+        // (bd-u2qv4). It decides; everything below is this surface's I/O for
+        // the decision — JSON events, the backoff sleep, tail restoration and
+        // the chain swap.
+        //
+        // The context window is None here, which is print mode's long-standing
+        // behaviour and is preserved deliberately: RPC supplies the real window
+        // and so refuses a SILENT context overflow that print retries to budget
+        // exhaustion. Resolving the window on this path is a behaviour change
+        // and needs its own test.
+        let decision = {
+            let progress = pi::failover::TurnProgress {
+                retry_count,
+                failovers_this_turn,
+                stream_can_retry: snapshot_print_text_stream_state(text_stream_state)
+                    .can_retry(is_json),
+            };
+            let policy = print_mode_retry_policy(config, max_retries);
+            match &current_result {
+                Ok(msg) => pi::failover::decide(
+                    pi::failover::TurnOutcome::Completed(msg),
+                    &progress,
+                    &policy,
+                    None,
+                ),
+                Err(err) => pi::failover::decide(
+                    pi::failover::TurnOutcome::Failed(err),
+                    &progress,
+                    &policy,
+                    None,
+                ),
+            }
+        };
+
         match current_result {
-            Ok(msg) if matches!(msg.stop_reason, StopReason::Aborted) => {
+            Ok(msg)
+                if decision
+                    == pi::failover::TurnDecision::Terminal(
+                        pi::failover::TerminalReason::Aborted,
+                    ) =>
+            {
                 if retry_count > 0 && is_json {
                     emit_json_event(&AgentEvent::AutoRetryEnd {
                         success: false,
@@ -9109,18 +9712,16 @@ where
                 emit_print_failover_end(is_json, failed_over, session, false);
                 return Ok(msg);
             }
-            Ok(msg)
-                if is_retryable_prompt_result(&msg)
-                    && retry_count < max_retries
-                    && snapshot_print_text_stream_state(text_stream_state).can_retry(is_json) =>
-            {
+            Ok(msg) if matches!(decision, pi::failover::TurnDecision::Retry { .. }) => {
                 let err_msg = msg
                     .error_message
                     .clone()
                     .unwrap_or_else(|| "Request error".to_string());
 
-                retry_count += 1;
-                let delay_ms = print_mode_retry_delay_ms(config, retry_count);
+                let pi::failover::TurnDecision::Retry { attempt, delay_ms } = decision else {
+                    unreachable!("guarded by the arm pattern")
+                };
+                retry_count = attempt;
                 if is_json {
                     emit_json_event(&AgentEvent::AutoRetryStart {
                         attempt: retry_count,
@@ -9154,10 +9755,10 @@ where
                 if !success {
                     // Terminal guard (bd-8188r): never walk the failover
                     // chain for a session-persistence failure.
-                    if msg
-                        .error_message
-                        .as_deref()
-                        .is_some_and(message_marks_session_persistence)
+                    if decision
+                        == pi::failover::TurnDecision::Terminal(
+                            pi::failover::TerminalReason::SessionPersistence,
+                        )
                     {
                         if retry_count > 0 && is_json {
                             emit_json_event(&AgentEvent::AutoRetryEnd {
@@ -9171,16 +9772,17 @@ where
                     }
                     // Failover (bd-cv653.3.2): a classified transient failure
                     // on the final retry walks the fallback chain.
-                    let failover_result = if failovers_this_turn < config.max_failovers_per_turn() {
+                    let failover_result = if decision == pi::failover::TurnDecision::FailOver {
                         try_print_failover(
                             session,
                             config,
                             failover_ctx,
-                            &mut failover_position,
+                            failover_state,
                             msg.error_message.as_deref(),
                             is_json,
                             true,
                             (retry_count > 0).then_some(retry_count),
+                            failovers_this_turn,
                         )
                         .await
                     } else {
@@ -9226,7 +9828,11 @@ where
                 // must never reach quota bookkeeping, retry classification,
                 // or failover — the wrapped prose can look transient while
                 // repeating effects would be unsafe.
-                if err.is_session_persistence() {
+                if decision
+                    == pi::failover::TurnDecision::Terminal(
+                        pi::failover::TerminalReason::SessionPersistence,
+                    )
+                {
                     if retry_count > 0 && is_json {
                         emit_json_event(&AgentEvent::AutoRetryEnd {
                             success: false,
@@ -9246,15 +9852,8 @@ where
                         session.agent.stream_options().api_key.clone(),
                     )
                 });
-                // Classify from the TYPED error first (transient io::ErrorKind
-                // via the source chain), then fall back to message-text matching
-                // for prose-only errors (pi_agent_rust#118).
-                if retry_count < max_retries
-                    && (err.is_transient() || pi::error::is_retryable_error(&err_str, None, None))
-                    && snapshot_print_text_stream_state(text_stream_state).can_retry(is_json)
-                {
-                    retry_count += 1;
-                    let delay_ms = print_mode_retry_delay_ms(config, retry_count);
+                if let pi::failover::TurnDecision::Retry { attempt, delay_ms } = decision {
+                    retry_count = attempt;
                     if is_json {
                         emit_json_event(&AgentEvent::AutoRetryStart {
                             attempt: retry_count,
@@ -9309,16 +9908,17 @@ where
                     // Failover (bd-cv653.3.2): HTTP/transport errors surface on
                     // the Err path, so the chain walk must live here too —
                     // not only on the Ok-with-error-result path.
-                    let failover_result = if failovers_this_turn < config.max_failovers_per_turn() {
+                    let failover_result = if decision == pi::failover::TurnDecision::FailOver {
                         try_print_failover(
                             session,
                             config,
                             failover_ctx,
-                            &mut failover_position,
+                            failover_state,
                             Some(err_str.as_str()),
                             is_json,
                             false,
                             (retry_count > 0).then_some(retry_count),
+                            failovers_this_turn,
                         )
                         .await
                     } else {
@@ -9538,6 +10138,127 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    // Print mode's retry classification moved into `pi::failover` (bd-u2qv4),
+    // where RPC and the interactive stacks can reach it. These three aliases
+    // name what this surface asks for — in particular the `None` context
+    // window, which is print mode's long-standing choice and the one place it
+    // still differs from RPC — so the tests below keep exercising the real
+    // shared functions and the real config plumbing rather than a copy.
+    fn is_retryable_prompt_result(msg: &AssistantMessage) -> bool {
+        pi::failover::error_result_is_retryable(msg, None)
+    }
+
+    fn message_marks_session_persistence(error_text: &str) -> bool {
+        pi::failover::marks_session_persistence(error_text)
+    }
+
+    fn print_mode_retry_delay_ms(config: &Config, attempt: u32) -> u32 {
+        let policy = print_mode_retry_policy(config, 0);
+        pi::failover::retry_delay_ms(policy.base_delay_ms, policy.max_delay_ms, attempt)
+    }
+
+    /// A `MakeWriter` that keeps what a subscriber wrote, so a filter can be
+    /// asserted on what actually comes out rather than on its own opinion of
+    /// itself.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        // A panic inside the emitting closure poisons this buffer, and the
+        // assertion that follows says far more than a second panic about a
+        // lock would, so poisoning recovers rather than propagates.
+        fn with_bytes<R>(&self, f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+            f(&mut self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner))
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.with_bytes(|bytes| bytes.extend_from_slice(buf));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn logged_under(filter: EnvFilter, emit: impl FnOnce()) -> String {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(captured.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        let bytes = captured.with_bytes(|bytes| bytes.clone());
+        String::from_utf8(bytes).expect("log output is utf-8")
+    }
+
+    #[test]
+    fn settings_diagnostics_reach_the_user_without_rust_log() {
+        // The bug this pins: `EnvFilter::from_default_env()` with `RUST_LOG`
+        // unset enabled nothing above ERROR, so every settings warning pi
+        // emitted was formatted and then dropped. Asserting on the rendered
+        // output is deliberate — the first attempt at this filter named the
+        // target `pi_agent_rust::config`, which is not a target that exists,
+        // and a directive matching nothing is not an error.
+        let seen = logged_under(default_log_filter_for(None), || {
+            tracing::warn!(target: pi::config::USER_DIAGNOSTIC_TARGET, "misspelled key");
+            tracing::info!(target: pi::config::USER_DIAGNOSTIC_TARGET, "routine chatter");
+            tracing::warn!(target: "pi::agent", "somebody else's warning");
+            tracing::error!(target: "pi::agent", "somebody else's error");
+        });
+
+        assert!(
+            seen.contains("misspelled key"),
+            "the settings warning was dropped: {seen:?}"
+        );
+        assert!(
+            !seen.contains("routine chatter"),
+            "the default filter got louder than WARN: {seen:?}"
+        );
+        assert!(
+            !seen.contains("somebody else's warning"),
+            "the default filter reached past the user-diagnostic target: {seen:?}"
+        );
+        assert!(
+            seen.contains("somebody else's error"),
+            "errors elsewhere went quiet, which is a regression: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn rust_log_replaces_the_default_filter_wholesale() {
+        let silenced = logged_under(default_log_filter_for(Some("off")), || {
+            tracing::warn!(target: pi::config::USER_DIAGNOSTIC_TARGET, "misspelled key");
+        });
+        assert!(
+            silenced.is_empty(),
+            "RUST_LOG=off did not silence settings warnings: {silenced:?}"
+        );
+
+        let asked_for = logged_under(default_log_filter_for(Some("pi::agent=info")), || {
+            tracing::info!(target: "pi::agent", "what the user asked for");
+        });
+        assert!(
+            asked_for.contains("what the user asked for"),
+            "RUST_LOG was not honored: {asked_for:?}"
+        );
+    }
+
     fn spawn_auth_response_server(status: u16, body: &str) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind auth fixture");
         let address = listener.local_addr().expect("auth fixture address");
@@ -9654,6 +10375,145 @@ mod tests {
         let extension_output = String::from_utf8(extension_output).expect("UTF-8 diagnostics");
         assert!(extension_output.contains(&second.display().to_string()));
         assert!(!extension_output.contains(&first.display().to_string()));
+    }
+
+    /// gh #224: the approval-surface failure carries its own exit code, so a
+    /// caller can distinguish "the model could not use tools" from an ordinary
+    /// failure (1) or a usage error (2). Collapsing it back into
+    /// `EXIT_CODE_FAILURE` must fail this.
+    #[test]
+    fn approval_surface_unavailable_has_its_own_exit_code() {
+        let approval = anyhow::Error::new(ApprovalSurfaceUnavailable);
+        assert_eq!(
+            exit_code_for_error(&approval),
+            EXIT_CODE_APPROVAL_UNAVAILABLE
+        );
+        assert_ne!(EXIT_CODE_APPROVAL_UNAVAILABLE, EXIT_CODE_FAILURE);
+        assert_ne!(EXIT_CODE_APPROVAL_UNAVAILABLE, EXIT_CODE_USAGE);
+
+        // Still classified through a context chain, which is how it reaches
+        // `report_fatal_error_and_exit` from `run_print_mode`.
+        let wrapped = anyhow::Error::new(ApprovalSurfaceUnavailable).context("print mode");
+        assert_eq!(
+            exit_code_for_error(&wrapped),
+            EXIT_CODE_APPROVAL_UNAVAILABLE
+        );
+
+        // An unrelated failure is unaffected.
+        let other = anyhow::anyhow!("provider stream closed");
+        assert_eq!(exit_code_for_error(&other), EXIT_CODE_FAILURE);
+    }
+
+    /// gh #223: a failure loading configured skills/prompts/themes/extensions carries its own
+    /// exit code (4) and distinct fatal error code "`resource.load_failed`".
+    #[test]
+    fn configured_resource_load_failed_has_its_own_exit_code() {
+        let err = anyhow::Error::new(ConfiguredResourceLoadFailed(
+            "failed to resolve package".into(),
+        ));
+        assert_eq!(exit_code_for_error(&err), EXIT_CODE_RESOURCE_LOAD_FAILED);
+        assert_ne!(EXIT_CODE_RESOURCE_LOAD_FAILED, EXIT_CODE_FAILURE);
+        assert_ne!(EXIT_CODE_RESOURCE_LOAD_FAILED, EXIT_CODE_USAGE);
+        assert_ne!(
+            EXIT_CODE_RESOURCE_LOAD_FAILED,
+            EXIT_CODE_APPROVAL_UNAVAILABLE
+        );
+
+        let wrapped = anyhow::Error::new(ConfiguredResourceLoadFailed(
+            "failed to resolve package".into(),
+        ))
+        .context("startup");
+        assert_eq!(
+            exit_code_for_error(&wrapped),
+            EXIT_CODE_RESOURCE_LOAD_FAILED
+        );
+
+        assert_eq!(fatal_error_code(&err), "resource.load_failed");
+        assert_eq!(fatal_error_code(&wrapped), "resource.load_failed");
+    }
+
+    /// gh #217: the stdout record's `code` comes from the typed error in the
+    /// chain, clap/usage failures are `usage`, and untyped errors are
+    /// `internal`.
+    #[test]
+    fn fatal_error_code_classifies_by_error_kind() {
+        let missing_key = anyhow::Error::new(pi::error::Error::auth(
+            "No API key found for provider anthropic (set ANTHROPIC_API_KEY)",
+        ));
+        assert_eq!(fatal_error_code(&missing_key), "auth.missing_api_key");
+        let wrapped = anyhow::Error::new(pi::error::Error::config("settings.json: bad json"))
+            .context("Failed to load configuration");
+        assert_eq!(fatal_error_code(&wrapped), "config");
+        let validation = anyhow::Error::new(pi::error::Error::validation("bad --only"));
+        assert_eq!(fatal_error_code(&validation), "usage");
+        let startup_missing_key = anyhow::Error::new(StartupError::MissingApiKey {
+            provider: "anthropic".to_string(),
+        });
+        assert_eq!(
+            fatal_error_code(&startup_missing_key),
+            "auth.missing_api_key"
+        );
+        let startup_no_models = anyhow::Error::new(StartupError::NoModelsAvailable {
+            models_path: PathBuf::from("/tmp/models.json"),
+        })
+        .context("startup");
+        assert_eq!(
+            fatal_error_code(&startup_no_models),
+            "auth.no_models_available"
+        );
+        // gh #224: a run whose tool calls were all denied for want of an
+        // approval surface gets its own code, so a JSON host can tell it from
+        // a provider failure without parsing prose.
+        let approval = anyhow::Error::new(ApprovalSurfaceUnavailable).context("print mode");
+        assert_eq!(fatal_error_code(&approval), "approval.surface_unavailable");
+        // gh #223: configured resource load failure classified distinctly.
+        let resource_err =
+            anyhow::Error::new(ConfiguredResourceLoadFailed("broken package".into()));
+        assert_eq!(fatal_error_code(&resource_err), "resource.load_failed");
+        let clap_err = anyhow::Error::new(clap::Error::raw(
+            clap::error::ErrorKind::UnknownArgument,
+            "unknown --bogus",
+        ));
+        assert_eq!(fatal_error_code(&clap_err), "usage");
+        let usage_text = anyhow::anyhow!("theme file not found: x");
+        assert_eq!(fatal_error_code(&usage_text), "usage");
+        let plain = anyhow::anyhow!("something else entirely");
+        assert_eq!(fatal_error_code(&plain), "internal");
+    }
+
+    #[test]
+    fn machine_output_mode_from_args_recognizes_json_and_rpc_only() {
+        let args = |list: &[&str]| list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            machine_output_mode_from_args(&args(&["pi", "--mode", "json", "-p", "hi"])),
+            Some("json")
+        );
+        assert_eq!(
+            machine_output_mode_from_args(&args(&["pi", "--mode=rpc"])),
+            Some("rpc")
+        );
+        assert_eq!(
+            machine_output_mode_from_args(&args(&["pi", "--rpc"])),
+            Some("rpc")
+        );
+        assert_eq!(
+            machine_output_mode_from_args(&args(&["pi", "--mode", "text"])),
+            None
+        );
+        assert_eq!(
+            machine_output_mode_from_args(&args(&["pi", "-p", "hi"])),
+            None
+        );
+        // Positional text after `--` is not a flag.
+        assert_eq!(
+            machine_output_mode_from_args(&args(&["pi", "--", "--mode", "json"])),
+            None
+        );
+        // Last explicit mode wins.
+        assert_eq!(
+            machine_output_mode_from_args(&args(&["pi", "--mode", "json", "--mode", "text"])),
+            None
+        );
     }
 
     #[test]
@@ -10234,6 +11094,52 @@ mod tests {
                 .any(|entry| entry.model.provider.eq("openai") && entry.model.id.eq("gpt-4o")),
             "CLI API-key override should expose remote models to RPC model switching"
         );
+    }
+
+    /// gh #218: an explicit key for an explicit model must not reach for the
+    /// stored credentials; everything else still refreshes up front.
+    #[test]
+    fn startup_oauth_refresh_skipped_only_for_explicit_key_and_model() {
+        use clap::Parser as _;
+        let parse =
+            |args: &[&str]| cli::Cli::parse_from(std::iter::once("pi").chain(args.iter().copied()));
+        assert!(!startup_oauth_refresh_required(&parse(&[
+            "--api-key",
+            "sk-run",
+            "--model",
+            "openrouter/deepseek/deepseek-v4-pro"
+        ])));
+        assert!(!startup_oauth_refresh_required(&parse(&[
+            "--api-key",
+            "sk-run",
+            "--provider",
+            "openrouter",
+            "--model",
+            "deepseek/deepseek-v4-pro"
+        ])));
+        assert!(!startup_oauth_refresh_required(&parse(&[
+            "--api-key",
+            "sk-run",
+            "--provider",
+            "openrouter"
+        ])));
+        // A key without a selected provider/model may still fall back to the
+        // store (scoped models, extension providers): refresh.
+        assert!(startup_oauth_refresh_required(&parse(&[
+            "--api-key",
+            "sk-run"
+        ])));
+        assert!(startup_oauth_refresh_required(&parse(&[
+            "--api-key",
+            "   ",
+            "--model",
+            "openrouter/deepseek/deepseek-v4-pro"
+        ])));
+        assert!(startup_oauth_refresh_required(&parse(&[
+            "--model",
+            "anthropic/claude-sonnet-4-6"
+        ])));
+        assert!(startup_oauth_refresh_required(&parse(&[])));
     }
 
     #[test]
@@ -11250,7 +12156,7 @@ mod tests {
             let temp = tempfile::Builder::new()
                 .prefix("pi-print-persist-")
                 .tempdir_in("/tmp")
-                .expect("tempdir in /tmp");
+                .unwrap_or_else(|_| tempfile::tempdir().expect("tempdir"));
             let cwd = temp.path().to_path_buf();
             let poison = cwd.join("connection reset while saving");
             std::fs::create_dir(&poison).expect("poison directory");
@@ -11311,6 +12217,7 @@ mod tests {
                     keyword_scan_source: None,
                 },
                 None,
+                &mut PrintFailoverState::default(),
             )
             .await
             .expect_err("typed persistence failure must remain terminal");
@@ -11458,6 +12365,7 @@ mod tests {
                     keyword_scan_source: None,
                 },
                 None,
+                &mut PrintFailoverState::default(),
             )
             .await
             .expect("Ok(Error) persistence marker returns the original assistant");
@@ -11652,16 +12560,17 @@ mod tests {
                 auth: &auth,
                 cli_api_key: None,
             });
-            let mut position = 0;
+            let mut failover_state = PrintFailoverState::new(&config);
             let no_tail = try_print_failover(
                 &mut agent_session,
                 &config,
                 failover_ctx,
-                &mut position,
+                &mut failover_state,
                 Some("server error"),
                 false,
                 true,
                 None,
+                0,
             )
             .await
             .expect_err("known assistant failure requires a restorable tail");
@@ -11691,17 +12600,18 @@ mod tests {
                     .agent
                     .replace_messages(inner.to_messages_for_current_path());
             }
-            position = 0;
+            failover_state.set_chain_position(0);
             assert!(
                 try_print_failover(
                     &mut agent_session,
                     &config,
                     failover_ctx,
-                    &mut position,
+                    &mut failover_state,
                     Some("server error"),
                     false,
                     true,
                     None,
+                    0,
                 )
                 .await
                 .expect("durable print failover")
@@ -11805,6 +12715,7 @@ mod tests {
             .blocking_threads(1, 8)
             .build()
             .expect("runtime build");
+        let handle = runtime.handle();
         runtime.block_on(async move {
             let model_entry =
                 |provider: &str, model_id: &str, api: &str, key: Option<&str>| ModelEntry {
@@ -11891,16 +12802,17 @@ mod tests {
             // swapped to itself, and the valid fallback is installed.
             let (mut session, _keep) = build_session();
             let config = config_with_chain(&["openai/primary-model", "anthropic/fallback-model"]);
-            let mut position = 0;
+            let mut failover_state = PrintFailoverState::new(&config);
             let swapped = try_print_failover(
                 &mut session,
                 &config,
                 failover_ctx,
-                &mut position,
+                &mut failover_state,
                 Some("server error"),
                 false,
                 false,
                 None,
+                0,
             )
             .await
             .expect("walk past the current entry");
@@ -11909,7 +12821,20 @@ mod tests {
                 Some(("anthropic".to_string(), "fallback-model".to_string())),
                 "the current model must not consume the walk"
             );
-            assert_eq!(position, 2);
+            assert_eq!(failover_state.chain_position(), 2);
+            // bd-gm481.1: the swap records what to come back to.
+            assert_eq!(
+                failover_state
+                    .primary()
+                    .as_ref()
+                    .map(|p| (p.provider.as_str(), p.model_id.as_str())),
+                Some(("openai", "primary-model")),
+                "the model the chain started from is the one to restore"
+            );
+            assert_eq!(
+                failover_state.active().cloned(),
+                Some(("anthropic".to_string(), "fallback-model".to_string()))
+            );
             assert_eq!(session.agent.provider().name(), "anthropic");
             assert_eq!(session.agent.provider().model_id(), "fallback-model");
 
@@ -11923,16 +12848,17 @@ mod tests {
                 "anthropic/fallback-model",
                 "anthropic/fallback-model",
             ]);
-            let mut position = 0;
+            let mut failover_state = PrintFailoverState::new(&config);
             let swapped = try_print_failover(
                 &mut session,
                 &config,
                 failover_ctx,
-                &mut position,
+                &mut failover_state,
                 Some("server error"),
                 false,
                 false,
                 None,
+                0,
             )
             .await
             .expect("walk past keyless and duplicate entries");
@@ -11940,21 +12866,486 @@ mod tests {
                 swapped,
                 Some(("anthropic".to_string(), "fallback-model".to_string()))
             );
-            assert_eq!(position, 3);
+            assert_eq!(failover_state.chain_position(), 3);
             let again = try_print_failover(
                 &mut session,
                 &config,
                 failover_ctx,
-                &mut position,
+                &mut failover_state,
                 Some("server error"),
                 false,
                 false,
                 None,
+                0,
             )
             .await
             .expect("second walk");
             assert_eq!(again, None, "the trailing duplicate is not a new swap");
-            assert_eq!(position, 4, "the walk is bounded by the chain length");
+            // bd-gr6fk: an exhausted walk records nothing, so the cursor stays
+            // where the last COMMITTED swap left it. This assertion previously
+            // read 4 — print advanced the cursor past every rejected entry,
+            // which made a transient rejection (a credential that arrives
+            // later) permanent for the life of the process. RPC and the SDK
+            // never did that; this is print joining them, and the changed
+            // number is the behaviour change, not a loosened assertion.
+            assert_eq!(
+                failover_state.chain_position(),
+                3,
+                "an exhausted walk must not advance the cursor past entries it \
+                 only rejected transiently"
+            );
+
+            // bd-gm481.1: the restoration REFUSALS, which the e2e pair cannot
+            // reach — it can only observe the two outcomes, restored and not.
+            // Each of these leaves the fallback installed, which is the safe
+            // direction: a session on a working fallback beats one wrongly
+            // moved off it.
+            let (mut clean, _keep) = build_session();
+            let config = config_with_chain(&["anthropic/fallback-model"]);
+
+            // Nothing installed: there is nothing to come back from.
+            let mut empty = PrintFailoverState::new(&config);
+            assert!(
+                !maybe_restore_print_primary(&mut clean, &mut empty, failover_ctx, false).await,
+                "a session that never failed over must not be touched"
+            );
+            assert_eq!(clean.agent.provider().model_id(), "primary-model");
+
+            // Cooldown still holding: the primary just told us it was unwell.
+            let (mut swapped, _keep) = build_session();
+            let mut holding = PrintFailoverState::with_cooldown_secs(600);
+            assert!(
+                try_print_failover(
+                    &mut swapped,
+                    &config,
+                    failover_ctx,
+                    &mut holding,
+                    Some("server error"),
+                    false,
+                    false,
+                    None,
+                    0,
+                )
+                .await
+                .expect("swap for the cooldown case")
+                .is_some()
+            );
+            let holding_aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            swapped.park_pending_compaction_for_test(&handle, Some(Arc::clone(&holding_aborted)));
+            assert!(
+                swapped.has_pending_background_compaction(),
+                "compaction must be in flight before refused restoration"
+            );
+            assert!(
+                !maybe_restore_print_primary(&mut swapped, &mut holding, failover_ctx, false).await,
+                "the cooldown must hold the primary back"
+            );
+            assert_eq!(swapped.agent.provider().model_id(), "fallback-model");
+            assert!(
+                holding.active().is_some(),
+                "a refused restoration keeps the recorded fallback"
+            );
+            assert!(
+                swapped.has_pending_background_compaction(),
+                "a refused restoration must keep the in-flight background compaction active"
+            );
+            assert!(
+                !holding_aborted.load(std::sync::atomic::Ordering::SeqCst),
+                "compaction task must not be aborted when restoration is refused"
+            );
+
+            // The live model is no longer the fallback we recorded: something
+            // else moved it, and undoing that is not ours to do.
+            let (mut moved, _keep) = build_session();
+            let mut elapsed = PrintFailoverState::with_cooldown_secs(0);
+            assert!(
+                try_print_failover(
+                    &mut moved,
+                    &config,
+                    failover_ctx,
+                    &mut elapsed,
+                    Some("server error"),
+                    false,
+                    false,
+                    None,
+                    0,
+                )
+                .await
+                .expect("swap for the drift case")
+                .is_some()
+            );
+            // Drift: the recorded fallback is no longer what is installed.
+            let recorded_primary = elapsed
+                .primary()
+                .cloned()
+                .expect("the swap above recorded a primary"); // ubs:ignore test assertion
+            elapsed.record_swap(
+                recorded_primary,
+                ("anthropic".to_string(), "some-other-model".to_string()),
+                std::time::Instant::now(),
+            );
+            assert!(
+                !maybe_restore_print_primary(&mut moved, &mut elapsed, failover_ctx, false).await,
+                "a runtime that does not match the recorded fallback must not be swapped"
+            );
+            assert_eq!(moved.agent.provider().model_id(), "fallback-model");
+
+            // And the control: cooldown elapsed, everything consistent.
+            let (mut restorable, _keep) = build_session();
+            let mut ready = PrintFailoverState::with_cooldown_secs(0);
+            assert!(
+                try_print_failover(
+                    &mut restorable,
+                    &config,
+                    failover_ctx,
+                    &mut ready,
+                    Some("server error"),
+                    false,
+                    false,
+                    None,
+                    0,
+                )
+                .await
+                .expect("swap for the restore case")
+                .is_some()
+            );
+            assert_eq!(restorable.agent.provider().model_id(), "fallback-model");
+
+            // bd-uyqkk: Park an in-flight background compaction while running on the fallback.
+            let compaction_aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            restorable
+                .park_pending_compaction_for_test(&handle, Some(Arc::clone(&compaction_aborted)));
+            assert!(
+                restorable.has_pending_background_compaction(),
+                "compaction must be in flight before restoration"
+            );
+
+            assert!(
+                maybe_restore_print_primary(&mut restorable, &mut ready, failover_ctx, false).await,
+                "an elapsed cooldown with consistent state restores"
+            );
+            assert_eq!(restorable.agent.provider().model_id(), "primary-model");
+            assert_eq!(
+                restorable.agent.stream_options().api_key.as_deref(),
+                Some("primary-key"),
+                "restoring installs the primary's credential, not the fallback's"
+            );
+            assert!(ready.primary().is_none() && ready.active().is_none());
+            assert_eq!(
+                ready.chain_position(),
+                0,
+                "back on the primary, the chain starts over"
+            );
+            assert!(
+                !restorable.has_pending_background_compaction(),
+                "bd-uyqkk: primary restoration must invalidate the in-flight background compaction"
+            );
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+            assert!(
+                compaction_aborted.load(std::sync::atomic::Ordering::SeqCst),
+                "the in-flight compaction task must be aborted on restoration"
+            );
+        });
+    }
+
+    /// bd-gr6fk: an entry skipped because it had no usable credential must be
+    /// reconsidered once one appears.
+    ///
+    /// Print mode used to record the exhausted walk position, which made that
+    /// rejection permanent for the life of the process: configure a chain,
+    /// start without a key for one of its entries, and print would walk past it
+    /// once and never look again — silently shrinking the chain the user
+    /// configured. The cursor number is the mechanism; THIS is the consequence,
+    /// so this is what the test asserts.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn print_failover_reconsiders_an_entry_whose_credential_arrives_later() {
+        let runtime = RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let model_entry = |provider: &str, model_id: &str, key: Option<&str>| ModelEntry {
+                model: pi::provider::Model {
+                    id: model_id.to_string(),
+                    name: model_id.to_string(),
+                    api: if provider == "openai" {
+                        "openai-completions".to_string()
+                    } else {
+                        "anthropic".to_string()
+                    },
+                    provider: provider.to_string(),
+                    base_url: if provider == "openai" {
+                        "https://api.openai.com/v1".to_string()
+                    } else {
+                        "https://api.anthropic.com".to_string()
+                    },
+                    reasoning: false,
+                    input: vec![InputType::Text],
+                    cost: pi::provider::ModelCost {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    context_window: 8_192,
+                    max_tokens: 1_024,
+                    headers: std::collections::HashMap::new(),
+                },
+                api_key: key.map(str::to_string),
+                headers: std::collections::HashMap::new(),
+                auth_header: true,
+                compat: None,
+                oauth_config: None,
+            };
+            let primary = model_entry("openai", "primary-model", Some("primary-key"));
+            let keyless = model_entry("anthropic", "keyless-model", None);
+
+            let provider = providers::create_provider(&primary, None).expect("primary provider");
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let mut agent = Agent::new(provider, tools, AgentConfig::default());
+            agent.stream_options_mut().api_key = Some("primary-key".to_string());
+            let session_temp = tempfile::tempdir().expect("session tempdir");
+            let stored = Session::create_with_dir(Some(session_temp.path().join("sessions")));
+            let mut session = AgentSession::new(
+                agent,
+                Arc::new(Mutex::new(stored)),
+                true,
+                ResolvedCompactionSettings::default(),
+            );
+
+            let auth_temp = tempfile::tempdir().expect("auth tempdir");
+            let auth = AuthStorage::load(auth_temp.path().join("auth.json")).expect("auth load");
+            let available_models = vec![primary, keyless];
+            let mut config = Config::default();
+            config.retry = Some(pi::config::RetrySettings {
+                fallback_chains: Some(std::collections::HashMap::from([(
+                    "default".to_string(),
+                    vec!["anthropic/keyless-model".to_string()],
+                )])),
+                max_failovers_per_turn: Some(1),
+                ..Default::default()
+            });
+            let mut failover_state = PrintFailoverState::new(&config);
+
+            // No credential anywhere: the only entry is skipped and the walk
+            // finds nothing. Failing over into an auth error would be strictly
+            // worse than the error that started this.
+            let refused = try_print_failover(
+                &mut session,
+                &config,
+                Some(FailoverResolution {
+                    available_models: &available_models,
+                    auth: &auth,
+                    cli_api_key: None,
+                }),
+                &mut failover_state,
+                Some("server error"),
+                false,
+                false,
+                None,
+                0,
+            )
+            .await
+            .expect("first walk");
+            assert_eq!(refused, None, "an entry with no credential is not usable");
+            assert_eq!(
+                failover_state.chain_position(),
+                0,
+                "a transient rejection must not advance the cursor"
+            );
+
+            // The credential appears. The SAME state, the SAME chain — and the
+            // entry must now be reachable.
+            let installed = try_print_failover(
+                &mut session,
+                &config,
+                Some(FailoverResolution {
+                    available_models: &available_models,
+                    auth: &auth,
+                    cli_api_key: Some("late-key"),
+                }),
+                &mut failover_state,
+                Some("server error"),
+                false,
+                false,
+                None,
+                0,
+            )
+            .await
+            .expect("second walk");
+            assert_eq!(
+                installed,
+                Some(("anthropic".to_string(), "keyless-model".to_string())),
+                "an entry rejected only for a missing credential must be \
+                 reconsidered once that credential exists (bd-gr6fk)"
+            );
+            assert_eq!(session.agent.provider().model_id(), "keyless-model");
+        });
+    }
+
+    /// bd-jk057 and its unfiled sibling: from the SECOND hop of a chain onwards,
+    /// print mode resolved everything from the LIVE model, which by then is
+    /// itself a fallback. Two things went wrong at once, and this covers both.
+    ///
+    /// A user asking for High, on a chain `primary -> non-reasoning -> reasoning`
+    /// keyed by an exact `provider/model` spec, used to get: hop two never
+    /// running at all (the key names the primary, and the live model is no
+    /// longer it), and — with a role-keyed chain where hop two DID run — the
+    /// level clamped against what hop one allowed, so it ratcheted to Off and
+    /// stayed there for the session.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn print_failover_resolves_the_chain_and_the_thinking_level_from_the_primary() {
+        let runtime = RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let model_entry = |provider: &str, model_id: &str, reasoning: bool| ModelEntry {
+                model: pi::provider::Model {
+                    id: model_id.to_string(),
+                    name: model_id.to_string(),
+                    api: if provider == "openai" {
+                        "openai-completions".to_string()
+                    } else {
+                        "anthropic".to_string()
+                    },
+                    provider: provider.to_string(),
+                    base_url: if provider == "openai" {
+                        "https://api.openai.com/v1".to_string()
+                    } else {
+                        "https://api.anthropic.com".to_string()
+                    },
+                    reasoning,
+                    input: vec![InputType::Text],
+                    cost: pi::provider::ModelCost {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    context_window: 8_192,
+                    max_tokens: 1_024,
+                    headers: std::collections::HashMap::new(),
+                },
+                api_key: Some(format!("{model_id}-key")),
+                headers: std::collections::HashMap::new(),
+                auth_header: true,
+                compat: None,
+                oauth_config: None,
+            };
+            // A thinks; B does NOT, so it clamps any level to Off; C thinks
+            // again. B is the "worst model the chain touched".
+            let primary = model_entry("openai", "primary-model", true);
+            let no_reasoning = model_entry("anthropic", "b-no-reasoning", false);
+            let reasoning_again = model_entry("anthropic", "c-reasoning", true);
+
+            let provider = providers::create_provider(&primary, None).expect("primary provider");
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let mut agent = Agent::new(provider, tools, AgentConfig::default());
+            agent.stream_options_mut().api_key = Some("primary-model-key".to_string());
+            agent.stream_options_mut().thinking_level = Some(ThinkingLevel::High);
+            let session_temp = tempfile::tempdir().expect("session tempdir");
+            let stored = Session::create_with_dir(Some(session_temp.path().join("sessions")));
+            let mut session = AgentSession::new(
+                agent,
+                Arc::new(Mutex::new(stored)),
+                true,
+                ResolvedCompactionSettings::default(),
+            );
+
+            let auth_temp = tempfile::tempdir().expect("auth tempdir");
+            let auth = AuthStorage::load(auth_temp.path().join("auth.json")).expect("auth load");
+            let available_models = vec![
+                primary.clone(),
+                no_reasoning.clone(),
+                reasoning_again.clone(),
+            ];
+            let failover_ctx = Some(FailoverResolution {
+                available_models: &available_models,
+                auth: &auth,
+                cli_api_key: None,
+            });
+
+            // Keyed by the EXACT primary spec, not "default": this is what makes
+            // hop two depend on resolving the chain from the primary. A
+            // role-keyed chain would hide half the bug.
+            let mut config = Config::default();
+            config.retry = Some(pi::config::RetrySettings {
+                fallback_chains: Some(std::collections::HashMap::from([(
+                    "openai/primary-model".to_string(),
+                    vec![
+                        "anthropic/b-no-reasoning".to_string(),
+                        "anthropic/c-reasoning".to_string(),
+                    ],
+                )])),
+                max_failovers_per_turn: Some(2),
+                ..Default::default()
+            });
+            let mut failover_state = PrintFailoverState::new(&config);
+
+            let hop_one = try_print_failover(
+                &mut session,
+                &config,
+                failover_ctx,
+                &mut failover_state,
+                Some("server error"),
+                false,
+                false,
+                None,
+                0,
+            )
+            .await
+            .expect("hop one");
+            assert_eq!(
+                hop_one,
+                Some(("anthropic".to_string(), "b-no-reasoning".to_string())),
+                "hop one installs the first chain entry"
+            );
+            assert_eq!(
+                session.agent.stream_options().thinking_level,
+                Some(ThinkingLevel::Off),
+                "a non-reasoning model clamps the requested level to Off"
+            );
+
+            let hop_two = try_print_failover(
+                &mut session,
+                &config,
+                failover_ctx,
+                &mut failover_state,
+                Some("server error"),
+                false,
+                false,
+                None,
+                1,
+            )
+            .await
+            .expect("hop two");
+            assert_eq!(
+                hop_two,
+                Some(("anthropic".to_string(), "c-reasoning".to_string())),
+                "the chain is keyed by the PRIMARY, so hop two must still \
+                 resolve it after hop one moved the live model off that key"
+            );
+            assert_eq!(
+                session.agent.stream_options().thinking_level,
+                Some(ThinkingLevel::High),
+                "the clamp respects a MODEL's limit; it must not make hop one's \
+                 limit sticky across the rest of the chain (bd-jk057)"
+            );
+            assert_eq!(
+                failover_state
+                    .primary()
+                    .as_ref()
+                    .map(|p| (p.provider.as_str(), p.model_id.as_str())),
+                Some(("openai", "primary-model")),
+                "two hops in, the identity to restore is still the chain's origin"
+            );
         });
     }
 
@@ -12088,16 +13479,17 @@ mod tests {
                 cli_api_key: None,
             });
             let original_dialect = agent_session.agent.tool_call_dialect();
-            let mut position = 0;
+            let mut failover_state = PrintFailoverState::new(&config);
             let failover_error = try_print_failover(
                 &mut agent_session,
                 &config,
                 failover_ctx,
-                &mut position,
+                &mut failover_state,
                 Some("server error"),
                 false,
                 true,
                 None,
+                0,
             )
             .await
             .expect_err("unwritable candidate must block failover");
@@ -12107,9 +13499,14 @@ mod tests {
                     .contains("SESSION_PERSISTENCE_FAILED")
             );
             assert_eq!(
-                position, 0,
+                failover_state.chain_position(),
+                0,
                 "failed persistence must not consume the fallback"
             );
+            // bd-gm481.1: nor may it record anything to restore later — there
+            // is no committed swap to come back from.
+            assert!(failover_state.primary().is_none());
+            assert!(failover_state.active().is_none());
             assert_eq!(agent_session.agent.provider().name(), "openai");
             assert_eq!(agent_session.agent.provider().model_id(), "primary-model");
             assert_eq!(
@@ -12201,6 +13598,39 @@ mod tests {
         assert!(!is_retryable_prompt_result(&fatal));
     }
 
+    /// bd-print-json-panics-on-closed-stdout: a closed stdout reader is the one
+    /// write failure that must NOT end the run loudly.
+    ///
+    /// The exit itself cannot be asserted in-process — `exit_if_stdout_closed`
+    /// calls `std::process::exit`, so a test that triggered it would take the
+    /// test binary with it. What is checkable here is the classification, which
+    /// is the part that was wrong: `BrokenPipe` is the quiet case and everything
+    /// else is not. `tests/e2e_cli.rs` drives the real pipeline end to end.
+    #[test]
+    fn only_a_broken_pipe_is_a_quiet_stdout_ending() {
+        assert_eq!(
+            EXIT_CODE_STDOUT_CLOSED, 0,
+            "a reader that took what it asked for and left is not a failure"
+        );
+        assert_eq!(
+            io::Error::from(io::ErrorKind::BrokenPipe).kind(),
+            io::ErrorKind::BrokenPipe,
+            "the kind this hinges on"
+        );
+        for loud in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::StorageFull,
+            io::ErrorKind::WriteZero,
+            io::ErrorKind::Interrupted,
+        ] {
+            assert_ne!(
+                loud,
+                io::ErrorKind::BrokenPipe,
+                "a full disk or a denied write on `pi -p > out.json` must stay loud"
+            );
+        }
+    }
+
     #[test]
     fn emit_json_event_serializes_retry_events() {
         let start = AgentEvent::AutoRetryStart {
@@ -12262,6 +13692,109 @@ mod tests {
             }),
         };
         assert_eq!(streamed_text_delta(&start_event), None);
+    }
+
+    fn accumulated_assistant_message(text: &str) -> Arc<AssistantMessage> {
+        Arc::new(AssistantMessage {
+            content: vec![ContentBlock::Text(pi::model::TextContent::new(text))],
+            api: "test-api".to_string(),
+            provider: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            usage: pi::model::Usage::default(),
+            stop_reason: StopReason::Stop,
+            stop_details: None,
+            error_message: None,
+            timestamp: 0,
+        })
+    }
+
+    /// gh #222: `message_update` JSON records must not carry the accumulated
+    /// message (neither as `message` nor as `assistantMessageEvent.partial`).
+    #[test]
+    fn print_mode_json_record_message_update_is_delta_only() {
+        let partial = accumulated_assistant_message(&"x".repeat(10_000));
+        let event = AgentEvent::MessageUpdate {
+            message: pi::model::Message::Assistant(Arc::clone(&partial)),
+            assistant_message_event: pi::model::AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "tail".to_string(),
+                partial: Arc::clone(&partial),
+            },
+        };
+        let record = print_mode_json_record(&event).expect("serialize record");
+        let value: Value = serde_json::from_str(&record).expect("valid json");
+        assert_eq!(value["type"], "message_update");
+        assert!(value.get("message").is_none(), "record: {record}");
+        assert_eq!(value["assistantMessageEvent"]["type"], "text_delta");
+        assert_eq!(value["assistantMessageEvent"]["delta"], "tail");
+        assert_eq!(value["assistantMessageEvent"]["contentIndex"], 0);
+        assert!(
+            value["assistantMessageEvent"].get("partial").is_none(),
+            "record: {record}"
+        );
+        assert!(
+            record.len() < 200,
+            "record must not scale with the partial: {record}"
+        );
+
+        // Terminal variants keep their once-per-message payload.
+        let done = AgentEvent::MessageUpdate {
+            message: pi::model::Message::Assistant(Arc::clone(&partial)),
+            assistant_message_event: pi::model::AssistantMessageEvent::Done {
+                reason: StopReason::Stop,
+                message: Arc::clone(&partial),
+            },
+        };
+        let value: Value = serde_json::from_str(&print_mode_json_record(&done).unwrap()).unwrap();
+        assert_eq!(value["assistantMessageEvent"]["type"], "done");
+        assert_eq!(value["assistantMessageEvent"]["reason"], "stop");
+        assert_eq!(
+            value["assistantMessageEvent"]["message"]["stopReason"],
+            "stop"
+        );
+        assert!(value["assistantMessageEvent"]["message"]["content"].is_array());
+
+        // Other events are untouched.
+        let end = AgentEvent::MessageEnd {
+            message: pi::model::Message::Assistant(partial),
+        };
+        assert_eq!(
+            print_mode_json_record(&end).unwrap(),
+            serde_json::to_string(&end).unwrap()
+        );
+    }
+
+    /// gh #222: total stdout for a streamed response must grow linearly with
+    /// the number of deltas. Doubling the delta count must (roughly) double
+    /// the emitted bytes; the quadratic form grew ~4x.
+    #[test]
+    fn print_mode_json_stream_size_is_linear_in_delta_count() {
+        fn emitted_bytes(deltas: usize) -> usize {
+            let mut text = String::new();
+            let mut total = 0;
+            for index in 0..deltas {
+                let delta = format!("token{index} ");
+                text.push_str(&delta);
+                let partial = accumulated_assistant_message(&text);
+                let event = AgentEvent::MessageUpdate {
+                    message: pi::model::Message::Assistant(Arc::clone(&partial)),
+                    assistant_message_event: pi::model::AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta,
+                        partial,
+                    },
+                };
+                total += print_mode_json_record(&event).expect("record").len() + 1;
+            }
+            total
+        }
+
+        let small = emitted_bytes(500);
+        let large = emitted_bytes(1000);
+        assert!(
+            large < small * 5 / 2,
+            "stream is super-linear: {small} bytes for 500 deltas, {large} for 1000"
+        );
     }
 
     #[test]

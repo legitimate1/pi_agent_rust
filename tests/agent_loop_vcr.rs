@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; asupersync 0.5.0 nests its runtime future types deeply
+// enough that proving `Send` exceeds the default 128.
+#![recursion_limit = "256"]
+
 mod common;
 
 use common::{TestHarness, run_async};
@@ -119,6 +124,7 @@ fn format_event(event: &AgentEvent) -> serde_json::Value {
             to_model,
             class,
             attempt,
+            chain_index,
         } => json!({
             "event": "failover_start",
             "fromProvider": from_provider,
@@ -127,6 +133,7 @@ fn format_event(event: &AgentEvent) -> serde_json::Value {
             "toModel": to_model,
             "class": class,
             "attempt": attempt,
+            "chainIndex": chain_index,
         }),
         AgentEvent::FailoverEnd {
             success,

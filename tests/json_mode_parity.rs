@@ -314,20 +314,33 @@ fn json_parity_message_update_schema() {
             partial,
         },
     };
+    // The in-process event keeps the cumulative message for SDK/TUI consumers.
     let json = event_to_json(&event);
-
     assert_event_type(&json, "message_update");
     assert_has_field(&json, "message");
+    assert_has_field(&json, "assistantMessageEvent");
+    assert!(json.get("assistant_message_event").is_none());
+
+    // The `--mode json` stdout record is delta-only (upstream pi 0.84 contract,
+    // gh #222): no cumulative `message`, no `assistantMessageEvent.partial`,
+    // so the stream stays linear in the response length.
+    let line = event
+        .to_json_stream_line()
+        .expect("serialize json stream line");
+    let json: Value = serde_json::from_str(&line).expect("stream line is JSON");
+    assert_event_type(&json, "message_update");
+    assert!(json.get("message").is_none(), "delta-only record: {json}");
     assert_has_field(&json, "assistantMessageEvent");
 
     // Verify camelCase
     assert!(json.get("assistant_message_event").is_none());
 
-    // Verify nested event has correct type tag
+    // Verify nested event has correct type tag and no partial snapshot
     let ame = &json["assistantMessageEvent"];
     assert_eq!(ame["type"], "text_delta");
     assert_has_field(ame, "contentIndex");
     assert_has_field(ame, "delta");
+    assert!(ame.get("partial").is_none(), "delta-only record: {json}");
 
     harness
         .log()
@@ -1071,6 +1084,70 @@ fn json_parity_session_header_schema() {
 // ============================================================================
 // 20. Event type string stability
 // ============================================================================
+
+/// gh #217: a startup failure in `--mode json` / `--mode rpc` prints exactly
+/// one `{"type":"error","phase":"startup","code":…,"message":…,"exit_code":N}`
+/// record on stdout before the non-zero exit. The five fields are the
+/// contract; `type` must not collide with any agent event type string.
+#[test]
+fn json_parity_startup_error_record_schema() {
+    let harness = TestHarness::new("json_parity_startup_error_record_schema");
+
+    let error =
+        pi::error::Error::auth("No API key found for provider anthropic (set ANTHROPIC_API_KEY)");
+    let record = pi::error_hints::fatal_error_record(
+        pi::error_hints::error_code(&error),
+        pi::error_hints::FATAL_ERROR_PHASE_STARTUP,
+        &error.to_string(),
+        1,
+    );
+
+    assert_event_type(&record, "error");
+    assert_eq!(record["phase"], "startup");
+    assert_eq!(record["code"], "auth.missing_api_key");
+    assert_non_empty_string(&record, "message");
+    assert_eq!(record["exit_code"], 1);
+    let mut keys = record
+        .as_object()
+        .expect("record is an object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["code", "exit_code", "message", "phase", "type"],
+        "the record's field set is the contract"
+    );
+    assert_eq!(
+        pi::error_hints::FATAL_ERROR_RECORD_TYPE,
+        "error",
+        "hosts key on the literal type string"
+    );
+    assert_eq!(pi::error_hints::FATAL_ERROR_PHASE_RUN, "run");
+
+    // The record's type string is reserved: no AgentEvent serializes as it.
+    for event in [
+        AgentEvent::AgentStart {
+            session_id: "s".to_string().into(),
+        },
+        AgentEvent::ExtensionError {
+            extension_id: Some("ext".to_string()),
+            event: "boom".to_string(),
+            error: "failed".to_string(),
+        },
+    ] {
+        let json = event_to_json(&event);
+        assert_ne!(json["type"], "error", "{json}");
+    }
+
+    harness
+        .log()
+        .info_ctx("json_parity", "startup error record schema ok", |ctx| {
+            ctx.push(("type".to_string(), "error".to_string()));
+            ctx.push(("code".to_string(), "auth.missing_api_key".to_string()));
+        });
+}
 
 #[test]
 #[allow(clippy::too_many_lines)]

@@ -223,13 +223,20 @@ impl OpenAIProvider {
 
     /// Detect a provider-specific reasoning dialect for this transport.
     ///
-    /// An explicit catalog `compat.thinkingFormat` declaration wins (gh #166):
-    /// `"deepseek"` opts any custom OpenAI-compatible provider into the
-    /// DeepSeek dialect regardless of provider id or base URL, while any other
+    /// The OpenRouter gateway (by provider id or an `openrouter.ai` base URL)
+    /// always uses its normalized `reasoning` object (gh #220): with no
+    /// declared `thinkingFormat` it defaults on for reasoning models, and a
+    /// declared format other than `"openrouter"` opts out entirely — vendor
+    /// dialects such as DeepSeek's `thinking`/`reasoning_effort` never go
+    /// through the gateway, which translates `reasoning` itself.
+    ///
+    /// Elsewhere an explicit catalog `compat.thinkingFormat` declaration wins
+    /// (gh #166): `"deepseek"` opts any custom OpenAI-compatible provider into
+    /// the DeepSeek dialect regardless of provider id or base URL,
+    /// `"openrouter"` opts a proxy into the OpenRouter shape, while any other
     /// declared format (the legacy catalog also carries `"openai"`, `"zai"`,
-    /// `"qwen"`) explicitly opts out of it — this transport only models the
-    /// DeepSeek dialect today, so those serialize with no
-    /// `thinking`/`reasoning_effort`, exactly like providers with no dialect.
+    /// `"qwen"`) explicitly opts out — those serialize with no reasoning
+    /// controls, exactly like providers with no dialect.
     ///
     /// When no `thinkingFormat` is declared, DeepSeek is identified the same
     /// way `ModelEntry::is_deepseek_reasoning_model` does it — by the
@@ -242,16 +249,29 @@ impl OpenAIProvider {
         if !self.reasoning {
             return None;
         }
-        if let Some(format) = self
+        let declared = self
             .compat
             .as_ref()
             .and_then(|c| c.thinking_format.as_deref())
             .map(str::trim)
-            .filter(|format| !format.is_empty())
-        {
-            return format
-                .eq_ignore_ascii_case("deepseek")
-                .then_some(ReasoningStyle::DeepSeek);
+            .filter(|format| !format.is_empty());
+        if self.is_openrouter() {
+            return match declared {
+                None => Some(ReasoningStyle::OpenRouter),
+                Some(format) if format.eq_ignore_ascii_case("openrouter") => {
+                    Some(ReasoningStyle::OpenRouter)
+                }
+                Some(_) => None,
+            };
+        }
+        if let Some(format) = declared {
+            if format.eq_ignore_ascii_case("deepseek") {
+                return Some(ReasoningStyle::DeepSeek);
+            }
+            if format.eq_ignore_ascii_case("openrouter") {
+                return Some(ReasoningStyle::OpenRouter);
+            }
+            return None;
         }
         let provider_is_deepseek = canonical_provider_id(&self.provider)
             .is_some_and(|canonical| canonical == "deepseek")
@@ -314,10 +334,17 @@ impl OpenAIProvider {
             .unwrap_or(true);
 
         let stream_options = Some(OpenAIStreamOptions { include_usage });
+        // OpenRouter usage accounting (gh #221): `usage.include` makes the
+        // final usage chunk carry the billed `cost`, which is the only cost
+        // source for models the local catalog has no pricing for.
+        let usage = self
+            .is_openrouter()
+            .then_some(OpenAIUsageAccounting { include: true });
 
         // Forward the reasoning level for providers with a request-side reasoning
-        // dialect. Only DeepSeek today; all other transports get `(None, None)`,
-        // so their serialized body is unchanged. DeepSeek collapses `low`/`medium`
+        // dialect: DeepSeek's vendor fields, or OpenRouter's normalized
+        // `reasoning` object (gh #220). Every other transport gets all-`None`,
+        // so its serialized body is unchanged. DeepSeek collapses `low`/`medium`
         // into `high` itself, so we only emit the values it documents and let
         // `off` request the explicit non-thinking path. Both `xhigh` and `max`
         // map to DeepSeek's top `"max"` tier (xhigh kept its historical mapping
@@ -325,11 +352,11 @@ impl OpenAIProvider {
         // `thinkingLevelMap` overrides the emitted `reasoning_effort` value for
         // enabled levels (gh #117/#165), matching the anthropic-messages and
         // openai-responses transports; `off` never emits an effort.
-        let (thinking, reasoning_effort) = match self.reasoning_style() {
+        let (thinking, reasoning_effort, reasoning) = match self.reasoning_style() {
             Some(ReasoningStyle::DeepSeek) => {
                 let level = options.thinking_level.unwrap_or_default();
                 if level == ThinkingLevel::Off {
-                    (Some(OpenAIThinking { kind: "disabled" }), None)
+                    (Some(OpenAIThinking { kind: "disabled" }), None, None)
                 } else {
                     let mapped = self
                         .compat
@@ -345,10 +372,15 @@ impl OpenAIProvider {
                         | ThinkingLevel::Low
                         | ThinkingLevel::Medium => None,
                     });
-                    (Some(OpenAIThinking { kind: "enabled" }), effort)
+                    (Some(OpenAIThinking { kind: "enabled" }), effort, None)
                 }
             }
-            None => (None, None),
+            Some(ReasoningStyle::OpenRouter) => (
+                None,
+                None,
+                self.openrouter_reasoning(options.thinking_level.unwrap_or_default()),
+            ),
+            None => (None, None, None),
         };
 
         OpenAIRequest {
@@ -360,10 +392,64 @@ impl OpenAIProvider {
             tools,
             stream: true,
             stream_options,
+            usage,
             thinking,
             reasoning_effort,
+            reasoning,
             prompt_cache_key: options.prompt_cache_key.clone(),
+            service_tier: crate::provider::openai_service_tier(
+                &self.provider,
+                options.service_tier.as_deref(),
+            ),
         }
+    }
+
+    /// OpenRouter's normalized `reasoning` request object for a thinking
+    /// level (gh #220; https://openrouter.ai/docs/use-cases/reasoning-tokens).
+    ///
+    /// pi's level names are OpenRouter's `effort` vocabulary
+    /// (`minimal`/`low`/`medium`/`high`/`xhigh`/`max`), so the level is sent
+    /// as-is and the gateway translates it for models that take a token
+    /// budget instead. A catalog `thinkingLevelMap` entry overrides the value
+    /// per level: a positive integer becomes `reasoning.max_tokens` (the two
+    /// are mutually exclusive on the wire), anything else is sent as
+    /// `reasoning.effort` (e.g. `{"off": "none"}` to force thinking off on a
+    /// model that reasons by default). Unmapped `off` sends no `reasoning`
+    /// key, leaving the model's default.
+    fn openrouter_reasoning(&self, level: ThinkingLevel) -> Option<OpenRouterReasoning<'_>> {
+        let mapped = self
+            .compat
+            .as_ref()
+            .and_then(|c| c.thinking_level_map.as_ref())
+            .and_then(|map| map.get(level.to_string().as_str()))
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty());
+        match mapped {
+            Some(value) => match value.parse::<u32>() {
+                Ok(max_tokens) if max_tokens > 0 => Some(OpenRouterReasoning {
+                    effort: None,
+                    max_tokens: Some(max_tokens),
+                }),
+                _ => Some(OpenRouterReasoning {
+                    effort: Some(Cow::Borrowed(value)),
+                    max_tokens: None,
+                }),
+            },
+            None if level == ThinkingLevel::Off => None,
+            None => Some(OpenRouterReasoning {
+                effort: Some(Cow::Owned(level.to_string())),
+                max_tokens: None,
+            }),
+        }
+    }
+
+    /// True for the OpenRouter gateway, by provider id (canonical or alias)
+    /// or by base URL for custom providers pointed at `openrouter.ai`.
+    fn is_openrouter(&self) -> bool {
+        self.provider.eq_ignore_ascii_case("openrouter")
+            || canonical_provider_id(&self.provider)
+                .is_some_and(|canonical| canonical == "openrouter")
+            || self.base_url.to_ascii_lowercase().contains("openrouter.ai")
     }
 
     fn build_request_json(
@@ -694,12 +780,14 @@ impl Provider for OpenAIProvider {
         let stream = stream::unfold(
             StreamState::new(event_source, model, api, provider),
             |mut state| async move {
-                if state.done {
-                    return None;
-                }
                 loop {
                     if let Some(event) = state.pending_events.pop_front() {
                         return Some((Ok(event), state));
+                    }
+                    // A terminal frame can enqueue block-end events before Done.
+                    // Drain that queue even after the transport is finished.
+                    if state.done {
+                        return None;
                     }
 
                     match state.event_source.next().await {
@@ -707,11 +795,9 @@ impl Provider for OpenAIProvider {
                             // A successful chunk resets the consecutive error counter.
                             state.transient_error_count = 0;
                             // OpenAI sends "[DONE]" as final message
-                            if msg.data == "[DONE]" {
-                                state.done = true;
-                                let reason = state.partial.stop_reason;
-                                let message = std::mem::take(&mut state.partial);
-                                return Some((Ok(StreamEvent::Done { reason, message }), state));
+                            if msg.data.trim() == "[DONE]" {
+                                state.finish_response();
+                                continue;
                             }
 
                             if let Err(e) = state.process_event(&msg.data) {
@@ -782,6 +868,8 @@ where
     pending_events: VecDeque<StreamEvent>,
     started: bool,
     done: bool,
+    /// Block-end events and strict tool arguments have been finalized once.
+    finalized: bool,
     /// Consecutive WriteZero errors seen without a successful event in between.
     transient_error_count: usize,
 }
@@ -968,6 +1056,7 @@ where
             pending_events: VecDeque::new(),
             started: false,
             done: false,
+            finalized: false,
             transient_error_count: 0,
         }
     }
@@ -1005,16 +1094,22 @@ where
                 .unwrap_or_else(|| usage.prompt_tokens.saturating_sub(cached));
             self.partial.usage.output = usage.completion_tokens.unwrap_or(0);
             self.partial.usage.total_tokens = usage.total_tokens;
+            // Provider-reported billed total (OpenRouter). The agent fills the
+            // per-component breakdown from catalog rates when it has them and
+            // keeps this figure as the authoritative total (gh #221).
+            if let Some(cost) = usage.cost.filter(|cost| cost.is_finite() && *cost >= 0.0) {
+                self.partial.usage.cost.total = cost;
+            }
         }
 
         if let Some(error) = chunk.error {
-            self.partial.stop_reason = StopReason::Error;
-            if let Some(message) = error.message {
-                let message = message.trim();
-                if !message.is_empty() {
-                    self.partial.error_message = Some(message.to_string());
-                }
-            }
+            let message = error
+                .message
+                .as_deref()
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .unwrap_or("OpenAI returned an error while streaming");
+            self.record_error(message.to_string());
         }
 
         // Process choices
@@ -1035,31 +1130,134 @@ where
         Ok(())
     }
 
-    fn finalize_tool_call_arguments(&mut self) {
-        for tc in &self.tool_calls {
-            let arguments: serde_json::Value = match serde_json::from_str(&tc.arguments) {
-                Ok(args) => args,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        raw = %tc.arguments,
-                        "Failed to parse tool arguments as JSON"
-                    );
-                    serde_json::Value::Null
-                }
-            };
+    fn record_error(&mut self, message: String) {
+        self.partial.stop_reason = StopReason::Error;
+        // A trailing finish reason or secondary parse error must not conceal
+        // the provider's original failure.
+        if self.partial.error_message.is_none() {
+            self.partial.error_message = Some(message);
+        }
+    }
 
+    fn finalize_tool_call_arguments(&mut self) -> Result<()> {
+        // Validate the whole batch before exposing any completed tool call.
+        // Best-effort streaming snapshots are for display, never execution.
+        let arguments = self
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                parse_final_tool_arguments(&tc.arguments).map_err(|message| {
+                    Error::api(format!(
+                        "Invalid OpenAI tool arguments at index {}: {message}",
+                        tc.index
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        for (tc, arguments) in self.tool_calls.iter().zip(arguments) {
             if let Some(ContentBlock::ToolCall(block)) =
                 self.partial.content.get_mut(tc.content_index)
             {
                 block.arguments = arguments;
             }
         }
+        Ok(())
+    }
+
+    fn finalize_content(&mut self) {
+        if self.finalized {
+            return;
+        }
+        self.finalized = true;
+
+        if let Err(error) = self.finalize_tool_call_arguments() {
+            self.record_error(error.to_string());
+            // Do not persist a synthetically completed argument snapshot as
+            // the final arguments of an invalid response.
+            for tc in &self.tool_calls {
+                if let Some(ContentBlock::ToolCall(block)) =
+                    self.partial.content.get_mut(tc.content_index)
+                {
+                    block.arguments = serde_json::Value::Null;
+                }
+            }
+        }
+
+        for (content_index, block) in self.partial.content.iter().enumerate() {
+            match block {
+                ContentBlock::Text(text) => {
+                    self.pending_events.push_back(StreamEvent::TextEnd {
+                        content_index,
+                        content: text.text.clone(),
+                    });
+                }
+                ContentBlock::Thinking(thinking) => {
+                    self.pending_events.push_back(StreamEvent::ThinkingEnd {
+                        content_index,
+                        content: thinking.thinking.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if self.partial.stop_reason != StopReason::Error {
+            for tc in &self.tool_calls {
+                if let Some(ContentBlock::ToolCall(tool_call)) =
+                    self.partial.content.get(tc.content_index)
+                {
+                    self.pending_events.push_back(StreamEvent::ToolCallEnd {
+                        content_index: tc.content_index,
+                        tool_call: tool_call.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn finish_response(&mut self) {
+        if self.done {
+            return;
+        }
+        self.ensure_started();
+        self.finalize_content();
+        self.done = true;
+        let reason = self.partial.stop_reason;
+        let message = std::mem::take(&mut self.partial);
+        self.pending_events
+            .push_back(StreamEvent::Done { reason, message });
     }
 
     #[allow(clippy::too_many_lines)]
     fn process_choice(&mut self, choice: OpenAIChoice) {
         let delta = choice.delta;
+        if self.finalized {
+            if matches!(
+                choice.finish_reason.as_deref(),
+                Some("content_filter" | "error")
+            ) {
+                self.record_error("OpenAI reported a terminal stream failure".to_string());
+            }
+            let has_content = delta
+                .content
+                .as_deref()
+                .is_some_and(|text| !text.is_empty())
+                || delta
+                    .reasoning_content
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty())
+                || delta
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty());
+            if has_content {
+                self.record_error("OpenAI sent content after a terminal finish reason".to_string());
+            }
+            // Empty duplicate terminal frames are harmless, but must not
+            // overwrite a failure or emit duplicate block-end events.
+            return;
+        }
         if delta.content.is_some()
             || delta.tool_calls.is_some()
             || delta.reasoning_content.is_some()
@@ -1259,53 +1457,40 @@ where
         // Handle finish reason (MUST happen after delta processing to capture final chunks)
 
         if let Some(reason) = choice.finish_reason {
-            self.partial.stop_reason = match reason.as_str() {
-                "length" => StopReason::Length,
-
-                "tool_calls" => StopReason::ToolUse,
-
-                "content_filter" | "error" => StopReason::Error,
-
-                _ => StopReason::Stop,
-            };
-
-            // Emit TextEnd/ThinkingEnd for all open text/thinking blocks (not just the last one,
-            // since text/thinking may precede tool calls).
-
-            for (content_index, block) in self.partial.content.iter().enumerate() {
-                if let ContentBlock::Text(t) = block {
-                    self.pending_events.push_back(StreamEvent::TextEnd {
-                        content_index,
-                        content: t.text.clone(),
-                    });
-                } else if let ContentBlock::Thinking(t) = block {
-                    self.pending_events.push_back(StreamEvent::ThinkingEnd {
-                        content_index,
-                        content: t.thinking.clone(),
-                    });
-                }
+            if self.partial.stop_reason != StopReason::Error {
+                self.partial.stop_reason = match reason.as_str() {
+                    "length" => StopReason::Length,
+                    "tool_calls" => StopReason::ToolUse,
+                    "content_filter" | "error" => StopReason::Error,
+                    _ => StopReason::Stop,
+                };
             }
-
-            // Finalize tool call arguments
-
-            self.finalize_tool_call_arguments();
-
-            // Emit ToolCallEnd for each accumulated tool call
-
-            for tc in &self.tool_calls {
-                if let Some(ContentBlock::ToolCall(tool_call)) =
-                    self.partial.content.get(tc.content_index)
-                {
-                    self.pending_events.push_back(StreamEvent::ToolCallEnd {
-                        content_index: tc.content_index,
-
-                        tool_call: tool_call.clone(),
-                    });
-                }
-            }
+            self.finalize_content();
         }
     }
 }
+
+/// Parse final tool arguments without the repairs used for streaming previews.
+/// Empty arguments remain compatible with providers that omit an empty object
+/// for a no-argument tool. Every nonempty payload must be a complete JSON object.
+/// Error text deliberately excludes the payload, which may contain secrets.
+pub(super) fn parse_final_tool_arguments(
+    raw: &str,
+) -> std::result::Result<serde_json::Value, &'static str> {
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let arguments: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| "arguments are not complete JSON")?;
+    if !arguments.is_object() {
+        return Err("arguments must be a JSON object");
+    }
+    Ok(arguments)
+}
+
+#[cfg(test)]
+#[path = "openai_terminal_safety_tests.rs"]
+mod terminal_safety_tests;
 
 // ============================================================================
 // OpenAI API Types
@@ -1327,6 +1512,10 @@ pub struct OpenAIRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<OpenAIStreamOptions>,
+    /// OpenRouter usage accounting (`{"include": true}`), gh #221. Omitted for
+    /// every other provider so their wire format is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<OpenAIUsageAccounting>,
     /// DeepSeek-only thinking toggle (`{"type": "enabled" | "disabled"}`). Other
     /// OpenAI-compatible providers never set this, so it serializes away.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1338,16 +1527,43 @@ pub struct OpenAIRequest<'a> {
     /// compat config) is sent verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
+    /// OpenRouter's normalized reasoning control (`{"effort": …}` or
+    /// `{"max_tokens": …}`), gh #220. Only the OpenRouter dialect sets it; a
+    /// `compat.openRouterRouting` object carrying its own `reasoning` key
+    /// still wins because routing overrides are merged after serialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<OpenRouterReasoning<'a>>,
     /// Cache-affinity key (OpenAI `prompt_cache_key`, gh #188). Omitted when
     /// unset so backends that reject unknown params never see it. See
     /// `StreamOptions::prompt_cache_key`.
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<String>,
+    /// Processing tier (`/fast` → `priority`). Set only for backends that
+    /// honor it; see `provider::openai_service_tier`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct OpenAIStreamOptions {
     include_usage: bool,
+}
+
+/// OpenRouter request-level usage accounting toggle (gh #221).
+#[derive(Debug, Serialize)]
+struct OpenAIUsageAccounting {
+    include: bool,
+}
+
+/// OpenRouter's `reasoning` request object (gh #220). `effort` and
+/// `max_tokens` are mutually exclusive per the OpenRouter docs, so exactly one
+/// is populated.
+#[derive(Debug, Serialize)]
+struct OpenRouterReasoning<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 /// DeepSeek's `thinking` request object on the chat-completions transport.
@@ -1361,15 +1577,18 @@ struct OpenAIThinking {
 
 /// Request-side reasoning dialect for OpenAI-compatible providers that take
 /// non-standard reasoning controls. The plain Chat Completions transport has no
-/// reasoning toggle, so this is `None` for OpenAI/Groq/OpenRouter/etc. and the
-/// emitted body is byte-for-byte unchanged for them. Kept as an enum so other
-/// dialects (zai/qwen/openrouter "reasoning") can be added without touching the
-/// `build_request` call site.
+/// reasoning toggle, so this is `None` for OpenAI/Groq/etc. and the emitted
+/// body is byte-for-byte unchanged for them. Kept as an enum so other dialects
+/// (zai/qwen) can be added without touching the `build_request` call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReasoningStyle {
     /// DeepSeek: `thinking: {type: enabled|disabled}` + `reasoning_effort`
     /// (`high`|`max`). Mirrors the legacy `@earendil-works/pi-ai` `thinkingFormat`.
     DeepSeek,
+    /// OpenRouter: the gateway's normalized `reasoning: {effort | max_tokens}`
+    /// object (`compat.thinkingFormat: "openrouter"`, the default on the
+    /// OpenRouter transport; gh #220).
+    OpenRouter,
 }
 
 #[derive(Debug, Serialize)]
@@ -1492,6 +1711,10 @@ struct OpenAIUsage {
     /// When present it is the authoritative source for `usage.input`.
     #[serde(default)]
     prompt_cache_miss_tokens: Option<u64>,
+    /// OpenRouter usage accounting: the billed cost in USD for this request
+    /// (present when the request asked for `usage: {include: true}`, gh #221).
+    #[serde(default)]
+    cost: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1583,12 +1806,12 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
             messages
         }
         Message::ToolResult(result) => {
-            let mut text_parts = Vec::new();
+            let mut text_parts: Vec<Cow<'_, str>> = Vec::new();
             let mut image_parts = Vec::new();
 
             for block in &result.content {
                 match block {
-                    ContentBlock::Text(t) => text_parts.push(t.text.as_str()),
+                    ContentBlock::Text(t) => text_parts.push(Cow::Borrowed(t.text.as_str())),
                     ContentBlock::Image(img) => {
                         let url = format!("data:{};base64,{}", img.mime_type, img.data);
                         image_parts.push(OpenAIContentPart::ImageUrl {
@@ -1597,6 +1820,9 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
                                 _phantom: std::marker::PhantomData,
                             },
                         });
+                    }
+                    ContentBlock::Media(media) => {
+                        text_parts.push(Cow::Owned(media.placeholder()));
                     }
                     _ => {}
                 }
@@ -1657,6 +1883,11 @@ fn convert_user_content(content: &UserContent) -> OpenAIContent<'_> {
                             },
                         })
                     }
+                    // Chat Completions has no video/audio input part; degrade
+                    // to the text placeholder (gh #212).
+                    ContentBlock::Media(media) => Some(OpenAIContentPart::Text {
+                        text: Cow::Owned(media.placeholder()),
+                    }),
                     _ => None,
                 })
                 .collect();
@@ -1764,6 +1995,51 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    /// gh #212: Chat Completions has no video/audio part, so a media block
+    /// degrades to the `[media omitted: …]` text part (user content and tool
+    /// results alike) and never leaks the base64 payload.
+    #[test]
+    fn test_convert_media_block_degrades_to_placeholder() {
+        let media = crate::model::MediaContent {
+            data: "AAAA".to_string(),
+            mime_type: "video/mp4".to_string(),
+            name: Some("clip.mp4".to_string()),
+        };
+        let content = UserContent::Blocks(vec![
+            ContentBlock::Text(TextContent::new("look")),
+            ContentBlock::Media(media.clone()),
+        ]);
+        let wire = serde_json::to_value(convert_user_content(&content)).expect("serialize");
+        assert_eq!(
+            wire,
+            json!([
+                { "type": "text", "text": "look" },
+                { "type": "text", "text": "[media omitted: clip.mp4, video/mp4, 3 B]" },
+            ])
+        );
+        assert!(!wire.to_string().contains("AAAA"));
+
+        let result = Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: "call_media".to_string(),
+            tool_name: "read_media".to_string(),
+            content: vec![
+                ContentBlock::Text(TextContent::new("Read media file clip.mp4")),
+                ContentBlock::Media(media),
+            ],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        });
+        let messages = convert_message_to_openai(&result);
+        assert_eq!(messages.len(), 1, "no trailing image turn for media");
+        let wire = serde_json::to_value(&messages[0]).expect("serialize");
+        assert_eq!(wire["role"], "tool");
+        assert_eq!(
+            wire["content"],
+            "Read media file clip.mp4\n[media omitted: clip.mp4, video/mp4, 3 B]"
+        );
+    }
+
     #[test]
     fn test_convert_user_text_message() {
         let message = Message::User(crate::model::UserMessage {
@@ -1838,6 +2114,68 @@ mod tests {
             serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
                 .expect("serialize request");
         assert!(value.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn test_build_request_service_tier_only_for_backends_that_honor_it() {
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let fast = StreamOptions {
+            service_tier: Some("priority".to_string()),
+            ..Default::default()
+        };
+        let tier_for = |provider: OpenAIProvider, options: &StreamOptions| {
+            serde_json::to_value(provider.build_request(&context, options))
+                .expect("serialize request")
+                .get("service_tier")
+                .cloned()
+        };
+
+        assert_eq!(
+            tier_for(OpenAIProvider::new("gpt-5"), &fast),
+            Some(json!("priority"))
+        );
+        assert_eq!(
+            tier_for(
+                OpenAIProvider::new("x").with_provider_name("openrouter"),
+                &fast
+            ),
+            Some(json!("priority"))
+        );
+        // OpenAI-compatible backends that never documented the field don't
+        // get it: many reject unknown parameters with a 400.
+        assert_eq!(
+            tier_for(OpenAIProvider::new("x").with_provider_name("groq"), &fast),
+            None
+        );
+        // `auto` is OpenAI's default, and OpenRouter forwards no `default`.
+        let auto = StreamOptions {
+            service_tier: Some("auto".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(tier_for(OpenAIProvider::new("gpt-5"), &auto), None);
+        let default = StreamOptions {
+            service_tier: Some("default".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            tier_for(
+                OpenAIProvider::new("x").with_provider_name("openrouter"),
+                &default
+            ),
+            None
+        );
+        assert_eq!(
+            tier_for(OpenAIProvider::new("gpt-5"), &StreamOptions::default()),
+            None
+        );
     }
 
     #[test]
@@ -2453,6 +2791,263 @@ mod tests {
         );
     }
 
+    /// Serialized request body for one thinking level, as the wire sees it
+    /// (routing overrides applied).
+    fn openrouter_body(provider: &OpenAIProvider, level: crate::model::ThinkingLevel) -> Value {
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Solve it".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::<ToolDef>::new().into(),
+        };
+        let options = StreamOptions {
+            thinking_level: Some(level),
+            ..Default::default()
+        };
+        provider
+            .build_request_json(&context, &options)
+            .expect("serialize request")
+    }
+
+    /// gh #220: on the OpenRouter transport a reasoning model's thinking
+    /// level goes out as the gateway's normalized `reasoning: {effort}`
+    /// object — one fixture per level — and never as a vendor field.
+    #[test]
+    fn test_build_request_openrouter_reasoning_effort_per_level() {
+        use crate::model::ThinkingLevel;
+        let provider = OpenAIProvider::new("deepseek/deepseek-v4-pro")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(true);
+
+        let off = openrouter_body(&provider, ThinkingLevel::Off);
+        assert!(
+            off.get("reasoning").is_none(),
+            "unmapped off leaves the model default: {off}"
+        );
+
+        for (level, effort) in [
+            (ThinkingLevel::Minimal, "minimal"),
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::XHigh, "xhigh"),
+            (ThinkingLevel::Max, "max"),
+        ] {
+            let body = openrouter_body(&provider, level);
+            assert_eq!(
+                body["reasoning"],
+                json!({ "effort": effort }),
+                "level {level}: {body}"
+            );
+            assert!(
+                body.get("reasoning_effort").is_none() && body.get("thinking").is_none(),
+                "vendor fields must never be sent through the gateway: {body}"
+            );
+        }
+        // The rest of the OpenRouter shape is unchanged.
+        let high = openrouter_body(&provider, ThinkingLevel::High);
+        assert_eq!(high["usage"], json!({ "include": true }));
+        assert_eq!(high["model"], "deepseek/deepseek-v4-pro");
+    }
+
+    /// gh #220: a non-reasoning OpenRouter model never carries a `reasoning`
+    /// key, whatever level was requested.
+    #[test]
+    fn test_build_request_openrouter_non_reasoning_model_has_no_reasoning_key() {
+        use crate::model::ThinkingLevel;
+        let provider = OpenAIProvider::new("openai/gpt-4o")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(false);
+        for level in [ThinkingLevel::Off, ThinkingLevel::High, ThinkingLevel::Max] {
+            let body = openrouter_body(&provider, level);
+            assert!(body.get("reasoning").is_none(), "{body}");
+            assert!(body.get("reasoning_effort").is_none(), "{body}");
+            assert!(body.get("thinking").is_none(), "{body}");
+        }
+    }
+
+    /// gh #220: `thinkingLevelMap` steers the OpenRouter object per level —
+    /// an integer becomes `max_tokens` (mutually exclusive with `effort`),
+    /// any other string is sent as `effort`, and mapping `off` lets a
+    /// model that reasons by default be switched off explicitly.
+    #[test]
+    fn test_build_request_openrouter_thinking_level_map_budget_and_overrides() {
+        use crate::model::ThinkingLevel;
+        let provider = OpenAIProvider::new("anthropic/claude-sonnet-4.6")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                thinking_level_map: Some(HashMap::from([
+                    ("high".to_string(), "8000".to_string()),
+                    ("max".to_string(), " 32000 ".to_string()),
+                    ("low".to_string(), "minimal".to_string()),
+                    ("off".to_string(), "none".to_string()),
+                    ("medium".to_string(), "0".to_string()),
+                ])),
+                ..Default::default()
+            }));
+
+        let high = openrouter_body(&provider, ThinkingLevel::High);
+        assert_eq!(high["reasoning"], json!({ "max_tokens": 8000 }), "{high}");
+        let max = openrouter_body(&provider, ThinkingLevel::Max);
+        assert_eq!(max["reasoning"], json!({ "max_tokens": 32000 }), "{max}");
+        let low = openrouter_body(&provider, ThinkingLevel::Low);
+        assert_eq!(low["reasoning"], json!({ "effort": "minimal" }), "{low}");
+        let off = openrouter_body(&provider, ThinkingLevel::Off);
+        assert_eq!(off["reasoning"], json!({ "effort": "none" }), "{off}");
+        // A zero budget is not a budget; it is passed through as an effort
+        // string so the gateway rejects it loudly instead of us guessing.
+        let medium = openrouter_body(&provider, ThinkingLevel::Medium);
+        assert_eq!(medium["reasoning"], json!({ "effort": "0" }), "{medium}");
+        // Unmapped levels keep the pass-through name.
+        let xhigh = openrouter_body(&provider, ThinkingLevel::XHigh);
+        assert_eq!(xhigh["reasoning"], json!({ "effort": "xhigh" }), "{xhigh}");
+    }
+
+    /// gh #220: `compat.thinkingFormat` selects the dialect explicitly —
+    /// `"openrouter"` opts a custom proxy into the normalized object, any
+    /// other declared format on the OpenRouter transport opts out, and a
+    /// bare `openrouter.ai` base URL is enough to enable it by default.
+    #[test]
+    fn test_build_request_openrouter_thinking_format_declarations() {
+        use crate::model::ThinkingLevel;
+
+        // Custom provider that speaks the OpenRouter dialect by declaration.
+        let proxy = OpenAIProvider::new("some/model")
+            .with_provider_name("my-gateway")
+            .with_base_url("https://gateway.example.com/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                thinking_format: Some("OpenRouter".to_string()),
+                ..Default::default()
+            }));
+        let body = openrouter_body(&proxy, ThinkingLevel::High);
+        assert_eq!(body["reasoning"], json!({ "effort": "high" }), "{body}");
+        assert!(
+            body.get("usage").is_none(),
+            "usage accounting stays gateway-only"
+        );
+
+        // Explicit opt-out on the OpenRouter transport: no reasoning controls
+        // at all, and in particular no DeepSeek vendor dialect even when
+        // declared.
+        for format in ["openai", "deepseek", "zai"] {
+            let opted_out = OpenAIProvider::new("deepseek/deepseek-v4-pro")
+                .with_provider_name("openrouter")
+                .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+                .with_reasoning(true)
+                .with_compat(Some(CompatConfig {
+                    thinking_format: Some(format.to_string()),
+                    ..Default::default()
+                }));
+            let body = openrouter_body(&opted_out, ThinkingLevel::High);
+            assert!(body.get("reasoning").is_none(), "{format}: {body}");
+            assert!(body.get("reasoning_effort").is_none(), "{format}: {body}");
+            assert!(body.get("thinking").is_none(), "{format}: {body}");
+        }
+
+        // Detected by base URL alone (custom provider pointed at OpenRouter).
+        let by_url = OpenAIProvider::new("x/y")
+            .with_provider_name("custom-or")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(true);
+        let body = openrouter_body(&by_url, ThinkingLevel::Low);
+        assert_eq!(body["reasoning"], json!({ "effort": "low" }), "{body}");
+
+        // The direct DeepSeek transport is untouched by all of this.
+        let deepseek = OpenAIProvider::new("deepseek-v4-pro")
+            .with_provider_name("deepseek")
+            .with_reasoning(true);
+        let body = openrouter_body(&deepseek, ThinkingLevel::High);
+        assert!(body.get("reasoning").is_none(), "{body}");
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["thinking"]["type"], "enabled");
+    }
+
+    /// gh #220: `compat.openRouterRouting` keeps merging onto the top level
+    /// next to `reasoning`, and a routing object that carries its own
+    /// `reasoning` key wins over the level-derived one.
+    #[test]
+    fn test_build_request_openrouter_reasoning_coexists_with_routing_passthrough() {
+        use crate::model::ThinkingLevel;
+        let provider = OpenAIProvider::new("deepseek/deepseek-v4-pro")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                open_router_routing: Some(json!({
+                    "provider": { "only": ["deepseek"], "allow_fallbacks": false },
+                    "store": false,
+                })),
+                ..Default::default()
+            }));
+        let body = openrouter_body(&provider, ThinkingLevel::High);
+        assert_eq!(body["reasoning"], json!({ "effort": "high" }));
+        assert_eq!(
+            body["provider"],
+            json!({ "only": ["deepseek"], "allow_fallbacks": false })
+        );
+        assert_eq!(body["store"], false);
+
+        let pinned = OpenAIProvider::new("deepseek/deepseek-v4-pro")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                open_router_routing: Some(json!({ "reasoning": { "exclude": true } })),
+                ..Default::default()
+            }));
+        let body = openrouter_body(&pinned, ThinkingLevel::High);
+        assert_eq!(body["reasoning"], json!({ "exclude": true }));
+    }
+
+    /// gh #221: OpenRouter requests opt into usage accounting so the final
+    /// usage chunk carries the billed cost; other providers never see the
+    /// field.
+    #[test]
+    fn test_build_request_requests_openrouter_usage_accounting() {
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions::default();
+
+        let openrouter = OpenAIProvider::new("deepseek/deepseek-v4-pro")
+            .with_provider_name("openrouter")
+            .with_base_url("https://openrouter.ai/api/v1");
+        let request = openrouter
+            .build_request_json(&context, &options)
+            .expect("request json");
+        assert_eq!(request["usage"]["include"], true);
+        assert_eq!(request["stream_options"]["include_usage"], true);
+
+        // A custom provider pointed at the OpenRouter gateway counts too.
+        let custom_gateway = OpenAIProvider::new("openai/gpt-4o-mini")
+            .with_provider_name("my-router")
+            .with_base_url("https://openrouter.ai/api/v1");
+        let request = custom_gateway
+            .build_request_json(&context, &options)
+            .expect("request json");
+        assert_eq!(request["usage"]["include"], true);
+
+        let openai = OpenAIProvider::new("gpt-4o-mini");
+        let request = openai
+            .build_request_json(&context, &options)
+            .expect("request json");
+        assert!(request.get("usage").is_none(), "request: {request}");
+    }
+
     #[test]
     fn test_build_request_applies_openrouter_routing_overrides() {
         let provider = OpenAIProvider::new("openai/gpt-4o-mini")
@@ -2984,6 +3579,31 @@ mod tests {
         assert!(crate::error::is_retryable_error(&error, None, None));
     }
 
+    #[test]
+    fn stream_emits_exactly_one_done_when_transport_ends_after_done_sentinel() {
+        let body = [
+            r#"data: {"choices":[{"delta":{"content":"whole"}}]}"#,
+            "",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+
+        let out = collect_stream_items_from_body(&body);
+        assert!(out.iter().all(Result::is_ok), "complete stream: {out:?}");
+        let done = out
+            .iter()
+            .filter(|item| matches!(item, Ok(StreamEvent::Done { .. })))
+            .count();
+        assert_eq!(done, 1, "a complete stream finishes exactly once: {out:?}");
+        assert!(
+            matches!(out.last(), Some(Ok(StreamEvent::Done { .. }))),
+            "Done must be the terminal item: {out:?}"
+        );
+    }
+
     fn collect_stream_items_from_body(body: &str) -> Vec<Result<StreamEvent>> {
         let (base_url, _rx) = spawn_test_server(200, "text/event-stream", body);
         let provider = OpenAIProvider::new("gpt-test").with_base_url(base_url);
@@ -3027,9 +3647,14 @@ mod tests {
 
         std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().expect("accept");
+            // 250ms is the POLLING interval; the deadline below is the budget.
+            // Treating a timed-out read as end-of-request truncated the buffer
+            // and the header scan then failed as a malformed request rather
+            // than a slow one (bd-eg6ng).
             socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_millis(250)))
                 .expect("set read timeout");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
 
             let mut bytes = Vec::new();
             let mut chunk = [0_u8; 4096];
@@ -3046,7 +3671,10 @@ mod tests {
                         if err.kind() == std::io::ErrorKind::WouldBlock
                             || err.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        break;
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fixture timed out waiting for the request"
+                        );
                     }
                     Err(err) => panic!("read error: {err}"),
                 }
@@ -3072,7 +3700,10 @@ mod tests {
                         if err.kind() == std::io::ErrorKind::WouldBlock
                             || err.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        break;
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fixture timed out waiting for the request"
+                        );
                     }
                     Err(err) => panic!("read error: {err}"),
                 }
@@ -3649,6 +4280,31 @@ mod tests {
 
             assert_eq!(state.partial.usage.input, 0);
             assert_eq!(state.partial.usage.cache_read, 250);
+        }
+
+        /// gh #221: OpenRouter usage accounting reports the billed `cost`
+        /// on the final usage chunk; it must land in `usage.cost.total`
+        /// (captured shape: `usage: {…, "cost": 0.0123, "is_byok": false,
+        /// "cost_details": {"upstream_inference_cost": …}}`).
+        #[test]
+        fn openrouter_usage_cost_populates_cost_total() {
+            let mut state = make_state();
+            let chunk = r#"{"id":"gen-1","choices":[{"delta":{},"finish_reason":"stop","index":0}],"usage":{"prompt_tokens":3624,"completion_tokens":1,"total_tokens":3625,"cost":0.001087,"is_byok":false,"prompt_tokens_details":{"cached_tokens":0},"cost_details":{"upstream_inference_cost":null},"completion_tokens_details":{"reasoning_tokens":0}}}"#;
+            state.process_event(chunk).expect("process usage chunk");
+
+            assert_eq!(state.partial.usage.input, 3624);
+            assert_eq!(state.partial.usage.output, 1);
+            assert!((state.partial.usage.cost.total - 0.001_087).abs() < 1e-12);
+        }
+
+        /// Providers that do not report a cost leave `usage.cost` at zero
+        /// for the agent to fill from catalog rates.
+        #[test]
+        fn usage_without_cost_leaves_cost_total_zero() {
+            let mut state = make_state();
+            let chunk = r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":500,"completion_tokens":10,"total_tokens":510}}"#;
+            state.process_event(chunk).expect("process usage chunk");
+            assert!(state.partial.usage.cost.total.abs() < f64::EPSILON);
         }
 
         /// No cache details: `input` equals `prompt_tokens` and `cache_read`

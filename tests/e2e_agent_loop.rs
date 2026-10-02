@@ -1,3 +1,10 @@
+// Integration tests are separate crates, so the crate-level `recursion_limit`
+// raised in src/lib.rs does not reach here. Proving `Send` for the agent-loop
+// future now exceeds the default 128 — asupersync 0.5.0 nests its runtime
+// future types more deeply than 0.4.4 did — which nightly-2026-08-31 reports
+// as a `future_incompatible` warning and `-D warnings` makes fatal.
+#![recursion_limit = "256"]
+
 //! E2E: full agent loop integration tests (bd-2q00).
 //!
 //! These tests run the real `AgentSession` + `ToolRegistry` loop end-to-end

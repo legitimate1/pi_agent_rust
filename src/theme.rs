@@ -1291,6 +1291,105 @@ mod tests {
         assert!(light_config.document.style.color.is_some());
     }
 
+    /// Issue #195, the table half: a table cell truncated at a double-width
+    /// character boundary must be re-padded so the grid does not shear
+    /// (bd-xxlwk).
+    ///
+    /// The defect was in charmed-glamour: `truncate_content` reserves one
+    /// column for the ellipsis and fills the rest with whole characters, so a
+    /// CJK cell came back one column short whenever the cut landed
+    /// mid-character (`truncate_content("日本語", 4) == "日…"`, three columns
+    /// for a budget of four), and `table::fit_content` returned it unpadded.
+    /// charmed-glamour 0.2.4 re-pads it (charmed_rust 4150912).
+    ///
+    /// The user-visible property, which is what this asserts, is that the
+    /// column separator in a truncated data row lines up with the separator in
+    /// the header rule above it. It takes both wide characters and a column
+    /// narrow enough to truncate, which is why it was reported from a CJK
+    /// terminal. The untruncated control below shows the widths are otherwise
+    /// computed correctly.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn glamour_table_stays_aligned_when_a_wide_char_cell_is_truncated() {
+        use unicode_width::UnicodeWidthStr;
+
+        fn visible(line: &str) -> String {
+            // Drop CSI sequences, then any stray control characters.
+            let mut out = String::new();
+            let mut chars = line.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\u{1b}' {
+                    if chars.peek() == Some(&'[') {
+                        chars.next();
+                        for tail in chars.by_ref() {
+                            if tail.is_ascii_alphabetic() {
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if !c.is_control() {
+                    out.push(c);
+                }
+            }
+            out
+        }
+
+        // Column one is narrow enough at this wrap width to truncate the CJK
+        // cell; column two is not involved.
+        let markdown = "| A | B |\n| --- | --- |\n| 日本語テキスト | x |\n";
+        let rendered = glamour::Renderer::new().with_word_wrap(20).render(markdown);
+
+        let rule = rendered
+            .lines()
+            .map(visible)
+            .find(|line| line.contains('┼'))
+            .expect("the header rule row");
+        let data = rendered
+            .lines()
+            .map(visible)
+            .find(|line| line.contains('…'))
+            .expect("the truncated data row");
+
+        let rule_prefix = rule.split('┼').next().expect("rule prefix").width();
+        let data_prefix = data.split('│').next().expect("data prefix").width();
+
+        assert_eq!(
+            rule_prefix, data_prefix,
+            "a truncated wide-character cell must be re-padded to its column width (gh #195): \
+             the header rule and the data row disagree.\nrule: {rule:?}\ndata: {data:?}"
+        );
+
+        // The control that makes this a truncation defect rather than a width
+        // miscalculation: widen the wrap so nothing truncates and the same two
+        // rows line up exactly.
+        let wide = glamour::Renderer::new().with_word_wrap(30).render(markdown);
+        let wide_rule = wide
+            .lines()
+            .map(visible)
+            .find(|line| line.contains('┼'))
+            .expect("the wide header rule row");
+        let wide_data = wide
+            .lines()
+            .map(visible)
+            .find(|line| line.contains("日本語テキスト"))
+            .expect("the untruncated data row");
+        assert_eq!(
+            wide_rule
+                .split('┼')
+                .next()
+                .expect("wide rule prefix")
+                .width(),
+            wide_data
+                .split('│')
+                .next()
+                .expect("wide data prefix")
+                .width(),
+            "an untruncated wide-character cell must line up with the header rule"
+        );
+    }
+
     /// Issue #195: theme heading foregrounds must not sit on the glamour
     /// presets' fixed ANSI heading backgrounds (accent-on-ANSI-63 is
     /// unreadable); the preset backgrounds must be cleared.

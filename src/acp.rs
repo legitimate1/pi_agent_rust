@@ -209,6 +209,10 @@ pub struct AcpOptions {
     /// `pi --session`/`--resume` (#102). When `None`, ACP keeps its in-memory,
     /// non-persisted behavior.
     pub session_dir: Option<PathBuf>,
+    /// The "available skills" system-prompt block, rendered by the host from
+    /// its resource loader (`--no-skills` and trust applied), so the model
+    /// in an editor session knows which skills it can load.
+    pub skills_prompt: Option<String>,
 }
 
 #[derive(Clone)]
@@ -470,15 +474,20 @@ async fn run(
                             },
                         ];
 
+                        let config_options = config_options_for(&state, &options.available_models);
                         let state_arc = Arc::new(Mutex::new(state));
                         if let Ok(mut guard) = sessions.lock(&cx).await {
                             guard.insert(session_id.clone(), state_arc);
                         }
 
+                        // `configOptions` is the ACP-standard surface (model +
+                        // thought_level selects); `models`/`modes` stay for
+                        // clients built against the earlier shape.
                         let _ = out_tx.send(json_rpc_ok(
                             id,
                             json!({
                                 "sessionId": session_id,
+                                "configOptions": config_options,
                                 "models": models,
                                 "modes": modes,
                             }),
@@ -646,15 +655,26 @@ async fn run(
             }
 
             "session/list" => {
-                let session_list: Vec<Value> = sessions.lock(&cx).await.map_or_else(
-                    |_| Vec::new(),
-                    |guard| {
-                        guard
-                            .keys()
-                            .map(|sid| json!({ "sessionId": sid }))
-                            .collect()
-                    },
-                );
+                let entries: Vec<(String, Arc<Mutex<AcpSessionState>>)> =
+                    sessions.lock(&cx).await.map_or_else(
+                        |_| Vec::new(),
+                        |guard| {
+                            guard
+                                .iter()
+                                .map(|(sid, state)| (sid.clone(), Arc::clone(state)))
+                                .collect()
+                        },
+                    );
+                // ACP SessionInfo requires `cwd` alongside `sessionId`.
+                let mut session_list: Vec<Value> = Vec::with_capacity(entries.len());
+                for (sid, state) in entries {
+                    let cwd = state
+                        .lock(&cx)
+                        .await
+                        .map(|guard| guard.cwd.display().to_string())
+                        .unwrap_or_default();
+                    session_list.push(json!({ "sessionId": sid, "cwd": cwd }));
+                }
 
                 let _ = out_tx.send(json_rpc_ok(id, json!({ "sessions": session_list })));
             }
@@ -822,28 +842,59 @@ async fn run(
                     continue;
                 };
 
-                // Accept `name` or `key` for the option identifier; the value
-                // lives under `value`.
-                let name = request
-                    .params
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .or_else(|| request.params.get("key").and_then(Value::as_str));
-                let Some(name) = name else {
+                // ACP's `configId` names the option (`name`/`key` accepted
+                // too); the value lives under `value`.
+                let Some(name) = config_option_id(&request.params) else {
                     let _ = out_tx.send(json_rpc_error(
                         id,
                         INVALID_PARAMS,
-                        "Missing required parameter: name (or key)",
+                        "Missing required parameter: configId",
                     ));
                     continue;
                 };
                 let value = request.params.get("value").cloned().unwrap_or(Value::Null);
 
-                let option = match parse_config_option(name, &value) {
-                    Ok(option) => option,
-                    Err(msg) => {
-                        let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
-                        continue;
+                // `model` is the ACP model selector: same switch as
+                // session/set_model, with the value as `provider/id` or an id.
+                let model_target = if name.eq_ignore_ascii_case("model") {
+                    let target = value.as_str().map(str::trim).map(|raw| {
+                        let params = match raw.split_once('/') {
+                            Some((provider, model))
+                                if options.model_registry.find(provider, model).is_some() =>
+                            {
+                                json!({ "provider": provider, "model": model })
+                            }
+                            _ => json!({ "model": raw }),
+                        };
+                        resolve_set_model_target(&params, &options.model_registry)
+                    });
+                    match target {
+                        Some(Ok(pair)) => Some(pair),
+                        Some(Err(msg)) => {
+                            let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
+                            continue;
+                        }
+                        None => {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                INVALID_PARAMS,
+                                "Invalid value for config option 'model': expected a model id or provider/id string",
+                            ));
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let option = if model_target.is_some() {
+                    None
+                } else {
+                    match parse_config_option(name, &value) {
+                        Ok(option) => Some(option),
+                        Err(msg) => {
+                            let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, msg));
+                            continue;
+                        }
                     }
                 };
 
@@ -862,11 +913,27 @@ async fn run(
                     continue;
                 };
 
-                match apply_set_config_option(&session_state, option, &cx).await {
+                let applied = match (model_target, option) {
+                    (Some((provider, model)), _) => {
+                        apply_set_model(&session_state, &provider, &model, &cx)
+                            .await
+                            .map(drop)
+                    }
+                    (None, Some(option)) => {
+                        apply_set_config_option(&session_state, option, &cx).await
+                    }
+                    (None, None) => Ok(()),
+                };
+                match applied {
                     Ok(()) => {
+                        // ACP answers with the complete config state.
+                        let config_options = session_state.lock(&cx).await.ok().and_then(|guard| {
+                            config_options_for(&guard, &options.available_models)
+                        });
                         let _ = out_tx.send(json_rpc_ok(
                             id,
                             json!({
+                                "configOptions": config_options,
                                 "sessionId": session_id,
                                 "name": name,
                                 "applied": true,
@@ -1191,7 +1258,10 @@ fn handle_initialize() -> Value {
                 "embeddedContext": false,
                 "image": false,
             },
-            "sessionCapabilities": {},
+            // `session/list` is implemented (GH #245). `loadSession` stays
+            // false: ACP's `session/load` must replay the whole conversation
+            // as `session/update`s, and ours only re-attaches a live session.
+            "sessionCapabilities": { "list": {} },
             "_meta": {
                 "pi.dev": {
                     "toolApproval": true,
@@ -1245,8 +1315,86 @@ fn resolve_acp_thinking_level(
     model_entry.clamp_thinking_level(requested)
 }
 
-/// Build a system prompt for ACP mode without requiring a `Cli` struct.
-fn build_acp_system_prompt(cwd: &std::path::Path, enabled_tools: &[&str]) -> String {
+/// The system prompt for an ACP session: pi's own prompt, as the CLI and
+/// the SDK build it (tool guidance, every context file including CLAUDE.md,
+/// the global AGENTS.md and ancestors, always-apply foreign workspace rules,
+/// the discoverable-tool index), plus a note that pi is running inside an
+/// editor. ACP used a short hand-written prompt of its own before, which
+/// left all of that out. The short prompt remains the fallback if the
+/// builder fails (e.g. an unreadable prompt file).
+fn build_acp_system_prompt(
+    cwd: &std::path::Path,
+    enabled_tools: &[&str],
+    config: &Config,
+    skills_prompt: Option<&str>,
+) -> String {
+    use clap::Parser as _;
+    let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
+    let full = crate::cli::Cli::try_parse_from(["pi"])
+        .map_err(|err| err.to_string())
+        .and_then(|cli| {
+            let foreign_rules = if config.foreign_rules_enabled() && !test_mode {
+                crate::context_files::discover_foreign_rules(cwd)
+            } else {
+                crate::context_files::ForeignRules::default()
+            };
+            let package_dir = crate::app::stable_package_dir(&Config::package_dir(), Some(cwd));
+            crate::app::build_system_prompt(
+                &cli,
+                cwd,
+                enabled_tools,
+                skills_prompt.filter(|block| !block.is_empty()),
+                &Config::global_dir(),
+                &package_dir,
+                test_mode,
+                true,
+                Some(&foreign_rules),
+                config,
+            )
+            .map_err(|err| err.to_string())
+        });
+    match full {
+        Ok(mut prompt) => {
+            prompt.push_str(
+                "\n\nYou are running inside the user's editor via ACP (Agent Client \
+                 Protocol). When making file changes, explain what you're doing.",
+            );
+            prompt
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "ACP: full system prompt unavailable; using the minimal one");
+            minimal_acp_system_prompt(cwd, enabled_tools)
+        }
+    }
+}
+
+/// The tools an ACP session gets: the CLI's default set, minus the tools a
+/// terminal host joins after construction (`ask`, `todo`, `submit_plan`),
+/// which have no ACP surface. ACP used to offer only the seven basic file
+/// and shell tools. Every call still goes through the client's permission
+/// prompt (ACP sessions carry no approval state, so the approval hook sees
+/// all tools), so the wider set gives the editor nothing it cannot veto.
+fn acp_enabled_tools() -> Vec<String> {
+    use clap::Parser as _;
+    const HOST_COUPLED: [&str; 3] = ["ask", "todo", "submit_plan"];
+    crate::cli::Cli::try_parse_from(["pi"]).map_or_else(
+        |_| {
+            ["read", "bash", "edit", "write", "grep", "find", "ls"]
+                .map(String::from)
+                .to_vec()
+        },
+        |cli| {
+            cli.enabled_tools()
+                .into_iter()
+                .filter(|name| !HOST_COUPLED.contains(name))
+                .map(String::from)
+                .collect()
+        },
+    )
+}
+
+/// The original hand-written ACP prompt, kept as a fallback.
+fn minimal_acp_system_prompt(cwd: &std::path::Path, enabled_tools: &[&str]) -> String {
     use std::fmt::Write as _;
 
     let tool_descriptions = [
@@ -1331,8 +1479,8 @@ fn handle_session_new(
         new_acp_session(options.session_dir.as_ref(), &options.config, &cwd);
     let session_id = session.header.id.clone();
 
-    // Set up the enabled tools (all standard tools).
-    let enabled_tools: Vec<&str> = vec!["read", "bash", "edit", "write", "grep", "find", "ls"];
+    let enabled_tools = acp_enabled_tools();
+    let enabled_tools: Vec<&str> = enabled_tools.iter().map(String::as_str).collect();
     let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&options.config));
 
     // ACP should respect the same configured default provider/model preference
@@ -1343,8 +1491,12 @@ fn handle_session_new(
     let provider = providers::create_provider(&model_entry, None)
         .map_err(|e| Error::provider("acp", e.to_string()))?;
 
-    // Build system prompt directly (avoids constructing a Cli struct).
-    let system_prompt = build_acp_system_prompt(&cwd, &enabled_tools);
+    let system_prompt = build_acp_system_prompt(
+        &cwd,
+        &enabled_tools,
+        &options.config,
+        options.skills_prompt.as_deref(),
+    );
 
     // Resolve API key from auth storage and model entry.
     let api_key = options
@@ -1384,7 +1536,8 @@ fn handle_session_new(
         turn_recovery: options.config.turn_recovery_mode(),
         approval_state: None,
         bash_settings: options.config.bash.clone(),
-        secrets: None,
+        // Configured vault mode and patterns, as the CLI and SDK apply them.
+        secrets: options.config.secrets.clone(),
     };
 
     let agent = crate::agent::Agent::new(provider, tools, agent_config);
@@ -1445,6 +1598,84 @@ fn handle_session_new(
 // handling) is fixed at `session/new` time and requires a new session to
 // change — `session/set_config_option` returns a structured `INVALID_PARAMS`
 // error naming the option and the settable set rather than silently succeeding.
+
+/// Thinking levels offered by the `thought_level` config option, in order.
+const THOUGHT_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// The session's ACP `configOptions` (GH #245): a `model` select (values are
+/// `provider/id`) and a `thought_level` select, each with its current value.
+/// `current_model` is `(provider, id)`; `thinking` the current level name.
+fn session_config_options(
+    current_model: (&str, &str),
+    thinking: &str,
+    available_models: &[ModelEntry],
+) -> Value {
+    let (provider, model_id) = current_model;
+    let current = format!("{provider}/{model_id}");
+    let mut model_options: Vec<Value> = available_models
+        .iter()
+        .map(|entry| {
+            json!({
+                "value": format!("{}/{}", entry.model.provider, entry.model.id),
+                "name": entry.model.name,
+            })
+        })
+        .collect();
+    if !model_options
+        .iter()
+        .any(|option| option["value"].as_str() == Some(current.as_str()))
+    {
+        model_options.insert(0, json!({ "value": current, "name": model_id }));
+    }
+    let thought_options: Vec<Value> = THOUGHT_LEVELS
+        .iter()
+        .map(|level| json!({ "value": level, "name": level }))
+        .collect();
+    json!([
+        {
+            "id": "model",
+            "name": "Model",
+            "category": "model",
+            "type": "select",
+            "currentValue": current,
+            "options": model_options,
+        },
+        {
+            "id": "thought_level",
+            "name": "Thinking",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": thinking,
+            "options": thought_options,
+        },
+    ])
+}
+
+/// [`session_config_options`] for a live session, or `None` while a prompt
+/// holds the agent session.
+fn config_options_for(state: &AcpSessionState, available_models: &[ModelEntry]) -> Option<Value> {
+    let agent_session = state.agent_session.as_ref()?;
+    let provider = agent_session.agent.provider();
+    let thinking = agent_session
+        .agent
+        .stream_options()
+        .thinking_level
+        .unwrap_or_default()
+        .to_string();
+    Some(session_config_options(
+        (provider.name(), provider.model_id()),
+        &thinking,
+        available_models,
+    ))
+}
+
+/// The option id of a `session/set_config_option` request: ACP's `configId`,
+/// or the older `name`/`key` this server accepted first.
+fn config_option_id(params: &Value) -> Option<&str> {
+    ["configId", "name", "key"]
+        .iter()
+        .find_map(|key| params.get(*key).and_then(Value::as_str))
+}
 
 /// A configuration option recognized by `session/set_config_option`.
 #[derive(Debug)]
@@ -1877,6 +2108,55 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn acp_offers_the_cli_default_tools_without_host_coupled_ones() {
+        let tools = acp_enabled_tools();
+        for expected in [
+            "read",
+            "bash",
+            "edit",
+            "hashline_edit",
+            "ast_grep",
+            "web_search",
+        ] {
+            assert!(
+                tools.iter().any(|t| t == expected),
+                "{expected} in {tools:?}"
+            );
+        }
+        for host_only in ["ask", "todo", "submit_plan"] {
+            assert!(
+                !tools.iter().any(|t| t == host_only),
+                "{host_only} in {tools:?}"
+            );
+        }
+    }
+
+    /// ACP sessions get pi's real system prompt (full tool guidance, every
+    /// context file) plus the editor note, not the old hand-written one.
+    #[test]
+    fn acp_system_prompt_is_pi_prompt_with_context_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("CLAUDE.md"), "acp-claude-md-marker").expect("write");
+        let tools = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+        let prompt = build_acp_system_prompt(
+            dir.path(),
+            &tools,
+            &Config::default(),
+            Some("\n\n<available_skills>acp-skill-marker</available_skills>"),
+        );
+        assert!(prompt.contains("acp-skill-marker"), "skills are listed");
+        assert!(
+            prompt.contains("Make surgical edits to files (find exact text and replace)"),
+            "pi's own tool guidance: {prompt}"
+        );
+        assert!(prompt.contains("via ACP (Agent Client Protocol)"));
+        // Context files are skipped in PI_TEST_MODE by design.
+        if std::env::var_os("PI_TEST_MODE").is_none() {
+            assert!(prompt.contains("acp-claude-md-marker"), "CLAUDE.md is read");
+        }
+    }
+
+    #[test]
     fn new_acp_session_in_memory_without_session_dir() {
         // No --session-dir → existing behavior: in-memory, persistence disabled.
         let (session, save_enabled) =
@@ -1990,6 +2270,44 @@ mod tests {
         assert!(parsed.get("id").is_none());
     }
 
+    /// GH #245: configOptions carry ACP's reserved `model` and
+    /// `thought_level` selects with current values; a current model missing
+    /// from the available list is still offered.
+    #[test]
+    fn session_config_options_follow_the_acp_shape() {
+        let mut entry = crate::models::ad_hoc_model_entry("openai", "gpt-5").expect("entry");
+        entry.model.name = "GPT-5".to_string();
+        let options = session_config_options(("openai", "gpt-5"), "high", &[entry]);
+        let model = &options[0];
+        assert_eq!(model["id"], "model");
+        assert_eq!(model["category"], "model");
+        assert_eq!(model["type"], "select");
+        assert_eq!(model["currentValue"], "openai/gpt-5");
+        assert_eq!(model["options"][0]["value"], "openai/gpt-5");
+        assert_eq!(model["options"][0]["name"], "GPT-5");
+        let thought = &options[1];
+        assert_eq!(thought["id"], "thought_level");
+        assert_eq!(thought["category"], "thought_level");
+        assert_eq!(thought["currentValue"], "high");
+        assert_eq!(thought["options"].as_array().map(Vec::len), Some(7));
+
+        let unlisted = session_config_options(("local", "llama"), "off", &[]);
+        assert_eq!(unlisted[0]["options"][0]["value"], "local/llama");
+    }
+
+    #[test]
+    fn set_config_option_reads_the_acp_config_id() {
+        assert_eq!(
+            config_option_id(&json!({ "configId": "model", "value": "x" })),
+            Some("model")
+        );
+        assert_eq!(
+            config_option_id(&json!({ "name": "thinking" })),
+            Some("thinking")
+        );
+        assert_eq!(config_option_id(&json!({ "value": "x" })), None);
+    }
+
     #[test]
     fn handle_initialize_returns_correct_shape() {
         let result = handle_initialize();
@@ -2000,6 +2318,8 @@ mod tests {
         assert_eq!(result["agentInfo"]["version"], env!("CARGO_PKG_VERSION"));
         // Sessions are in-process only — we never advertise loadSession.
         assert_eq!(result["agentCapabilities"]["loadSession"], false);
+        // GH #245: session/list is implemented, so it is advertised.
+        assert!(result["agentCapabilities"]["sessionCapabilities"]["list"].is_object());
         // promptCapabilities advertise text/resource_link baseline only.
         assert_eq!(
             result["agentCapabilities"]["promptCapabilities"]["audio"],

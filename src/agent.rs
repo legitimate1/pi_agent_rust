@@ -1298,6 +1298,40 @@ impl MessageQueue {
 // Agent Event
 // ============================================================================
 
+impl AgentEvent {
+    /// Serialize this event as one line of a JSON event stream (`--mode json`,
+    /// gh #222).
+    ///
+    /// `message_update` records are delta-only: they omit the cumulative
+    /// `message` field and `assistantMessageEvent.partial`, both of which carry
+    /// the whole accumulated assistant message and would make the stream
+    /// quadratic in the response length (measured at ~500 MB of stdout for a
+    /// 50 KB reply). `message_start` / `message_end` still carry the full
+    /// message, so consumers reconstruct text by concatenating deltas or by
+    /// reading `message_end`. This matches upstream pi's 0.84 JSON contract.
+    /// Every other event serializes exactly like the plain `Serialize` impl.
+    pub fn to_json_stream_line(&self) -> serde_json::Result<String> {
+        #[derive(Serialize)]
+        struct DeltaOnlyMessageUpdate<'a> {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            #[serde(rename = "assistantMessageEvent")]
+            assistant_message_event: crate::model::AssistantMessageEventDelta<'a>,
+        }
+
+        match self {
+            Self::MessageUpdate {
+                assistant_message_event,
+                ..
+            } => serde_json::to_string(&DeltaOnlyMessageUpdate {
+                kind: "message_update",
+                assistant_message_event: assistant_message_event.delta_only(),
+            }),
+            other => serde_json::to_string(other),
+        }
+    }
+}
+
 /// Events emitted by the agent during execution.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1415,7 +1449,25 @@ pub enum AgentEvent {
         to_model: String,
         /// Failure class that triggered the failover (quota/overload/transient).
         class: String,
+        /// Which successful swap this is within the logical turn, 1-based.
+        ///
+        /// This is the number `retry.maxFailoversPerTurn` is counted against,
+        /// so a consumer can say "swap 2 of at most 3" without tracking state.
+        /// It used to carry the chain index instead, which stopped meaning
+        /// anything once the walk began skipping the current model, duplicates
+        /// and unusable entries (bd-oqo03.1) — the number then jumped by more
+        /// than one per swap, or not at all, with nothing to say why. The index
+        /// is still reported, as `chain_index`.
         attempt: u32,
+        /// Position in the fallback chain of the entry being swapped to,
+        /// 0-based.
+        ///
+        /// Durable across turns, unlike `attempt`: the walk resumes from where
+        /// the previous turn left it. Reported separately because the two
+        /// answer different questions — `attempt` is budget, this is
+        /// provenance — and conflating them is what bd-oqo03 was opened for.
+        #[serde(rename = "chainIndex")]
+        chain_index: u32,
     },
     /// Cross-model failover end (bd-cv653.3.2): the turn completed on a
     /// failover entry, or the primary was restored after cooldown.
@@ -1518,6 +1570,180 @@ impl AbortSignal {
     }
 }
 
+/// Compaction window for a model entry, with a reported zero treated as
+/// "unknown" rather than "no room".
+///
+/// Print mode and the RPC server each had a private copy of this, one of them
+/// silently — the warning is worth having wherever it happens (bd-u2qv4).
+#[must_use]
+pub fn context_window_tokens_for_entry(entry: &crate::models::ModelEntry) -> u32 {
+    if entry.model.context_window == 0 {
+        tracing::warn!(
+            "Model {} reported context_window=0; falling back to default compaction window",
+            entry.model.id
+        );
+        return ResolvedCompactionSettings::default().context_window_tokens;
+    }
+    entry.model.context_window
+}
+
+/// A walk of a fallback chain looking for an entry worth swapping to.
+pub struct FailoverSwapAttempt<'a> {
+    /// The chain resolved for the live model.
+    pub chain: &'a crate::failover::FailoverChain,
+    /// Where to resume the walk, from the caller's cross-turn state.
+    pub start_position: usize,
+    /// Models a chain spec can resolve against.
+    pub available_models: &'a [crate::models::ModelEntry],
+    /// Credential store consulted for each candidate.
+    pub auth: &'a crate::auth::AuthStorage,
+    /// An explicit `--api-key`, which pins and never rotates.
+    pub cli_api_key: Option<&'a str>,
+    /// Why the swap is happening, recorded in the transcript.
+    pub class: crate::failover::FailoverClass,
+    /// The level a candidate is clamped against; see
+    /// [`FailoverSwapRequest::thinking_level_to_clamp`].
+    pub thinking_level_to_clamp: crate::model::ThinkingLevel,
+    /// Whether a completed error response must have left a revertible tail.
+    pub require_incomplete_tail: bool,
+    /// The primary identity before failover started (bd-gm481.2).
+    pub primary: Option<&'a crate::failover::FailoverPrimary>,
+    /// Cooldown duration in seconds (bd-gm481.2).
+    pub cooldown_secs: Option<u64>,
+    /// Unique lifecycle ID across hops in this failover cycle (bd-gm481.2).
+    pub lifecycle_id: Option<&'a str>,
+}
+
+/// A swap that committed, with what the caller needs for its own events and
+/// cross-turn bookkeeping.
+#[derive(Debug, Clone)]
+pub struct CommittedFailover {
+    /// Where the installed entry sits in the chain. Note this is the entry's
+    /// index, not the resume position — reporting the latter is off by one
+    /// (bd-oqo03).
+    pub entry_index: usize,
+    /// Provider left behind.
+    pub from_provider: String,
+    /// Model left behind.
+    pub from_model: String,
+    /// Provider now installed.
+    pub to_provider: String,
+    /// Model now installed.
+    pub to_model: String,
+}
+
+/// The result of a chain walk, swapped or not.
+#[derive(Debug, Clone)]
+pub struct FailoverSwapOutcome {
+    /// Where the NEXT walk resumes. Record it either way, so a later turn does
+    /// not re-walk entries this one already rejected.
+    pub next_position: usize,
+    /// `None` means the chain held nothing installable.
+    pub committed: Option<CommittedFailover>,
+}
+
+/// One fallback-chain swap, as [`AgentSession::commit_failover_swap`] needs it.
+///
+/// The caller has already classified the failure, walked the chain, resolved a
+/// credential and constructed the provider; what remains is the persisted
+/// transition, which is identical on every surface.
+pub struct FailoverSwapRequest<'a> {
+    /// The chain entry being installed.
+    pub entry: &'a crate::models::ModelEntry,
+    /// Credential resolved for that entry, `None` only where none is required.
+    pub api_key: Option<String>,
+    /// Provider constructed for the entry.
+    pub provider: Arc<dyn Provider>,
+    /// The identity being left, recorded in the transcript.
+    pub from_provider: &'a str,
+    /// The model being left, recorded in the transcript.
+    pub from_model: &'a str,
+    /// Why the swap is happening, recorded in the transcript.
+    pub class: crate::failover::FailoverClass,
+    /// Chain index recorded with the transcript entry.
+    pub chain_position: usize,
+    /// The level the entry is clamped against: the level ORIGINALLY REQUESTED,
+    /// captured before any swap — never the live level (bd-jk057, settled).
+    ///
+    /// A clamp exists to respect a MODEL's limit, not to make one model's limit
+    /// sticky across models. Passing the live level ratchets it down through
+    /// whatever the worst model the chain happened to touch allowed, and never
+    /// recovers it — for the turn and, because the level is written into the
+    /// session header, for the session.
+    ///
+    /// Every surface gets this value the same way, from
+    /// `FailoverState::primary_for_swap`, which yields the recorded primary
+    /// while a chain is in flight and the live identity otherwise. Print mode
+    /// passed the live level until bd-jk057; RPC and the SDK never did.
+    pub thinking_level_to_clamp: crate::model::ThinkingLevel,
+    /// Whether a completed error response must have left a revertible tail.
+    pub require_incomplete_tail: bool,
+    /// The primary identity before failover started (bd-gm481.2).
+    pub primary: Option<&'a crate::failover::FailoverPrimary>,
+    /// Cooldown duration in seconds (bd-gm481.2).
+    pub cooldown_secs: Option<u64>,
+    /// Unique lifecycle ID across hops in this failover cycle (bd-gm481.2).
+    pub lifecycle_id: Option<&'a str>,
+}
+
+/// One restoration of the captured primary after a failover cooldown, as
+/// [`AgentSession::restore_primary_swap`] needs it.
+///
+/// The mirror image of [`FailoverSwapRequest`]: same staged-candidate
+/// transition, but the transcript records `primary_restore` rather than
+/// `failover`, and there is no incomplete tail to revert because the turn that
+/// ran on the fallback completed.
+pub struct PrimaryRestoreRequest<'a> {
+    /// The primary captured at the first swap, to be reinstalled.
+    pub primary: &'a crate::failover::FailoverPrimary,
+    /// The fallback the caller believes is live, as `(provider, model)`. Both
+    /// the runtime and the persisted Session must still agree with it, or the
+    /// caller's model of the session is stale and nothing is installed.
+    pub active: &'a (String, String),
+    /// Whether the cooldown has actually elapsed. Passed in rather than
+    /// computed here because the cooldown lives in each surface's own
+    /// cross-turn state, and it is checked at the point RPC checks it so a
+    /// stale-runtime session is still reported before this short-circuits.
+    pub cooldown_elapsed: bool,
+    /// Models the primary can resolve against.
+    pub available_models: &'a [crate::models::ModelEntry],
+    /// Credential store consulted for the primary.
+    pub auth: &'a crate::auth::AuthStorage,
+    /// An explicit `--api-key`, which pins and never rotates.
+    pub cli_api_key: Option<&'a str>,
+    /// How a refusal is reported, which is the one place print and RPC
+    /// genuinely disagree.
+    ///
+    /// RPC treats a mismatch between its recorded fallback and the live
+    /// runtime or the persisted Session as a corrupted model of the session:
+    /// it blocks provider admission and fails the call, because re-entering a
+    /// provider against a session nobody can describe is how work gets
+    /// re-billed against a record that no longer matches it. Print has no
+    /// admission gate and no long-lived state to corrupt, so it declines and
+    /// runs the next prompt on the fallback, which is a correct outcome there.
+    ///
+    /// Preserved rather than unified, because unifying it would silently
+    /// change a surface people depend on; the divergence is tracked
+    /// separately.
+    pub strict_invariants: bool,
+    /// Whether to discard an in-flight background compaction.
+    ///
+    /// RPC, the SDK, and print mode discard an in-flight background compaction across
+    /// primary restoration (bd-uyqkk). The restoration changes the model and the context
+    /// window in the same transition, so a compaction computed against the fallback's
+    /// window is stale by construction.
+    pub invalidate_background_compaction: bool,
+}
+
+/// What a restoration actually installed.
+#[derive(Debug, Clone)]
+pub struct RestoredPrimary {
+    /// Provider now installed.
+    pub provider: String,
+    /// Model now installed.
+    pub model: String,
+}
+
 /// The agent runtime that orchestrates LLM calls and tool execution.
 pub struct Agent {
     /// The LLM provider.
@@ -1544,6 +1770,11 @@ pub struct Agent {
 
     /// Fetchers for queued follow-up messages (idle).
     follow_up_fetchers: Vec<MessageFetcher>,
+
+    /// Whether queue sources may be polled and dispatched automatically.
+    /// Hosts can pause either lane and explicitly take already staged batches.
+    automatic_steering_dispatch: bool,
+    automatic_follow_up_dispatch: bool,
 
     /// Live owner resolver for background completions. Notices retain the
     /// resolved owner across the registry-to-Agent handoff and are checked
@@ -1681,6 +1912,8 @@ impl Agent {
             steering_fetchers: Vec::new(),
             initial_follow_up_fetcher: None,
             follow_up_fetchers: Vec::new(),
+            automatic_steering_dispatch: true,
+            automatic_follow_up_dispatch: true,
             job_session_scope,
             message_queue: MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime),
             cached_tool_defs: None,
@@ -2054,6 +2287,39 @@ impl Agent {
         )
     }
 
+    /// Enable or pause automatic queue dispatch independently of batch mode.
+    ///
+    /// Pausing a lane prevents the agent from polling that lane's external
+    /// fetchers and from consuming already staged messages automatically.
+    /// Direct tool-call continuations are unaffected. Pausing follow-ups also
+    /// suppresses synthetic turn-recovery nudges, so an idle/truncated turn
+    /// cannot trigger an unexpected provider request.
+    pub const fn set_automatic_queue_dispatch(&mut self, steering: bool, follow_up: bool) {
+        self.automatic_steering_dispatch = steering;
+        self.automatic_follow_up_dispatch = follow_up;
+    }
+
+    #[must_use]
+    pub const fn automatic_queue_dispatch(&self) -> (bool, bool) {
+        (
+            self.automatic_steering_dispatch,
+            self.automatic_follow_up_dispatch,
+        )
+    }
+
+    /// Explicitly take one configured steering batch without polling fetchers.
+    pub fn take_queued_steering_batch(&mut self) -> Vec<QueuedAgentMessage> {
+        self.message_queue.pop_steering()
+    }
+
+    /// Explicitly take one configured follow-up batch without polling fetchers.
+    ///
+    /// Background-job notices are still owner-validated before they leave the
+    /// queue; stale notices are restored to their owning session registry.
+    pub async fn take_queued_follow_up_batch(&mut self) -> Vec<QueuedAgentMessage> {
+        self.pop_follow_up_for_current_session().await
+    }
+
     /// Count queued messages (steering + follow-up).
     #[must_use]
     pub fn queued_message_count(&self) -> usize {
@@ -2096,6 +2362,29 @@ impl Agent {
 
     pub fn set_system_prompt(&mut self, system_prompt: Option<String>) {
         self.config.system_prompt = system_prompt;
+    }
+
+    /// What the next completion request would carry: the system prompt,
+    /// tool definitions and messages after the same filtering a real request
+    /// applies. OMP `/dump` writes this beside the transcript.
+    pub fn request_context_json(&mut self) -> serde_json::Value {
+        let context = self.build_context();
+        let tools: Vec<serde_json::Value> = context
+            .tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "systemPrompt": context.system_prompt,
+            "tools": tools,
+            "messages": context.messages,
+        })
     }
 
     /// Build context for a completion request.
@@ -2309,9 +2598,13 @@ impl Agent {
         .await
     }
 
-    /// Outbound secrets transform (bd-cv653.7.9): obfuscate credential
-    /// shapes in the context before the provider sees it (or refuse the
-    /// send in block mode). Off mode is byte-identical.
+    /// Outbound secret screening at the primary provider boundary.
+    ///
+    /// The whole request is transactional: all mutations happen against a
+    /// cloned vault and owned context, and the live vault is installed only
+    /// after every field succeeds. This prevents a late refusal from learning
+    /// credentials or consuming placeholder identities.
+    #[allow(clippy::too_many_lines)] // one transaction; splitting it would scatter the commit point
     fn apply_secrets_outbound(
         &mut self,
         mut context: Context<'static>,
@@ -2329,87 +2622,289 @@ impl Agent {
                 .and_then(|s| s.extra_patterns.as_deref())
                 .unwrap_or(&[]),
         );
+        let mut staged_vault = self.secrets_vault.clone();
+
+        // Discover across the complete screenable request before rewriting any
+        // one field. A later assignment such as {"api_key": "..."} can
+        // therefore identify an earlier bare echo of the same opaque value.
+        // Binary image/media bytes and provider-opaque redacted reasoning are
+        // deliberately absent from this projection. Block mode refuses here on
+        // any detection, signed and paused content included; discovery never
+        // rewrites, so it cannot fail on content that is replayed verbatim.
+        let discovery = Self::secrets_discovery_projection(&context);
+        crate::secrets::discover_outbound_json(&discovery, &mut staged_vault, mode, &extra)?;
+
         let mut total = 0usize;
         let mut labels: Vec<String> = Vec::new();
 
         if let Some(prompt) = context.system_prompt.as_deref() {
-            let out = Self::secrets_transform_text(
+            context.system_prompt = Some(Cow::Owned(Self::secrets_transform_text(
                 prompt,
-                &mut self.secrets_vault,
+                &mut staged_vault,
                 mode,
                 &extra,
                 &mut total,
                 &mut labels,
-            )?;
-            context.system_prompt = Some(std::borrow::Cow::Owned(out));
+            )?));
         }
+
         for message in context.messages.to_mut().iter_mut() {
             match message {
-                Message::User(user) => {
-                    Self::secrets_transform_user_content(
-                        &mut user.content,
-                        &mut self.secrets_vault,
-                        mode,
-                        &extra,
-                        &mut total,
-                        &mut labels,
-                    )?;
-                }
+                Message::User(user) => Self::secrets_transform_user_content(
+                    &mut user.content,
+                    &mut staged_vault,
+                    mode,
+                    &extra,
+                    &mut total,
+                    &mut labels,
+                )?,
                 Message::Assistant(assistant) => {
-                    let assistant_mut = Arc::make_mut(assistant);
-                    for block in &mut assistant_mut.content {
-                        match block {
-                            ContentBlock::Text(t) => {
-                                t.text = Self::secrets_transform_text(
-                                    &t.text,
-                                    &mut self.secrets_vault,
-                                    mode,
-                                    &extra,
-                                    &mut total,
-                                    &mut labels,
-                                )?;
-                            }
-                            ContentBlock::Thinking(t) => {
-                                t.thinking = Self::secrets_transform_text(
-                                    &t.thinking,
-                                    &mut self.secrets_vault,
-                                    mode,
-                                    &extra,
-                                    &mut total,
-                                    &mut labels,
-                                )?;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Message::ToolResult(result) => {
-                    let result_mut = Arc::make_mut(result);
-                    for block in &mut result_mut.content {
-                        if let ContentBlock::Text(t) = block {
-                            t.text = Self::secrets_transform_text(
-                                &t.text,
-                                &mut self.secrets_vault,
+                    // Paused server-tool responses and signed blocks must remain
+                    // byte/structure stable for provider replay. Block mode has
+                    // already refused any detection in them (discovery above);
+                    // obfuscate mode replays them as the provider produced them.
+                    // Refusing there wedged every later request in the session
+                    // (a signature can be a plain OpenAI item id, and model-made
+                    // text such as a DSN matches the detector).
+                    if assistant.stop_reason == StopReason::PauseTurn {
+                        if mode == crate::secrets::SecretsMode::Block {
+                            let original =
+                                serde_json::to_value(assistant.as_ref()).map_err(|_| {
+                                    Error::validation(
+                                        "PI_SECRET_SERIALIZE: failed to screen paused assistant message"
+                                            .to_string(),
+                                    )
+                                })?;
+                            Self::secrets_transform_json(
+                                &original,
+                                &mut staged_vault,
                                 mode,
                                 &extra,
                                 &mut total,
                                 &mut labels,
                             )?;
                         }
+                        continue;
+                    }
+
+                    let assistant_mut = Arc::make_mut(assistant);
+                    for block in &mut assistant_mut.content {
+                        Self::secrets_transform_content_block(
+                            block,
+                            true,
+                            &mut staged_vault,
+                            mode,
+                            &extra,
+                            &mut total,
+                            &mut labels,
+                        )?;
+                    }
+                    if let Some(error_message) = assistant_mut.error_message.as_mut() {
+                        *error_message = Self::secrets_transform_text(
+                            error_message,
+                            &mut staged_vault,
+                            mode,
+                            &extra,
+                            &mut total,
+                            &mut labels,
+                        )?;
+                    }
+                    if let Some(details) = assistant_mut.stop_details.as_mut()
+                        && let Some(explanation) = details.explanation.as_mut()
+                    {
+                        *explanation = Self::secrets_transform_text(
+                            explanation,
+                            &mut staged_vault,
+                            mode,
+                            &extra,
+                            &mut total,
+                            &mut labels,
+                        )?;
                     }
                 }
-                Message::Custom(_) => {}
+                Message::ToolResult(result) => {
+                    let result_mut = Arc::make_mut(result);
+                    for block in &mut result_mut.content {
+                        Self::secrets_transform_content_block(
+                            block,
+                            false,
+                            &mut staged_vault,
+                            mode,
+                            &extra,
+                            &mut total,
+                            &mut labels,
+                        )?;
+                    }
+                    if let Some(details) = result_mut.details.as_mut() {
+                        *details = Self::secrets_transform_json(
+                            details,
+                            &mut staged_vault,
+                            mode,
+                            &extra,
+                            &mut total,
+                            &mut labels,
+                        )?;
+                    }
+                }
+                Message::Custom(custom) => {
+                    custom.content = Self::secrets_transform_text(
+                        &custom.content,
+                        &mut staged_vault,
+                        mode,
+                        &extra,
+                        &mut total,
+                        &mut labels,
+                    )?;
+                    if let Some(details) = custom.details.as_mut() {
+                        *details = Self::secrets_transform_json(
+                            details,
+                            &mut staged_vault,
+                            mode,
+                            &extra,
+                            &mut total,
+                            &mut labels,
+                        )?;
+                    }
+                }
             }
         }
+
+        for tool in context.tools.to_mut().iter_mut() {
+            // Tool names are routing identifiers. A replacement here would
+            // advertise a name the local registry cannot execute, so names are
+            // never rewritten. Only block mode refuses; obfuscate mode sends
+            // the name as registered (MCP server keys are user configuration).
+            let screened_name = Self::secrets_transform_text(
+                &tool.name,
+                &mut staged_vault,
+                mode,
+                &extra,
+                &mut total,
+                &mut labels,
+            )?;
+            if screened_name != tool.name && mode == crate::secrets::SecretsMode::Block {
+                return Err(Error::validation(
+                    "PI_SECRET_IDENTIFIER: tool name contains secret material and cannot be rewritten safely"
+                        .to_string(),
+                ));
+            }
+            tool.description = Self::secrets_transform_text(
+                &tool.description,
+                &mut staged_vault,
+                mode,
+                &extra,
+                &mut total,
+                &mut labels,
+            )?;
+            tool.parameters = Self::secrets_transform_json(
+                &tool.parameters,
+                &mut staged_vault,
+                mode,
+                &extra,
+                &mut total,
+                &mut labels,
+            )?;
+        }
+
+        self.secrets_vault = staged_vault;
         if total > 0 {
             tracing::info!(
                 event = "pi.secrets.outbound",
                 detections = total,
                 rules = ?labels,
-                "secrets obfuscated in outbound context (redacted)"
+                "secrets screened in outbound provider context (redacted)"
             );
         }
         Ok(context)
+    }
+
+    fn secrets_discovery_projection(context: &Context<'_>) -> Value {
+        let mut fields = Vec::new();
+        if let Some(prompt) = context.system_prompt.as_deref() {
+            fields.push(Value::String(prompt.to_string()));
+        }
+        for message in context.messages.iter() {
+            match message {
+                Message::User(user) => match &user.content {
+                    UserContent::Text(text) => fields.push(Value::String(text.clone())),
+                    UserContent::Blocks(blocks) => {
+                        Self::secrets_discovery_blocks(blocks, &mut fields);
+                    }
+                },
+                Message::Assistant(assistant) => {
+                    Self::secrets_discovery_blocks(&assistant.content, &mut fields);
+                    if let Some(error) = &assistant.error_message {
+                        fields.push(Value::String(error.clone()));
+                    }
+                    if let Some(explanation) = assistant
+                        .stop_details
+                        .as_ref()
+                        .and_then(|details| details.explanation.as_ref())
+                    {
+                        fields.push(Value::String(explanation.clone()));
+                    }
+                }
+                Message::ToolResult(result) => {
+                    Self::secrets_discovery_blocks(&result.content, &mut fields);
+                    if let Some(details) = &result.details {
+                        fields.push(details.clone());
+                    }
+                }
+                Message::Custom(custom) => {
+                    fields.push(Value::String(custom.content.clone()));
+                    if let Some(details) = &custom.details {
+                        fields.push(details.clone());
+                    }
+                }
+            }
+        }
+        for tool in context.tools.iter() {
+            fields.push(Value::String(tool.name.clone()));
+            fields.push(Value::String(tool.description.clone()));
+            fields.push(tool.parameters.clone());
+        }
+        Value::Array(fields)
+    }
+
+    fn secrets_discovery_blocks(blocks: &[ContentBlock], fields: &mut Vec<Value>) {
+        for block in blocks {
+            match block {
+                ContentBlock::Text(text) => fields.push(Value::String(text.text.clone())),
+                ContentBlock::Thinking(thinking) => {
+                    fields.push(Value::String(thinking.thinking.clone()));
+                }
+                ContentBlock::ToolCall(call) => fields.push(call.arguments.clone()),
+                ContentBlock::RedactedThinking(_)
+                | ContentBlock::Image(_)
+                | ContentBlock::Media(_) => {}
+            }
+        }
+    }
+
+    fn secrets_add_audit(
+        audit: crate::secrets::TransformAudit,
+        total: &mut usize,
+        labels: &mut Vec<String>,
+    ) {
+        *total = total.saturating_add(audit.detections);
+        for rule in audit.rules {
+            if !labels.contains(&rule) {
+                labels.push(rule);
+            }
+        }
+    }
+
+    fn secrets_transform_json(
+        value: &Value,
+        vault: &mut crate::secrets::SecretVault,
+        mode: crate::secrets::SecretsMode,
+        extra: &[regex::Regex],
+        total: &mut usize,
+        labels: &mut Vec<String>,
+    ) -> Result<Value> {
+        let (output, audit) = crate::secrets::transform_outbound_json(value, vault, mode, extra)?;
+        Self::secrets_add_audit(audit, total, labels);
+        Ok(output)
     }
 
     fn secrets_transform_text(
@@ -2420,23 +2915,76 @@ impl Agent {
         total: &mut usize,
         labels: &mut Vec<String>,
     ) -> Result<String> {
-        if mode == crate::secrets::SecretsMode::Block {
-            crate::secrets::gate_outbound(text, mode, extra)?;
-        }
-        let (out, audit) = crate::secrets::obfuscate(text, vault, extra);
-        *total += audit.detections;
-        for rule in audit.rules {
-            if !labels.contains(&rule) {
-                labels.push(rule);
-            }
-        }
-        Ok(out)
+        let value = Value::String(text.to_string());
+        let output = Self::secrets_transform_json(&value, vault, mode, extra, total, labels)?;
+        output.as_str().map(ToString::to_string).ok_or_else(|| {
+            Error::validation(
+                "PI_SECRET_JSON_PRIMITIVE: text screening changed the JSON value type".to_string(),
+            )
+        })
     }
 
-    /// Outbound secret hygiene for a user message. Attachment-carrying
-    /// messages (`Blocks`: text + images) must get the same treatment as
-    /// plain text — that is the shape the interactive app sends whenever an
-    /// attachment exists.
+    /// `honor_signatures` is true only for assistant blocks: a provider signs
+    /// its own output. User and tool-result blocks are rewritten even when
+    /// they carry a signature field (an extension can set one on any JSON).
+    fn secrets_transform_content_block(
+        block: &mut ContentBlock,
+        honor_signatures: bool,
+        vault: &mut crate::secrets::SecretVault,
+        mode: crate::secrets::SecretsMode,
+        extra: &[regex::Regex],
+        total: &mut usize,
+        labels: &mut Vec<String>,
+    ) -> Result<()> {
+        // A signed assistant block (a real provider signature, or a plain item
+        // id such as OpenAI's `fc_`/`msg_` that replay is keyed on) is never
+        // rewritten outside block mode: see the paused-turn comment in
+        // `apply_secrets_outbound`. Skipping the rewrite (not just discarding
+        // it) also keeps a type-changing replacement from refusing the request.
+        let keep_signed = honor_signatures && mode != crate::secrets::SecretsMode::Block;
+        match block {
+            ContentBlock::Text(text) => {
+                if keep_signed && text.text_signature.is_some() {
+                    return Ok(());
+                }
+                text.text =
+                    Self::secrets_transform_text(&text.text, vault, mode, extra, total, labels)?;
+            }
+            ContentBlock::Thinking(thinking) => {
+                if keep_signed && thinking.thinking_signature.is_some() {
+                    return Ok(());
+                }
+                thinking.thinking = Self::secrets_transform_text(
+                    &thinking.thinking,
+                    vault,
+                    mode,
+                    extra,
+                    total,
+                    labels,
+                )?;
+            }
+            ContentBlock::ToolCall(call) => {
+                if keep_signed && call.thought_signature.is_some() {
+                    return Ok(());
+                }
+                call.arguments = Self::secrets_transform_json(
+                    &call.arguments,
+                    vault,
+                    mode,
+                    extra,
+                    total,
+                    labels,
+                )?;
+            }
+            ContentBlock::RedactedThinking(_) | ContentBlock::Image(_) | ContentBlock::Media(_) => {
+                // Opaque signed/provider bytes and binary payloads are not
+                // interpreted as text by the secret detector.
+            }
+        }
+        Ok(())
+    }
+
+    /// Outbound secret hygiene for user content, including structured blocks.
     fn secrets_transform_user_content(
         content: &mut UserContent,
         vault: &mut crate::secrets::SecretVault,
@@ -2450,12 +2998,10 @@ impl Agent {
                 *text = Self::secrets_transform_text(text, vault, mode, extra, total, labels)?;
             }
             UserContent::Blocks(blocks) => {
-                for block in blocks.iter_mut() {
-                    if let ContentBlock::Text(t) = block {
-                        t.text = Self::secrets_transform_text(
-                            &t.text, vault, mode, extra, total, labels,
-                        )?;
-                    }
+                for block in blocks {
+                    Self::secrets_transform_content_block(
+                        block, false, vault, mode, extra, total, labels,
+                    )?;
                 }
             }
         }
@@ -3220,7 +3766,10 @@ impl Agent {
                 // synthetic continue nudge (hard-capped) instead of a silent
                 // end. The nudge flows through pending_messages so it is
                 // evented and persisted like any user message.
-                if pending_messages.is_empty() && !has_more_tool_calls {
+                if self.automatic_follow_up_dispatch
+                    && pending_messages.is_empty()
+                    && !has_more_tool_calls
+                {
                     let text = assistant_text_content(&assistant_arc.content);
                     if let Some(action) = turn_recovery.evaluate(assistant_arc.stop_reason, &text) {
                         pending_messages =
@@ -3408,6 +3957,9 @@ impl Agent {
     }
 
     async fn drain_steering_messages(&mut self) -> Vec<QueuedAgentMessage> {
+        if !self.automatic_steering_dispatch {
+            return Vec::new();
+        }
         for fetcher in &self.steering_fetchers {
             let fetched = self.fetch_messages(Some(fetcher)).await;
             for message in fetched {
@@ -3422,6 +3974,9 @@ impl Agent {
     }
 
     async fn stage_follow_up_messages(&mut self) -> bool {
+        if !self.automatic_follow_up_dispatch {
+            return false;
+        }
         let mut owning_surface_ready = self.message_queue.follow_up_batch_len() > 0;
         if !owning_surface_ready {
             let owning_surface = self
@@ -3547,7 +4102,61 @@ impl Agent {
         // (block) before any provider sees them. The vault is in-memory and
         // dies with the session.
         let context = self.apply_secrets_outbound(context)?;
-        let mut stream = provider.stream(&context, &stream_options).await?;
+
+        if checkpoint_cx.checkpoint().is_err()
+            || abort.as_ref().is_some_and(AbortSignal::is_aborted)
+        {
+            let abort_arc = Arc::new(self.build_abort_message(None));
+            on_event(AgentEvent::MessageStart {
+                message: Message::Assistant(Arc::clone(&abort_arc)),
+            });
+            self.messages
+                .push(Message::Assistant(Arc::clone(&abort_arc)));
+            on_event(AgentEvent::MessageUpdate {
+                message: Message::Assistant(Arc::clone(&abort_arc)),
+                assistant_message_event: AssistantMessageEvent::Error {
+                    reason: StopReason::Aborted,
+                    error: Arc::clone(&abort_arc),
+                },
+            });
+            return Ok(self.finalize_assistant_message(
+                Arc::try_unwrap(abort_arc).unwrap_or_else(|a| (*a).clone()),
+                &on_event,
+                true,
+            ));
+        }
+
+        let stream_fut = provider.stream(&context, &stream_options);
+        let mut stream = if let Some(signal) = abort.as_ref() {
+            let abort_fut = signal.wait().fuse();
+            let stream_fut = stream_fut.fuse();
+            futures::pin_mut!(abort_fut, stream_fut);
+            match futures::future::select(abort_fut, stream_fut).await {
+                futures::future::Either::Left(((), _)) => {
+                    let abort_arc = Arc::new(self.build_abort_message(None));
+                    on_event(AgentEvent::MessageStart {
+                        message: Message::Assistant(Arc::clone(&abort_arc)),
+                    });
+                    self.messages
+                        .push(Message::Assistant(Arc::clone(&abort_arc)));
+                    on_event(AgentEvent::MessageUpdate {
+                        message: Message::Assistant(Arc::clone(&abort_arc)),
+                        assistant_message_event: AssistantMessageEvent::Error {
+                            reason: StopReason::Aborted,
+                            error: Arc::clone(&abort_arc),
+                        },
+                    });
+                    return Ok(self.finalize_assistant_message(
+                        Arc::try_unwrap(abort_arc).unwrap_or_else(|a| (*a).clone()),
+                        &on_event,
+                        true,
+                    ));
+                }
+                futures::future::Either::Right((res, _)) => res?,
+            }
+        } else {
+            stream_fut.await?
+        };
 
         let mut added_partial = false;
         // Track whether we've already emitted `MessageStart` for this streaming response.
@@ -3567,7 +4176,9 @@ impl Agent {
         let mut tool_call_started = false;
 
         'stream: loop {
-            if checkpoint_cx.checkpoint().is_err() {
+            if checkpoint_cx.checkpoint().is_err()
+                || abort.as_ref().is_some_and(AbortSignal::is_aborted)
+            {
                 let last_partial = if added_partial {
                     match self
                         .messages
@@ -4265,10 +4876,16 @@ impl Agent {
 
     fn finalize_assistant_message(
         &mut self,
-        message: AssistantMessage,
+        mut message: AssistantMessage,
         on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
         added_partial: bool,
     ) -> AssistantMessage {
+        // gh #221: price the finished turn from the catalog rates. Transports
+        // only fill token counts (plus OpenRouter's billed total); without
+        // this every `usage.cost` stayed 0.0 on every provider.
+        if let Some(rates) = self.provider.model_cost() {
+            rates.price_usage(&mut message.usage);
+        }
         let arc = Arc::new(message);
         if added_partial {
             if let Some(target) = self
@@ -4574,6 +5191,22 @@ impl Agent {
         // operator approves the REAL command), and restored values are
         // masked again in the result heading back to the model.
         let tool_call = self.restore_secrets_inbound(tool_call);
+
+        // Plan-mode gate (bd-cv653.3.5): Planning/PendingApproval reject any
+        // tool whose effects intersect the mutation/process BARRIER set before
+        // soliciting approval or running extensions.
+        if !self
+            .plan_state
+            .allows_effects(self.effects_for_call(&tool_call))
+        {
+            return (
+                Self::xdev_text_output(
+                    &crate::plan::PlanState::block_message(&tool_call.name),
+                    true,
+                ),
+                true,
+            );
+        }
 
         let approval_denied_output = self
             .request_tool_approval(&tool_call, Arc::clone(&on_event))
@@ -7090,6 +7723,7 @@ mod extensions_integration_tests {
                 content: "Use strict TypeScript.".to_string(),
                 globs: vec!["*.ts".to_string()],
                 always_apply: false,
+                description: None,
                 source: ".cursor/rules/ts.mdc".to_string(),
                 format: crate::context_files::ForeignRuleFormat::CursorMdc,
             }],
@@ -9278,6 +9912,147 @@ mod extensions_integration_tests {
     }
 
     #[test]
+    fn manual_follow_up_dispatch_keeps_staged_work_without_an_extra_provider_call() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let provider = Arc::new(TruncatingProvider::new(0));
+            let provider_dyn: Arc<dyn Provider> = provider.clone();
+            let mut agent = Agent::new(
+                provider_dyn,
+                ToolRegistry::from_tools(vec![]),
+                AgentConfig::default(),
+            );
+            agent.set_automatic_queue_dispatch(true, false);
+            agent.queue_follow_up(Message::User(UserMessage {
+                content: UserContent::Text("manual follow-up".to_string()),
+                timestamp: 0,
+            }));
+
+            let final_message = agent.run("initial", |_| {}).await.expect("run");
+            assert_eq!(final_message.stop_reason, StopReason::Stop);
+            assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(agent.queued_message_count(), 1);
+
+            let batch = agent.take_queued_follow_up_batch().await;
+            assert_eq!(batch.len(), 1);
+            assert_eq!(agent.queued_message_count(), 0);
+        });
+    }
+
+    #[test]
+    fn manual_follow_up_dispatch_suppresses_turn_recovery_continuations() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let provider = Arc::new(TruncatingProvider::new(10));
+            let provider_dyn: Arc<dyn Provider> = provider.clone();
+            let mut agent = Agent::new(
+                provider_dyn,
+                ToolRegistry::from_tools(vec![]),
+                AgentConfig::default(),
+            );
+            agent.set_automatic_queue_dispatch(true, false);
+
+            let final_message = agent.run("write main", |_| {}).await.expect("run");
+            assert_eq!(final_message.stop_reason, StopReason::Length);
+            assert_eq!(
+                provider.stream_calls.load(Ordering::SeqCst),
+                1,
+                "manual follow-up control must suppress synthetic recovery requests"
+            );
+            assert!(!agent.messages().iter().any(|message| {
+                matches!(message, Message::User(user)
+                    if matches!(&user.content, UserContent::Text(text)
+                        if text.contains("auto-continue")))
+            }));
+        });
+    }
+
+    #[test]
+    fn manual_steering_dispatch_never_polls_external_fetchers() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let provider = Arc::new(TruncatingProvider::new(0));
+            let provider_dyn: Arc<dyn Provider> = provider.clone();
+            // The fixture's final reply ("}\n```\nAll done.") reads as an
+            // unclosed fence, so conservative turn recovery would add a
+            // continuation call. Only steering is manual here (follow-up
+            // dispatch, which suppresses recovery, stays automatic), so turn
+            // recovery is switched off to isolate steering dispatch.
+            let mut agent = Agent::new(
+                provider_dyn,
+                ToolRegistry::from_tools(vec![]),
+                AgentConfig {
+                    turn_recovery: crate::turn_recovery::TurnRecoveryMode::Off,
+                    ..AgentConfig::default()
+                },
+            );
+            let polls = Arc::new(AtomicUsize::new(0));
+            let polls_for_fetcher = Arc::clone(&polls);
+            agent.register_message_fetchers(
+                Some(Arc::new(move || {
+                    let polls = Arc::clone(&polls_for_fetcher);
+                    Box::pin(async move {
+                        polls.fetch_add(1, Ordering::SeqCst);
+                        vec![QueuedAgentMessage::generated(Message::User(UserMessage {
+                            content: UserContent::Text("should not be fetched".to_string()),
+                            timestamp: 0,
+                        }))]
+                    })
+                })),
+                None,
+            );
+            agent.set_automatic_queue_dispatch(false, true);
+
+            let final_message = agent.run("initial", |_| {}).await.expect("run");
+            assert_eq!(final_message.stop_reason, StopReason::Stop);
+            assert_eq!(polls.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn explicit_manual_batch_take_respects_queue_modes_without_enabling_dispatch() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let provider: Arc<dyn Provider> = Arc::new(TruncatingProvider::new(0));
+            let mut agent = Agent::new(
+                provider,
+                ToolRegistry::from_tools(vec![]),
+                AgentConfig::default(),
+            );
+            agent.set_queue_modes(QueueMode::All, QueueMode::All);
+            agent.set_automatic_queue_dispatch(false, false);
+            assert_eq!(agent.automatic_queue_dispatch(), (false, false));
+
+            for text in ["s1", "s2"] {
+                agent.queue_steering(Message::User(UserMessage {
+                    content: UserContent::Text(text.to_string()),
+                    timestamp: 0,
+                }));
+            }
+            for text in ["f1", "f2"] {
+                agent.queue_follow_up(Message::User(UserMessage {
+                    content: UserContent::Text(text.to_string()),
+                    timestamp: 0,
+                }));
+            }
+            assert_eq!(agent.queued_message_count(), 4);
+            assert_eq!(agent.take_queued_steering_batch().len(), 2);
+            assert_eq!(agent.take_queued_follow_up_batch().await.len(), 2);
+            assert_eq!(agent.queued_message_count(), 0);
+            assert_eq!(agent.automatic_queue_dispatch(), (false, false));
+        });
+    }
+
+    #[test]
     fn send_user_message_follow_up_does_not_skip_tools() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -10674,31 +11449,24 @@ mod abort_tests {
 
             let cancel_thread = std::thread::spawn(move || {
                 started_rx
-                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .recv_timeout(std::time::Duration::from_secs(10))
                     .expect("stream start");
                 cancel_cx.set_cancel_requested(true);
             });
 
-            let run = agent_session.run_text_with_abort("hello".to_string(), None, move |event| {
-                if matches!(
-                    event,
-                    AgentEvent::MessageStart {
-                        message: Message::Assistant(_)
+            let message = agent_session
+                .run_text_with_abort("hello".to_string(), None, move |event| {
+                    if matches!(
+                        event,
+                        AgentEvent::MessageStart {
+                            message: Message::Assistant(_)
+                        }
+                    ) {
+                        let _ = started_tx.send(());
                     }
-                ) {
-                    let _ = started_tx.send(());
-                }
-            });
-            futures::pin_mut!(run);
-
-            let message = asupersync::time::timeout(
-                asupersync::time::wall_now(),
-                std::time::Duration::from_secs(1),
-                run,
-            )
-            .await
-            .expect("ambient cancellation should finish before timeout")
-            .expect("run_text_with_abort");
+                })
+                .await
+                .expect("run_text_with_abort");
 
             cancel_thread.join().expect("cancel thread");
 
@@ -12035,6 +12803,25 @@ impl AgentSession {
         self
     }
 
+    /// The runtime this session dispatches background work on, if it has one.
+    ///
+    /// Set either explicitly by [`Self::with_runtime_handle`] or lazily by
+    /// `compaction_runtime_handle` when background compaction first needs a
+    /// runtime and none was supplied. So a `Some` here does not imply a caller
+    /// provided it, and a `None` means nothing has needed one yet — not that
+    /// none will ever exist.
+    ///
+    /// Exposed for surfaces that need to route agent events to extensions:
+    /// `EventCoalescer::dispatch_agent_event_lazy` spawns onto a runtime, and
+    /// a surface holding only an `AgentSession` had no way to reach one. See
+    /// bd-82331, where the default interactive stack silently delivered no
+    /// observation events to extensions because its event path could not build
+    /// a coalescer.
+    #[must_use]
+    pub const fn runtime_handle(&self) -> Option<&RuntimeHandle> {
+        self.runtime_handle.as_ref()
+    }
+
     #[must_use]
     pub fn with_model_registry(mut self, registry: ModelRegistry) -> Self {
         self.set_model_registry(registry);
@@ -12074,6 +12861,31 @@ impl AgentSession {
 
     pub fn set_auth_storage(&mut self, auth: AuthStorage) {
         self.auth_storage = Some(auth);
+    }
+
+    /// Adopt credentials changed outside this session (`/login`, `/logout`)
+    /// and re-resolve the running model's key with the usual precedence:
+    /// CLI override, then stored credential, then the catalog entry's key.
+    pub(crate) fn adopt_auth_storage(&mut self, auth: AuthStorage) {
+        self.auth_storage = Some(auth);
+        let entry = self.current_model_entry();
+        let key = entry.as_ref().map_or_else(
+            || {
+                let provider = self.agent.provider();
+                normalize_api_key_opt(self.api_key_override.clone()).or_else(|| {
+                    self.auth_storage.as_ref().and_then(|auth| {
+                        normalize_api_key_opt(auth.resolve_api_key(provider.name(), None))
+                    })
+                })
+            },
+            |entry| self.resolve_stream_api_key_for_model(entry),
+        );
+        self.agent.stream_options_mut().api_key = key;
+        self.refresh_extension_completion_host_state();
+    }
+
+    pub(crate) const fn model_registry(&self) -> Option<&ModelRegistry> {
+        self.model_registry.as_ref()
     }
 
     #[must_use]
@@ -12330,9 +13142,6 @@ impl AgentSession {
         if !previous_thinking.is_some_and(|previous| previous.eq(&next_thinking)) {
             candidate.append_thinking_level_change(next_thinking.to_string());
         }
-        if runtime_model_changed {
-            self.invalidate_background_compaction();
-        }
         let _provider_transition = self
             .provider_admission
             .begin_transition(
@@ -12350,6 +13159,11 @@ impl AgentSession {
             );
             self.quarantine_provider_reentry(reason.clone());
             return Err(Error::session_persistence(reason));
+        }
+        // Only a durable switch retires in-flight background compaction; a
+        // failed save leaves the old model live, so its compaction stays valid.
+        if runtime_model_changed {
+            self.invalidate_background_compaction();
         }
         *session = candidate;
         drop(session);
@@ -12388,8 +13202,10 @@ impl AgentSession {
             .effective_thinking_level_for_current_path()
             .as_deref()
             != Some(level_string.as_str());
-        candidate.set_model_header(None, None, Some(level_string.clone()));
+        // An unchanged level is not saved below, so it must not mutate the
+        // header either: the installed session would diverge from disk.
         if changed {
+            candidate.set_model_header(None, None, Some(level_string.clone()));
             candidate.append_thinking_level_change(level_string);
         }
         let _provider_transition = if changed {
@@ -12423,6 +13239,20 @@ impl AgentSession {
             self.clear_provider_reentry_quarantine();
         }
         Ok(())
+    }
+
+    /// The catalog entry for the model this session is currently running.
+    ///
+    /// `None` when no registry was installed or the running model is not in
+    /// it — an extension-registered or ad-hoc model, say. Callers that need a
+    /// model's declared capabilities (thinking levels, context window) should
+    /// resolve through here rather than re-deriving them, so a session that
+    /// cannot be resolved degrades the same way everywhere.
+    pub fn current_model_entry(&self) -> Option<ModelEntry> {
+        let provider = self.agent.provider();
+        self.model_registry
+            .as_ref()
+            .and_then(|registry| registry.find(provider.name(), provider.model_id()))
     }
 
     pub(crate) fn clamp_thinking_level_for_model(
@@ -12563,6 +13393,689 @@ impl AgentSession {
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Whether a background compaction task is currently pending.
+    #[must_use]
+    pub const fn has_pending_background_compaction(&self) -> bool {
+        self.compaction_worker.has_pending()
+    }
+
+    /// Inject a parked background compaction task for testing context-switch invalidation.
+    pub fn park_pending_compaction_for_test(
+        &mut self,
+        runtime_handle: &RuntimeHandle,
+        aborted: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        self.compaction_worker
+            .park_pending_for_test(runtime_handle, aborted);
+        self.extensions_is_compacting
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Strip the failed request's incomplete output so a retry RESUMES the turn
+    /// instead of replaying it.
+    ///
+    /// A transient drop leaves a partial or error assistant message on the
+    /// path. Reverting only that keeps the user prompt and every completed tool
+    /// cycle, so the retry re-issues one provider request rather than re-running
+    /// tools and re-billing work already done (pi_agent_rust#125).
+    ///
+    /// The whole transition is built on a private `Session` candidate: the live
+    /// transcript and the agent's message list are untouched unless the revert
+    /// and its persistence both succeed. A save that stays indeterminate after
+    /// one idempotent retry is reported as a session-persistence failure, which
+    /// every surface treats as terminal (bd-8188r) — silently continuing there
+    /// could repeat side effects against a record that no longer describes them.
+    ///
+    /// `require_incomplete_tail` is for the caller that has already seen a
+    /// COMPLETED error response: there must be an incomplete tail to revert, and
+    /// its absence means the caller's model of the turn is wrong rather than
+    /// that there is nothing to do.
+    ///
+    /// Print mode and the RPC server each had their own copy of this, down to
+    /// the same error prose (bd-u2qv4). `admission` is what was genuinely
+    /// RPC's: the gate is blocked for the window between persistence and live
+    /// installation, so a crash in between leaves provider re-entry quarantined
+    /// rather than silently resumed. Surfaces without such a gate pass `None`.
+    /// It is taken here rather than wrapped around the call so the lock order —
+    /// inner session first, admission permit second — stays exactly as it was.
+    pub async fn restore_retry_tail(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        require_incomplete_tail: bool,
+    ) -> Result<()> {
+        self.restore_retry_tail_with_admission(cx, require_incomplete_tail, None)
+            .await
+    }
+
+    /// [`Self::restore_retry_tail`] with RPC's provider-admission gate. The gate
+    /// type is internal, so this stays crate-visible while the plain form above
+    /// is what an embedder driving its own retry loop calls.
+    pub(crate) async fn restore_retry_tail_with_admission(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        require_incomplete_tail: bool,
+        admission: Option<&ProviderAdmissionGate>,
+    ) -> Result<()> {
+        let session_store = Arc::clone(&self.session);
+        let mut inner = OwnedMutexGuard::lock(session_store, cx)
+            .await
+            .map_err(|err| {
+                Error::session(format!("retry restoration session lock failed: {err}"))
+            })?;
+        let mut candidate = inner.clone();
+        let reverted = candidate.revert_incomplete_response();
+        if require_incomplete_tail && !reverted {
+            return Err(Error::session(
+                "retry restoration invariant failed: the completed error response had no incomplete assistant tail",
+            ));
+        }
+        if !reverted {
+            return Ok(());
+        }
+
+        let restored_messages = candidate.to_messages_for_current_path();
+        let save_enabled = self.save_enabled();
+        let _provider_transition = match admission {
+            Some(gate) => Some(
+                gate.begin_transition(
+                    "retry restoration persistence was interrupted before live installation completed"
+                        .to_string(),
+                    cx,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        if save_enabled
+            && let Err(first_err) = candidate.save().await
+            && let Err(retry_err) = candidate.save().await
+        {
+            let reason = format!(
+                "retry restoration persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+            );
+            if let Some(gate) = admission {
+                gate.block(reason.clone());
+            }
+            return Err(Error::session_persistence(reason));
+        }
+
+        // The message list is about to change underneath any background
+        // compaction computed against the old one. RPC has always invalidated
+        // here; print mode did not, so a compaction prepared before the revert
+        // could be applied after it. Discarding prepared work is the safe
+        // direction — the worker recomputes — so the shared path does it.
+        self.invalidate_background_compaction();
+        *inner = candidate;
+        self.agent.replace_messages(restored_messages);
+        if let Some(gate) = admission {
+            gate.clear();
+        }
+        Ok(())
+    }
+
+    /// Everything a fallback-chain swap does to the session and the live agent.
+    ///
+    /// Print mode and the RPC server each carried this whole transition — revert
+    /// the failed tail, record the swap in the transcript, persist, then install
+    /// the new provider and its options — and the two install blocks were
+    /// identical line for line (bd-u2qv4). A duplicated persisted-mutation path
+    /// is the worst kind to let drift: a fallback running with the wrong tool
+    /// dialect, thinking clamp or context window is a silent behaviour change
+    /// nobody would attribute to a failover.
+    ///
+    /// The whole transition is built on a private `Session` candidate, so the
+    /// live transcript, provider and options are untouched unless the revert and
+    /// its persistence both succeed. A save that stays indeterminate after one
+    /// idempotent retry is a session-persistence failure, which every surface
+    /// treats as terminal (bd-8188r).
+    ///
+    /// Returns the thinking level actually installed, which callers record for
+    /// their own restoration bookkeeping.
+    pub async fn commit_failover(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        request: &FailoverSwapRequest<'_>,
+    ) -> Result<crate::model::ThinkingLevel> {
+        self.commit_failover_swap(cx, request, None).await
+    }
+
+    /// Walk a fallback chain and install the first entry that is actually
+    /// usable, or report that the chain held nothing.
+    ///
+    /// The walk is bounded by the chain, never by `max_failovers_per_turn`: the
+    /// caller counts committed swaps against that cap. Bounding the cursor by
+    /// the cap let malformed, uncredentialed, unconstructible, current or
+    /// duplicate entries consume the budget and hide a later valid entry
+    /// (bd-oqo03.1). An entry with no usable credential is skipped rather than
+    /// installed — failing over into an auth error is strictly worse than the
+    /// quota error that started this.
+    ///
+    /// Print mode and the RPC server each had this loop, and it is what a third
+    /// surface would otherwise copy: the interactive stacks, where a configured
+    /// chain is currently inert (bd-u2qv4). Classification, chain resolution
+    /// and event emission stay with the caller, because those genuinely differ.
+    pub async fn try_failover(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        attempt: &FailoverSwapAttempt<'_>,
+    ) -> Result<FailoverSwapOutcome> {
+        self.try_failover_swap(cx, attempt, None).await
+    }
+
+    /// Reinstall the primary captured at the first swap, once its cooldown has
+    /// elapsed.
+    ///
+    /// The counterpart to [`Self::try_failover`]: a failover is only half a
+    /// policy if nothing ever goes back. Without this a single 429 pins a
+    /// long-lived session to a fallback model for as long as it runs, which on
+    /// an interactive surface can be hours.
+    ///
+    /// Returns `Ok(None)` when nothing was installed — the cooldown has not
+    /// elapsed, there is no fallback live, the primary no longer resolves, it
+    /// has no usable credential, or (in lenient mode) the caller's record of
+    /// the live model is stale. Every one of those leaves the working fallback
+    /// installed, which is the right outcome: restoring into an auth error or a
+    /// half-written transition is strictly worse than staying on a model that
+    /// works.
+    ///
+    /// Print mode and the RPC server each had their own copy of this, and the
+    /// interactive stacks had none at all (bd-u2qv4, bd-gm481).
+    pub async fn restore_primary(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        request: &PrimaryRestoreRequest<'_>,
+    ) -> Result<Option<RestoredPrimary>> {
+        self.restore_primary_swap(cx, request, None).await
+    }
+
+    /// [`Self::restore_primary`] with RPC's provider-admission gate. The gate
+    /// type is internal, so this stays crate-visible while the plain form above
+    /// is what print mode and any embedder call.
+    pub(crate) async fn restore_primary_swap(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        request: &PrimaryRestoreRequest<'_>,
+        admission: Option<&ProviderAdmissionGate>,
+    ) -> Result<Option<RestoredPrimary>> {
+        let (active_provider, active_model) = request.active;
+
+        // The runtime must still be on the fallback the caller recorded.
+        let runtime_provider = self.agent.provider();
+        if !crate::provider_metadata::provider_ids_match(runtime_provider.name(), active_provider)
+            || !runtime_provider
+                .model_id()
+                .eq_ignore_ascii_case(active_model)
+        {
+            return Self::refuse_restore(
+                request,
+                admission,
+                format!(
+                    "primary restore invariant failed: runtime {}/{} does not match recorded fallback {active_provider}/{active_model}",
+                    runtime_provider.name(),
+                    runtime_provider.model_id()
+                ),
+            );
+        }
+
+        let session_store = Arc::clone(&self.session);
+        let mut inner = OwnedMutexGuard::lock(session_store, cx)
+            .await
+            .map_err(|err| Error::session(format!("primary restore inner lock failed: {err}")))?;
+        let session_matches_active = inner.effective_model_for_current_path().is_some_and(
+            |(session_provider, session_model)| {
+                crate::provider_metadata::provider_ids_match(&session_provider, active_provider)
+                    && session_model.eq_ignore_ascii_case(active_model)
+            },
+        );
+        if !session_matches_active {
+            return Self::refuse_restore(
+                request,
+                admission,
+                format!(
+                    "primary restore invariant failed: Session path does not match recorded fallback {active_provider}/{active_model}"
+                ),
+            );
+        }
+
+        // Checked here, after the invariants, so a session whose runtime has
+        // drifted is still reported rather than hidden behind a live cooldown.
+        if !request.cooldown_elapsed {
+            return Ok(None);
+        }
+
+        let Some((entry, key)) = Self::resolve_restore_target(request)? else {
+            return Ok(None);
+        };
+        let provider_impl = match crate::providers::create_provider(
+            &entry,
+            self.extensions.as_ref().map(ExtensionRegion::manager),
+        ) {
+            Ok(provider_impl) => provider_impl,
+            Err(err) if request.strict_invariants => return Err(err),
+            Err(_) => return Ok(None),
+        };
+
+        let to_provider = entry.model.provider.clone();
+        let to_model = entry.model.id.clone();
+        let (mut candidate, target_thinking) =
+            Self::prepare_restore_candidate(&inner, &entry, request.primary);
+
+        let save_enabled = self.save_enabled();
+        if request.invalidate_background_compaction {
+            self.invalidate_background_compaction();
+        }
+        let _provider_transition = match admission {
+            Some(gate) => Some(
+                gate.begin_transition(
+                    "primary restore persistence was interrupted before live installation completed"
+                        .to_string(),
+                    cx,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        if save_enabled
+            && let Err(first_err) = candidate.save().await
+            && let Err(retry_err) = candidate.save().await
+        {
+            // Leave the fallback installed. A half-written restoration is worse
+            // than a working session on the wrong model.
+            let reason = format!(
+                "primary restore persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+            );
+            if let Some(gate) = admission {
+                gate.block(reason.clone());
+            }
+            if request.strict_invariants {
+                return Err(Error::session_persistence(reason));
+            }
+            return Ok(None);
+        }
+
+        // No fallible operation remains after installing the candidate.
+        *inner = candidate;
+        self.install_restored_entry(&entry, provider_impl, key, target_thinking);
+        if let Some(gate) = admission {
+            gate.clear();
+        }
+        drop(inner);
+        Ok(Some(RestoredPrimary {
+            provider: to_provider,
+            model: to_model,
+        }))
+    }
+
+    /// Resolve the primary to a model entry and a credential, or decline.
+    ///
+    /// `Ok(None)` is the lenient decline; the same conditions are hard errors
+    /// under `strict_invariants`, with the error kinds RPC has always returned
+    /// for them.
+    fn resolve_restore_target(
+        request: &PrimaryRestoreRequest<'_>,
+    ) -> Result<Option<(crate::models::ModelEntry, Option<String>)>> {
+        let primary = request.primary;
+        let Some(entry) = request
+            .available_models
+            .iter()
+            .find(|m| {
+                crate::provider_metadata::provider_ids_match(&m.model.provider, &primary.provider)
+                    && m.model.id.eq_ignore_ascii_case(&primary.model_id)
+            })
+            .cloned()
+            .or_else(|| crate::models::ad_hoc_model_entry(&primary.provider, &primary.model_id))
+        else {
+            if request.strict_invariants {
+                return Err(Error::validation(format!(
+                    "Unable to restore primary provider/model {}/{}",
+                    primary.provider, primary.model_id
+                )));
+            }
+            return Ok(None);
+        };
+
+        let key = crate::models::resolve_model_key(request.cli_api_key, request.auth, &entry);
+        if crate::models::model_requires_configured_credential(&entry) && key.is_none() {
+            // Restoring into an auth error would be strictly worse than staying
+            // on a working fallback.
+            if request.strict_invariants {
+                return Err(Error::auth(format!(
+                    "Missing credentials for primary provider/model {}/{}",
+                    primary.provider, primary.model_id
+                )));
+            }
+            return Ok(None);
+        }
+        Ok(Some((entry, key)))
+    }
+
+    /// Stage the restoration on a private `Session` candidate, so the live
+    /// transcript is untouched unless its persistence succeeds.
+    fn prepare_restore_candidate(
+        inner: &Session,
+        entry: &crate::models::ModelEntry,
+        primary: &crate::failover::FailoverPrimary,
+    ) -> (Session, crate::model::ThinkingLevel) {
+        let to_provider = entry.model.provider.clone();
+        let to_model = entry.model.id.clone();
+        let target_thinking = entry.clamp_thinking_level(primary.requested_thinking_level);
+        let target_thinking_text = target_thinking.to_string();
+        let mut candidate = inner.clone();
+        let thinking_changed = candidate
+            .effective_thinking_level_for_current_path()
+            .as_deref()
+            != Some(target_thinking_text.as_str());
+        candidate.set_model_header(
+            Some(to_provider.clone()),
+            Some(to_model.clone()),
+            Some(target_thinking_text.clone()),
+        );
+        candidate.append_model_change_with_role(
+            to_provider,
+            to_model,
+            Some("primary_restore".to_string()),
+        );
+        if thinking_changed {
+            candidate.append_thinking_level_change(target_thinking_text);
+        }
+        (candidate, target_thinking)
+    }
+
+    /// The infallible half of the transition: no operation here can fail, so
+    /// the live agent can never be left describing a model it is not using.
+    fn install_restored_entry(
+        &mut self,
+        entry: &crate::models::ModelEntry,
+        provider_impl: Arc<dyn Provider>,
+        key: Option<String>,
+        target_thinking: crate::model::ThinkingLevel,
+    ) {
+        self.agent.set_provider(provider_impl);
+        self.agent.set_keyword_max_thinking_level(
+            entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
+        );
+        self.agent.set_tool_call_dialect(entry.tool_call_dialect());
+        self.agent.set_model_accepts_images(
+            entry
+                .model
+                .input
+                .contains(&crate::provider::InputType::Image),
+        );
+        {
+            let stream_options = self.agent.stream_options_mut();
+            stream_options.api_key = key;
+            stream_options.headers.clone_from(&entry.headers);
+            stream_options.max_tokens = Some(entry.model.max_tokens);
+            stream_options.thinking_level = Some(target_thinking);
+        }
+        self.set_compaction_context_window(context_window_tokens_for_entry(entry));
+        self.refresh_extension_completion_host_state();
+        if let Some(region) = &self.extensions {
+            region.manager().set_current_model(
+                Some(entry.model.provider.clone()),
+                Some(entry.model.id.clone()),
+            );
+        }
+    }
+
+    /// A refused restoration: a hard, admission-blocking failure where the
+    /// caller keeps long-lived state that is now known to be wrong, and a plain
+    /// decline where it does not.
+    fn refuse_restore(
+        request: &PrimaryRestoreRequest<'_>,
+        admission: Option<&ProviderAdmissionGate>,
+        reason: String,
+    ) -> Result<Option<RestoredPrimary>> {
+        if request.strict_invariants {
+            if let Some(gate) = admission {
+                gate.block(reason.clone());
+            }
+            return Err(Error::session_persistence(reason));
+        }
+        Ok(None)
+    }
+
+    /// [`Self::try_failover`] with RPC's provider-admission gate. The gate type
+    /// is internal, so this stays crate-visible while the plain form above is
+    /// what print mode and any embedder call.
+    pub(crate) async fn try_failover_swap(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        attempt: &FailoverSwapAttempt<'_>,
+        admission: Option<&ProviderAdmissionGate>,
+    ) -> Result<FailoverSwapOutcome> {
+        let (from_provider, from_model) = {
+            let provider = self.agent.provider();
+            (provider.name().to_string(), provider.model_id().to_string())
+        };
+        let mut walk = crate::failover::FailoverWalk::new(
+            attempt.chain,
+            attempt.start_position,
+            &from_provider,
+            &from_model,
+        );
+        while let Some((entry_index, spec)) = walk.next_spec() {
+            let next_position = walk.position();
+            let Some(entry) = crate::failover::resolve_chain_spec(spec, attempt.available_models)
+            else {
+                continue;
+            };
+            let api_key =
+                crate::models::resolve_model_key(attempt.cli_api_key, attempt.auth, &entry);
+            if crate::models::model_requires_configured_credential(&entry) && api_key.is_none() {
+                continue;
+            }
+            let Ok(provider) = crate::providers::create_provider(
+                &entry,
+                self.extensions.as_ref().map(ExtensionRegion::manager),
+            ) else {
+                continue;
+            };
+
+            let to_provider = entry.model.provider.clone();
+            let to_model = entry.model.id.clone();
+            let request = FailoverSwapRequest {
+                entry: &entry,
+                api_key,
+                provider,
+                from_provider: &from_provider,
+                from_model: &from_model,
+                class: attempt.class,
+                chain_position: next_position,
+                thinking_level_to_clamp: attempt.thinking_level_to_clamp,
+                require_incomplete_tail: attempt.require_incomplete_tail,
+                primary: attempt.primary,
+                cooldown_secs: attempt.cooldown_secs,
+                lifecycle_id: attempt.lifecycle_id,
+            };
+            self.commit_failover_swap(cx, &request, admission).await?;
+            return Ok(FailoverSwapOutcome {
+                next_position,
+                committed: Some(CommittedFailover {
+                    entry_index,
+                    from_provider,
+                    from_model,
+                    to_provider,
+                    to_model,
+                }),
+            });
+        }
+        Ok(FailoverSwapOutcome {
+            next_position: walk.position(),
+            committed: None,
+        })
+    }
+
+    /// The private `Session` candidate a swap would install, plus the message
+    /// list and thinking level that go with it.
+    ///
+    /// Nothing here touches live state: build it, and only if the whole
+    /// transition succeeds does the caller install it.
+    fn prepare_failover_candidate(
+        inner: &Session,
+        request: &FailoverSwapRequest<'_>,
+    ) -> Result<(Session, Vec<Message>, crate::model::ThinkingLevel)> {
+        let mut candidate = inner.clone();
+        let reverted = candidate.revert_incomplete_response();
+        if request.require_incomplete_tail && !reverted {
+            return Err(Error::session(
+                "failover restoration invariant failed: the completed error response had no incomplete assistant tail",
+            ));
+        }
+        let restored_messages = candidate.to_messages_for_current_path();
+
+        let entry = request.entry;
+        let to_provider = entry.model.provider.clone();
+        let to_model = entry.model.id.clone();
+        let target_thinking = entry.clamp_thinking_level(request.thinking_level_to_clamp);
+        let target_thinking_text = target_thinking.to_string();
+        let thinking_changed = candidate
+            .effective_thinking_level_for_current_path()
+            .as_deref()
+            != Some(target_thinking_text.as_str());
+        candidate.set_model_header(
+            Some(to_provider.clone()),
+            Some(to_model.clone()),
+            Some(target_thinking_text.clone()),
+        );
+        candidate.append_custom_entry(
+            "failover".to_string(),
+            Some(serde_json::json!({
+                "from": format!("{}/{}", request.from_provider, request.from_model),
+                "to": format!("{to_provider}/{to_model}"),
+                "class": format!("{:?}", request.class).to_ascii_lowercase(),
+                "attempt": request.chain_position,
+            })),
+        );
+
+        let primary_provider = request
+            .primary
+            .as_ref()
+            .map_or_else(|| request.from_provider.to_string(), |p| p.provider.clone());
+        let primary_model_id = request
+            .primary
+            .as_ref()
+            .map_or_else(|| request.from_model.to_string(), |p| p.model_id.clone());
+        let primary_thinking_level = request
+            .primary
+            .as_ref()
+            .map(|p| p.requested_thinking_level.to_string())
+            .or_else(|| Some(request.thinking_level_to_clamp.to_string()));
+        let cooldown_secs = request.cooldown_secs.unwrap_or(0);
+        let now = chrono::Utc::now();
+        let cooldown_i64 = i64::try_from(cooldown_secs).unwrap_or(i64::MAX);
+        let deadline = now + chrono::Duration::seconds(cooldown_i64);
+        let cooldown_deadline = Some(deadline.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        let lifecycle_id = request.lifecycle_id.map(String::from).or_else(|| {
+            inner
+                .active_failover_provenance_for_current_path()
+                .and_then(|p| p.lifecycle_id.clone())
+                .or_else(|| Some(uuid::Uuid::new_v4().to_string()))
+        });
+
+        let failover_meta = crate::session::ModelChangeFailover {
+            primary_provider,
+            primary_model_id,
+            primary_thinking_level,
+            fallback_provider: to_provider.clone(),
+            fallback_model_id: to_model.clone(),
+            chain_position: Some(request.chain_position),
+            cooldown_deadline,
+            cooldown_secs: Some(cooldown_secs),
+            lifecycle_id,
+        };
+
+        candidate.append_model_change_with_role_and_failover(
+            to_provider,
+            to_model,
+            Some("failover".to_string()),
+            Some(failover_meta),
+        );
+        if thinking_changed {
+            candidate.append_thinking_level_change(target_thinking_text);
+        }
+        Ok((candidate, restored_messages, target_thinking))
+    }
+
+    /// [`Self::commit_failover`] with RPC's provider-admission gate. The gate
+    /// type is internal, so this stays crate-visible while the plain form above
+    /// is what print mode and any embedder call.
+    pub(crate) async fn commit_failover_swap(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        request: &FailoverSwapRequest<'_>,
+        admission: Option<&ProviderAdmissionGate>,
+    ) -> Result<crate::model::ThinkingLevel> {
+        let session_store = Arc::clone(&self.session);
+        let mut inner = OwnedMutexGuard::lock(session_store, cx)
+            .await
+            .map_err(|err| Error::session(format!("failover session lock failed: {err}")))?;
+        let (mut candidate, restored_messages, target_thinking) =
+            Self::prepare_failover_candidate(&inner, request)?;
+        let entry = request.entry;
+        let to_provider = entry.model.provider.clone();
+        let to_model = entry.model.id.clone();
+
+        let save_enabled = self.save_enabled();
+        self.invalidate_background_compaction();
+        let _provider_transition = match admission {
+            Some(gate) => Some(
+                gate.begin_transition(
+                    "failover Session persistence was interrupted before live installation completed"
+                        .to_string(),
+                    cx,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        if save_enabled
+            && let Err(first_err) = candidate.save().await
+            && let Err(retry_err) = candidate.save().await
+        {
+            let reason = format!(
+                "failover Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+            );
+            if let Some(gate) = admission {
+                gate.block(reason.clone());
+            }
+            return Err(Error::session_persistence(reason));
+        }
+
+        // No fallible operation remains after installing the candidate.
+        *inner = candidate;
+        self.agent.replace_messages(restored_messages);
+        self.agent.set_provider(Arc::clone(&request.provider));
+        self.agent.set_keyword_max_thinking_level(
+            entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
+        );
+        self.agent.set_tool_call_dialect(entry.tool_call_dialect());
+        self.agent.set_model_accepts_images(
+            entry
+                .model
+                .input
+                .contains(&crate::provider::InputType::Image),
+        );
+        {
+            let stream_options = self.agent.stream_options_mut();
+            stream_options.api_key.clone_from(&request.api_key);
+            stream_options.headers.clone_from(&entry.headers);
+            stream_options.max_tokens = Some(entry.model.max_tokens);
+            stream_options.thinking_level = Some(target_thinking);
+        }
+        self.set_compaction_context_window(context_window_tokens_for_entry(entry));
+        self.refresh_extension_completion_host_state();
+        if let Some(region) = &self.extensions {
+            region
+                .manager()
+                .set_current_model(Some(to_provider), Some(to_model));
+        }
+        if let Some(gate) = admission {
+            gate.clear();
+        }
+        Ok(target_thinking)
+    }
+
     async fn current_compaction_origin(&self) -> Result<CompactionOrigin> {
         let provider = self.agent.provider();
         let cx = crate::agent_cx::AgentCx::for_request();
@@ -12619,7 +14132,17 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<()> {
         self.ensure_provider_reentry_allowed()?;
-        self.compact_synchronous(Arc::new(on_event)).await
+        self.compact_synchronous(Arc::new(on_event), false).await
+    }
+
+    /// OMP `/shake` (bd-cv653.3.18): compact by dropping bulky tool output
+    /// from the older span instead of asking the model for a summary.
+    /// Instant, and no provider request is made.
+    pub async fn shake_now(
+        &mut self,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.compact_synchronous(Arc::new(on_event), true).await
     }
 
     pub async fn execute_extension_command(
@@ -13249,7 +14772,11 @@ impl AgentSession {
 
     /// Run compaction synchronously (inline), blocking until completion.
     #[allow(clippy::too_many_lines)]
-    async fn compact_synchronous(&mut self, on_event: AgentEventHandler) -> Result<()> {
+    async fn compact_synchronous(
+        &mut self,
+        on_event: AgentEventHandler,
+        shake: bool,
+    ) -> Result<()> {
         if !self.compaction_settings.enabled {
             return Ok(());
         }
@@ -13371,7 +14898,11 @@ impl AgentSession {
                 });
                 return Err(err);
             }
-            let compaction_result = compaction::compact(prep, provider, &credential, None).await;
+            let compaction_result = if shake {
+                Ok(compaction::compact_shake(prep))
+            } else {
+                compaction::compact(prep, provider, &credential, None).await
+            };
 
             match compaction_result {
                 Ok(result) => {
@@ -15486,6 +17017,123 @@ mod tests {
                 message: assistant_message("done"),
             })])))
         }
+    }
+
+    /// Reports token usage (and optionally a billed total) plus catalog
+    /// pricing, so a finished turn must carry a priced `usage.cost` (gh #221).
+    #[derive(Debug)]
+    struct PricedUsageProvider {
+        provider_reported_total: Option<f64>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for PricedUsageProvider {
+        fn name(&self) -> &str {
+            "priced-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        fn model_cost(&self) -> Option<crate::provider::ModelCost> {
+            Some(crate::provider::ModelCost {
+                input: 2.0,
+                output: 10.0,
+                cache_read: 0.2,
+                cache_write: 2.5,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let mut message = assistant_message("done");
+            message.usage = Usage {
+                input: 1_000_000,
+                output: 100_000,
+                cache_read: 500_000,
+                cache_write: 0,
+                total_tokens: 1_600_000,
+                cost: crate::model::Cost {
+                    total: self.provider_reported_total.unwrap_or(0.0),
+                    ..crate::model::Cost::default()
+                },
+            };
+            Ok(Box::pin(futures::stream::iter([Ok(StreamEvent::Done {
+                reason: StopReason::Stop,
+                message,
+            })])))
+        }
+    }
+
+    fn run_priced_turn(provider_reported_total: Option<f64>) -> crate::model::Usage {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let provider = StdArc::new(PricedUsageProvider {
+                provider_reported_total,
+            });
+            let mut agent = Agent::new(
+                provider,
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            let ended = StdArc::new(std::sync::Mutex::new(None));
+            let ended_for_events = StdArc::clone(&ended);
+            agent
+                .run("price me", move |event| {
+                    if let AgentEvent::MessageEnd {
+                        message: Message::Assistant(message),
+                    } = event
+                    {
+                        *ended_for_events.lock().unwrap() = Some(message.usage.clone());
+                    }
+                })
+                .await
+                .expect("agent run");
+            let usage = ended.lock().unwrap().clone().expect("message_end usage");
+            let stored = match agent.messages().last() {
+                Some(Message::Assistant(message)) => message.usage.clone(),
+                other => panic!("expected assistant message, got {other:?}"),
+            };
+            assert!(
+                (stored.cost.total - usage.cost.total).abs() < 1e-12,
+                "history and message_end must agree"
+            );
+            usage
+        })
+    }
+
+    /// gh #221: `usage.cost` is priced from catalog rates on every finished
+    /// assistant message; previously it stayed 0.0 for every provider.
+    #[test]
+    fn finished_turn_prices_usage_from_catalog_rates() {
+        let usage = run_priced_turn(None);
+        assert!((usage.cost.input - 2.0).abs() < 1e-9);
+        assert!((usage.cost.output - 1.0).abs() < 1e-9);
+        assert!((usage.cost.cache_read - 0.1).abs() < 1e-9);
+        assert!(usage.cost.cache_write.abs() < 1e-12);
+        assert!((usage.cost.total - 3.1).abs() < 1e-9);
+    }
+
+    /// gh #221: a billed total reported by the provider (OpenRouter
+    /// `usage.cost`) survives pricing as the authoritative total.
+    #[test]
+    fn finished_turn_keeps_provider_reported_cost_total() {
+        let usage = run_priced_turn(Some(2.75));
+        assert!((usage.cost.total - 2.75).abs() < 1e-12);
+        assert!((usage.cost.input - 2.0).abs() < 1e-9);
     }
 
     #[test]
@@ -18342,6 +19990,7 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
+        let handle = runtime.handle();
 
         runtime.block_on(async {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -18374,12 +20023,17 @@ mod tests {
             agent_session.save_enabled = true;
             let original_compaction_window =
                 agent_session.compaction_settings().context_window_tokens;
+            agent_session.park_pending_compaction_for_test(&handle, None);
 
             let err = agent_session
                 .set_provider_model("openai", "gpt-4o")
                 .await
                 .expect_err("unwritable model-selection candidate must fail closed");
             assert!(err.is_session_persistence(), "unexpected error: {err}");
+            assert!(
+                agent_session.has_pending_background_compaction(),
+                "a switch that never became durable must not retire the live model's compaction"
+            );
             assert_eq!(agent_session.agent.provider().name(), "anthropic");
             assert_eq!(
                 agent_session.agent.provider().model_id(),
@@ -18474,6 +20128,61 @@ mod tests {
                         crate::session::SessionEntry::ThinkingLevelChange(_)
                     ))
             );
+        });
+    }
+
+    /// bd-5jfkl: a setter cancelled while its save is in flight. The write may
+    /// still land on the blocking thread, so the durable outcome is unknown;
+    /// the live runtime and live Session must stay as they were and provider
+    /// re-entry must be quarantined rather than silently resumed.
+    #[test]
+    fn set_thinking_level_cancelled_mid_save_quarantines_without_live_mutation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let auth = AuthStorage::load(dir.path().join("auth.json")).expect("load auth");
+            let mut agent_session = build_switch_test_session(&auth);
+            {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = agent_session
+                    .session
+                    .lock(cx.cx())
+                    .await
+                    .expect("session lock");
+                session.session_dir = Some(dir.path().to_path_buf());
+                session.path = Some(dir.path().join("cancelled.jsonl"));
+            }
+            agent_session.save_enabled = true;
+            let original_thinking = agent_session.agent.stream_options().thinking_level;
+
+            {
+                let setter = agent_session.set_thinking_level(crate::model::ThinkingLevel::High);
+                futures::pin_mut!(setter);
+                assert!(
+                    futures::poll!(setter.as_mut()).is_pending(),
+                    "the first poll must park on the blocking save"
+                );
+            }
+
+            assert_eq!(
+                agent_session.agent.stream_options().thinking_level,
+                original_thinking
+            );
+            assert!(
+                agent_session.ensure_provider_reentry_allowed().is_err(),
+                "a cancelled transition must leave provider re-entry quarantined"
+            );
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let session = agent_session
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("session lock after cancellation");
+            assert!(session.header.thinking_level.is_none());
         });
     }
 
@@ -19933,6 +21642,56 @@ mod tests {
             assert_eq!(
                 std::fs::read_to_string(&target).expect("read back"),
                 "changed"
+            );
+        });
+    }
+
+    /// bd-wfcu7: the github tool declares a process effect, so plan mode must
+    /// refuse it through the real dispatch path before any `gh` is spawned.
+    #[cfg(unix)]
+    #[test]
+    fn plan_gate_refuses_github_before_spawning_gh() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let spawned = temp.path().join("gh-was-spawned");
+            let stub = temp.path().join("gh");
+            std::fs::write(
+                &stub,
+                format!("#!/bin/sh\ntouch '{}'\nprintf '[]'\n", spawned.display()),
+            )
+            .expect("write gh stub");
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod gh stub");
+            let tools = ToolRegistry::from_tools(vec![Box::new(crate::github::GithubTool::new(
+                temp.path(),
+                Some(stub.to_str().expect("utf-8 path")),
+            ))]);
+            let agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+            agent.plan_state().enter_planning();
+
+            let call = ToolCall {
+                id: "gh1".to_string(),
+                name: "github".to_string(),
+                arguments: json!({"op": "run_list", "repo": "o/r"}),
+                thought_signature: None,
+            };
+            let (output, is_error) = agent
+                .execute_tool_without_hooks(&call, Arc::new(|_| {}))
+                .await;
+            assert!(is_error, "github must be blocked while planning");
+            let text = match &output.content[0] {
+                ContentBlock::Text(t) => t.text.clone(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            assert!(text.contains("PLAN_MODE_BLOCKED"), "gate error: {text}");
+            assert!(
+                !spawned.exists(),
+                "plan mode must refuse before gh is spawned"
             );
         });
     }

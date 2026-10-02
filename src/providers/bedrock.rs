@@ -1,7 +1,7 @@
 //! Amazon Bedrock Converse provider implementation.
 //!
-//! This provider targets the Bedrock Converse API and maps its non-streaming
-//! JSON response into Pi stream events.
+//! Uses ConverseStream for incremental text, tool calls, and reasoning. Explicit
+//! Converse endpoints and JSON-speaking gateways retain the bounded JSON path.
 
 use crate::auth::{
     AUTH_RESOLUTION_LOCK_TIMEOUT, AuthStorage, AuthStorageLoadFailure, AwsResolvedCredentials,
@@ -11,8 +11,8 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::http::client::{Client, RequestBuilder};
 use crate::model::{
-    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ToolCall,
-    ToolResultMessage, Usage, UserContent,
+    AssistantMessage, ContentBlock, Message, RedactedThinkingContent, StopReason, StreamEvent,
+    TextContent, ThinkingContent, ToolCall, ToolResultMessage, Usage, UserContent,
 };
 use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
@@ -31,6 +31,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use url::Url;
+
+mod request_options;
+mod streaming;
 
 const DEFAULT_REGION: &str = "us-east-1";
 const BEDROCK_SERVICE: &str = "bedrock";
@@ -307,6 +310,9 @@ impl BedrockProvider {
             ));
         }
 
+        // An explicit Converse endpoint is the opt-out for models or gateways
+        // without streaming support. Never retry a failed stream as a second
+        // non-streaming inference request.
         if url.path().ends_with("/converse") || url.path().ends_with("/converse-stream") {
             return Ok(url);
         }
@@ -318,9 +324,10 @@ impl BedrockProvider {
                     "Bedrock base URL does not support path segments",
                 )
             })?;
+            segments.pop_if_empty();
             segments.push("model");
             segments.push(&self.model);
-            segments.push("converse");
+            segments.push("converse-stream");
         }
         Ok(url)
     }
@@ -407,6 +414,21 @@ impl BedrockProvider {
                             thought_signature: None,
                         }));
                     }
+                    BedrockResponseContent::ReasoningContent { reasoning_content } => {
+                        content.push(match reasoning_content {
+                            BedrockReasoningContent::Text { reasoning_text } => {
+                                ContentBlock::Thinking(ThinkingContent {
+                                    thinking: reasoning_text.text,
+                                    thinking_signature: reasoning_text.signature,
+                                })
+                            }
+                            BedrockReasoningContent::Redacted { redacted_content } => {
+                                ContentBlock::RedactedThinking(RedactedThinkingContent {
+                                    data: redacted_content,
+                                })
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -440,6 +462,17 @@ impl BedrockProvider {
                     events.push(Ok(StreamEvent::TextEnd {
                         content_index,
                         content: text.text.clone(),
+                    }));
+                }
+                ContentBlock::Thinking(thinking) => {
+                    events.push(Ok(StreamEvent::ThinkingStart { content_index }));
+                    events.push(Ok(StreamEvent::ThinkingDelta {
+                        content_index,
+                        delta: thinking.thinking.clone(),
+                    }));
+                    events.push(Ok(StreamEvent::ThinkingEnd {
+                        content_index,
+                        content: thinking.thinking.clone(),
                     }));
                 }
                 ContentBlock::ToolCall(tool_call) => {
@@ -495,11 +528,16 @@ impl BedrockProvider {
         auth_context: BedrockAuthContext,
         options: &StreamOptions,
     ) -> Result<(RequestBuilder<'a>, Vec<String>)> {
+        let accept = if url.path().ends_with("/converse-stream") {
+            streaming::CONTENT_TYPE
+        } else {
+            "application/json"
+        };
         let mut request = self
             .client
             .post(url.as_str())
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
+            .header("Accept", accept);
         let mut response_secrets = url
             .query_pairs()
             .map(|(_, value)| value.into_owned())
@@ -583,7 +621,9 @@ impl Provider for BedrockProvider {
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        let request_body = Self::build_request(context, options);
+        // Apply model controls before hooks, auth discovery, and body signing.
+        let request_body =
+            request_options::prepare(&self.model, self.compat.as_ref(), context, options)?;
 
         let auth_context = self.resolve_auth_context(options).await?;
         // Reject caller-owned signing headers before endpoint parsing or an inference request.
@@ -621,27 +661,64 @@ impl Provider for BedrockProvider {
 
         let response = request.body(body).send().await?;
         let status = response.status();
-        let response_text = response
-            .text_limited(MAX_BEDROCK_RESPONSE_BYTES)
-            .await
-            .unwrap_or_else(|err| format!("<failed to read body: {err}>"));
-
         if !(200..300).contains(&status) {
+            let response_text = response
+                .text_limited(MAX_BEDROCK_RESPONSE_BYTES)
+                .await
+                .unwrap_or_else(|err| format!("<failed to read body: {err}>"));
             let response_snippet = bedrock_error_snippet(&response_text, &response_secrets);
             return Err(Error::provider(
-                "amazon-bedrock",
+                self.name(),
                 format!("Bedrock Converse API error (HTTP {status}): {response_snippet}"),
             ));
         }
 
+        let is_event_stream = response.headers().iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type")
+                && value
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .eq_ignore_ascii_case(streaming::CONTENT_TYPE)
+        });
+        if is_event_stream {
+            // Return before reading the response body. The owned decoder emits
+            // deltas as frames arrive and releases the socket on drop or error.
+            return Ok(streaming::from_bytes(
+                response.bytes_stream(),
+                self.model.clone(),
+                self.provider_name.clone(),
+                response_secrets,
+            ));
+        }
+
+        // Explicit /converse endpoints and some gateways respond with JSON.
+        // This consumes the same response, never a second inference request.
+        let response_text = response
+            .text_limited(MAX_BEDROCK_RESPONSE_BYTES)
+            .await
+            .map_err(|err| {
+                let detail = bedrock_error_snippet(&err.to_string(), &response_secrets);
+                Error::provider(
+                    self.name(),
+                    format!("Failed to read Bedrock response: {detail}"),
+                )
+            })?;
         let parsed: BedrockConverseResponse =
             serde_json::from_str(&response_text).map_err(|err| {
                 let response_snippet = bedrock_error_snippet(&response_text, &response_secrets);
                 Error::provider(
-                    "amazon-bedrock",
+                    self.name(),
                     format!("Failed to parse Bedrock response: {err}\nData: {response_snippet}"),
                 )
             })?;
+        if parsed.output.is_none() || parsed.stop_reason.is_none() {
+            return Err(Error::provider(
+                self.name(),
+                "Bedrock JSON response is missing output or stopReason",
+            ));
+        }
 
         let message = self.response_to_message(parsed);
         Ok(Box::pin(stream::iter(Self::message_events(&message))))
@@ -688,6 +765,30 @@ enum BedrockContent {
         #[serde(rename = "toolResult")]
         tool_result: BedrockToolResult,
     },
+    ReasoningContent {
+        #[serde(rename = "reasoningContent")]
+        reasoning_content: BedrockReasoningContent,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum BedrockReasoningContent {
+    Text {
+        #[serde(rename = "reasoningText")]
+        reasoning_text: BedrockReasoningText,
+    },
+    Redacted {
+        #[serde(rename = "redactedContent")]
+        redacted_content: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BedrockReasoningText {
+    text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -800,6 +901,14 @@ fn convert_user_message(message: &crate::model::UserMessage) -> Option<BedrockMe
                             },
                         });
                     }
+                    // Converse has a `video` block for Amazon's own models
+                    // only; the Claude models pi routes here take text, so
+                    // degrade to the placeholder (gh #212).
+                    ContentBlock::Media(media) => {
+                        content.push(BedrockContent::Text {
+                            text: media.placeholder(),
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -823,6 +932,25 @@ fn convert_assistant_message(message: &AssistantMessage) -> Option<BedrockMessag
             ContentBlock::Text(text) if !text.text.trim().is_empty() => {
                 content.push(BedrockContent::Text {
                     text: text.text.clone(),
+                });
+            }
+            ContentBlock::Thinking(thinking) if message.api == "bedrock-converse-stream" => {
+                content.push(BedrockContent::ReasoningContent {
+                    reasoning_content: BedrockReasoningContent::Text {
+                        reasoning_text: BedrockReasoningText {
+                            text: thinking.thinking.clone(),
+                            signature: thinking.thinking_signature.clone(),
+                        },
+                    },
+                });
+            }
+            ContentBlock::RedactedThinking(redacted)
+                if message.api == "bedrock-converse-stream" =>
+            {
+                content.push(BedrockContent::ReasoningContent {
+                    reasoning_content: BedrockReasoningContent::Redacted {
+                        redacted_content: redacted.data.clone(),
+                    },
                 });
             }
             ContentBlock::ToolCall(tool_call) => {
@@ -872,6 +1000,11 @@ fn convert_tool_result_message(message: &ToolResultMessage) -> BedrockMessage {
                             bytes: img.data.clone(),
                         },
                     },
+                });
+            }
+            ContentBlock::Media(media) => {
+                contents.push(BedrockToolResultContent::Text {
+                    text: media.placeholder(),
                 });
             }
             _ => {}
@@ -946,6 +1079,10 @@ enum BedrockResponseContent {
         #[serde(rename = "toolUse")]
         tool_use: BedrockResponseToolUse,
     },
+    ReasoningContent {
+        #[serde(rename = "reasoningContent")]
+        reasoning_content: BedrockReasoningContent,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -966,6 +1103,10 @@ struct BedrockUsage {
     #[serde(default)]
     output_tokens: u64,
     #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
+    cache_write_input_tokens: u64,
+    #[serde(default)]
     total_tokens: u64,
 }
 
@@ -973,12 +1114,18 @@ fn convert_usage(usage: &BedrockUsage) -> Usage {
     let total = if usage.total_tokens > 0 {
         usage.total_tokens
     } else {
-        usage.input_tokens + usage.output_tokens
+        usage
+            .input_tokens
+            .saturating_add(usage.output_tokens)
+            .saturating_add(usage.cache_read_input_tokens)
+            .saturating_add(usage.cache_write_input_tokens)
     };
 
     Usage {
         input: usage.input_tokens,
         output: usage.output_tokens,
+        cache_read: usage.cache_read_input_tokens,
+        cache_write: usage.cache_write_input_tokens,
         total_tokens: total,
         ..Usage::default()
     }
@@ -1195,11 +1342,52 @@ mod tests {
     use super::*;
     use crate::auth::AuthCredential;
     use chrono::TimeZone as _;
+    use futures::StreamExt as _;
     use serde_json::json;
     use std::io::{Read as _, Write as _};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    /// Polling interval for a fixture socket read. NOT the budget — see
+    /// [`read_with_deadline`].
+    const FIXTURE_POLL: Duration = Duration::from_millis(250);
+    /// Wall-clock budget for one fixture request.
+    const FIXTURE_BUDGET: Duration = Duration::from_secs(30);
+
+    /// Read into `chunk`, treating a socket read timeout as "keep waiting"
+    /// until `deadline` rather than as a hard error.
+    ///
+    /// macOS surfaces a read timeout as EAGAIN/`WouldBlock` (errno 35), not
+    /// `TimedOut`, so `read().expect(..)` failed the test outright whenever a
+    /// client had merely not been scheduled in time. Two seconds is nothing
+    /// under a parallel lib suite; the same shape took seven tests out of the
+    /// Gemini and Vertex fixtures before it was fixed there (bd-eg6ng).
+    fn read_with_deadline(
+        socket: &mut TcpStream,
+        chunk: &mut [u8],
+        deadline: Instant,
+        what: &str,
+    ) -> usize {
+        loop {
+            match socket.read(chunk) {
+                Ok(count) => return count,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture timed out waiting for {what}"
+                    );
+                }
+                // ubs:ignore an unexpected socket error in a fixture is an assertion failure
+                Err(err) => panic!("{what}: {err}"),
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct CapturedBedrockRequest {
@@ -1215,13 +1403,15 @@ mod tests {
         std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().expect("accept Bedrock request");
             socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(FIXTURE_POLL))
                 .expect("set Bedrock request read timeout");
+            let deadline = Instant::now() + FIXTURE_BUDGET;
 
             let mut request = Vec::new();
             let mut chunk = [0_u8; 4096];
             let header_end = loop {
-                let read = socket.read(&mut chunk).expect("read Bedrock request");
+                let read =
+                    read_with_deadline(&mut socket, &mut chunk, deadline, "read Bedrock request");
                 assert!(read > 0, "Bedrock request ended before its headers");
                 request.extend_from_slice(&chunk[..read]);
                 if let Some(position) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
@@ -1242,7 +1432,12 @@ mod tests {
                 .expect("Bedrock request content-length");
             let body_start = header_end + 4;
             while request.len().saturating_sub(body_start) < content_length {
-                let read = socket.read(&mut chunk).expect("read Bedrock request body");
+                let read = read_with_deadline(
+                    &mut socket,
+                    &mut chunk,
+                    deadline,
+                    "read Bedrock request body",
+                );
                 assert!(read > 0, "Bedrock request ended before its body");
                 request.extend_from_slice(&chunk[..read]);
             }
@@ -1431,7 +1626,7 @@ mod tests {
             .expect("build converse URL");
         assert_eq!(
             url.path(),
-            "/model/anthropic.claude-3-5-sonnet-20240620-v1:0/converse"
+            "/model/anthropic.claude-3-5-sonnet-20240620-v1:0/converse-stream"
         );
     }
 
@@ -1584,8 +1779,8 @@ mod tests {
         let signing_time = chrono::NaiveDateTime::parse_from_str(amz_date, "%Y%m%dT%H%M%SZ")
             .expect("parse x-amz-date")
             .and_utc();
-        let request_url =
-            Url::parse(&format!("{base_url}/model/model/converse")).expect("Bedrock request URL");
+        let request_url = Url::parse(&format!("{base_url}/model/model/converse-stream"))
+            .expect("Bedrock request URL");
         let expected = build_sigv4_headers(
             &request_url,
             &captured.body,
@@ -1836,5 +2031,178 @@ mod tests {
             value["content"][0]["toolResult"]["content"][0]["image"]["format"],
             "webp"
         );
+    }
+
+    #[test]
+    fn model_controls_reach_hook_and_signed_http_body() {
+        let (base_url, captured_request) = spawn_bedrock_test_server();
+        let temp_dir = tempfile::tempdir().expect("auth directory");
+        let auth_path = temp_dir.path().join("auth.json");
+        write_test_sigv4_auth(&auth_path);
+        let provider = BedrockProvider::new("us.anthropic.claude-opus-4-6-v1")
+            .with_auth_path(auth_path)
+            .with_base_url(&base_url);
+        let context = test_context_with_tools();
+        let original = serde_json::to_value(context.messages.as_ref()).unwrap();
+        let options = StreamOptions {
+            thinking_level: Some(crate::model::ThinkingLevel::High),
+            max_tokens: Some(8192),
+            temperature: Some(0.2),
+            cache_retention: crate::provider::CacheRetention::Long,
+            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                |mut event| {
+                    assert_eq!(
+                        event.payload["additionalModelRequestFields"]["thinking"]["type"],
+                        "adaptive"
+                    );
+                    assert_eq!(event.payload["system"][1]["cachePoint"]["ttl"], "1h");
+                    assert!(
+                        event.payload["inferenceConfig"]
+                            .get("temperature")
+                            .is_none()
+                    );
+                    event.payload["additionalModelRequestFields"]["output_config"]["effort"] =
+                        json!("low");
+                    event.payload["messages"][0]["content"][0]["text"] = json!("Hook rewrite");
+                    Box::pin(futures::future::ready(Some(event.payload)))
+                },
+            )),
+            ..StreamOptions::default()
+        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let events = runtime.block_on(async {
+            provider
+                .stream(&context, &options)
+                .await
+                .expect("provider stream")
+                .collect::<Vec<_>>()
+                .await
+        });
+        assert!(events.iter().all(Result::is_ok));
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::Done { .. }))));
+        assert_eq!(
+            serde_json::to_value(context.messages.as_ref()).unwrap(),
+            original
+        );
+        let captured = captured_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        let body: Value = serde_json::from_slice(&captured.body).unwrap();
+        assert_eq!(body["messages"][0]["content"][0]["text"], "Hook rewrite");
+        assert_eq!(
+            body["additionalModelRequestFields"]["output_config"]["effort"],
+            "low"
+        );
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 8192);
+        assert_eq!(body["toolConfig"]["tools"][1]["cachePoint"]["ttl"], "1h");
+        assert_eq!(body["messages"][2]["content"][1]["cachePoint"]["ttl"], "1h");
+        let signing_time = chrono::NaiveDateTime::parse_from_str(
+            &captured.headers["x-amz-date"],
+            "%Y%m%dT%H%M%SZ",
+        )
+        .unwrap()
+        .and_utc();
+        let expected = build_sigv4_headers(
+            &provider.converse_url("us-west-2").unwrap(),
+            &captured.body,
+            "AKIDEXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            Some("session-token"),
+            "us-west-2",
+            signing_time,
+        )
+        .unwrap();
+        assert_eq!(captured.headers["authorization"], expected.authorization);
+        assert_eq!(
+            captured.headers["x-amz-content-sha256"],
+            expected.payload_hash
+        );
+    }
+
+    #[test]
+    fn rejected_request_hook_preserves_native_controls_on_the_wire() {
+        let (base_url, captured_request) = spawn_bedrock_test_server();
+        let provider = BedrockProvider::new("anthropic.claude-3-7-sonnet").with_base_url(base_url);
+        let context = test_context_with_tools();
+        let options = StreamOptions {
+            api_key: Some("test-bearer".to_string()),
+            thinking_level: Some(crate::model::ThinkingLevel::Low),
+            max_tokens: Some(4096),
+            cache_retention: crate::provider::CacheRetention::Short,
+            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(|_| {
+                Box::pin(futures::future::ready(Some(json!({"invalid": true}))))
+            })),
+            ..StreamOptions::default()
+        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(async { provider.stream(&context, &options).await });
+        assert!(result.is_ok(), "{:?}", result.err());
+        let captured = captured_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        let body: Value = serde_json::from_slice(&captured.body).unwrap();
+        assert_eq!(
+            body["additionalModelRequestFields"]["thinking"]["type"],
+            "enabled"
+        );
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 4096);
+        assert_eq!(
+            body["system"][1],
+            json!({"cachePoint": {"type": "default"}})
+        );
+        assert_eq!(body["messages"][0]["content"][0]["text"], "Ping");
+    }
+
+    #[test]
+    fn invalid_thinking_budget_fails_before_endpoint_or_hook() {
+        let provider = BedrockProvider::new("anthropic.claude-sonnet-4-5")
+            .with_base_url("not a valid endpoint URL");
+        let options = StreamOptions {
+            api_key: Some("test-bearer".to_string()),
+            thinking_level: Some(crate::model::ThinkingLevel::High),
+            max_tokens: Some(1024),
+            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(|_| {
+                panic!("invalid budget must not reach the request hook")
+            })),
+            ..StreamOptions::default()
+        };
+        let context = test_context_with_tools();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let error = runtime
+            .block_on(async { provider.stream(&context, &options).await })
+            .err()
+            .expect("invalid budget");
+        assert!(error.to_string().contains("max_tokens greater than 1024"));
+    }
+
+    #[test]
+    fn json_usage_keeps_cache_counters_and_saturates_total_fallback() {
+        let mut wire = json!({
+            "inputTokens": 10,
+            "outputTokens": 5,
+            "cacheReadInputTokens": 20,
+            "cacheWriteInputTokens": 3
+        });
+        let usage: BedrockUsage = serde_json::from_value(wire.clone()).unwrap();
+        let converted = convert_usage(&usage);
+        assert_eq!(converted.input, 10);
+        assert_eq!(converted.cache_read, 20);
+        assert_eq!(converted.cache_write, 3);
+        assert_eq!(converted.total_tokens, 38);
+        wire["totalTokens"] = json!(50);
+        let usage: BedrockUsage = serde_json::from_value(wire).unwrap();
+        assert_eq!(convert_usage(&usage).total_tokens, 50);
+        let huge: BedrockUsage = serde_json::from_value(json!({
+            "inputTokens": u64::MAX, "outputTokens": 1,
+            "cacheReadInputTokens": 2, "cacheWriteInputTokens": 3
+        }))
+        .unwrap();
+        assert_eq!(convert_usage(&huge).total_tokens, u64::MAX);
     }
 }

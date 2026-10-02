@@ -1252,6 +1252,20 @@ fn git_command_succeeds(root: &Path, args: &[&str]) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+/// Issue-tracker database state is never product source, never packaged, and
+/// cannot affect a measurement — but the beads daemon exports `.beads/*` on
+/// every issue write and the auto-commit sweeper commits the result, so a
+/// whole-worktree cleanliness proxy reports the repository dirty essentially
+/// all the time. That silently cost this project its ability to produce
+/// claimable performance evidence: `generate_budget_report` binds
+/// `source_commit` to whatever `clean_source_commit` returns, so one bead
+/// comment landing mid-generation yields `source_commit: null`, a
+/// non-authoritative lineage, and an artifact that is blocked no matter how
+/// good the numbers are. Excluding the tracker paths is what makes an honest
+/// benchmark run bindable. Matched against Git rather than by string prefix so
+/// path quoting cannot defeat it.
+const TRACKER_STATE_EXCLUDE_PATHSPEC: &str = ":(exclude,top).beads/";
+
 fn clean_source_commit(root: &Path) -> Option<String> {
     let index_flags = Command::new("git")
         .args(["ls-files", "-v", "-z", "--"])
@@ -1263,19 +1277,41 @@ fn clean_source_commit(root: &Path) -> Option<String> {
     }
 
     let status = Command::new("git")
-        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .args([
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--",
+            TRACKER_STATE_EXCLUDE_PATHSPEC,
+        ])
         .current_dir(root)
         .output()
         .ok()?;
     if !status.status.success() || !status.stdout.is_empty() {
         return None;
     }
-    if !git_command_succeeds(root, &["diff", "--quiet", "--no-ext-diff", "HEAD", "--"])
-        || !git_command_succeeds(
-            root,
-            &["diff", "--cached", "--quiet", "--no-ext-diff", "HEAD", "--"],
-        )
-    {
+    if !git_command_succeeds(
+        root,
+        &[
+            "diff",
+            "--quiet",
+            "--no-ext-diff",
+            "HEAD",
+            "--",
+            TRACKER_STATE_EXCLUDE_PATHSPEC,
+        ],
+    ) || !git_command_succeeds(
+        root,
+        &[
+            "diff",
+            "--cached",
+            "--quiet",
+            "--no-ext-diff",
+            "HEAD",
+            "--",
+            TRACKER_STATE_EXCLUDE_PATHSPEC,
+        ],
+    ) {
         return None;
     }
     let mut head_commit = String::from("HEAD^");
@@ -1375,6 +1411,22 @@ fn benchmark_lineage_is_authoritative(lineage: &BudgetSummaryLineage<'_>) -> boo
         && lineage.run_id == lineage.correlation_id
 }
 
+/// The "missing control" contract id for budgets whose v2 contract demands a
+/// named measurement-control failure whenever their result carries no data.
+///
+/// Must stay in step with `perf_measurement_control_failure_ids` in
+/// `tests/release_evidence_gate.rs`, which is the validator that reads these.
+fn blocked_measurement_control_contract_id(budget_name: &str) -> Option<&'static str> {
+    match budget_name {
+        "binary_size_release" => Some("missing_binary_size_measurement_control"),
+        "idle_memory_rss" => Some("missing_idle_rss_measurement_control"),
+        "ext_cold_load_simple_p95" | "ext_cold_load_complex_p95" => {
+            Some("missing_cold_load_measurement_control")
+        }
+        _ => None,
+    }
+}
+
 fn blocked_sentinel_result(budget: &Budget) -> BudgetResult {
     BudgetResult {
         budget_name: budget.name.to_string(),
@@ -1397,7 +1449,34 @@ fn evaluate_budget_report(
     if !benchmark_lineage_is_authoritative(lineage) {
         return (
             BUDGETS.iter().map(blocked_sentinel_result).collect(),
-            Vec::new(),
+            // Name the missing measurement controls rather than returning no
+            // failures at all. The v2 contract requires every data-less result
+            // for a control-governed budget to carry one of its named control
+            // failures (release_evidence_gate: "budget result {name} without
+            // data lacks a named measurement-control failure"), so an empty
+            // list made the blocked form unvalidatable — the generator could
+            // not produce an artifact that both gates accepted. Without an
+            // authoritative run these controls are genuinely absent, so saying
+            // so is the accurate answer, and it can only add blocking reasons.
+            BUDGETS
+                .iter()
+                .filter_map(|budget| {
+                    blocked_measurement_control_contract_id(budget.name).map(|contract_id| {
+                        DataContractFailure {
+                            contract_id: contract_id.to_string(),
+                            budget_name: Some(budget.name.to_string()),
+                            detail:
+                                "authoritative benchmark lineage is incomplete, so no measurement \
+                                 control was captured for this budget"
+                                    .to_string(),
+                            remediation:
+                                "re-run the benchmark with a correlation id and strict mode, then \
+                                 regenerate the budget report"
+                                    .to_string(),
+                        }
+                    })
+                })
+                .collect(),
         );
     }
 
@@ -5568,7 +5647,39 @@ fn blocked_sentinel_is_independent_of_artifact_roots_and_contents() {
     let second_summary = budget_summary_value(&lineage, &second_results, &second_failures);
 
     assert_eq!(first_summary, second_summary);
-    assert!(first_failures.is_empty());
+
+    // The property this test is named for is independence from the artifact
+    // roots, and it still holds: the blocked path derives its failures from the
+    // static BUDGETS list, never from anything on disk. It used to assert the
+    // list was empty, which pinned the shape rather than the property — and an
+    // empty list is what made the blocked artifact fail the v2 contract, which
+    // requires a data-less control-governed budget to name its missing control.
+    let failure_ids = |failures: &[DataContractFailure]| {
+        let mut pairs: Vec<(String, Option<String>)> = failures
+            .iter()
+            .map(|failure| (failure.contract_id.clone(), failure.budget_name.clone()))
+            .collect();
+        pairs.sort();
+        pairs
+    };
+    assert_eq!(
+        failure_ids(&first_failures),
+        failure_ids(&second_failures),
+        "blocked data-contract failures must not depend on the artifact root"
+    );
+    let mut expected: Vec<(String, Option<String>)> = BUDGETS
+        .iter()
+        .filter_map(|budget| {
+            blocked_measurement_control_contract_id(budget.name)
+                .map(|id| (id.to_string(), Some(budget.name.to_string())))
+        })
+        .collect();
+    expected.sort();
+    assert_eq!(
+        failure_ids(&first_failures),
+        expected,
+        "blocked mode must name exactly the absent measurement controls"
+    );
     assert_eq!(first_summary["pass"].as_u64(), Some(0));
     assert_eq!(first_summary["fail"].as_u64(), Some(0));
     assert_eq!(
@@ -5640,6 +5751,77 @@ fn clean_source_commit_rejects_hidden_index_flags_and_untracked_files() {
     std::fs::create_dir_all(nested.parent().expect("nested parent"))
         .expect("create untracked directory");
     std::fs::write(nested, "untracked\n").expect("write untracked file");
+    assert_eq!(clean_source_commit(repo.path()), None);
+}
+
+/// A benchmark run must stay bindable while the tracker database is written
+/// underneath it, which on this project it continuously is. Without this,
+/// `generate_budget_report` records `source_commit: null` whenever a bead is
+/// written mid-run, and the resulting artifact is unclaimable regardless of
+/// what it measured.
+#[test]
+fn clean_source_commit_tolerates_live_tracker_writes_but_not_source_drift() {
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let repo = tempfile::tempdir().expect("temporary git repository");
+    git(repo.path(), &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::create_dir_all(repo.path().join(".beads")).expect("create tracker directory");
+    std::fs::write(
+        repo.path().join(".beads/issues.jsonl"),
+        "{\"id\":\"seed\"}\n",
+    )
+    .expect("seed tracker export");
+    std::fs::write(repo.path().join("tracked.txt"), "tracked\n").expect("write tracked file");
+    git(repo.path(), &["add", "--all"]);
+    git(
+        repo.path(),
+        &[
+            "-c",
+            "user.name=Pi Test",
+            "-c",
+            "user.email=pi-test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "initial",
+        ],
+    );
+    let bound = clean_source_commit(repo.path()).expect("clean tree binds");
+
+    // Modified export, untracked journal, and a staged export all stand in for
+    // the ways the daemon and the auto-commit sweeper touch `.beads/` mid-run.
+    std::fs::write(
+        repo.path().join(".beads/issues.jsonl"),
+        "{\"id\":\"seed\"}\n{\"id\":\"written-mid-run\"}\n",
+    )
+    .expect("rewrite tracker export");
+    std::fs::write(repo.path().join(".beads/beads.db-wal-cert"), "cert\n")
+        .expect("write untracked tracker artifact");
+    assert_eq!(
+        clean_source_commit(repo.path()).as_deref(),
+        Some(bound.as_str()),
+        "live tracker writes must not un-bind the source commit"
+    );
+    git(repo.path(), &["add", "--", ".beads"]);
+    assert_eq!(
+        clean_source_commit(repo.path()).as_deref(),
+        Some(bound.as_str()),
+        "a staged tracker export must not un-bind the source commit either"
+    );
+
+    // The exemption is exactly the tracker prefix: real drift still un-binds.
+    std::fs::write(repo.path().join("tracked.txt"), "drifted\n").expect("drift the source");
     assert_eq!(clean_source_commit(repo.path()), None);
 }
 
@@ -8071,5 +8253,96 @@ fn artifact_age_hours_accepts_fresh_embedded_timestamp_with_old_mtime() {
     assert!(
         rejection.is_none(),
         "expected fresh artifact to pass contract evaluation"
+    );
+}
+
+/// The `PiJS` regression gate must refuse records shaped like the checked-in
+/// synthetic artifact (`bd-tool-call-throughput-canonical-o3ubk`).
+///
+/// Why this exists, since a test that asserts a rejection is easy to write for
+/// the wrong reason. `tests/perf/reports/pijs_workload_perf.jsonl` holds 20,000
+/// records that all carry `"binary_profile": "synthetic_stub"` and
+/// `"source_dirty": true`, and the two tool-call budgets report
+/// `missing_measurement_data` because the harness never looks in that
+/// directory. The tempting fix is to point the harness at the file or to relax
+/// the eligibility filter, and either would turn a fail-closed gate green on
+/// the strength of a stub: those records would claim a mean tool-call latency of
+/// 0.203 us against a 200 us budget and 697,643 calls/sec against a 5,000
+/// minimum.
+///
+/// So the gate's refusal is the behaviour under test, not the bug. These two
+/// cases pin it at the exact failure messages, so relaxing the filter to make
+/// the budgets pass breaks them loudly.
+#[test]
+fn pijs_gate_refuses_synthetic_stub_records() {
+    // Exactly the field set of the checked-in artifact: ten keys, no
+    // eligibility flag, no lane size, no build provenance.
+    let stub = |tool_name: &str, latency_us: f64, throughput: f64| {
+        json!({
+            "embedded_timestamp": "2026-08-28T09:17:30.813786+00:00",
+            "source_commit": "e178a73d4145c25f09c845e65a8385a3684d7920",
+            "source_dirty": true,
+            "run_id": "pijs-20260828T091730Z",
+            "correlation_id": "pijs-20260828T091730Z",
+            "iteration": 0,
+            "tool_name": tool_name,
+            "latency_us": latency_us,
+            "throughput_calls_per_sec": throughput,
+            "binary_profile": "synthetic_stub",
+        })
+    };
+    let events = vec![
+        stub("read", 1.083, 236_451.022),
+        stub("bash", 0.125, 4_991.0),
+    ];
+
+    let error = validate_pijs_gate_pair(&events, max_artifact_age_hours())
+        .expect_err("synthetic stub records must not satisfy the PiJS regression gate");
+    assert!(
+        error.contains("requires exactly two eligible records"),
+        "rejection must name the eligibility requirement, got: {error}"
+    );
+    assert!(
+        error.contains("observed 0"),
+        "no stub record carries eligible_for_regression_gate, so none is admitted; got: {error}"
+    );
+}
+
+/// Marking stub records eligible is still not enough (bd-tool-call-throughput-canonical-o3ubk).
+///
+/// The companion to the case above, and the one that matters more: someone
+/// looking at that failure could reasonably conclude the producer just forgot a
+/// flag. It did not. The gate cross-checks the 1-call and 10-call lanes on
+/// `binary_path`, `binary_sha256`, `build_fingerprint_contract`, `config_hash`,
+/// `compiled_profile_family`, `compiled_opt_level`, `compiled_debug`,
+/// `allocator_requested` and `allocator_effective`, and derives its metrics from
+/// `total_calls` / `elapsed_us` / `per_call_us` rather than trusting a reported
+/// latency. The synthetic records carry none of that, so adding the flag moves
+/// the failure rather than fixing it.
+#[test]
+fn pijs_gate_refuses_stub_records_even_when_marked_eligible() {
+    let stub = |tool_calls: u64| {
+        json!({
+            "embedded_timestamp": "2026-08-28T09:17:30.813786+00:00",
+            "source_commit": "e178a73d4145c25f09c845e65a8385a3684d7920",
+            "source_dirty": true,
+            "run_id": "pijs-20260828T091730Z",
+            "correlation_id": "pijs-20260828T091730Z",
+            "iteration": 0,
+            "tool_name": "read",
+            "latency_us": 1.083,
+            "throughput_calls_per_sec": 236_451.022,
+            "binary_profile": "synthetic_stub",
+            "eligible_for_regression_gate": true,
+            "tool_calls_per_iteration": tool_calls,
+        })
+    };
+    let events = vec![stub(1), stub(10)];
+
+    let error = validate_pijs_gate_pair(&events, max_artifact_age_hours())
+        .expect_err("an eligibility flag must not admit records with no build provenance");
+    assert!(
+        !error.contains("observed 0"),
+        "the flag should get these records as far as per-record validation; got: {error}"
     );
 }

@@ -21,8 +21,25 @@ use std::fs::OpenOptions;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+/// Patience budgets for the tmux-driven FTUI lane.
+///
+/// These drive a real `pi` inside a real tmux pane and poll the pane's contents
+/// until the expected text appears, so every wait here is bounded by how fast
+/// the machine can start a process, render a frame, and let tmux report it.
+///
+/// They were 30 and 15 seconds. That is comfortable on an idle worker and not
+/// comfortable in a full lane: `e2e_ftui_wheel_scroll_inside_tmux` failed once
+/// during the ftui 0.7 bump with "wheel-up did not scroll the conversation",
+/// and the run that failed took 117.73 seconds for this binary against roughly
+/// 12 to 14 seconds for two runs that passed — the same suite, the same commit,
+/// a busier machine. Read literally, a 15 second budget on a worker running an
+/// order of magnitude slow is about a second and a half of effective time.
+///
+/// Raising them costs nothing when things are healthy, because
+/// `wait_for_pane_contains` returns as soon as the pane matches and the budget
+/// is only ever spent on the way to a failure.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Serialize against every other tmux-based E2E lane (same lock file as
 /// tests/e2e_tui.rs — cross-process via fs4, in-process via a static mutex).
@@ -82,6 +99,9 @@ fn ftui_args() -> Vec<&'static str> {
 }
 
 fn quit_and_assert_clean(session: &TuiSession) {
+    // OMP semantics: the first ctrl+c clears the editor, a second one within
+    // 500ms quits.
+    session.tmux.send_key("C-c");
     session.tmux.send_key("C-c");
     let start = std::time::Instant::now();
     while session.tmux.session_exists() {
@@ -108,15 +128,14 @@ fn e2e_ftui_launch_help_bash_quit() {
 
     // The banner is sent by the driver AFTER the SDK session is created, so
     // seeing it proves the full launch path (runtime, session, bridge).
-    let pane = session.wait_and_capture("startup", "ftui preview stack", STARTUP_TIMEOUT);
+    let pane = session.wait_and_capture("startup", "pi interactive stack", STARTUP_TIMEOUT);
     assert!(
         pane.contains("pi ·"),
         "header missing from ftui frame; got:\n{pane}"
     );
 
     // UI-side slash routing.
-    let pane =
-        session.send_text_and_wait("help", "/help", "ftui preview commands", COMMAND_TIMEOUT);
+    let pane = session.send_text_and_wait("help", "/help", "pi commands", COMMAND_TIMEOUT);
     assert!(
         pane.contains("/model"),
         "help text incomplete; got:\n{pane}"
@@ -134,6 +153,95 @@ fn e2e_ftui_launch_help_bash_quit() {
         "bash output missing; got:\n{pane}"
     );
 
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
+/// bd-2crrf: a default (FTUI) launch initializes ONE extension runtime and
+/// one agent session. main used to build a classic `AgentSession`, boot the
+/// extension runtime on it and drop it, before the FTUI driver built its own
+/// SDK session, so every extension loaded, and ran its startup hooks, twice.
+///
+/// The extension records each load and each `session_start` by running a
+/// shell command (its `node:fs` is a virtual overlay, so a file write from JS
+/// would never reach the host). Exactly one of each must appear.
+#[test]
+fn e2e_ftui_launch_initializes_extensions_once() {
+    let Some((_lock, mut session)) =
+        new_locked_session("e2e_ftui_launch_initializes_extensions_once")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+    let log = session.harness.temp_path("init-count.log");
+    let ext = session.harness.temp_path("count-init.mjs");
+    let record = |what: &str| {
+        format!(
+            "pi.exec(\"sh\", [\"-c\", \"echo {what} >> '{}'\"])",
+            log.display()
+        )
+    };
+    std::fs::write(
+        &ext,
+        format!(
+            "export default function (pi) {{\n  void {load};\n  pi.on(\"session_start\", async () => {{ await {start}; }});\n}}\n",
+            load = record("load"),
+            start = record("session_start"),
+        ),
+    )
+    .expect("write counting extension"); // ubs:ignore test setup expect
+    let ext_arg = ext.display().to_string();
+    let mut args = ftui_args();
+    args.extend([
+        "--extension",
+        ext_arg.as_str(),
+        "--extension-policy",
+        "permissive",
+        "--trust",
+    ]);
+    session.launch(&args);
+    session.wait_and_capture("startup", "pi interactive stack", STARTUP_TIMEOUT);
+
+    // Both records land shortly after startup; then give a duplicate runtime
+    // time to show itself before counting.
+    let read = || std::fs::read_to_string(&log).unwrap_or_default();
+    let start = std::time::Instant::now();
+    while !(read().contains("load") && read().contains("session_start"))
+        && start.elapsed() < COMMAND_TIMEOUT
+    {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+
+    let records = read();
+    let count = |what: &str| records.lines().filter(|line| line.trim() == what).count();
+    assert_eq!(count("load"), 1, "extension loaded {records:?}");
+    assert_eq!(count("session_start"), 1, "session_start ran {records:?}");
+}
+
+/// `--plan-mode` starts the default stack in planning, as it always did on
+/// the classic stack; the FTUI launch used to ignore the flag.
+#[test]
+fn e2e_ftui_plan_mode_flag_starts_in_planning() {
+    let Some((_lock, mut session)) =
+        new_locked_session("e2e_ftui_plan_mode_flag_starts_in_planning")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+    let mut args = ftui_args();
+    args.push("--plan-mode");
+    session.launch(&args);
+    session.wait_and_capture("startup", "pi interactive stack", STARTUP_TIMEOUT);
+    let pane = session
+        .tmux
+        .wait_for_pane_contains("planning", COMMAND_TIMEOUT);
+    assert!(
+        pane.contains("planning"),
+        "status line shows planning:\n{pane}"
+    );
     quit_and_assert_clean(&session);
     session.write_artifacts();
 }
@@ -241,14 +349,14 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
     // poisoned rch execution context against a known-good interactive run.
     let startup_pane = session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
     let wrapper_env = std::fs::read_to_string(session.harness.temp_path("wrapper-env.txt"))
         .unwrap_or_else(|_| String::from("<no dump>"));
     let wrapper_trace =
         std::fs::read_to_string(&trace_log).unwrap_or_else(|_| String::from("<no trace>"));
     let script_present = script_path.exists();
     assert!(
-        startup_pane.contains("ftui preview stack"),
+        startup_pane.contains("pi interactive stack"),
         "startup banner never appeared; session_alive={}; script_present={script_present}; wrapper_env:\n{wrapper_env}\nwrapper_trace:\n{wrapper_trace}\nscript:\n{script}\npane:\n{startup_pane}",
         session.tmux.session_exists()
     );
@@ -452,9 +560,9 @@ fn e2e_ftui_ctrl_z_suspend_fg_resumes() {
     // 1) Live launch on the ftui runtime.
     let pane = session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
     assert!(
-        pane.contains("ftui preview stack"),
+        pane.contains("pi interactive stack"),
         "startup banner never appeared; pane:\n{pane}"
     );
 
@@ -518,9 +626,9 @@ fn e2e_ftui_ctrl_z_suspend_fg_resumes() {
     }
     let pane = session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", COMMAND_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", COMMAND_TIMEOUT);
     assert!(
-        pane.contains("ftui preview stack"),
+        pane.contains("pi interactive stack"),
         "banner never repainted after fg; pi did not resume cleanly; pane:\n{pane}"
     );
 
@@ -607,7 +715,7 @@ fn scrollback_case(name: &str, sentinel: &str, inline: bool, expect_visible: boo
     launch_with_sentinel(&session, sentinel, inline);
     session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
     let pane = capture_with_history(&session);
     if expect_visible {
         assert!(
@@ -651,7 +759,7 @@ fn e2e_ftui_resize_storm_survives() {
     session.launch(&ftui_args());
     session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
 
     // Storm: rapid alternating geometries, ending back at 80x24.
     for (w, h) in [
@@ -687,12 +795,7 @@ fn e2e_ftui_resize_storm_survives() {
     std::thread::sleep(Duration::from_millis(500));
 
     // Post-storm: the UI must still route input correctly...
-    session.send_text_and_wait(
-        "post_storm_help",
-        "/help",
-        "ftui preview commands",
-        COMMAND_TIMEOUT,
-    );
+    session.send_text_and_wait("post_storm_help", "/help", "pi commands", COMMAND_TIMEOUT);
     // ...and the steady-state frame must be laid out for the final geometry
     // (a stale-size frame pushes the header off the top of the pane).
     std::thread::sleep(Duration::from_millis(300));
@@ -744,7 +847,7 @@ fn e2e_ftui_resize_storm_stream_is_flicker_free() {
     session.launch(&ftui_args());
     session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
 
     // Tap the RAW output stream (escape sequences included — capture-pane
     // only exposes rendered text). `-o` pipes everything the pane emits.
@@ -794,12 +897,7 @@ fn e2e_ftui_resize_storm_stream_is_flicker_free() {
         assert!(status.success(), "resize to {w}x{h} failed");
         std::thread::sleep(Duration::from_millis(60));
     }
-    session.send_text_and_wait(
-        "flicker_help",
-        "/help",
-        "ftui preview commands",
-        COMMAND_TIMEOUT,
-    );
+    session.send_text_and_wait("flicker_help", "/help", "pi commands", COMMAND_TIMEOUT);
     for (w, h) in [("90", "28"), ("50", "16"), ("80", "24")] {
         let mut cmd = std::process::Command::new("tmux"); // ubs:ignore test helper — same tmux invocation pattern as tests/common/tmux.rs
         let status = cmd
@@ -920,10 +1018,87 @@ const FTUI_VCR_PROMPT: &str = "ftui vcr prompt: say the marker";
 const FTUI_VCR_RESPONSE: &str = "ftui-vcr-response-marker alpha beta gamma";
 const FTUI_VCR_SYSTEM_PROMPT_ARG: &str = "pi e2e ftui vcr harness";
 
-fn ftui_vcr_args() -> Vec<&'static str> {
-    vec![
-        "--ftui",
-        "--no-session",
+fn ftui_vcr_args() -> Vec<String> {
+    ftui_vcr_args_with_session(false, false)
+}
+
+/// Write the launch wrapper a VCR scenario starts `pi` through, and return its
+/// path.
+///
+/// Stderr goes to a file because tracing output otherwise interleaves with the
+/// pane, and on failure that log is the diagnostic. Extracted so a scenario can
+/// launch more than once — relaunching with different args against the same
+/// env root is how the `--continue` case is expressed.
+#[allow(clippy::too_many_arguments)]
+fn write_ftui_vcr_launcher(
+    script_path: &std::path::Path,
+    env_root: &std::path::Path,
+    cassette_dir: &std::path::Path,
+    stderr_log: &std::path::Path,
+    test_name: &str,
+    args: &[String],
+) {
+    use std::fmt::Write as _;
+    let mut script = String::from("#!/usr/bin/env sh\nset -u\n");
+    for (key, sub) in [
+        ("PI_CODING_AGENT_DIR", "agent"),
+        ("PI_CONFIG_PATH", "config.toml"),
+        ("PI_SESSIONS_DIR", "sessions"),
+        ("PI_PACKAGE_DIR", "packages"),
+    ] {
+        let _ = writeln!(script, "export {key}={}", env_root.join(sub).display());
+    }
+    script.push_str("export PI_TEST_MODE=1\nexport ANTHROPIC_API_KEY=pi-e2e-vcr-dummy\n");
+    let _ = writeln!(script, "export {}=playback", pi::vcr::VCR_ENV_MODE);
+    let _ = writeln!(
+        script,
+        "export {}={}",
+        pi::vcr::VCR_ENV_DIR,
+        cassette_dir.display()
+    );
+    let _ = writeln!(script, "export PI_VCR_TEST_NAME={test_name}");
+    script.push_str("export VCR_DEBUG_BODY=1\n");
+    // Stable path: the harness temp dir is deleted on drop, and the debug
+    // bodies are exactly what we need after a failure.
+    script.push_str("export VCR_DEBUG_BODY_FILE=/private/tmp/pi-tests/ftui-vcr-bodies.txt\n");
+    let binary = std::env::var_os("CARGO_BIN_EXE_pi").expect("CARGO_BIN_EXE_pi"); // ubs:ignore test setup expect
+    let _ = write!(
+        script,
+        "exec {}",
+        std::path::PathBuf::from(binary).display()
+    );
+    for arg in args {
+        let _ = write!(script, " '{arg}'");
+    }
+    let _ = writeln!(script, " 2>{}", stderr_log.display());
+    std::fs::write(script_path, &script).expect("write vcr script"); // ubs:ignore test setup expect
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(script_path)
+            .expect("stat vcr script") // ubs:ignore test setup expect
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(script_path, perms).expect("chmod vcr script"); // ubs:ignore test setup expect
+    }
+}
+
+/// The VCR arg list, optionally with session persistence on and `--continue`
+/// requested.
+///
+/// `persist` drops `--no-session`, which the other VCR scenarios want precisely
+/// because they must not leave session files behind; the continue scenario
+/// needs the opposite. Sessions land under the harness's `PI_SESSIONS_DIR`, so
+/// nothing escapes the temp root either way.
+fn ftui_vcr_args_with_session(persist: bool, continue_recent: bool) -> Vec<String> {
+    let mut args: Vec<String> = vec!["--ftui".to_string()];
+    if !persist {
+        args.push("--no-session".to_string());
+    }
+    if continue_recent {
+        args.push("--continue".to_string());
+    }
+    for arg in [
         "--provider",
         "anthropic",
         "--model",
@@ -937,17 +1112,31 @@ fn ftui_vcr_args() -> Vec<&'static str> {
         "off",
         "--system-prompt",
         FTUI_VCR_SYSTEM_PROMPT_ARG,
-    ]
+    ] {
+        args.push(arg.to_string());
+    }
+    args
 }
 
 /// Effective system prompt for the ftui VCR args, computed with the same
 /// builder the session uses (mirrors build_vcr_system_prompt_for_args in
 /// tests/e2e_tui.rs).
 fn ftui_vcr_system_prompt(workdir: &std::path::Path, env_root: &std::path::Path) -> String {
+    ftui_vcr_system_prompt_for(&ftui_vcr_args(), workdir, env_root)
+}
+
+/// The same builder for an arbitrary arg list, so a scenario that changes the
+/// CLI (session persistence, `--continue`) still computes the system prompt the
+/// session will actually send and its cassette still matches on the body.
+fn ftui_vcr_system_prompt_for(
+    args: &[String],
+    workdir: &std::path::Path,
+    env_root: &std::path::Path,
+) -> String {
     use clap::Parser as _;
-    let mut args: Vec<&str> = vec!["pi"];
-    args.extend(ftui_vcr_args());
-    let cli = pi::cli::Cli::try_parse_from(args).expect("parse ftui vcr args"); // ubs:ignore test setup expect
+    let mut parsed: Vec<&str> = vec!["pi"];
+    parsed.extend(args.iter().map(String::as_str));
+    let cli = pi::cli::Cli::try_parse_from(parsed).expect("parse ftui vcr args"); // ubs:ignore test setup expect
     let enabled_tools = cli.enabled_tools();
     let global_dir = env_root.join("agent");
     let package_dir = env_root.join("packages");
@@ -1084,58 +1273,21 @@ fn e2e_ftui_vcr_streamed_turn() {
     // otherwise interleaves with the pane, and on failure the log is the
     // diagnostic.
     let stderr_log = session.harness.temp_path("pi-stderr.log");
-    {
-        use std::fmt::Write as _;
-        let mut script = String::from("#!/usr/bin/env sh\nset -u\n");
-        for (key, sub) in [
-            ("PI_CODING_AGENT_DIR", "agent"),
-            ("PI_CONFIG_PATH", "config.toml"),
-            ("PI_SESSIONS_DIR", "sessions"),
-            ("PI_PACKAGE_DIR", "packages"),
-        ] {
-            let _ = writeln!(script, "export {key}={}", env_root.join(sub).display());
-        }
-        script.push_str("export PI_TEST_MODE=1\nexport ANTHROPIC_API_KEY=pi-e2e-vcr-dummy\n");
-        let _ = writeln!(script, "export {}=playback", pi::vcr::VCR_ENV_MODE);
-        let _ = writeln!(
-            script,
-            "export {}={}",
-            pi::vcr::VCR_ENV_DIR,
-            cassette_dir.display()
-        );
-        let _ = writeln!(script, "export PI_VCR_TEST_NAME={FTUI_VCR_TEST_NAME}");
-        script.push_str("export VCR_DEBUG_BODY=1\n");
-        // Stable path: the harness temp dir is deleted on drop, and the
-        // debug bodies are exactly what we need after a failure.
-        script.push_str("export VCR_DEBUG_BODY_FILE=/private/tmp/pi-tests/ftui-vcr-bodies.txt\n");
-        let binary = std::env::var_os("CARGO_BIN_EXE_pi").expect("CARGO_BIN_EXE_pi"); // ubs:ignore test setup expect
-        let _ = write!(
-            script,
-            "exec {}",
-            std::path::PathBuf::from(binary).display()
-        );
-        for arg in ftui_vcr_args() {
-            let _ = write!(script, " '{arg}'");
-        }
-        let _ = writeln!(script, " 2>{}", stderr_log.display());
-        let script_path = session.harness.temp_path("vcr-run.sh");
-        std::fs::write(&script_path, &script).expect("write vcr script"); // ubs:ignore test setup expect
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path)
-                .expect("stat vcr script") // ubs:ignore test setup expect
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).expect("chmod vcr script"); // ubs:ignore test setup expect
-        }
-        session
-            .tmux
-            .start_session(session.harness.temp_dir(), &script_path);
-    }
+    let script_path = session.harness.temp_path("vcr-run.sh");
+    write_ftui_vcr_launcher(
+        &script_path,
+        &env_root,
+        &cassette_dir,
+        &stderr_log,
+        FTUI_VCR_TEST_NAME,
+        &ftui_vcr_args(),
+    );
     session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+        .start_session(session.harness.temp_dir(), &script_path);
+    session
+        .tmux
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
 
     session.tmux.send_literal(FTUI_VCR_PROMPT);
     session.tmux.send_key("Enter");
@@ -1151,6 +1303,349 @@ fn e2e_ftui_vcr_streamed_turn() {
 
     quit_and_assert_clean(&session);
     session.write_artifacts();
+}
+
+// ── `--continue` reopens the latest session (bd-ydz1t.3) ───────────────────
+
+const FTUI_CONTINUE_TEST_NAME: &str = "e2e_ftui_continue";
+
+/// `pi -c` was silently ignored on this stack: the classic path resolves it
+/// inside `Session::from_cli`, which the FTUI branch does not use, and
+/// `SessionOptions` carried no "reopen the latest" concept — so the flag fell
+/// on the floor and the user got a fresh session (bd-ydz1t.3).
+///
+/// The unit test pins which PATH `--continue` resolves to. This pins the thing
+/// the user actually cares about: after quitting and relaunching with `-c`, the
+/// previous turn is on screen. It relaunches with NO prompt, so the marker can
+/// only come from restored history — a second provider turn would need a
+/// cassette hit that never happens.
+#[test]
+fn e2e_ftui_continue_reopens_the_previous_session() {
+    let Some((_lock, session)) = new_locked_session(FTUI_CONTINUE_TEST_NAME) else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let env_root = session.harness.temp_dir().join("env");
+    std::fs::create_dir_all(&env_root).expect("create env root"); // ubs:ignore test setup expect
+    let first_args = ftui_vcr_args_with_session(true, false);
+    let system_prompt =
+        ftui_vcr_system_prompt_for(&first_args, session.harness.temp_dir(), &env_root);
+    let cassette_dir = session.harness.temp_dir().join("cassettes");
+    let cassette_path = write_ftui_vcr_cassette(
+        &cassette_dir,
+        &system_prompt,
+        FTUI_CONTINUE_TEST_NAME,
+        FTUI_VCR_RESPONSE,
+    );
+    session
+        .harness
+        .record_artifact("ftui-continue-cassette.json", &cassette_path);
+
+    // First launch: a real turn, persisted under the harness's sessions dir.
+    let stderr_log = session.harness.temp_path("pi-stderr-first.log");
+    let script_path = session.harness.temp_path("continue-first.sh");
+    write_ftui_vcr_launcher(
+        &script_path,
+        &env_root,
+        &cassette_dir,
+        &stderr_log,
+        FTUI_CONTINUE_TEST_NAME,
+        &first_args,
+    );
+    session
+        .tmux
+        .start_session(session.harness.temp_dir(), &script_path);
+    session
+        .tmux
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
+    session.tmux.send_literal(FTUI_VCR_PROMPT);
+    session.tmux.send_key("Enter");
+    session
+        .tmux
+        .wait_for_pane_contains("ftui-vcr-response-marker", COMMAND_TIMEOUT);
+    quit_and_assert_clean(&session);
+
+    // The session file must exist before the relaunch can mean anything: with
+    // nothing saved, `--continue` correctly starts fresh and the assertion
+    // below would be testing the fallback rather than the feature.
+    let sessions_root = env_root.join("sessions");
+    let saved = walk_session_files(&sessions_root);
+    assert!(
+        !saved.is_empty(),
+        "first launch saved no session under {}; --continue has nothing to reopen",
+        sessions_root.display()
+    );
+
+    // Second launch: `-c`, and NO prompt. Anything on screen came from history.
+    let resume_stderr = session.harness.temp_path("pi-stderr-continue.log");
+    let resume_script = session.harness.temp_path("continue-second.sh");
+    write_ftui_vcr_launcher(
+        &resume_script,
+        &env_root,
+        &cassette_dir,
+        &resume_stderr,
+        FTUI_CONTINUE_TEST_NAME,
+        &ftui_vcr_args_with_session(true, true),
+    );
+    session
+        .tmux
+        .start_session(session.harness.temp_dir(), &resume_script);
+    let pane = session
+        .tmux
+        .wait_for_pane_contains("ftui-vcr-response-marker", COMMAND_TIMEOUT);
+    let stderr_tail = std::fs::read_to_string(&resume_stderr).unwrap_or_default();
+    assert!(
+        pane.contains(FTUI_VCR_PROMPT),
+        "the restored transcript must show the earlier USER turn too; pane:\n{pane}\nstderr tail:\n{}",
+        &stderr_tail[stderr_tail.len().saturating_sub(2000)..]
+    );
+
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
+const FTUI_RESTART_TEST_NAME: &str = "e2e_ftui_restart";
+
+/// OMP `/restart`: after a real turn, `/restart` tears the UI down, saves
+/// the session, and re-execs pi with the launch flags plus `--session
+/// <file>`. The relaunch shows the earlier turn from history, followed by the
+/// startup banner, while the first launch showed the banner BEFORE the turn:
+/// that ordering is what proves a new process drew the screen rather than
+/// the old frame surviving.
+#[test]
+fn e2e_ftui_restart_relaunches_into_the_same_session() {
+    let Some((_lock, session)) = new_locked_session(FTUI_RESTART_TEST_NAME) else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let env_root = session.harness.temp_dir().join("env");
+    std::fs::create_dir_all(&env_root).expect("create env root"); // ubs:ignore test setup expect
+    let args = ftui_vcr_args_with_session(true, false);
+    let system_prompt = ftui_vcr_system_prompt_for(&args, session.harness.temp_dir(), &env_root);
+    let cassette_dir = session.harness.temp_dir().join("cassettes");
+    write_ftui_vcr_cassette(
+        &cassette_dir,
+        &system_prompt,
+        FTUI_RESTART_TEST_NAME,
+        FTUI_VCR_RESPONSE,
+    );
+    let stderr_log = session.harness.temp_path("pi-stderr-restart.log");
+    let script_path = session.harness.temp_path("restart.sh");
+    write_ftui_vcr_launcher(
+        &script_path,
+        &env_root,
+        &cassette_dir,
+        &stderr_log,
+        FTUI_RESTART_TEST_NAME,
+        &args,
+    );
+    session
+        .tmux
+        .start_session(session.harness.temp_dir(), &script_path);
+    session
+        .tmux
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
+    session.tmux.send_literal(FTUI_VCR_PROMPT);
+    session.tmux.send_key("Enter");
+    let before = session
+        .tmux
+        .wait_for_pane_contains("ftui-vcr-response-marker", COMMAND_TIMEOUT);
+    let banner_first = |pane: &str| {
+        pane.find("pi interactive stack")
+            .zip(pane.find("ftui-vcr-response-marker"))
+            .map(|(banner, marker)| banner < marker)
+    };
+    assert_eq!(banner_first(&before), Some(true), "first launch:\n{before}");
+    // The reply text lands before the turn ends; commands typed mid-turn are
+    // refused, so wait for the turn's usage footer.
+    session
+        .tmux
+        .wait_for_pane_contains("tokens ", COMMAND_TIMEOUT);
+
+    session.tmux.send_literal("/restart");
+    session.tmux.send_key("Enter");
+    let start = std::time::Instant::now();
+    let after = loop {
+        let pane = session.tmux.capture_pane();
+        if banner_first(&pane) == Some(false) {
+            break pane;
+        }
+        assert!(
+            start.elapsed() < STARTUP_TIMEOUT,
+            "no relaunch into the saved session; pane:\n{pane}\nstderr tail:\n{}",
+            std::fs::read_to_string(&stderr_log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(
+        after.contains(FTUI_VCR_PROMPT),
+        "the relaunch shows the earlier user turn from history:\n{after}"
+    );
+
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
+const FTUI_RESUME_LIST_TEST_NAME: &str = "e2e_ftui_resume_list";
+
+/// `/resume` lists sessions saved during this run: the list used to be
+/// built once at launch, so after a turn and `/new` the session just left
+/// was missing (a fresh launch had "no saved sessions found").
+#[test]
+fn e2e_ftui_resume_lists_a_session_saved_this_run() {
+    let Some((_lock, session)) = new_locked_session(FTUI_RESUME_LIST_TEST_NAME) else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let env_root = session.harness.temp_dir().join("env");
+    std::fs::create_dir_all(&env_root).expect("create env root"); // ubs:ignore test setup expect
+    let args = ftui_vcr_args_with_session(true, false);
+    let system_prompt = ftui_vcr_system_prompt_for(&args, session.harness.temp_dir(), &env_root);
+    let cassette_dir = session.harness.temp_dir().join("cassettes");
+    write_ftui_vcr_cassette(
+        &cassette_dir,
+        &system_prompt,
+        FTUI_RESUME_LIST_TEST_NAME,
+        FTUI_VCR_RESPONSE,
+    );
+    let stderr_log = session.harness.temp_path("pi-stderr-resume-list.log");
+    let script_path = session.harness.temp_path("resume-list.sh");
+    write_ftui_vcr_launcher(
+        &script_path,
+        &env_root,
+        &cassette_dir,
+        &stderr_log,
+        FTUI_RESUME_LIST_TEST_NAME,
+        &args,
+    );
+    session
+        .tmux
+        .start_session(session.harness.temp_dir(), &script_path);
+    session
+        .tmux
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
+    session.tmux.send_literal(FTUI_VCR_PROMPT);
+    session.tmux.send_key("Enter");
+    session
+        .tmux
+        .wait_for_pane_contains("ftui-vcr-response-marker", COMMAND_TIMEOUT);
+    session
+        .tmux
+        .wait_for_pane_contains("tokens ", COMMAND_TIMEOUT);
+
+    session.tmux.send_literal("/new");
+    session.tmux.send_key("Enter");
+    std::thread::sleep(Duration::from_secs(2));
+    session.tmux.send_literal("/resume");
+    session.tmux.send_key("Enter");
+    let pane = session
+        .tmux
+        .wait_for_pane_contains("Resume session", COMMAND_TIMEOUT);
+    assert!(
+        pane.contains("msgs") && !pane.contains("no saved sessions found"),
+        "the session saved this run is listed:\n{pane}"
+    );
+
+    session.tmux.send_key("Escape");
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
+const FTUI_DELETE_TEST_NAME: &str = "e2e_ftui_delete";
+
+/// OMP `/delete`: after a saved turn, `/delete yes` moves to a new session
+/// and removes the old session's file from disk.
+#[test]
+fn e2e_ftui_delete_removes_the_saved_session_file() {
+    let Some((_lock, session)) = new_locked_session(FTUI_DELETE_TEST_NAME) else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let env_root = session.harness.temp_dir().join("env");
+    std::fs::create_dir_all(&env_root).expect("create env root"); // ubs:ignore test setup expect
+    let args = ftui_vcr_args_with_session(true, false);
+    let system_prompt = ftui_vcr_system_prompt_for(&args, session.harness.temp_dir(), &env_root);
+    let cassette_dir = session.harness.temp_dir().join("cassettes");
+    write_ftui_vcr_cassette(
+        &cassette_dir,
+        &system_prompt,
+        FTUI_DELETE_TEST_NAME,
+        FTUI_VCR_RESPONSE,
+    );
+    let stderr_log = session.harness.temp_path("pi-stderr-delete.log");
+    let script_path = session.harness.temp_path("delete.sh");
+    write_ftui_vcr_launcher(
+        &script_path,
+        &env_root,
+        &cassette_dir,
+        &stderr_log,
+        FTUI_DELETE_TEST_NAME,
+        &args,
+    );
+    session
+        .tmux
+        .start_session(session.harness.temp_dir(), &script_path);
+    session
+        .tmux
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
+    session.tmux.send_literal(FTUI_VCR_PROMPT);
+    session.tmux.send_key("Enter");
+    session
+        .tmux
+        .wait_for_pane_contains("ftui-vcr-response-marker", COMMAND_TIMEOUT);
+    session
+        .tmux
+        .wait_for_pane_contains("tokens ", COMMAND_TIMEOUT);
+
+    let sessions_root = env_root.join("sessions");
+    let saved = walk_session_files(&sessions_root);
+    assert_eq!(
+        saved.len(),
+        1,
+        "one saved session before /delete: {saved:?}"
+    );
+
+    session.tmux.send_literal("/delete yes");
+    session.tmux.send_key("Enter");
+    let pane = session
+        .tmux
+        .wait_for_pane_contains("this is a new session", COMMAND_TIMEOUT);
+    assert!(
+        !saved[0].exists(),
+        "the deleted session's file is gone; pane:\n{pane}"
+    );
+    assert!(
+        !pane.contains("ftui-vcr-response-marker"),
+        "the new session starts empty:\n{pane}"
+    );
+
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
+/// Every `*.jsonl` under the harness sessions root, at any depth: sessions are
+/// filed under an encoded-cwd subdirectory.
+fn walk_session_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                found.push(path);
+            }
+        }
+    }
+    found
 }
 
 // ── Mid-STREAM SIGTERM (bd-pb4fw follow-through via VCR chunk pacing) ───────
@@ -1252,7 +1747,7 @@ fn e2e_ftui_sigterm_mid_stream_restores_terminal() {
 
     session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
     session.tmux.send_literal(FTUI_VCR_PROMPT);
     session.tmux.send_key("Enter");
 
@@ -1313,7 +1808,7 @@ fn e2e_ftui_wheel_scroll_inside_tmux() {
     session.launch(&ftui_args());
     session
         .tmux
-        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+        .wait_for_pane_contains("pi interactive stack", STARTUP_TIMEOUT);
 
     // Fill the transcript well past one screen. A single tall tool output
     // no longer guarantees overflow: card collapsing (bd-cv653.9.2) can
@@ -1372,6 +1867,313 @@ fn e2e_ftui_wheel_scroll_inside_tmux() {
     assert!(
         pane.contains("lines up] End to follow"),
         "wheel-up did not scroll the conversation; pane:\n{pane}"
+    );
+
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
+/// bd-ydz1t.1: `/share` reaches `gh` on the ftui stack and reports the URL.
+///
+/// The classic stack has had this scenario since the command existed; this is
+/// the same scenario against the stack most people run, driving the same
+/// `run_share` implementation through a mock `gh`. Without it, the ftui port
+/// was covered only by unit tests of the ROUTING — that the driver then
+/// produces a gist was true by construction and unasserted.
+#[test]
+fn e2e_ftui_share_creates_secret_gist() {
+    let Some((_lock, mut session)) = new_locked_session("e2e_ftui_share_creates_gist") else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let mock_bin = session.harness.temp_path("mock_bin");
+    std::fs::create_dir_all(&mock_bin).expect("create mock_bin");
+    let gist_url = "https://gist.github.com/testuser/e2e_ftui_share_id";
+    let gh_path = common::mocks::write_mock_gh_script(&mock_bin, gist_url);
+
+    let pi_dir = session.harness.temp_path(".pi");
+    std::fs::create_dir_all(&pi_dir).expect("create .pi");
+    std::fs::write(
+        pi_dir.join("settings.json"),
+        format!("{{\"ghPath\": \"{}\"}}", gh_path.display()),
+    )
+    .expect("write settings.json");
+    session.set_env(
+        "PI_CONFIG_PATH",
+        &pi_dir.join("settings.json").display().to_string(),
+    );
+    session.set_env("PI_WORKSPACE_TRUST", "trusted");
+
+    session.launch(&ftui_args());
+    session.wait_and_capture("startup", "pi interactive stack", STARTUP_TIMEOUT);
+
+    // The success message's LAST paragraph, so the capture cannot land between
+    // two frames of the same multi-paragraph message.
+    let pane = session.send_text_and_wait("share", "/share", "Gist:", COMMAND_TIMEOUT);
+    assert!(
+        pane.contains(gist_url),
+        "the gist URL the mock printed must reach the transcript; pane:\n{pane}"
+    );
+    assert!(
+        pane.contains("Share URL:"),
+        "the viewer URL paragraph is missing; pane:\n{pane}"
+    );
+
+    // What `gh` was actually asked to do. `--public=false` is the whole
+    // security claim of this command and it is invisible in the transcript.
+    let args_log = std::fs::read_to_string(mock_bin.join("gh_args.log"))
+        .expect("the mock gh must have been invoked");
+    assert!(
+        args_log.contains("--public=false"),
+        "the gist must be created secret; gh saw:\n{args_log}"
+    );
+
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
+/// bd-ydz1t.1: `/share public` is refused WITHOUT invoking `gh`.
+///
+/// The unit test proves the command never reaches the driver. This proves the
+/// consequence that actually matters: no process was spawned, so there is no
+/// path by which a public gist could have been created. Asserted on the
+/// absence of the mock's argument log, because "the command errored" and "the
+/// command never ran" look identical in a transcript.
+#[test]
+fn e2e_ftui_share_public_never_invokes_gh() {
+    let Some((_lock, mut session)) = new_locked_session("e2e_ftui_share_public_refused") else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let mock_bin = session.harness.temp_path("mock_bin");
+    std::fs::create_dir_all(&mock_bin).expect("create mock_bin");
+    let gh_path =
+        common::mocks::write_mock_gh_script(&mock_bin, "https://gist.github.com/testuser/never");
+
+    let pi_dir = session.harness.temp_path(".pi");
+    std::fs::create_dir_all(&pi_dir).expect("create .pi");
+    std::fs::write(
+        pi_dir.join("settings.json"),
+        format!("{{\"ghPath\": \"{}\"}}", gh_path.display()),
+    )
+    .expect("write settings.json");
+    session.set_env(
+        "PI_CONFIG_PATH",
+        &pi_dir.join("settings.json").display().to_string(),
+    );
+    session.set_env("PI_WORKSPACE_TRUST", "trusted");
+
+    session.launch(&ftui_args());
+    session.wait_and_capture("startup", "pi interactive stack", STARTUP_TIMEOUT);
+
+    let pane = session.send_text_and_wait(
+        "share_public",
+        "/share public",
+        "public sharing is disabled",
+        COMMAND_TIMEOUT,
+    );
+    assert!(
+        !pane.contains("Sharing session"),
+        "a refused /share must not start the export; pane:\n{pane}"
+    );
+    assert!(
+        !mock_bin.join("gh_args.log").exists(),
+        "gh must never be invoked for `/share public`"
+    );
+
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
+/// SSE body for a one-shot OpenAI-compatible completion.
+fn openai_sse(text: &str) -> common::harness::MockHttpResponse {
+    let delta = serde_json::json!({
+        "choices": [{"index": 0, "delta": {"content": text}}]
+    });
+    let done = serde_json::json!({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    });
+    let body = format!("data: {delta}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+    common::harness::MockHttpResponse {
+        status: 200,
+        headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+        body: body.into_bytes(),
+    }
+}
+
+/// bd-ydz1t.2: `/tan` runs a child agent on the ftui stack and its summary
+/// reaches the PARENT AGENT at the next turn boundary.
+///
+/// The mirror of `e2e_tan_runs_in_background_and_delivers_at_next_turn_boundary`
+/// in tests/btw_tan.rs, which carried a comment claiming "FTUI is covered by
+/// tests/e2e_ftui.rs" while no such coverage existed. It does now.
+///
+/// The load-bearing assertions are the SERVER-SIDE ones. A pane can show
+/// "(/tan completed)" whether or not the agent ever learned anything; only the
+/// second parent request proves the summary was actually fed back into the
+/// conversation, which is the whole point of the command.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_ftui_tan_delivers_its_summary_to_the_parent_turn() {
+    let Some((_lock, mut session)) = new_locked_session("e2e_ftui_tan_delivery") else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let server = session.harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/tan-role/v1/chat/completions",
+        openai_sse("ftui tan child summary marker"),
+    );
+    server.add_route_queue(
+        "POST",
+        "/parent/v1/chat/completions",
+        vec![
+            openai_sse("ftui parent main turn marker"),
+            openai_sse("ftui parent processed tan follow-up marker"),
+        ],
+    );
+
+    let env_root = session.harness.temp_path("ftui-tan-env");
+    let coding_dir = env_root.join("agent");
+    let sessions_dir = env_root.join("sessions");
+    let packages_dir = env_root.join("packages");
+    for dir in [&coding_dir, &sessions_dir, &packages_dir] {
+        std::fs::create_dir_all(dir).expect("create env dir");
+    }
+
+    let models = serde_json::json!({
+        "providers": {
+            "parent": {
+                "api": "openai-completions",
+                "baseUrl": format!("{}/parent/v1", server.base_url()),
+                "apiKey": "test-key",
+                "models": [{"id": "parent-model", "contextWindow": 128_000}]
+            },
+            "tan-role": {
+                "api": "openai-completions",
+                "baseUrl": format!("{}/tan-role/v1", server.base_url()),
+                "apiKey": "test-key",
+                "models": [{"id": "task-model", "contextWindow": 128_000}]
+            }
+        }
+    });
+    std::fs::write(
+        coding_dir.join("models.json"),
+        serde_json::to_vec_pretty(&models).expect("serialize models"),
+    )
+    .expect("write models");
+    let settings_path = env_root.join("settings.json");
+    std::fs::write(
+        &settings_path,
+        r#"{"modelRoles":{"task":"tan-role/task-model"},"checkForUpdates":false,"approval":{"mode":"yolo"}}"#,
+    )
+    .expect("write settings");
+
+    session.set_env("PI_CODING_AGENT_DIR", &coding_dir.display().to_string());
+    session.set_env("PI_CONFIG_PATH", &settings_path.display().to_string());
+    session.set_env("PI_SESSIONS_DIR", &sessions_dir.display().to_string());
+    session.set_env("PI_PACKAGE_DIR", &packages_dir.display().to_string());
+    session.set_env("PI_NO_AUTO_UPDATE_CHECK", "1");
+    session.set_env("PI_WORKSPACE_TRUST", "trusted");
+
+    session.launch(&[
+        "--ftui",
+        "--provider",
+        "parent",
+        "--model",
+        "parent-model",
+        "--tools",
+        "subagent",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-extensions",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "--system-prompt",
+        "ftui tan e2e parent",
+    ]);
+    session.wait_and_capture("startup", "pi interactive stack", STARTUP_TIMEOUT);
+
+    let started = session.send_text_and_wait(
+        "start_tan",
+        "/tan update the changelog",
+        "(/tan started)",
+        COMMAND_TIMEOUT,
+    );
+    assert!(
+        started.contains("update the changelog"),
+        "the started note must echo the work; pane:\n{started}"
+    );
+
+    let completed =
+        session.wait_and_capture("tan_completed", "(/tan completed)", Duration::from_secs(60));
+    assert!(
+        completed.contains("ftui tan child summary marker"),
+        "the child's answer must reach the user; pane:\n{completed}"
+    );
+
+    let main_turn = session.send_text_and_wait(
+        "main_turn",
+        "continue main work",
+        "ftui parent main turn marker",
+        Duration::from_secs(30),
+    );
+    assert!(main_turn.contains("ftui parent main turn marker"));
+
+    session.wait_and_capture(
+        "tan_follow_up_boundary",
+        "ftui parent processed tan follow-up marker",
+        Duration::from_secs(30),
+    );
+
+    // The assertions that actually prove the feature. The pane above could
+    // look right with the agent none the wiser.
+    let requests = server.requests();
+    let role_requests = requests
+        .iter()
+        .filter(|request| request.path == "/tan-role/v1/chat/completions")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        role_requests.len(),
+        1,
+        "exactly one child agent request was expected"
+    );
+    let role_body = role_requests
+        .first()
+        .map(|request| String::from_utf8_lossy(&request.body))
+        .unwrap_or_default();
+    assert!(
+        role_body.contains("Task: update the changelog"),
+        "the child must receive the work; body:\n{role_body}"
+    );
+
+    let parent_requests = requests
+        .iter()
+        .filter(|request| request.path == "/parent/v1/chat/completions")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parent_requests.len(),
+        2,
+        "expected the main turn plus the tan follow-up turn"
+    );
+    let follow_up_body = parent_requests
+        .get(1)
+        .map(|request| String::from_utf8_lossy(&request.body))
+        .unwrap_or_default();
+    assert!(
+        follow_up_body.contains("[background tan"),
+        "the follow-up seam must feed the summary back to the parent agent, \
+         not just to the screen; body:\n{follow_up_body}"
+    );
+    assert!(
+        follow_up_body.contains("ftui tan child summary marker"),
+        "the parent must receive the CHILD's answer; body:\n{follow_up_body}"
     );
 
     quit_and_assert_clean(&session);

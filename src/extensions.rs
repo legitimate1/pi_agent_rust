@@ -1737,19 +1737,19 @@ pub fn strip_unc_prefix(path: PathBuf) -> PathBuf {
     {
         let s = path.to_string_lossy();
         if let Some(stripped) = s.strip_prefix(r"\\?\") {
-            if let Some(unc) = stripped.strip_prefix("UNC") {
-                if unc.starts_with('\\') {
-                    return PathBuf::from(format!(r"\{}", unc));
-                }
+            if let Some(unc) = stripped.strip_prefix("UNC")
+                && unc.starts_with('\\')
+            {
+                return PathBuf::from(format!(r"\{unc}"));
             }
             return PathBuf::from(stripped);
         }
         // fd normalises separators to `/`, producing `//?/` instead of `\\?\`.
         if let Some(stripped) = s.strip_prefix("//?/") {
-            if let Some(unc) = stripped.strip_prefix("UNC") {
-                if unc.starts_with('/') {
-                    return PathBuf::from(format!("/{}", unc));
-                }
+            if let Some(unc) = stripped.strip_prefix("UNC")
+                && unc.starts_with('/')
+            {
+                return PathBuf::from(format!("/{unc}"));
             }
             return PathBuf::from(stripped);
         }
@@ -10121,7 +10121,24 @@ pub enum ExtensionEventName {
 
 impl std::fmt::Display for ExtensionEventName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ExtensionEventName {
+    /// The wire name, without allocating.
+    ///
+    /// The hot path needs this: every agent event asks `has_hook_for` whether
+    /// anything is listening before doing any work, and going through
+    /// [`std::fmt::Display`] to ask meant a `String` per event — on a streaming
+    /// turn, one allocation per token, paid by sessions whose extensions
+    /// subscribe to nothing. That is the opposite of the "subscribing to
+    /// nothing costs nothing" guarantee bd-82331 relies on when it builds a
+    /// coalescer unconditionally, so the check takes this instead and the
+    /// allocation happens only once something is actually listening.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
             Self::Startup => "startup",
             Self::Input => "input",
             Self::BeforeAgentStart => "before_agent_start",
@@ -10152,8 +10169,7 @@ impl std::fmt::Display for ExtensionEventName {
             Self::SessionBeforeTree => "session_before_tree",
             Self::SessionTree => "session_tree",
             Self::SessionShutdown => "session_shutdown",
-        };
-        write!(f, "{name}")
+        }
     }
 }
 
@@ -13447,12 +13463,27 @@ fn collect_extension_roots_from_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
             roots.push(root);
         }
 
+        // An ancestor package donates its directory tree only when its
+        // `pi.extensions` declaration actually resolves to this entry, the
+        // same test co-entry discovery applies. An unrelated package.json
+        // anywhere above (in $HOME, a projects folder, ...) grants nothing
+        // (bd-2rthm); an unreadable or malformed one grants nothing either.
+        let canonical_entry = safe_canonicalize(entry_path);
         for package_json in find_package_json_ancestors(Some(parent)) {
-            if let Some(package_dir) = package_json.parent() {
-                let root = safe_canonicalize(package_dir);
-                if seen.insert(root.clone()) {
-                    roots.push(root);
-                }
+            let Some(package_dir) = package_json.parent() else {
+                continue;
+            };
+            let Ok(Some(package_entries)) = read_pi_extensions_from_package(&package_json) else {
+                continue;
+            };
+            if !resolve_package_declared_entries(package_dir, &package_entries)
+                .contains(&canonical_entry)
+            {
+                continue;
+            }
+            let root = safe_canonicalize(package_dir);
+            if seen.insert(root.clone()) {
+                roots.push(root);
             }
         }
     }
@@ -14420,6 +14451,56 @@ async fn dispatch_extension_event_across_shards_until(
             Value::Null
         } else {
             Value::Object(result)
+        });
+    }
+
+    if event_name == "before_provider_request" {
+        // gh #219: the request-body rewrite chains across realms exactly as it
+        // chains across handlers inside one realm (see the JS dispatcher):
+        // each shard receives the payload as rewritten by the shards before
+        // it, and the final payload is handed back to the provider. A shard's
+        // reply is `{ payload }` (or, from an older bootstrap, the payload
+        // object itself); anything else keeps the current payload.
+        let mut current_payload = event_payload.get("payload").cloned().unwrap_or(Value::Null);
+        let mut saw_handler_result = false;
+        for phase in ["direct", "event_bus"] {
+            for &shard_index in &owners {
+                let mut payload = event_payload.clone();
+                if let Value::Object(map) = &mut payload {
+                    map.insert("payload".to_string(), current_payload.clone());
+                }
+                let Some(value) = dispatch_extension_event_phase_sharded(
+                    shards,
+                    host,
+                    JsEventPhaseDispatch {
+                        shard_index,
+                        event_name,
+                        event_payload: payload,
+                        ctx_payload,
+                        phase,
+                        batch_id,
+                        origin,
+                        deadline,
+                    },
+                )
+                .await?
+                else {
+                    continue;
+                };
+                saw_handler_result = true;
+                let Value::Object(mut reply) = value else {
+                    continue;
+                };
+                let next = reply.remove("payload").unwrap_or(Value::Object(reply));
+                if next.is_object() {
+                    current_payload = next;
+                }
+            }
+        }
+        return Ok(if saw_handler_result {
+            json!({ "payload": current_payload })
+        } else {
+            Value::Null
         });
     }
 

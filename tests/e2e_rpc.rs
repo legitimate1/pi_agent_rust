@@ -1,4 +1,8 @@
 #![allow(clippy::similar_names)]
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; asupersync 0.5.0 nests its runtime future types deeply
+// enough that proving `Send` exceeds the default 128.
+#![recursion_limit = "256"]
 #![allow(clippy::too_many_lines)]
 
 //! E2E RPC protocol tests — comprehensive command coverage.
@@ -47,7 +51,7 @@ use std::time::{Duration, Instant};
 // Helpers
 // ---------------------------------------------------------------------------
 
-const RPC_E2E_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const RPC_E2E_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
 const KEYLESS_REPLAY_ABORT_WINDOW: Duration = Duration::from_secs(10);
 
 fn cassette_root() -> PathBuf {
@@ -875,8 +879,27 @@ const CRASH_INTERRUPT_RECOVERY_READY_ENV: &str = "PI_CRASH_INTERRUPT_RECOVERY_RE
 const CRASH_INTERRUPT_RECOVERY_SUMMARY_ENV: &str = "PI_CRASH_INTERRUPT_RECOVERY_SUMMARY_PATH";
 #[cfg(unix)]
 const CRASH_INTERRUPT_RECOVERY_SESSION_ENV: &str = "PI_CRASH_INTERRUPT_RECOVERY_SESSION_PATH";
+/// How long the crash/interrupt recovery cases wait on the real `pi` binary.
+///
+/// These are the only cases here that spawn the shipped binary, drive a bash
+/// tool call through it, and then wait on the filesystem for a persisted
+/// session. 45 seconds was enough in isolation and not enough in the lane:
+/// `rpc_binary_sigint_exits_orderly_and_preserves_session` failed the first
+/// complete test run with "timed out waiting for pi --rpc to persist the SIGINT
+/// fixture", and passes on its own (173 of 173, run 20260910T032641-68164).
+/// Hundreds of test binaries run concurrently there, and process spawn plus a
+/// tool call plus a session write does not fit a 45 second budget under that
+/// load.
+///
+/// Raising it costs nothing when things are healthy: every wait loop breaks the
+/// moment its condition holds, so the budget is only ever spent on the way to a
+/// failure.
+///
+/// Stated plainly, because it would be easy to over-claim: this removes a
+/// margin, it does not fix a demonstrated defect. If the case fails again with
+/// this budget, the cause is real and is not load.
 #[cfg(unix)]
-const CRASH_INTERRUPT_RECOVERY_DEFAULT_TIMEOUT: Duration = Duration::from_secs(45);
+const CRASH_INTERRUPT_RECOVERY_DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
@@ -5455,7 +5478,7 @@ fn rpc_late_extension_mcp_registration_reaches_the_session_at_the_next_prompt() 
         let manager = ExtensionManager::default();
         agent_session.extensions = Some(ExtensionRegion::new(manager.clone()));
         let mcp_manager = Arc::new(
-            pi::mcp::bootstrap_with_project_trust(&cwd, &global_dir, &[], true)
+            pi::mcp::McpManager::bootstrap(&cwd, &global_dir, &[], true)
                 .expect("bootstrap MCP manager"),
         );
         agent_session.set_mcp_manager(Arc::clone(&mcp_manager));

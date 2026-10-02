@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; asupersync 0.5.0 nests its runtime future types deeply
+// enough that proving `Send` exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! bd-kh2.2: E2E RPC extension session connector scenarios.
 //!
 //! Tests the RPC protocol's session-management commands end-to-end:

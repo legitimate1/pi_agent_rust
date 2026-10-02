@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; asupersync 0.5.0 nests its runtime future types deeply
+// enough that proving `Send` exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! E2E: auto-retry on a transient connection error must RESUME the turn, not
 //! replay it from the user message (`pi_agent_rust#125`).
 //!

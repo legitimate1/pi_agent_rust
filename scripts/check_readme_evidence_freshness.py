@@ -350,6 +350,12 @@ def parse_citation_obligations(readme_text: str) -> list[ClaimObligation]:
         # Explicit historical contract: the citation itself declares the
         # obligation a retained snapshot, not a current release claim.
         ("historical", re.compile(r'\*\(from ([^,);]+); historical snapshot\)\*')),
+        # Explicit no-claim contract: the block cites the artifact in order to
+        # disclose that it authorizes nothing. Without this form the only way
+        # to report a blocked budget summary was to stop citing it -- and the
+        # claim bindings key off citations, so dropping the citation is what
+        # let the numbers drift unnoticed in the first place.
+        ("no_claim", re.compile(r'\*\(from ([^,);]+); no performance claim\)\*')),
         # Bare path-only form: *(from path)*. The captured token must look
         # like a repository-relative artifact path (contains "/" and no
         # whitespace) so prose citations such as "the Git-pinned verdict
@@ -363,7 +369,7 @@ def parse_citation_obligations(readme_text: str) -> list[ClaimObligation]:
         for citation_kind, citation_pattern in citation_patterns:
             for match in citation_pattern.finditer(stripped_line):
                 artifact_path = match.group(1).strip()
-                if citation_kind in {"bare", "historical"}:
+                if citation_kind in {"bare", "historical", "no_claim"}:
                     if " " in artifact_path or "/" not in artifact_path:
                         continue
                     citation_value = ""
@@ -447,6 +453,9 @@ def parse_quantitative_performance_claims(
         for obligation in parse_citation_obligations(readme_text)
         if obligation.artifact_path.strip().replace("\\", "/")
         == CANONICAL_PERFORMANCE_SUMMARY_PATH
+        # A "; no performance claim" citation must not license a performance
+        # number on its own line; that is the whole point of the label.
+        and obligation.citation_kind != "no_claim"
     }
 
     claims: list[QuantitativePerformanceClaim] = []
@@ -733,6 +742,25 @@ def _repository_identity_error(repository: GitRepositoryBinding) -> str | None:
     return None
 
 
+# Issue-tracker database state: never product source, never packaged, and
+# incapable of affecting a measurement. The beads daemon exports `.beads/*` on
+# every issue write and the auto-commit sweeper commits the result, so a
+# whole-worktree cleanliness proxy reports this repository dirty essentially all
+# the time. The exemption is exactly this prefix; anything else still
+# invalidates the binding. `scripts/check_clean_release_commit.py` classifies
+# these paths the same way.
+_TRACKER_STATE_PREFIX = ".beads/"
+
+
+def _is_tracker_state_status_record(entry: bytes) -> bool:
+    """Is this ``git status --porcelain=v1 -z --no-renames`` record a tracker write?
+
+    Every record is ``XY<space>PATH``, so the path begins at byte 3.
+    """
+
+    return entry[3:].startswith(_TRACKER_STATE_PREFIX.encode("utf-8"))
+
+
 def _repository_clean_state_error(repository: GitRepositoryBinding) -> str | None:
     status, git_error = _git_bytes(
         repository,
@@ -746,12 +774,12 @@ def _repository_clean_state_error(repository: GitRepositoryBinding) -> str | Non
     if git_error is not None:
         return f"budget summary repository cleanliness could not be verified: {git_error}"
     assert status is not None
-    if status:
-        entries = [
-            entry.decode("utf-8", "replace")
-            for entry in status.split(b"\0")
-            if entry
-        ]
+    entries = [
+        entry.decode("utf-8", "replace")
+        for entry in status.split(b"\0")
+        if entry and not _is_tracker_state_status_record(entry)
+    ]
+    if entries:
         return f"budget summary repository is not clean: {entries[:3]!r}"
 
     index_listing, git_error = _git_bytes(repository, "ls-files", "-v", "-z")
@@ -1188,6 +1216,10 @@ def performance_source_binding_error(
             "docs/evidence/",
         )
         for path in changed_paths:
+            # Tracker-database churn is not source drift; see
+            # _TRACKER_STATE_PREFIX.
+            if path.startswith(_TRACKER_STATE_PREFIX):
+                continue
             if not path.startswith(allowed_prefixes):
                 return f"non-evidence path changed after budget summary source_commit: {path}"
             try:
@@ -1646,6 +1678,24 @@ def check_artifact_content(
             )
         return tuple(errors)
 
+    if citation_kind == "no_claim":
+        # The block asserts no performance result; it discloses the artifact's
+        # readiness state. The contract is the mirror image of the normal one:
+        # the artifact must genuinely NOT authorize claims, so the label
+        # cannot be used to wave a real claim past the strict contract.
+        if artifact_path == "tests/perf/reports/budget_summary.json":
+            claim = payload.get("claim_readiness")
+            authorized = (
+                isinstance(claim, dict)
+                and claim.get("performance_claims_authorized") is True
+            )
+            if authorized:
+                errors.append(
+                    "citation is labelled '; no performance claim' but the budget "
+                    "summary authorizes performance claims; cite it normally instead"
+                )
+        return tuple(errors)
+
     if citation_kind in {"bare", "historical"}:
         # Path-only and explicit-historical citations carry no inline
         # provenance value to match. Existence, decodability, and JSON
@@ -1788,6 +1838,29 @@ def _resolve_dotted_field(payload: Any, dotted: str) -> Any:
     return current
 
 
+_NUMERIC_VALUE = re.compile(r"^-?\d+(?:\.\d+)?$")
+
+
+def _value_appears(expected: str, text: str) -> bool:
+    """Whether `expected` is stated in `text`, not merely embedded in it.
+
+    Plain substring matching is unsafe for the small integers these bindings
+    mostly carry. Observed: with `pass` and `fail` both 0 in
+    tests/perf/reports/budget_summary.json, the binding reported "0 mismatched"
+    because "0" occurs inside `20260823`, `2026-08-28` and `bd-sog97.20` in the
+    citing block -- while that block claimed 16 PASS and 3 FAIL. A guard that
+    accepts a digit borrowed from a date is not binding anything.
+
+    So a numeric value must not abut a digit on either side, nor sit on either
+    side of a decimal point that belongs to a longer number. Non-numeric values
+    (run ids, statuses) keep substring semantics, where they are unambiguous.
+    """
+    if not _NUMERIC_VALUE.match(expected):
+        return expected in text
+    pattern = r"(?<!\d)(?<!\d\.)" + re.escape(expected) + r"(?!\d)(?!\.\d)"
+    return re.search(pattern, text) is not None
+
+
 def check_claim_bindings(
     obligations: list[ClaimObligation],
     bindings: list[dict[str, Any]],
@@ -1849,17 +1922,130 @@ def check_claim_bindings(
             )
             continue
         expected = str(resolved)
-        if any(expected in block_text(o.line_number) for o in cited):
+        if any(_value_appears(expected, block_text(o.line_number)) for o in cited):
             continue
         errors.append(
-            f"BINDING MISMATCH: no README block citing {artifact} contains the "
+            f"BINDING MISMATCH: no README block citing {artifact} states the "
             f"current value {expected!r} of '{field}'"
         )
     return errors
 
 
-def check_readme(repo_root: Path, now: datetime | None = None) -> int:
-    """Check the README under repo_root for missing or stale artifact citations."""
+EVIDENCE_STATE_HEADING_RE = re.compile(
+    r"^##\s+Current Evidence State\b", re.IGNORECASE
+)
+_EVIDENCE_ROW_RE = re.compile(r"^\|\s*`([A-Za-z0-9_]+)`\s*\|\s*([^|]*)\|")
+_EVIDENCE_STATUS_RE = re.compile(r"\b(PASS|FAIL|NO_DATA)\b", re.IGNORECASE)
+# A labelled aggregate anywhere in the section: "`0` PASS", "19 declared
+# budgets". Claim bindings alone cannot police these, because a bound value
+# only has to appear in *some* block citing the artifact -- so a second,
+# lying block is covered for by an honest one elsewhere in the README.
+_EVIDENCE_COUNT_RE = re.compile(
+    r"`?(\d+)`?\s+(PASS|FAIL|NO_DATA|declared)\b", re.IGNORECASE
+)
+_EVIDENCE_COUNT_FIELDS = {
+    "pass": "pass",
+    "fail": "fail",
+    "no_data": "no_data",
+    "declared": "total_budgets",
+}
+
+
+def check_evidence_state_table(
+    readme_text: str, summary: dict[str, Any] | None
+) -> list[str]:
+    """Verify the README's evidence table agrees with the budget summary.
+
+    The claim-binding manifest can only bind header aggregates, and the
+    quantitative-claim regexes miss underscore-form budget names entirely
+    (`binary[ -]size` does not match `binary_size_release`). Between those two
+    gaps the table sat for a month advertising four PASS measurements --
+    binary size, idle memory, complex cold-load, event dispatch -- against an
+    artifact whose rows were all NO_DATA, under an "(auto-generated)" heading
+    with no generator behind it. This binds each row that names a declared
+    budget to that budget's status in the artifact, which is the claim a
+    reader actually takes away from the table.
+
+    Rows naming something other than a declared budget (`ext_must_pass`,
+    `evidence_bundle`) are bound to other artifacts and are left alone.
+    """
+    if summary is None:
+        return []
+    statuses = {
+        row.get("budget_name"): row.get("status")
+        for row in summary.get("budget_results", [])
+        if isinstance(row, dict) and isinstance(row.get("budget_name"), str)
+    }
+    if not statuses:
+        return []
+
+    lines = readme_text.splitlines()
+    errors: list[str] = []
+    in_section = False
+    for index, line in enumerate(lines, start=1):
+        if line.startswith("## "):
+            in_section = bool(EVIDENCE_STATE_HEADING_RE.match(line))
+            continue
+        # Labelled aggregates are checked document-wide, not just inside the
+        # section: the phrasing only ever occurs in budget-summary prose, and
+        # the second such block lives a thousand lines away under the testing
+        # policy, where it drifted to "16 PASS and 3 FAIL" unnoticed.
+        for count in _EVIDENCE_COUNT_RE.finditer(line):
+            field = _EVIDENCE_COUNT_FIELDS[count.group(2).lower()]
+            if field not in summary:
+                continue
+            stated = int(count.group(1))
+            if stated != summary[field]:
+                errors.append(
+                    f"EVIDENCE COUNT MISMATCH: line {index}: README states "
+                    f"{count.group(0).strip()} but "
+                    f"{CANONICAL_PERFORMANCE_SUMMARY_PATH} has {field}="
+                    f"{summary[field]}"
+                )
+        if not in_section:
+            continue
+        row = _EVIDENCE_ROW_RE.match(line)
+        if row is None:
+            continue
+        budget_name = row.group(1)
+        expected = statuses.get(budget_name)
+        if expected is None:
+            continue
+        declared = _EVIDENCE_STATUS_RE.search(row.group(2))
+        if declared is None:
+            errors.append(
+                f"EVIDENCE TABLE UNREADABLE: line {index}: row for "
+                f"`{budget_name}` states no PASS/FAIL/NO_DATA status; the "
+                f"artifact says {expected}"
+            )
+            continue
+        if declared.group(1).upper() != str(expected).upper():
+            errors.append(
+                f"EVIDENCE TABLE MISMATCH: line {index}: `{budget_name}` is "
+                f"shown as {declared.group(1).upper()} but "
+                f"{CANONICAL_PERFORMANCE_SUMMARY_PATH} says {expected}"
+            )
+    return errors
+
+
+def check_readme(
+    repo_root: Path,
+    now: datetime | None = None,
+    *,
+    enforce_staleness: bool = True,
+) -> int:
+    """Check the README under repo_root for missing or stale artifact citations.
+
+    `enforce_staleness=False` is the `--structural-only` mode. It drops the
+    14-day age limits and keeps everything that compares the README against
+    what the artifacts currently say. The distinction is what makes this
+    script safe to put in the DSR quality recipe: agreement between the README
+    and an artifact is a property of the commit and stays true until someone
+    edits one of them, whereas an age limit goes red on a calendar, with no
+    commit to blame and nothing the committer can do about it. A gate that
+    turns red on its own is the gate this project already has too much
+    experience with.
+    """
     readme_path = repo_root / "README.md"
     if not readme_path.exists():
         print(f"ERROR: README.md not found at {readme_path}")
@@ -1910,8 +2096,12 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
     missing_count = 0
     results: list[CitationCheck] = []
 
-    # 14-day staleness threshold
-    staleness_threshold = timedelta(days=14)
+    # 14-day staleness threshold. Structural-only mode sets it beyond any
+    # plausible artifact age rather than branching at each comparison, so the
+    # two modes cannot drift apart: every other check runs identically.
+    staleness_threshold = timedelta(days=14 if enforce_staleness else 36500)
+    if not enforce_staleness:
+        print("INFO: structural-only mode: artifact age limits are not enforced")
     now = as_utc(now or datetime.now(timezone.utc))
     content_error_count = len(uncited_quantitative_claims)
 
@@ -2097,6 +2287,25 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
     for error in binding_errors:
         print(error)
 
+    # The "Current Evidence State" table is hand-written; bind its rows to the
+    # artifact so it cannot quietly disagree with the summary it cites.
+    perf_summary: dict[str, Any] | None = None
+    perf_summary_path = repo_root / CANONICAL_PERFORMANCE_SUMMARY_PATH
+    if perf_summary_path.exists():
+        try:
+            loaded = json.loads(perf_summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(
+                f"INVALID: {CANONICAL_PERFORMANCE_SUMMARY_PATH} is unreadable "
+                f"for the evidence-table check: {exc}"
+            )
+            return 2
+        if isinstance(loaded, dict):
+            perf_summary = loaded
+    evidence_table_errors = check_evidence_state_table(readme_text, perf_summary)
+    for error in evidence_table_errors:
+        print(error)
+
     # Summary
     print(f"\nSUMMARY:")
     print(f"  Total proof obligations: {len(obligations)}")
@@ -2108,6 +2317,15 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
     print(f"  Missing artifacts: {missing_count}")
     print(f"  Invalid artifact content checks: {content_error_count}")
     print(f"  Claim bindings enforced: {len(bindings)} ({len(binding_errors)} mismatched)")
+    print(f"  Evidence statements disagreeing with the artifact: {len(evidence_table_errors)}")
+
+    if evidence_table_errors:
+        print(
+            f"\nFAIL: {len(evidence_table_errors)} README evidence statement(s) "
+            f"disagree with {CANONICAL_PERFORMANCE_SUMMARY_PATH}."
+        )
+        print("Restate them from the artifact; never hand-patch the artifact.")
+        return 1
 
     if stale_count > 0:
         print(f"\nFAIL: {stale_count} cited artifact(s) are >14 days stale.")
@@ -2187,7 +2405,13 @@ def _run_self_test_cases() -> int:
     def cloned(value: object) -> object:
         return json.loads(json.dumps(value))
 
-    def run_check(repo_root: Path, readme_text: str) -> tuple[int, str]:
+    def run_check(
+        repo_root: Path,
+        readme_text: str,
+        *,
+        when: datetime | None = None,
+        enforce_staleness: bool = True,
+    ) -> tuple[int, str]:
         (repo_root / "README.md").write_text(readme_text, encoding="utf-8")
         if (repo_root / ".git").is_dir():
             git(repo_root, "add", "--all")
@@ -2195,7 +2419,11 @@ def _run_self_test_cases() -> int:
                 git(repo_root, "commit", "-q", "-m", "generic evidence fixture")
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            result = check_readme(repo_root, now=now)
+            result = check_readme(
+                repo_root,
+                now=when or now,
+                enforce_staleness=enforce_staleness,
+            )
         return result, output.getvalue()
 
     def git(repo_root: Path, *args: str, env: dict[str, str] | None = None) -> bytes:
@@ -2400,6 +2628,28 @@ def _run_self_test_cases() -> int:
             print("SELF-TEST FAIL: canonically equivalent generated citation should pass")
             return 2
 
+        # --structural-only. The same fixture, checked a year later: the
+        # default mode goes red purely on the calendar, and structural-only
+        # does not. This is the whole reason the flag exists -- a gate that
+        # reddens with no commit to blame teaches everyone to ignore it.
+        much_later = now + timedelta(days=400)
+        stale_citation = (
+            "Claim: *(from tests/perf/reports/generated.json, generated "
+            "`2026-05-01T08:00:00.000-04:00`)*\n"
+        )
+        result, output = run_check(generic_root, stale_citation, when=much_later)
+        if result != 1 or "stale" not in output:
+            print(output)
+            print("SELF-TEST FAIL: a year-old artifact must be stale by default")
+            return 2
+        result, output = run_check(
+            generic_root, stale_citation, when=much_later, enforce_staleness=False
+        )
+        if result != 0:
+            print(output)
+            print("SELF-TEST FAIL: --structural-only must not enforce artifact age")
+            return 2
+
         run_collision = reports / "run_collision.json"
         run_collision.write_text(
             json.dumps(
@@ -2593,6 +2843,131 @@ def _run_self_test_cases() -> int:
         )
         if len(drifted_errors) != 1 or "BINDING MISMATCH" not in drifted_errors[0]:
             print(f"SELF-TEST FAIL: diverged binding must fail: {drifted_errors}")
+            return 2
+
+        # The evidence section and the labelled aggregates elsewhere in the
+        # README must both track the artifact. The "16 PASS and 3 FAIL" case
+        # below is the drift that actually happened, a thousand lines away
+        # from the table, against a summary whose rows were all NO_DATA.
+        evidence_summary = {
+            "pass": 0,
+            "fail": 0,
+            "no_data": 19,
+            "total_budgets": 19,
+            "budget_results": [
+                {"budget_name": "binary_size_release", "status": "NO_DATA"},
+                {"budget_name": "event_dispatch_p99", "status": "NO_DATA"},
+            ],
+        }
+        honest_section = (
+            "## Current Evidence State\n"
+            "\n"
+            "> Of `19` declared budgets, `0` PASS, `0` FAIL and `19` NO_DATA.\n"
+            "\n"
+            "| Budget | Status | Why |\n"
+            "|---|---|---|\n"
+            "| `binary_size_release` | NO_DATA | lineage incomplete |\n"
+            "| `event_dispatch_p99` | NO_DATA | lineage incomplete |\n"
+            "| `ext_must_pass` | fail | bound to another artifact |\n"
+        )
+        evidence_cases = [
+            ("honest section", honest_section, 0),
+            (
+                "row flipped to PASS",
+                honest_section.replace(
+                    "| `binary_size_release` | NO_DATA |",
+                    "| `binary_size_release` | **PASS** (32.8 MB) |",
+                ),
+                1,
+            ),
+            (
+                "row with no status at all",
+                honest_section.replace(
+                    "| `event_dispatch_p99` | NO_DATA |",
+                    "| `event_dispatch_p99` | pending |",
+                ),
+                1,
+            ),
+            (
+                "aggregate drifted",
+                honest_section.replace("`0` PASS", "`4` PASS"),
+                1,
+            ),
+            (
+                "declared count drifted",
+                honest_section.replace("`19` declared", "`21` declared"),
+                1,
+            ),
+            (
+                "labelled aggregate outside the section",
+                honest_section
+                + "\n## Testing Policy\n\nRows show `16` PASS and `3` FAIL.\n",
+                2,
+            ),
+        ]
+        for label, fixture, expected_count in evidence_cases:
+            found = check_evidence_state_table(fixture, evidence_summary)
+            if len(found) != expected_count:
+                print(
+                    f"SELF-TEST FAIL: evidence-state check on {label!r} produced "
+                    f"{len(found)} error(s), expected {expected_count}: {found}"
+                )
+                return 2
+        if check_evidence_state_table(honest_section, None):
+            print("SELF-TEST FAIL: a missing budget summary must not raise errors")
+            return 2
+
+        # The "; no performance claim" form: disclosing a blocked summary must
+        # pass, mislabelling an authorized one must fail, and the label must
+        # not license a performance number on the same line.
+        no_claim_forms = parse_citation_obligations(
+            "- Blocked. *(from tests/perf/reports/budget_summary.json; no performance claim)*\n"
+        )
+        if len(no_claim_forms) != 1 or no_claim_forms[0].citation_kind != "no_claim":
+            print(f"SELF-TEST FAIL: no-claim citation form not parsed: {no_claim_forms}")
+            return 2
+        smuggled = parse_quantitative_performance_claims(
+            "- Startup latency is 12.5 ms. "
+            "*(from tests/perf/reports/budget_summary.json; no performance claim)*\n"
+        )
+        if len(smuggled) != 1 or smuggled[0].has_canonical_inline_citation:
+            print(
+                "SELF-TEST FAIL: a no-claim citation must not license a "
+                f"quantitative claim: {smuggled}"
+            )
+            return 2
+
+        # A digit borrowed from a date, a version or a bead id must not satisfy
+        # a binding. This is the exact shape that let the README's perf block
+        # claim "16 PASS and 3 FAIL" while the artifact carried pass=0, fail=0
+        # and the check reported 0 mismatched.
+        zero_target = generic_root / "tests/perf/reports/zero_target.json"
+        zero_target.write_text(
+            json.dumps({"pass": 0, "fail": 0, "total": 19}), encoding="utf-8"
+        )
+        zero_fixture_text = (
+            "- Budget summary from run `beige-evidence-refresh-20260823`: `19`\n"
+            "  declared budgets, `16` PASS and `3` FAIL as of 2026-08-28\n"
+            "  (bd-sog97.20). *(from tests/perf/reports/zero_target.json)*\n"
+        )
+        zero_bindings = [
+            {"artifact": "tests/perf/reports/zero_target.json", "field": "pass"},
+            {"artifact": "tests/perf/reports/zero_target.json", "field": "fail"},
+            {"artifact": "tests/perf/reports/zero_target.json", "field": "total"},
+        ]
+        zero_errors = check_claim_bindings(
+            parse_citation_obligations(zero_fixture_text),
+            zero_bindings,
+            zero_fixture_text,
+            base_dir=generic_root,
+        )
+        if len(zero_errors) != 2 or not all(
+            "BINDING MISMATCH" in error for error in zero_errors
+        ):
+            print(
+                "SELF-TEST FAIL: digits inside dates/bead ids must not satisfy a "
+                f"binding, and 19 must still bind: {zero_errors}"
+            )
             return 2
 
 
@@ -3023,6 +3398,50 @@ def _run_self_test_cases() -> int:
             print("SELF-TEST FAIL: untracked dirt must invalidate source binding")
             return 2
 
+        # The beads daemon and the auto-commit sweeper write `.beads/*`
+        # continuously, so the binding must survive tracker churn in every Git
+        # state while still catching real dirt one directory over.
+        tracker_root, _, tracker_source = create_binding_repo(base, "binding-tracker")
+        (tracker_root / ".beads").mkdir(parents=True, exist_ok=True)
+        (tracker_root / ".beads" / "issues.jsonl").write_text(
+            '{"id":"seed"}\n', encoding="utf-8"
+        )
+        git(tracker_root, "add", ".beads")
+        git(tracker_root, "commit", "-m", "record tracker export")
+        for stage_it, label in ((False, "unstaged"), (True, "staged")):
+            (tracker_root / ".beads" / "issues.jsonl").write_text(
+                '{"id":"seed"}\n{"id":"written-mid-run"}\n', encoding="utf-8"
+            )
+            (tracker_root / ".beads" / "beads.db-wal-cert").write_text(
+                "cert\n", encoding="utf-8"
+            )
+            if stage_it:
+                git(tracker_root, "add", ".beads")
+            binding_error = performance_source_binding_error(
+                tracker_root,
+                tracker_source,
+                "tests/perf/reports/budget_summary.json",
+            )
+            if binding_error is not None:
+                print(binding_error)
+                print(
+                    f"SELF-TEST FAIL: {label} tracker writes must not invalidate source binding"
+                )
+                return 2
+        (tracker_root / "Cargo.toml").write_text(
+            (tracker_root / "Cargo.toml").read_text(encoding="utf-8") + "# dirty\n",
+            encoding="utf-8",
+        )
+        binding_error = performance_source_binding_error(
+            tracker_root,
+            tracker_source,
+            "tests/perf/reports/budget_summary.json",
+        )
+        if binding_error is None or "repository is not clean" not in binding_error:
+            print(binding_error)
+            print("SELF-TEST FAIL: the tracker exemption must not excuse real dirt")
+            return 2
+
         head_root, _, _ = create_binding_repo(base, "binding-head-dirty")
         head_commit = git(head_root, "rev-parse", "HEAD").decode("ascii").strip()
         (head_root / "untracked.txt").write_text("untracked\n", encoding="utf-8")
@@ -3167,11 +3586,21 @@ def main() -> int:
         action="store_true",
         help="run fixture-based checks for citation parsing behavior",
     )
+    parser.add_argument(
+        "--structural-only",
+        action="store_true",
+        help=(
+            "skip the 14-day artifact age limits; check only that the README "
+            "agrees with what the artifacts currently say. This is the form "
+            "that is safe in a per-commit gate, because it cannot go red on "
+            "the calendar."
+        ),
+    )
     args = parser.parse_args()
     if args.self_test:
         return run_self_test()
     repo_root = Path(__file__).resolve().parent.parent
-    return check_readme(repo_root)
+    return check_readme(repo_root, enforce_staleness=not args.structural_only)
 
 
 if __name__ == "__main__":

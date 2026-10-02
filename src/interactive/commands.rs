@@ -213,6 +213,126 @@ pub enum SlashCommand {
 }
 
 impl SlashCommand {
+    /// The spelling this command is written as in the help text and the
+    /// completion menu — the first alternative [`Self::parse`] accepts.
+    ///
+    /// Exhaustive on purpose. A new variant will not compile until it is named
+    /// here, and the tests below then force it into `/help` and the completion
+    /// menu. Four commands had reached users without either (`/checkpoint`,
+    /// `/rewind`, `/fresh`, `/retry`) and three more without a completion
+    /// (`/add-dir`, `/remove-dir`, `/crash`), because nothing connected the
+    /// parser to the two lists that advertise it.
+    ///
+    /// Adding a variant means adding it here AND to [`Self::ALL`].
+    #[must_use]
+    pub const fn canonical(self) -> &'static str {
+        match self {
+            Self::Help => "/help",
+            Self::Login => "/login",
+            Self::Logout => "/logout",
+            Self::Clear => "/clear",
+            Self::Model => "/model",
+            Self::Thinking => "/thinking",
+            Self::ScopedModels => "/scoped-models",
+            Self::Exit => "/exit",
+            Self::History => "/history",
+            Self::Export => "/export",
+            Self::Session => "/session",
+            Self::Settings => "/settings",
+            Self::Theme => "/theme",
+            Self::Resume => "/resume",
+            Self::New => "/new",
+            Self::Copy => "/copy",
+            Self::Name => "/name",
+            Self::Hotkeys => "/hotkeys",
+            Self::Changelog => "/changelog",
+            Self::Tree => "/tree",
+            Self::Fork => "/fork",
+            Self::Compact => "/compact",
+            Self::Reload => "/reload",
+            Self::Template => "/template",
+            Self::Share => "/share",
+            Self::Mcp => "/mcp",
+            Self::Plan => "/plan",
+            Self::Advisor => "/advisor",
+            Self::Checkpoint => "/checkpoint",
+            Self::Rewind => "/rewind",
+            Self::Fresh => "/fresh",
+            Self::Retry => "/retry",
+            Self::Undo => "/undo",
+            Self::Redo => "/redo",
+            Self::Usage => "/usage",
+            Self::Approval => "/approval",
+            Self::Handoff => "/handoff",
+            Self::Review => "/review",
+            Self::Rules => "/rules",
+            Self::AddDir => "/add-dir",
+            Self::RemoveDir => "/remove-dir",
+            Self::Btw => "/btw",
+            Self::Tan => "/tan",
+            Self::Crash => "/crash",
+            Self::Omfg => "/omfg",
+            Self::Commit => "/commit",
+        }
+    }
+
+    /// Every slash command, so the help text and the completion menu can be
+    /// checked against the parser rather than against each other.
+    ///
+    /// Hand-kept, unavoidably: Rust cannot enumerate a plain enum. The
+    /// mitigation is that [`Self::canonical`] is exhaustive, so a new variant
+    /// stops the build at a doc comment that says to add it here too; and
+    /// `every_listed_command_parses_back_to_itself` catches a wrong entry.
+    /// A forgotten entry is the one mistake that still slips.
+    pub const ALL: &'static [Self] = &[
+        Self::Help,
+        Self::Login,
+        Self::Logout,
+        Self::Clear,
+        Self::Model,
+        Self::Thinking,
+        Self::ScopedModels,
+        Self::Exit,
+        Self::History,
+        Self::Export,
+        Self::Session,
+        Self::Settings,
+        Self::Theme,
+        Self::Resume,
+        Self::New,
+        Self::Copy,
+        Self::Name,
+        Self::Hotkeys,
+        Self::Changelog,
+        Self::Tree,
+        Self::Fork,
+        Self::Compact,
+        Self::Reload,
+        Self::Template,
+        Self::Share,
+        Self::Mcp,
+        Self::Plan,
+        Self::Advisor,
+        Self::Checkpoint,
+        Self::Rewind,
+        Self::Fresh,
+        Self::Retry,
+        Self::Undo,
+        Self::Redo,
+        Self::Usage,
+        Self::Approval,
+        Self::Handoff,
+        Self::Review,
+        Self::Rules,
+        Self::AddDir,
+        Self::RemoveDir,
+        Self::Btw,
+        Self::Tan,
+        Self::Crash,
+        Self::Omfg,
+        Self::Commit,
+    ];
+
     /// Parse a slash command from input.
     pub fn parse(input: &str) -> Option<(Self, &str)> {
         let input = input.trim();
@@ -316,6 +436,10 @@ impl SlashCommand {
   /commit [dry-run|all|bead] - Create dependency-ordered atomic commits from changes
   /review [target]   - Run prioritized code review on changes with ship verdict card
   /advisor [status|pause|resume] - Manage the turn-review advisor model
+  /checkpoint, /cp2 [name] [note] - Mark a restore point on the current branch
+  /rewind [name]     - Collapse everything since a checkpoint into a summary
+  /fresh             - Reset provider stream state; the transcript is untouched
+  /retry             - Re-send the last user turn as a sibling branch
   /undo [n] [force]  - Roll back the last n agent file edits (force: skip external-change guard)
   /redo [n] [force]  - Re-apply previously undone file edits
   /usage [refresh]   - Show provider usage/quota state
@@ -399,7 +523,7 @@ fn provider_has_dedicated_login_flow(provider: &str) -> bool {
 /// flows now succeed out of the box (#97). We still prefer the device flow when
 /// no client id is explicitly configured, since that path is the most robust on
 /// headless/SSH sessions where a localhost OAuth redirect can't be reached.
-fn should_use_copilot_device_flow() -> bool {
+pub(super) fn should_use_copilot_device_flow() -> bool {
     if std::env::var("PI_COPILOT_FORCE_DEVICE_FLOW")
         .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
     {
@@ -601,7 +725,7 @@ fn collect_extension_oauth_providers(
     providers
 }
 
-fn extension_oauth_config_for_provider(
+pub(super) fn extension_oauth_config_for_provider(
     available_models: &[ModelEntry],
     registered_extension_bindings: &[ExtensionProviderBinding],
     provider: &str,
@@ -632,7 +756,7 @@ fn extension_oauth_config_for_provider(
         })
 }
 
-fn registered_extension_provider_bindings(
+pub(super) fn registered_extension_provider_bindings(
     extensions: Option<&ExtensionManager>,
 ) -> crate::error::Result<Vec<ExtensionProviderBinding>> {
     extensions.map_or_else(
@@ -766,6 +890,116 @@ pub fn strip_thinking_level_suffix(pattern: &str) -> &str {
     match suffix.to_ascii_lowercase().as_str() {
         "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => prefix,
         _ => pattern,
+    }
+}
+
+/// Put `text` on the system clipboard, falling back to a private temp file,
+/// and return the sentence describing what happened.
+///
+/// Free rather than a `PiApp` method because the ftui stack runs the same
+/// `/copy` (bd-cv653): the feature gating, the 0600 fallback file and the
+/// exact wording of each outcome must not exist twice. The wording is the
+/// charmed stack's, unchanged, so the two stacks report a copy identically.
+pub fn copy_text_to_clipboard(text: &str) -> String {
+    fn write_fallback(text: &str) -> std::io::Result<std::path::PathBuf> {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let filename = format!("pi_copy_{}.txt", Utc::now().timestamp_millis());
+        // ubs:ignore filename is a literal plus a timestamp, never external input
+        let path = dir.join(filename);
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        let mut file = options.open(&path)?;
+        file.write_all(text.as_bytes())?;
+
+        Ok(path)
+    }
+
+    // GH #242: under WSL without WSLg there is no display for arboard, but
+    // WSL puts Windows' clip.exe on PATH.
+    if running_under_wsl() && copy_via_clip_exe(text).is_ok() {
+        return String::from("Copied to clipboard");
+    }
+
+    #[cfg(feature = "clipboard")]
+    {
+        match ArboardClipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_string()))
+        {
+            Ok(()) => String::from("Copied to clipboard"),
+            Err(err) => match write_fallback(text) {
+                Ok(path) => format!(
+                    "Clipboard support is disabled or unavailable ({err}). Wrote to {}",
+                    path.display()
+                ),
+                Err(io_err) => format!(
+                    "Clipboard support is disabled or unavailable ({err}); also failed to write fallback file: {io_err}"
+                ),
+            },
+        }
+    }
+
+    #[cfg(not(feature = "clipboard"))]
+    {
+        match write_fallback(text) {
+            Ok(path) => format!("Clipboard support is disabled. Wrote to {}", path.display()),
+            Err(err) => {
+                format!("Clipboard support is disabled; failed to write fallback file: {err}")
+            }
+        }
+    }
+}
+
+/// Whether this process runs inside WSL (GH #242).
+pub fn running_under_wsl() -> bool {
+    wsl_detected(
+        std::env::var_os("WSL_DISTRO_NAME").is_some() || std::env::var_os("WSL_INTEROP").is_some(),
+        std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn wsl_detected(wsl_env: bool, kernel_release: Option<&str>) -> bool {
+    wsl_env
+        || kernel_release.is_some_and(|release| release.to_ascii_lowercase().contains("microsoft"))
+}
+
+/// What `clip.exe` is fed: UTF-16LE with a byte-order mark. Plain UTF-8 is
+/// read in the console code page and garbles anything non-ASCII.
+fn clip_exe_payload(text: &str) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
+/// Put `text` on the Windows clipboard from inside WSL.
+pub fn copy_via_clip_exe(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("clip.exe")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(&clip_exe_payload(text))?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "clip.exe exited with {status}"
+        )))
     }
 }
 
@@ -1475,159 +1709,18 @@ impl PiApp {
         self.scroll_to_bottom();
 
         let event_tx = self.event_tx.clone();
-        let PendingOAuth {
-            provider,
-            kind,
-            verifier,
-            oauth_config,
-            device_code,
-            redirect_uri,
-        } = pending;
         let code_input = code_input.to_string();
 
         let runtime_handle = self.runtime_handle.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
             let auth_path = crate::config::Config::auth_path();
-            let mut auth = match crate::auth::AuthStorage::load_async(auth_path).await {
-                Ok(a) => a,
-                Err(e) => {
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &task_cx,
-                        PiMsg::AgentError(e.to_string()),
-                    )
-                    .await;
-                    return;
-                }
-            };
-
-            let credential = match kind {
-                PendingLoginKind::ApiKey => normalize_api_key_input(&code_input)
-                    .map(|key| crate::auth::AuthCredential::ApiKey { key })
-                    .map_err(crate::error::Error::auth),
-                PendingLoginKind::OAuth => {
-                    if provider == "anthropic" {
-                        Box::pin(crate::auth::complete_anthropic_oauth(
-                            &code_input,
-                            &verifier,
-                        ))
-                        .await
-                    } else if provider == "openai-codex" {
-                        Box::pin(crate::auth::complete_openai_codex_oauth(
-                            &code_input,
-                            &verifier,
-                        ))
-                        .await
-                    } else if provider == "google-gemini-cli" {
-                        Box::pin(crate::auth::complete_google_gemini_cli_oauth(
-                            &code_input,
-                            &verifier,
-                        ))
-                        .await
-                    } else if provider == "google-antigravity" {
-                        Box::pin(crate::auth::complete_google_antigravity_oauth(
-                            &code_input,
-                            &verifier,
-                        ))
-                        .await
-                    } else if provider == "github-copilot" || provider == "copilot" {
-                        let client_id =
-                            crate::auth::resolved_copilot_client_id();
-                        let copilot_config = crate::auth::CopilotOAuthConfig {
-                            client_id,
-                            ..crate::auth::CopilotOAuthConfig::default()
-                        };
-                        Box::pin(crate::auth::complete_copilot_browser_oauth(
-                            &copilot_config,
-                            &code_input,
-                            &verifier,
-                            redirect_uri.as_deref(),
-                        ))
-                        .await
-                    } else if provider == "gitlab" || provider == "gitlab-duo" {
-                        let client_id = std::env::var("GITLAB_CLIENT_ID").unwrap_or_default();
-                        let base_url = std::env::var("GITLAB_BASE_URL")
-                            .unwrap_or_else(|_| "https://gitlab.com".to_string());
-                        let gitlab_config = crate::auth::GitLabOAuthConfig {
-                            client_id,
-                            base_url,
-                            ..crate::auth::GitLabOAuthConfig::default()
-                        };
-                        let gitlab_redirect_uri = redirect_uri
-                            .clone()
-                            .or_else(|| oauth_config.as_ref().and_then(|c| c.redirect_uri.clone()));
-                        Box::pin(crate::auth::complete_gitlab_oauth(
-                            &gitlab_config,
-                            &code_input,
-                            &verifier,
-                            gitlab_redirect_uri.as_deref(),
-                        ))
-                        .await
-                    } else if let Some(config) = &oauth_config {
-                        Box::pin(crate::auth::complete_extension_oauth(
-                            config,
-                            &code_input,
-                            &verifier,
-                        ))
-                        .await
-                    } else {
-                        Err(crate::error::Error::auth(format!(
-                            "OAuth provider not supported: {provider}"
-                        )))
-                    }
-                }
-                PendingLoginKind::DeviceFlow => match device_code {
-                    Some(dc) => {
-                        let poll_result = if provider == "kimi-for-coding" {
-                            Box::pin(crate::auth::poll_kimi_code_device_flow(&dc)).await
-                        } else if provider == "github-copilot" || provider == "copilot" {
-                            let client_id =
-                                crate::auth::resolved_copilot_client_id();
-                            let copilot_config = crate::auth::CopilotOAuthConfig {
-                                client_id,
-                                ..crate::auth::CopilotOAuthConfig::default()
-                            };
-                            Box::pin(crate::auth::poll_copilot_device_flow(&copilot_config, &dc))
-                                .await
-                        } else {
-                            crate::auth::DeviceFlowPollResult::Error(format!(
-                                "Device flow polling not supported for {provider}"
-                            ))
-                        };
-                        match poll_result {
-                            crate::auth::DeviceFlowPollResult::Success(cred) => Ok(cred),
-                            crate::auth::DeviceFlowPollResult::Error(e) => {
-                                Err(crate::error::Error::auth(e))
-                            }
-                            crate::auth::DeviceFlowPollResult::Expired => {
-                                Err(crate::error::Error::auth(format!(
-                                    "Device code expired for {provider}. Run /login {provider} again."
-                                )))
-                            }
-                            crate::auth::DeviceFlowPollResult::AccessDenied => {
-                                Err(crate::error::Error::auth(format!(
-                                    "Access denied for {provider}."
-                                )))
-                            }
-                            crate::auth::DeviceFlowPollResult::Pending => {
-                                Err(crate::error::Error::auth(format!(
-                                    "Authorization for {provider} is still pending. Complete the browser step and submit again."
-                                )))
-                            }
-                            crate::auth::DeviceFlowPollResult::SlowDown => {
-                                Err(crate::error::Error::auth(format!(
-                                    "Authorization server asked to slow down for {provider}. Wait a few seconds and submit again."
-                                )))
-                            }
-                        }
-                    }
-                    None => Err(crate::error::Error::auth(
-                        "Device flow missing device_code".to_string(),
-                    )),
-                },
-            };
-
+            let provider = pending.provider.clone();
+            // The exchange and the save are shared with the FTUI stack
+            // (login_flow); this stack keeps only its display and input.
+            let credential = super::login_flow::obtain_credential(&pending, &code_input)
+                .await
+                .map_err(|(_, err)| err);
             let credential = match credential {
                 Ok(c) => c,
                 Err(e) => {
@@ -1641,8 +1734,9 @@ impl PiApp {
                 }
             };
 
-            save_provider_credential(&mut auth, &provider, credential);
-            if let Err(e) = auth.save_async().await {
+            if let Err(e) =
+                super::login_flow::save_credential(&auth_path, &provider, credential).await
+            {
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
                     &task_cx,
@@ -1660,22 +1754,10 @@ impl PiApp {
             )
             .await;
 
-            let status = match kind {
-                PendingLoginKind::ApiKey => {
-                    format!("API key saved for {provider}. Credentials saved to auth.json.")
-                }
-                PendingLoginKind::OAuth | PendingLoginKind::DeviceFlow => {
-                    format!(
-                        "OAuth login successful for {provider}. Credentials saved to auth.json."
-                    )
-                }
-            };
-            let _ = crate::interactive::enqueue_pi_event(
-                &event_tx,
-                &task_cx,
-                PiMsg::System(status),
-            )
-            .await;
+            let status = super::login_flow::success_status(&provider, pending.kind);
+            let _ =
+                crate::interactive::enqueue_pi_event(&event_tx, &task_cx, PiMsg::System(status))
+                    .await;
         });
 
         None
@@ -1935,7 +2017,7 @@ impl PiApp {
         let mut info = format!(
             "Session info:\n  file: {file}\n  id: {id}\n  name: {name}\n  model: {model}\n  thinking: {thinking}\n  messageCount: {message_count}\n  tokens: {total_tokens}\n  cost: {cost_str}",
             id = session.header.id,
-            model = self.model,
+            model = session_model_line(&self.model_entry),
         );
         info.push_str("\n\n");
         info.push_str(&self.frame_timing.summary());
@@ -2321,64 +2403,7 @@ impl PiApp {
                     return None;
                 };
 
-                let write_fallback = |text: &str| -> std::io::Result<std::path::PathBuf> {
-                    use std::io::Write;
-                    let dir = std::env::temp_dir();
-                    let filename = format!("pi_copy_{}.txt", Utc::now().timestamp_millis());
-                    let path = dir.join(filename);
-
-                    let mut options = std::fs::OpenOptions::new();
-                    options.write(true).create_new(true);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::OpenOptionsExt;
-                        options.mode(0o600);
-                    }
-
-                    let mut file = options.open(&path)?;
-                    file.write_all(text.as_bytes())?;
-
-                    Ok(path)
-                };
-
-                #[cfg(feature = "clipboard")]
-                {
-                    match ArboardClipboard::new()
-                        .and_then(|mut clipboard| clipboard.set_text(text.clone()))
-                    {
-                        Ok(()) => self.status_message = Some("Copied to clipboard".to_string()),
-                        Err(err) => match write_fallback(&text) {
-                            Ok(path) => {
-                                self.status_message = Some(format!(
-                                    "Clipboard support is disabled or unavailable ({err}). Wrote to {}",
-                                    path.display()
-                                ));
-                            }
-                            Err(io_err) => {
-                                self.status_message = Some(format!(
-                                    "Clipboard support is disabled or unavailable ({err}); also failed to write fallback file: {io_err}"
-                                ));
-                            }
-                        },
-                    }
-                }
-
-                #[cfg(not(feature = "clipboard"))]
-                {
-                    match write_fallback(&text) {
-                        Ok(path) => {
-                            self.status_message = Some(format!(
-                                "Clipboard support is disabled. Wrote to {}",
-                                path.display()
-                            ));
-                        }
-                        Err(err) => {
-                            self.status_message = Some(format!(
-                                "Clipboard support is disabled; failed to write fallback file: {err}"
-                            ));
-                        }
-                    }
-                }
+                self.status_message = Some(copy_text_to_clipboard(&text));
 
                 None
             }
@@ -3052,7 +3077,10 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         }
 
         if model_entry_matches(&next, &self.model_entry) {
-            self.status_message = Some(format!("Current model: {}", self.model));
+            self.status_message = Some(format!(
+                "Current model: {}",
+                session_model_line(&self.model_entry)
+            ));
             return None;
         }
 
@@ -3079,7 +3107,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             self.available_models.push(next.clone());
         }
 
-        self.status_message = Some(format!("Switched model: {}", self.model));
+        self.status_message = Some(format!("Switched model: {}", next.model.display_label()));
         None
     }
 
@@ -3198,7 +3226,6 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     }
 
     fn handle_slash_approval(&mut self, args: &str) -> Option<Cmd> {
-        let sub = args.trim().to_ascii_lowercase();
         let approval_state = {
             let Ok(agent_guard) = self.agent.try_lock() else {
                 self.status_message = Some("Agent is busy".to_string());
@@ -3212,53 +3239,11 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             return None;
         };
 
-        match sub.as_str() {
-            "" | "status" => {
-                let mode = state.mode();
-                let dual_classes = state.dual_confirm_classes();
-                let dual_str = if dual_classes.is_empty() {
-                    "none".to_string()
-                } else {
-                    dual_classes
-                        .iter()
-                        .map(|c| c.label())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                self.status_message = Some(format!(
-                    "Approval mode: {} | Dual-confirm classes: {}",
-                    mode.as_str(),
-                    dual_str
-                ));
-            }
-            "always-ask" | "always_ask" | "always" | "ask" => {
-                state.set_mode(crate::approval::ApprovalMode::AlwaysAsk);
-                Self::log_approval_transition(
-                    &self.session,
-                    crate::approval::ApprovalMode::AlwaysAsk,
-                );
-                self.status_message = Some("Approval mode set to always-ask".to_string());
-            }
-            "write" | "files" => {
-                state.set_mode(crate::approval::ApprovalMode::Write);
-                Self::log_approval_transition(&self.session, crate::approval::ApprovalMode::Write);
-                self.status_message =
-                    Some("Approval mode set to write (file mutations auto-approved)".to_string());
-            }
-            "yolo" | "auto-approve" | "auto" | "all" => {
-                state.set_mode(crate::approval::ApprovalMode::Yolo);
-                Self::log_approval_transition(&self.session, crate::approval::ApprovalMode::Yolo);
-                self.status_message = Some(
-                    "Approval mode set to yolo (all auto-approved except hard policy gates)"
-                        .to_string(),
-                );
-            }
-            other => {
-                self.status_message = Some(format!(
-                    "Unknown /approval mode {other:?}: use /approval [always-ask|write|yolo|status]"
-                ));
-            }
+        let (report, changed) = super::workspace_reports::approval(&state, args);
+        if let Some(mode) = changed {
+            Self::log_approval_transition(&self.session, mode);
         }
+        self.show_workspace_report(report);
         None
     }
 
@@ -3275,112 +3260,36 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     }
 
     pub(super) fn handle_slash_handoff(&mut self, args: &str) -> Option<Cmd> {
-        let args = args.trim();
-        let (to_target, out_path) = if args.is_empty() {
-            (crate::handoff::HandoffTarget::Human, None)
-        } else {
-            let mut parts = args.split_whitespace();
-            let target_str = parts.next().unwrap_or("human");
-            let path_str = parts.next().map(std::path::PathBuf::from);
-            (crate::handoff::HandoffTarget::parse(target_str), path_str)
+        let report = {
+            let Ok(session_guard) = self.session.try_lock() else {
+                self.status_message = Some("Session busy; try again".to_string());
+                return None;
+            };
+            super::workspace_reports::handoff(&session_guard, args)
         };
-
-        let Ok(session_guard) = self.session.try_lock() else {
-            self.status_message = Some("Session busy; try again".to_string());
-            return None;
-        };
-
-        let doc = crate::handoff::HandoffGenerator::generate_from_session(&session_guard);
-        drop(session_guard);
-
-        match crate::handoff::HandoffGenerator::deliver(&doc, &to_target, out_path.as_deref()) {
-            Ok(report) => {
-                self.messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content: format!(
-                        "### 📋 Handoff Brief Generated\n\n{}\n\n*{}*",
-                        doc.to_markdown(),
-                        report.status
-                    ),
-                    thinking: None,
-                    collapsed: false,
-                });
-                self.scroll_to_bottom();
-                self.status_message = Some("Handoff brief generated successfully".to_string());
-            }
-            Err(e) => {
-                self.status_message = Some(format!("Failed to generate handoff: {e}"));
-            }
-        }
-
+        self.show_workspace_report(report);
         None
     }
 
     pub(super) fn handle_slash_rules(&mut self, args: &str) -> Option<Cmd> {
-        let args = args.trim();
-        let project_root = self.cwd.clone();
-        let mut store = crate::stream_rules::StreamRuleStore::load_for_project(&project_root);
+        let report = super::workspace_reports::rules(&self.cwd, args);
+        self.show_workspace_report(report);
+        None
+    }
 
-        if args.is_empty() || args == "list" {
-            let rules = store.list_all_rules();
-            let mut text = format!("### 🛡️ Active Stream Rules ({})\n\n", rules.len());
-            if rules.is_empty() {
-                text.push_str("No stream rules configured. Use `/rules add <id> <pattern> <body>` or `/omfg <complaint>` to create one.\n");
-            } else {
-                for r in &rules {
-                    let status = if r.enabled {
-                        "✅ enabled"
-                    } else {
-                        "⏸️ disabled"
-                    };
-                    let _ = writeln!(
-                        text,
-                        "- **{}** [{status}]: `/{}/`\n  {}",
-                        r.name, r.pattern, r.body
-                    );
-                }
-            }
+    /// Show a shared workspace command's result: its card (if any) in the
+    /// transcript, its status line in the footer.
+    fn show_workspace_report(&mut self, report: super::workspace_reports::Report) {
+        if let Some(card) = report.card {
             self.messages.push(ConversationMessage {
                 role: MessageRole::System,
-                content: text,
+                content: card,
                 thinking: None,
                 collapsed: false,
             });
             self.scroll_to_bottom();
-        } else if let Some(rest) = args.strip_prefix("remove ") {
-            let id = rest.trim();
-            match store.remove_rule(id) {
-                Ok(true) => {
-                    self.status_message = Some(format!("Removed stream rule '{id}'"));
-                }
-                Ok(false) => {
-                    self.status_message = Some(format!("Stream rule '{id}' not found"));
-                }
-                Err(e) => {
-                    self.status_message = Some(format!("Error removing rule: {e}"));
-                }
-            }
-        } else if let Some(rest) = args.strip_prefix("toggle ") {
-            let id = rest.trim();
-            let current = store
-                .list_all_rules()
-                .into_iter()
-                .find(|r| r.id == id)
-                .is_none_or(|r| r.enabled);
-            match store.toggle_rule(id, !current) {
-                Ok(true) => {
-                    let st = if current { "disabled" } else { "enabled" };
-                    self.status_message = Some(format!("Stream rule '{id}' is now {st}"));
-                }
-                _ => {
-                    self.status_message = Some(format!("Stream rule '{id}' not found"));
-                }
-            }
-        } else {
-            self.status_message = Some("Usage: /rules [list|remove <id>|toggle <id>]".to_string());
         }
-
-        None
+        self.status_message = Some(report.status);
     }
 
     /// /add-dir <dir> — grant access to an additional workspace root
@@ -3730,217 +3639,20 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     }
 
     pub(super) fn handle_slash_omfg(&mut self, args: &str) -> Option<Cmd> {
-        let args = args.trim();
-        if args.is_empty() {
-            self.status_message = Some("Usage: /omfg <complaint about model behavior>".to_string());
-            return None;
-        }
-
-        let project_root = self.cwd.clone();
-        match crate::stream_rules::GrievancesLedger::record_complaint(&project_root, args, None) {
-            Ok(g) => {
-                let candidate = crate::stream_rules::GrievancesLedger::forge_candidate_rule(&g);
-                let mut store =
-                    crate::stream_rules::StreamRuleStore::load_for_project(&project_root);
-                let _ = store.add_rule(candidate.clone(), false);
-
-                let content = format!(
-                    "### 📝 Grievance Logged & Stream Rule Forged\n\n\
-                     - **Grievance ID:** `{gid}`\n\
-                     - **Complaint:** {complaint}\n\n\
-                     **Generated TTSR Stream Rule (`{rid}`):**\n\
-                     - **Name:** {name}\n\
-                     - **Pattern:** `/{pattern}/`\n\
-                     - **Directive:** {body}\n\n\
-                     *Rule is now active for this project and will abort & retry if this pattern occurs mid-stream.*",
-                    gid = g.id,
-                    complaint = g.complaint,
-                    rid = candidate.id,
-                    name = candidate.name,
-                    pattern = candidate.pattern,
-                    body = candidate.body,
-                );
-
-                self.messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content,
-                    thinking: None,
-                    collapsed: false,
-                });
-                self.scroll_to_bottom();
-                self.status_message = Some(format!(
-                    "Forged and activated stream rule '{}'",
-                    candidate.id
-                ));
-            }
-            Err(e) => {
-                self.status_message = Some(format!("Failed to record grievance: {e}"));
-            }
-        }
-
+        let report = super::workspace_reports::omfg(&self.cwd, args);
+        self.show_workspace_report(report);
         None
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_commit(&mut self, args: &str) -> Option<Cmd> {
-        let args = args.trim();
-        let dry_run = args.contains("--dry-run")
-            || args.contains("-n")
-            || args == "dry-run"
-            || args == "plan";
-        let include_lockfiles = args.contains("--include-lockfiles");
-
-        let status_out = match std::process::Command::new("git")
-            .arg("status")
-            .arg("--porcelain")
-            .current_dir(&self.cwd)
-            .output()
-        {
-            Ok(o) => o,
-            Err(e) => {
-                self.status_message = Some(format!("Failed to run git status: {e}"));
-                return None;
-            }
-        };
-
-        let status_str = String::from_utf8_lossy(&status_out.stdout);
-        let mut changed_files = Vec::new();
-        for line in status_str.lines() {
-            let trimmed = line.trim();
-            if trimmed.len() > 3 {
-                let file_path = &trimmed[3..].trim();
-                let actual_path = if let Some((_, new_p)) = file_path.split_once(" -> ") {
-                    new_p.trim()
-                } else {
-                    file_path
-                };
-                changed_files.push(actual_path.to_string());
-            }
-        }
-
-        if changed_files.is_empty() {
-            self.status_message = Some("Working tree clean; nothing to commit.".to_string());
-            return None;
-        }
-
-        let diff_out = std::process::Command::new("git")
-            .arg("diff")
-            .arg("HEAD")
-            .current_dir(&self.cwd)
-            .output()
-            .ok();
-
-        let hunks = if let Some(out) = diff_out {
-            let diff_str = String::from_utf8_lossy(&out.stdout);
-            crate::commit_split::DiffParser::parse_unified_diff(&diff_str).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        let options = crate::commit_split::CommitOptions {
-            dry_run,
-            include_lockfiles,
-            all_untracked: false,
-            bead_reference: None,
-            custom_prefix: None,
-        };
-
-        match crate::commit_split::CommitPlanner::plan(&hunks, &changed_files, &options) {
-            Ok(plan) => {
-                if plan.units.is_empty() {
-                    self.status_message = Some("No eligible files to commit.".to_string());
-                    return None;
-                }
-
-                let mut card = format!("### 📦 Planned Atomic Commits ({})\n\n", plan.units.len());
-                for (idx, unit) in plan.units.iter().enumerate() {
-                    let msg = unit.formatted_message(None);
-                    let _ = writeln!(card, "{}. **{}** (`{}`)", idx + 1, msg, unit.scope);
-                    for f in &unit.files {
-                        let _ = writeln!(card, "   - `{f}`");
-                    }
-                }
-
-                if dry_run {
-                    card.push_str("\n*Dry run: no commits were created.*");
-                } else {
-                    match crate::commit_split::CommitExecutor::execute(&self.cwd, &plan, &options) {
-                        Ok(results) => {
-                            let successful = results.iter().filter(|r| r.success).count();
-                            let _ = writeln!(
-                                card,
-                                "\n\n**Committed {successful}/{} units successfully.**",
-                                plan.units.len()
-                            );
-                            for res in results {
-                                if let Some(ref sha) = res.commit_sha {
-                                    let _ = writeln!(card, "- `[{sha}]` {}", res.message);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = write!(card, "\n\n**Error executing commits:** {e}");
-                        }
-                    }
-                }
-
-                self.messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content: card,
-                    thinking: None,
-                    collapsed: false,
-                });
-                self.scroll_to_bottom();
-                self.status_message = Some(format!(
-                    "Generated commit plan with {} units",
-                    plan.units.len()
-                ));
-            }
-            Err(e) => {
-                self.status_message = Some(format!("Failed to plan commits: {e}"));
-            }
-        }
-
+        let report = super::workspace_reports::commit(&self.cwd, args);
+        self.show_workspace_report(report);
         None
     }
 
     pub(super) fn handle_slash_review(&mut self, args: &str) -> Option<Cmd> {
-        let args = args.trim();
-        let target = if args.is_empty() {
-            None
-        } else {
-            Some(args.to_string())
-        };
-
-        let options = crate::review::ReviewOptions {
-            target,
-            fail_on: None,
-            confidence_threshold: 0.70,
-            format: "markdown".to_string(),
-            max_findings: 15,
-            out_file: None,
-        };
-
-        match crate::review::CodeReviewer::review(&self.cwd, &options) {
-            Ok(report) => {
-                let badge = report.verdict.badge();
-                let summary = report.summary.clone();
-                let markdown = report.format_markdown();
-
-                self.messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content: markdown,
-                    thinking: None,
-                    collapsed: false,
-                });
-                self.scroll_to_bottom();
-                self.status_message = Some(format!("{badge}: {summary}"));
-            }
-            Err(e) => {
-                self.status_message = Some(format!("Review failed: {e}"));
-            }
-        }
-
+        let report = super::workspace_reports::review(&self.cwd, args);
+        self.show_workspace_report(report);
         None
     }
 
@@ -4028,38 +3740,13 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     /// `/advisor` (bd-cv653.3.3): status + pause/resume for the turn-review
     /// second model.
     fn handle_slash_advisor(&mut self, args: &str) -> Option<Cmd> {
-        let sub = args.trim().to_ascii_lowercase();
         let configured = self
             .config
             .model_roles
             .as_ref()
-            .and_then(|roles| crate::app::role_spec_from_settings(roles, ModelRole::Advisor))
-            .map(str::to_string);
-        match sub.as_str() {
-            "" | "status" => {
-                let paused =
-                    crate::advisor::ADVISOR_PAUSED.load(std::sync::atomic::Ordering::SeqCst);
-                let state = match (&configured, paused) {
-                    (Some(spec), false) => format!("active on {spec}"),
-                    (Some(spec), true) => format!("configured ({spec}) but paused"),
-                    (None, _) => "not configured (set modelRoles.advisor or --advisor)".to_string(),
-                };
-                self.status_message = Some(format!("Advisor: {state}"));
-            }
-            "pause" => {
-                crate::advisor::ADVISOR_PAUSED.store(true, std::sync::atomic::Ordering::SeqCst);
-                self.status_message = Some("Advisor paused".to_string());
-            }
-            "resume" => {
-                crate::advisor::ADVISOR_PAUSED.store(false, std::sync::atomic::Ordering::SeqCst);
-                self.status_message = Some("Advisor resumed".to_string());
-            }
-            other => {
-                self.status_message = Some(format!(
-                    "Unknown /advisor subcommand {other:?}: use /advisor [status|pause|resume]"
-                ));
-            }
-        }
+            .and_then(|roles| crate::app::role_spec_from_settings(roles, ModelRole::Advisor));
+        let report = super::workspace_reports::advisor(configured, args);
+        self.show_workspace_report(report);
         None
     }
 
@@ -4373,13 +4060,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             }
         }
         for warning in manager.warnings() {
-            let _ = writeln!(
-                content,
-                "  ⚠ {}: {} ({})",
-                warning.source_file.display(),
-                warning.entry,
-                warning.reason
-            );
+            let _ = writeln!(content, "  ⚠ {warning}");
         }
         self.messages.push(ConversationMessage {
             role: MessageRole::System,
@@ -4824,6 +4505,27 @@ mod tests {
         );
     }
 
+    /// GH #242: WSL is recognized by its env vars or by the kernel release
+    /// string; a plain Linux or macOS host is not.
+    #[test]
+    fn wsl_is_detected_from_env_or_kernel_release() {
+        use super::wsl_detected;
+        assert!(wsl_detected(true, None));
+        assert!(wsl_detected(
+            false,
+            Some("5.15.153.1-microsoft-standard-WSL2\n")
+        ));
+        assert!(!wsl_detected(false, Some("6.8.0-45-generic\n")));
+        assert!(!wsl_detected(false, None));
+    }
+
+    /// clip.exe gets UTF-16LE with a BOM, so non-ASCII text survives.
+    #[test]
+    fn clip_exe_payload_is_utf16le_with_bom() {
+        let payload = super::clip_exe_payload("é!");
+        assert_eq!(payload, vec![0xFF, 0xFE, 0xE9, 0x00, 0x21, 0x00]);
+    }
+
     #[test]
     fn excluded_bash_persistence_success_reopens_exact_record() {
         let temp = TempDir::new().expect("tempdir");
@@ -5100,7 +4802,7 @@ mod tests {
             let cx = Cx::for_testing();
             asupersync::time::timeout(
                 asupersync::time::wall_now(),
-                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(30),
                 event_rx.recv(&cx),
             )
             .await
@@ -5133,7 +4835,7 @@ mod tests {
             let cx = Cx::for_testing();
             asupersync::time::timeout(
                 asupersync::time::wall_now(),
-                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(30),
                 event_rx.recv(&cx),
             )
             .await
@@ -5214,7 +4916,7 @@ mod tests {
             let cx = Cx::for_testing();
             asupersync::time::timeout(
                 asupersync::time::wall_now(),
-                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(30),
                 event_rx.recv(&cx),
             )
             .await
@@ -5606,6 +5308,51 @@ mod tests {
         assert_eq!(plan.effective, crate::model::ThinkingLevel::Off);
         assert!(!plan.thinking_changed);
         assert!(plan.persist_needed);
+    }
+
+    #[test]
+    fn every_listed_command_parses_back_to_itself() {
+        // Catches a wrong entry in ALL or a canonical spelling the parser does
+        // not actually accept. It cannot catch a variant missing from ALL —
+        // see the note there.
+        for command in SlashCommand::ALL {
+            let spelling = command.canonical();
+            let parsed = SlashCommand::parse(spelling)
+                .unwrap_or_else(|| panic!("{spelling} is listed but the parser rejects it"));
+            assert_eq!(
+                parsed.0, *command,
+                "{spelling} parses as a different command than the one that claims it"
+            );
+        }
+    }
+
+    #[test]
+    fn no_two_commands_claim_the_same_spelling() {
+        let mut spellings: Vec<&str> = SlashCommand::ALL
+            .iter()
+            .map(|command| command.canonical())
+            .collect();
+        let before = spellings.len();
+        spellings.sort_unstable();
+        spellings.dedup();
+        assert_eq!(before, spellings.len(), "duplicate canonical spelling");
+    }
+
+    #[test]
+    fn every_command_the_parser_knows_is_in_the_help_text() {
+        // `/checkpoint`, `/rewind`, `/fresh` and `/retry` shipped as working
+        // commands that `/help` never mentioned. The help text is the only
+        // place a user who does not know a command's name can find it.
+        let help = SlashCommand::help_text();
+        let missing: Vec<&str> = SlashCommand::ALL
+            .iter()
+            .map(|command| command.canonical())
+            .filter(|spelling| !help.contains(*spelling))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the parser accepts these and /help never names them: {missing:?}"
+        );
     }
 
     #[test]

@@ -3210,9 +3210,12 @@ impl ExtensionManager {
                 provider
             }));
             all_mcp_servers.extend(mcp_servers.into_iter().map(|mut server| {
+                // The owning id is part of the MCP trust identity, so it is
+                // always stamped from the snapshot and never taken from the
+                // spec: a descriptor claiming another extension's id would
+                // otherwise inherit that extension's acknowledgement.
                 if let Some(obj) = server.as_object_mut() {
-                    obj.entry("extension_id".to_string())
-                        .or_insert_with(|| Value::String(id.clone()));
+                    obj.insert("extension_id".to_string(), Value::String(id.clone()));
                 }
                 server
             }));
@@ -3335,9 +3338,12 @@ impl ExtensionManager {
                 provider
             }));
             all_mcp_servers.extend(mcp_servers.into_iter().map(|mut server| {
+                // The owning id is part of the MCP trust identity, so it is
+                // always stamped from the snapshot and never taken from the
+                // spec: a descriptor claiming another extension's id would
+                // otherwise inherit that extension's acknowledgement.
                 if let Some(obj) = server.as_object_mut() {
-                    obj.entry("extension_id".to_string())
-                        .or_insert_with(|| Value::String(id.clone()));
+                    obj.insert("extension_id".to_string(), Value::String(id.clone()));
                 }
                 server
             }));
@@ -4047,6 +4053,16 @@ impl ExtensionManager {
                     })
                 });
 
+            // Extract provider-level headers if present.
+            let mut provider_headers = HashMap::new();
+            if let Some(headers_obj) = provider_spec.get("headers").and_then(Value::as_object) {
+                for (k, v) in headers_obj {
+                    if let Some(s) = v.as_str() {
+                        provider_headers.insert(k.clone(), s.to_string());
+                    }
+                }
+            }
+
             let models = provider_spec
                 .get("models")
                 .and_then(Value::as_array)
@@ -4095,14 +4111,53 @@ impl ExtensionManager {
                         |arr| {
                             arr.iter()
                                 .filter_map(Value::as_str)
-                                .filter_map(|s| match s {
-                                    "text" => Some(InputType::Text),
-                                    "image" => Some(InputType::Image),
-                                    _ => None,
+                                .filter_map(|s| {
+                                    let parsed = InputType::parse(s);
+                                    if parsed.is_none() {
+                                        tracing::warn!(
+                                            provider = %provider_id,
+                                            model = %model_id,
+                                            input = %s,
+                                            "Extension-registered model declares an unknown input type (known: text, image, video, audio)"
+                                        );
+                                    }
+                                    parsed
                                 })
                                 .collect::<Vec<_>>()
                         },
                     );
+
+                let mut model_headers = provider_headers.clone();
+                if let Some(headers_obj) = model_spec.get("headers").and_then(Value::as_object) {
+                    for (k, v) in headers_obj {
+                        if let Some(s) = v.as_str() {
+                            model_headers.insert(k.clone(), s.to_string());
+                        }
+                    }
+                }
+
+                let cost = model_spec.get("cost").and_then(Value::as_object).map_or(
+                    ModelCost {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    |c| ModelCost {
+                        input: c.get("input").and_then(Value::as_f64).unwrap_or(0.0),
+                        output: c.get("output").and_then(Value::as_f64).unwrap_or(0.0),
+                        cache_read: c
+                            .get("cacheRead")
+                            .or_else(|| c.get("cache_read"))
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0),
+                        cache_write: c
+                            .get("cacheWrite")
+                            .or_else(|| c.get("cache_write"))
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0),
+                    },
+                );
 
                 entries.push(crate::models::ModelEntry {
                     model: Model {
@@ -4113,18 +4168,13 @@ impl ExtensionManager {
                         base_url: base_url.clone(),
                         reasoning,
                         input,
-                        cost: ModelCost {
-                            input: 0.0,
-                            output: 0.0,
-                            cache_read: 0.0,
-                            cache_write: 0.0,
-                        },
+                        cost,
                         context_window,
                         max_tokens,
-                        headers: HashMap::new(),
+                        headers: model_headers.clone(),
                     },
                     api_key: resolved_key.clone(),
-                    headers: HashMap::new(),
+                    headers: model_headers,
                     auth_header: true,
                     compat: None,
                     oauth_config: oauth_config.clone(),
@@ -4858,6 +4908,23 @@ impl ExtensionManager {
         let ctx_payload = self.get_or_build_ctx_payload().await;
 
         if let Some(runtime) = runtime {
+            // Same record `dispatch_event_value` emits, for the same reason:
+            // this is the host's own statement that an event reached
+            // extensions, and it is the only way an operator can answer "did my
+            // extension get this?". Logging it on one route and not the other
+            // made that answer depend on an internal detail — whether the event
+            // happened to be coalescable — which is invisible from outside
+            // (bd-82331). Emitted inside this branch because without a runtime
+            // nothing is dispatched and the line would be a lie.
+            for (event_name, _) in &filtered_events {
+                tracing::info!(
+                    event = "ext.event.start",
+                    event_name = %event_name,
+                    timeout_ms,
+                    batched = true,
+                    "Extension event dispatch start"
+                );
+            }
             let results = runtime
                 .dispatch_event_batch(filtered_events, ctx_payload, timeout_ms)
                 .await;

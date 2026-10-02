@@ -10,6 +10,28 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## RULE 0.5 - SUITE-WIDE RULES LIVE IN /data/projects/AGENTS.md
+
+The suite-wide rules in **`/data/projects/AGENTS.md`** bind you here too. Read it. Two sections
+are load-bearing for perf work and are NOT duplicated below, so they cannot drift out of sync:
+
+- **`## Named Reward-Hacking Patterns (ALL FORBIDDEN)`** — 12 named patterns, several already
+  observed in this suite: gate self-weakening (and the exact price of a legitimate gate fix),
+  proof-class inflation, golden regeneration reflex, commit-stream pumping, tautological tests,
+  easy-lever cherry-picking, close-pump abuse, scope-splitting, spec-editing as progress,
+  conformance metastasis, dependency smuggling, bench-path hardcoding.
+- **`### Work-Graph Discipline`** — JSONL is truth and `beads.db` is disposable, `br sync
+  --import-only` after every pull, single-writer on graph structure, closure on cited evidence
+  with blocker beads gated on their named probe, `br dep cycles` stays empty.
+
+The three that most often decide whether a number here is real: a **self-speedup is
+MAINTENANCE, not a win** — a win needs the incumbent live in the SAME invocation; **never
+weaken a gate to land a change**, and if a gate is genuinely defective, meet the evidence
+standard and publish the win/lose split of what the fix admits; and **reporting a loss is a
+success** — one line, revert, next lever, no retraction narrative.
+
+---
+
 ## RULE NUMBER 1: NO FILE DELETION
 
 **YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION.** Even a new file that you yourself created, such as a test code file. You have a horrible track record of deleting critically important files or otherwise throwing away tons of expensive work. As a result, you have permanently lost any and all rights to determine that a file or folder should be deleted.
@@ -171,6 +193,30 @@ compile, test, or quality claim.
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
 
+### Enumerate whole-tree breakage in one pass, not one error at a time
+
+Clippy stops at the first error per run, so a change that breaks many targets
+looks like one problem and then another and then another. Getting the whole
+list at once is worth the extra run:
+
+```bash
+cargo clippy --locked --all-targets --keep-going 2>&1 | grep -E 'overflow|error\[' -A2
+cargo check  --locked --all-targets --keep-going --message-format short
+```
+
+`--keep-going` builds every remaining target instead of stopping. On
+2026-09-13 an `asupersync` minor bump raised the nesting of its future types
+past rustc's default `recursion_limit` of 128, breaking nineteen targets:
+without `--keep-going` that took nine sequential clippy runs to enumerate.
+
+Two things make this class hard to recognise. `recursion_limit` is **per
+crate** and is not inherited, so `src/lib.rs` raising it does nothing for the
+binary, the examples, or any integration test — each is its own crate. And
+`cargo check` reports most of these as `future_incompatible` **warnings**
+while clippy makes them **errors**, so a green `cargo check` proves nothing
+about the gate. SDK embedders hit the same thing in their own crates; see the
+Install section of `docs/sdk.md`.
+
 ---
 
 ## Testing
@@ -224,7 +270,7 @@ Session persistence + index (JSONL, default-enabled SQLite backend support)
 | `src/providers/cohere.rs` | Cohere API implementation |
 | `src/providers/azure.rs` | Azure OpenAI API implementation |
 | `src/providers/mod.rs` | Provider factory and extension stream-simple bridge |
-| `src/tools.rs` | Tool trait, registry, and the core file/shell/search tools; other built-ins live in their own modules (35 total, tiered in `src/xdev.rs`; `subagent` is opt-in) |
+| `src/tools.rs` | Tool trait, registry, and the core file/shell/search tools; other built-ins live in their own modules (36 total, tiered in `src/xdev.rs`; `subagent` is opt-in) |
 | `src/interactive_ftui.rs` | Default FrankenTUI interactive stack (feature `ftui`, on by default) |
 | `src/interactive.rs` | Classic charmed_rust TUI application state and event loop (`--classic`) |
 | `src/rpc.rs` | RPC/stdin server mode |
@@ -253,12 +299,12 @@ Session persistence + index (JSONL, default-enabled SQLite backend support)
 - Extension-provided providers via stream-simple bridge
 - Tool definitions with JSON Schema
 
-**Built-in Tools** (35 total; the tier table is `ESSENTIAL_DEFAULTS` / `OPT_IN_ONLY` in `src/xdev.rs`, the default `--tools` list is in `src/cli.rs`, and README "35 Built-in Tools" is the user-facing inventory — keep all three in sync):
+**Built-in Tools** (36 total; the tier table is `ESSENTIAL_DEFAULTS` / `OPT_IN_ONLY` in `src/xdev.rs`, the default `--tools` list is in `src/cli.rs`, and README "36 Built-in Tools" is the user-facing inventory — keep all three in sync):
 - Essential, always in the schema: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `hashline_edit`, `ask`, `todo`, `web_search`, `submit_plan`, `current_time`, `xdev`
 - Discoverable behind `xdev`: `ast_grep`, `ast_edit`, `lsp`, `debug`, `manage_skill`, plus the memory bank (`retain`, `recall`, `reflect`, `memory_edit`, `learn`) when `memory.backend` is `local`
 - Default-enabled: `jobs`, `hub`
 - `--tools` opt-in: `eval`, `github`, `security_scan`
-- Settings-gated: `browser`, `computer`, `inspect_image`, `generate_image`, `tts`
+- Settings-gated: `browser`, `computer`, `inspect_image`, `generate_image`, `tts`, `read_media`
 - `subagent` - Native isolated Rust Pi child-agent delegation (opt-in only via `--tools ...subagent`)
 
 **Session Management:**
@@ -398,10 +444,32 @@ every commit against the active **exclusive** file reservations. It exists
 because an unattended sweeper committed another agent's unverified in-flight
 work five times in one day (last: `5d3eb35a`).
 
-- **Identify yourself:** the guard reads `AGENT_NAME` (falling back to the
-  registered pane identity). Commit and push as
-  `AGENT_NAME=<your registered agent name> git commit …`; an unidentified
-  commit is refused while any exclusive reservation is active.
+- **Identify yourself, on push as well as commit:** the guard reads
+  `AGENT_NAME` (falling back to the registered pane identity) and is installed
+  on both hooks. Use
+  `AGENT_NAME=<your registered agent name> git commit …` **and**
+  `AGENT_NAME=<your registered agent name> git push …`; an unidentified commit
+  or push is refused when it touches files under an active exclusive
+  reservation — including your own, because without `AGENT_NAME` the guard
+  cannot tell the lease is yours. The push refusal surfaces as a bare
+  `50-agent-mail.py exited with status 2`, which reads like a tool failure
+  rather than a refusal — it is the guard.
+- **Reserve EXCLUSIVELY, or the guard ignores you.** The MCP examples above
+  pass `exclusive=true`; the CLI does not default to it.
+  `am file_reservations reserve <project> <agent> <paths>` creates a SHARED
+  lease unless you pass `--exclusive`, and `50-agent-mail.py` skips every
+  reservation whose `exclusive` is not exactly true. A shared reservation
+  announces intent and blocks nothing. Verified by running the hook both ways
+  against a live reservation: exclusive refuses and names the holder, shared
+  exits 0 silently (bd-0x31m).
+- **Give the lease longer than a gate run.** The 3600s default is shorter than
+  the work it protects: `clippy --all-targets` alone ran 4–22 minutes across
+  this session depending on cache warmth, a three-check cycle 25–45, and a
+  change usually needs two or three cycles before it is committable.
+  A lease taken when you start routinely expires before you commit. Use
+  `--ttl 14400` for a session that will run dsr, or renew while you wait. On
+  2026-09-11 a lease on three files expired at 02:47:01Z and the sweeper
+  committed those exact three files at 02:47:18Z.
 - **Never commit into someone else's reservation.** If the guard names a
   holder, coordinate in the bead thread or wait for the lease to expire; do
   not bypass it to land your slice.
@@ -411,6 +479,28 @@ work five times in one day (last: `5d3eb35a`).
   and `AGENT_MAIL_BYPASS=1` (skip) are for the operator, not for agents.
 - The hook files live under `.git/` and are not versioned; reinstall with the
   agent-mail `install_precommit_guard` tool if a fresh clone lacks them.
+- **The guard fails OPEN, and its failure looks like success.** If your commit
+  prints
+
+      WARNING: mcp-agent-mail: no agent-mail archive matches project
+      '/Users/jemanuel/projects/pi_agent_rust'; nothing to guard, allowing
+
+  that does not mean the project is unregistered. It may mean the mailbox
+  database is unreadable, and the guard allows the commit either way. Nothing
+  else signals it, so from the outside an inert guard is indistinguishable
+  from a working one. On 2026-09-21 it had been inert for six days
+  (bd-n0lnc). Diagnose it rather than reading past the line:
+
+      cat ~/.mcp_agent_mail_git_mailbox_repo/.mailbox.activity.lock   # pid, acquired_at
+      ps -p <pid>                                                     # still alive?
+      cat ~/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3.am-recovery-breaker.json
+      ls  ~/.mcp_agent_mail_git_mailbox_repo/*.corrupt-*
+
+  If a live `am` process holds the exclusive storage-root lock, **do not kill
+  it** — a half-finished recovery is how the corrupt snapshots in that
+  directory got there. Escalate to the operator, and until it clears treat
+  reservations as unavailable: announce intent in the bead thread instead, and
+  do not rely on the guard to stop you landing in someone else's file.
 
 ---
 

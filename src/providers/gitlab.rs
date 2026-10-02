@@ -291,12 +291,10 @@ fn user_content_text(content: &UserContent) -> String {
         UserContent::Text(text) => text.clone(),
         UserContent::Blocks(blocks) => blocks
             .iter()
-            .filter_map(|block| {
-                if let ContentBlock::Text(text) = block {
-                    Some(text.text.as_str())
-                } else {
-                    None
-                }
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.text.clone()),
+                ContentBlock::Media(media) => Some(media.placeholder()),
+                _ => None,
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -307,13 +305,16 @@ fn text_block_bytes<'a>(blocks: impl Iterator<Item = &'a ContentBlock>) -> usize
     let mut total = 0usize;
     let mut text_blocks = 0usize;
     for block in blocks {
-        if let ContentBlock::Text(text) = block {
-            if text_blocks > 0 {
-                total = total.saturating_add(1);
-            }
-            total = total.saturating_add(text.text.len());
-            text_blocks = text_blocks.saturating_add(1);
+        let len = match block {
+            ContentBlock::Text(text) => text.text.len(),
+            ContentBlock::Media(media) => media.placeholder().len(),
+            _ => continue,
+        };
+        if text_blocks > 0 {
+            total = total.saturating_add(1);
         }
+        total = total.saturating_add(len);
+        text_blocks = text_blocks.saturating_add(1);
     }
     total
 }
@@ -707,8 +708,45 @@ mod tests {
     use crate::model::{ImageContent, UserMessage};
     use crate::provider::ToolDef;
     use std::io::{ErrorKind, Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::time::{Duration, Instant};
+
+    /// Polling interval for a fixture socket read. NOT the budget — see
+    /// [`read_with_deadline`].
+    const FIXTURE_POLL: Duration = Duration::from_millis(250);
+    /// Wall-clock budget for one fixture request.
+    const FIXTURE_BUDGET: Duration = Duration::from_secs(30);
+
+    /// Read into `chunk`, treating a socket read timeout as "keep waiting"
+    /// until `deadline` rather than as a hard error.
+    ///
+    /// macOS surfaces a read timeout as EAGAIN/`WouldBlock` (errno 35), not
+    /// `TimedOut`, so `read().expect(..)` failed the test outright whenever a
+    /// client had merely not been scheduled in time. These fixtures allowed two
+    /// seconds, which is nothing under a parallel lib suite: the same shape
+    /// took seven tests out of the Gemini and Vertex fixtures before it was
+    /// fixed there (bd-eg6ng). The accept loops above have always been patient
+    /// this way; the reads were not.
+    fn read_with_deadline(
+        socket: &mut TcpStream,
+        chunk: &mut [u8],
+        deadline: Instant,
+        what: &str,
+    ) -> usize {
+        loop {
+            match socket.read(chunk) {
+                Ok(count) => return count,
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture timed out waiting for {what}"
+                    );
+                }
+                // ubs:ignore an unexpected socket error in a fixture is an assertion failure
+                Err(err) => panic!("{what}: {err}"),
+            }
+        }
+    }
 
     // Ownership is part of the call contract here: consuming the listener
     // closes it after the single accepted connection.
@@ -729,15 +767,16 @@ mod tests {
             }
         };
         socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(FIXTURE_POLL))
             .expect("set request read timeout");
         socket
             .set_write_timeout(Some(Duration::from_secs(2)))
             .expect("set response write timeout");
+        let deadline = Instant::now() + FIXTURE_BUDGET;
         let mut request = Vec::new();
         let mut chunk = [0_u8; 4096];
         while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-            let read = socket.read(&mut chunk).expect("read request");
+            let read = read_with_deadline(&mut socket, &mut chunk, deadline, "read request");
             if read == 0 {
                 break;
             }
@@ -1316,12 +1355,13 @@ mod tests {
                 }
             };
             socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(FIXTURE_POLL))
                 .expect("set request read timeout");
+            let deadline = Instant::now() + FIXTURE_BUDGET;
             let mut request = Vec::new();
             let mut chunk = [0_u8; 4096];
             while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let read = socket.read(&mut chunk).expect("read request");
+                let read = read_with_deadline(&mut socket, &mut chunk, deadline, "read request");
                 if read == 0 {
                     break;
                 }

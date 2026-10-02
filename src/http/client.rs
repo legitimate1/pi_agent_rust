@@ -602,19 +602,34 @@ async fn send_parts(
     BoxStream<'static, std::io::Result<Vec<u8>>>,
 )> {
     let parsed = ParsedUrl::parse(url).map_err(|e| Error::api(format!("Invalid URL: {e}")))?;
-    // #210: a configured proxy applies to every request this client makes.
-    // `https://` goes through a CONNECT tunnel (so TLS is still end-to-end to
-    // the origin); `http://` uses the absolute-form request line.
+    // The same resolved endpoint governs connection establishment and HTTP
+    // serialization. SOCKS5 tunnels both schemes; only a plain HTTP proxy
+    // uses absolute-form requests and Proxy-Authorization on the HTTP hop.
     let proxy_config = crate::http::proxy::active();
     let proxy = proxy_config.endpoint_for(
         matches!(parsed.scheme, Scheme::Https),
         &parsed.host,
         parsed.port,
     );
-    let mut transport = connect_transport(&parsed, client, proxy).await?;
+    send_parts_with_proxy(client, method, &parsed, headers, body, proxy).await
+}
+
+async fn send_parts_with_proxy(
+    client: &Client,
+    method: Method,
+    parsed: &ParsedUrl,
+    headers: &[(String, String)],
+    body: &[u8],
+    proxy: Option<&ProxyEndpoint>,
+) -> Result<(
+    u16,
+    Vec<(String, String)>,
+    BoxStream<'static, std::io::Result<Vec<u8>>>,
+)> {
+    let mut transport = connect_transport(parsed, client, proxy).await?;
 
     let request_bytes =
-        build_request_bytes(method, &parsed, &client.user_agent, headers, body, proxy);
+        build_request_bytes(method, parsed, &client.user_agent, headers, body, proxy);
     write_all_with_retry(&mut transport, &request_bytes).await?;
     if !body.is_empty() {
         write_all_with_retry(&mut transport, body).await?;
@@ -749,7 +764,6 @@ impl Response {
         &self.headers
     }
 
-    #[must_use]
     pub fn bytes_stream(self) -> Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>> {
         wrap_stream_with_idle_timeout(self.stream, self.timeout_info)
     }
@@ -908,8 +922,8 @@ async fn connect_transport_once(
     client: &Client,
     proxy: Option<&ProxyEndpoint>,
 ) -> std::result::Result<Transport, ConnectAttemptError> {
-    // With a proxy the TCP hop terminates at the proxy; the origin host is
-    // named in the CONNECT request (https) or the request line (http).
+    // With a proxy the TCP hop terminates at the proxy; destination DNS and
+    // tunnelling follow its protocol. No failed proxy path falls back direct.
     let addr = proxy.map_or_else(
         || (parsed.host.clone(), parsed.port),
         |proxy| (proxy.host.clone(), proxy.port),
@@ -922,7 +936,14 @@ async fn connect_transport_once(
         })?;
     let tcp =
         match (proxy, parsed.scheme) {
-            // Plain-HTTP origin through a proxy: no tunnel, absolute-form request.
+            (Some(proxy), _) if !proxy.is_http() => proxy
+                .connect_socks5(tcp, &parsed.host, parsed.port)
+                .await
+                .map_err(|error| ConnectAttemptError {
+                    retryable_not_connected: is_retryable_not_connected(&error),
+                    error: Error::from(error),
+                })?,
+            // Plain-HTTP origin through an HTTP proxy: no tunnel, absolute form.
             (Some(_), Scheme::Http) | (None, _) => tcp,
             (Some(proxy), Scheme::Https) => proxy_connect_tunnel(tcp, parsed, proxy)
                 .await
@@ -1118,10 +1139,10 @@ fn build_request_bytes(
     let effective_user_agent =
         sanitize_header_value(header_value(headers, "user-agent").unwrap_or(user_agent));
     let host_header = host_header_value(parsed);
-    // #210: a plain-HTTP request through a proxy carries the absolute URI in
-    // the request line (RFC 9112 §3.2.2). An https request is already inside a
-    // CONNECT tunnel by this point and uses origin form as usual.
-    let proxy_absolute_form = proxy.is_some() && matches!(parsed.scheme, Scheme::Http);
+    // Only a plain HTTP origin through an HTTP proxy uses absolute form.
+    // HTTPS CONNECT and both SOCKS5 origin schemes are already tunnelled.
+    let proxy_absolute_form =
+        proxy.is_some_and(ProxyEndpoint::is_http) && matches!(parsed.scheme, Scheme::Http);
     let request_target = if proxy_absolute_form {
         format!("http://{host_header}{}", parsed.path)
     } else {
@@ -1159,9 +1180,9 @@ fn build_request_bytes(
             // This client only emits fixed-length request bodies, so
             // caller-supplied transfer codings would lie about the wire format.
             || clean_name.eq_ignore_ascii_case("transfer-encoding")
-            // The proxy hop owns this header (#210); a caller-supplied copy
-            // would duplicate or contradict the configured credentials.
-            || (proxy_absolute_form && clean_name.eq_ignore_ascii_case("proxy-authorization"))
+            // Proxy credentials belong exclusively to the configured HTTP hop.
+            // Never forward a caller-supplied copy to a direct or tunnelled origin.
+            || clean_name.eq_ignore_ascii_case("proxy-authorization")
         {
             continue;
         }
@@ -1256,7 +1277,7 @@ fn parse_response_head(head: &[u8]) -> Result<(u16, Vec<(String, String)>)> {
         .ok_or_else(|| Error::api("Invalid HTTP status line"))?;
     let status_str = parts
         .next()
-        .ok_or_else(|| Error::api("Invalid HTTP status line"))?;
+        .ok_or_else(|| Error::api("Invalid HTTP status code"))?;
     let status: u16 = status_str
         .parse()
         .map_err(|_| Error::api("Invalid HTTP status code"))?;
@@ -3030,5 +3051,396 @@ mod tests {
         let bytes = build_request_bytes(Method::Get, &parsed, &ua, &[], &[], None);
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains(&format!("User-Agent: {ua}\r\n")));
+    }
+
+    // ── body-idle timeout (gh #213: stalled / disconnected provider streams) ──
+
+    type ByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>>;
+
+    fn now() -> asupersync::Time {
+        asupersync::Cx::current()
+            .and_then(|cx| cx.timer_driver())
+            .map_or_else(asupersync::time::wall_now, |timer| timer.now())
+    }
+
+    /// Build the wrapped stream *inside* the runtime (so `now()` and the
+    /// wrapper's clock agree) and collect items, stopping after the first
+    /// error: the wrapper keeps reporting the timeout on every poll after
+    /// it fires, and a consumer that kept polling would be the bug.
+    fn drain(build: impl FnOnce() -> ByteStream + Send + 'static) -> Vec<std::io::Result<Vec<u8>>> {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async move {
+            let mut stream = build();
+            let mut out = Vec::new();
+            while let Some(item) = stream.next().await {
+                let failed = item.is_err();
+                out.push(item);
+                if failed {
+                    break;
+                }
+            }
+            out
+        })
+    }
+
+    /// A provider that sends one chunk and then goes silent forever (a
+    /// stalled upstream, a half-open connection) must not hang the turn:
+    /// the idle bound fires and surfaces a named timeout error.
+    #[test]
+    fn idle_timeout_fires_when_body_stalls() {
+        let items = drain(|| {
+            let stalled: ByteStream = Box::pin(
+                futures::stream::once(async { Ok(b"data: hello\n\n".to_vec()) })
+                    .chain(futures::stream::pending()),
+            );
+            wrap_stream_with_idle_timeout(
+                stalled,
+                Some((now(), std::time::Duration::from_millis(50))),
+            )
+        });
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0].as_ref().expect("first chunk"), b"data: hello\n\n");
+        let err = items[1]
+            .as_ref()
+            .expect_err("stall must surface as an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(
+            err.to_string()
+                .contains("Request timed out reading body stream"),
+            "{err}"
+        );
+    }
+
+    /// The bound is an *idle* bound, not a total-duration bound: a slow but
+    /// live stream whose gaps each stay under the limit must run to
+    /// completion even when the whole body takes longer than the limit.
+    #[test]
+    fn idle_timeout_resets_on_each_chunk() {
+        let items = drain(|| {
+            let slow: ByteStream = Box::pin(futures::stream::unfold(0u8, |i| async move {
+                if i == 5 {
+                    return None;
+                }
+                asupersync::time::sleep(now(), std::time::Duration::from_millis(30)).await;
+                Some((Ok(vec![i]), i + 1))
+            }));
+            wrap_stream_with_idle_timeout(
+                slow,
+                Some((now(), std::time::Duration::from_millis(100))),
+            )
+        });
+        let chunks: Vec<Vec<u8>> = items
+            .into_iter()
+            .map(|item| item.expect("live stream must not time out"))
+            .collect();
+        assert_eq!(chunks, vec![vec![0], vec![1], vec![2], vec![3], vec![4]]);
+    }
+
+    /// A transport error from the underlying stream passes through
+    /// unchanged (kind and message); with no timeout configured the stream
+    /// is returned untouched and ends on EOF without a synthetic item.
+    #[test]
+    fn idle_timeout_wrapper_passes_through_errors_and_eof() {
+        let items = drain(|| {
+            let reset: ByteStream = Box::pin(futures::stream::iter(vec![
+                Ok(b"a".to_vec()),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "peer reset",
+                )),
+            ]));
+            wrap_stream_with_idle_timeout(reset, Some((now(), std::time::Duration::from_secs(5))))
+        });
+        assert_eq!(items.len(), 2, "{items:?}");
+        let err = items[1].as_ref().expect_err("reset must pass through");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+        assert_eq!(err.to_string(), "peer reset");
+
+        let items = drain(|| {
+            let plain: ByteStream = Box::pin(futures::stream::iter(vec![
+                Ok(b"x".to_vec()),
+                Ok(b"y".to_vec()),
+            ]));
+            wrap_stream_with_idle_timeout(plain, None)
+        });
+        let chunks: Vec<Vec<u8>> = items
+            .into_iter()
+            .map(|item| item.expect("plain stream"))
+            .collect();
+        assert_eq!(chunks, vec![b"x".to_vec(), b"y".to_vec()]);
+    }
+
+    #[test]
+    fn socks_requests_use_origin_form_and_never_forward_proxy_authorization() {
+        let socks = test_proxy("socks5h://user:password@127.0.0.1:1080");
+        let http = test_proxy("http://user:password@127.0.0.1:8080");
+        let headers = vec![
+            (
+                "Proxy-Authorization".to_string(),
+                "DO-NOT-FORWARD".to_string(),
+            ),
+            (
+                "Authorization".to_string(),
+                "Bearer origin-token".to_string(),
+            ),
+        ];
+        for url in [
+            "http://origin.invalid/v1?x=1",
+            "https://origin.invalid/v1?x=1",
+        ] {
+            let parsed = ParsedUrl::parse(url).unwrap();
+            for proxy in [None, Some(&socks), Some(&http)] {
+                let wire = String::from_utf8(build_request_bytes(
+                    Method::Get,
+                    &parsed,
+                    "test",
+                    &headers,
+                    &[],
+                    proxy,
+                ))
+                .unwrap();
+                assert!(!wire.contains("DO-NOT-FORWARD"));
+                assert!(wire.contains("Authorization: Bearer origin-token\r\n"));
+                let absolute = proxy.is_some_and(ProxyEndpoint::is_http)
+                    && matches!(parsed.scheme, Scheme::Http);
+                if absolute {
+                    assert!(wire.starts_with("GET http://origin.invalid/v1?x=1 HTTP/1.1\r\n"));
+                    assert_eq!(wire.matches("Proxy-Authorization:").count(), 1);
+                } else {
+                    assert!(wire.starts_with("GET /v1?x=1 HTTP/1.1\r\n"));
+                    assert!(!wire.to_ascii_lowercase().contains("proxy-authorization"));
+                }
+            }
+        }
+    }
+
+    fn socks_fixture(
+        handle: impl FnOnce(std::net::TcpStream) + Send + 'static,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let thread = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            started.elapsed() < std::time::Duration::from_secs(5),
+                            "proxy accept timed out"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("proxy accept failed: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            handle(socket);
+        });
+        (address, thread)
+    }
+
+    fn fixture_read(socket: &mut std::net::TcpStream, count: usize) -> Vec<u8> {
+        let mut bytes = vec![0; count];
+        std::io::Read::read_exact(socket, &mut bytes).unwrap();
+        bytes
+    }
+
+    fn fixture_write(socket: &mut std::net::TcpStream, bytes: &[u8]) {
+        std::io::Write::write_all(socket, bytes).unwrap();
+    }
+
+    fn fixture_greeting(socket: &mut std::net::TcpStream, authenticated: bool) {
+        let method = if authenticated { 2 } else { 0 };
+        assert_eq!(fixture_read(socket, 3), [5, 1, method]);
+        fixture_write(socket, &[5, method]);
+        if authenticated {
+            assert_eq!(
+                fixture_read(socket, 9),
+                [1, 3, b'u', b':', b'x', 3, b'p', 0xff, 0]
+            );
+            fixture_write(socket, &[1, 0]);
+        }
+    }
+
+    fn fixture_domain_connect(socket: &mut std::net::TcpStream, port: u16) {
+        assert_eq!(fixture_read(socket, 5), [5, 1, 0, 3, 20]);
+        assert_eq!(fixture_read(socket, 20), b"unresolvable.invalid");
+        assert_eq!(fixture_read(socket, 2), port.to_be_bytes());
+    }
+
+    fn fixture_http_head(socket: &mut std::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            assert!(bytes.len() < MAX_HEADER_BYTES);
+            bytes.extend(fixture_read(socket, 1));
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn socks_request(url: &str, proxy: &ProxyEndpoint) -> Result<Vec<u8>> {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let client = Client::new();
+            let parsed = ParsedUrl::parse(url).unwrap();
+            let headers = vec![
+                (
+                    "Authorization".to_string(),
+                    "Bearer origin-token".to_string(),
+                ),
+                (
+                    "Proxy-Authorization".to_string(),
+                    "DO-NOT-FORWARD".to_string(),
+                ),
+            ];
+            crate::text_completion::with_timeout(std::time::Duration::from_secs(5), async {
+                let (status, headers, stream) = send_parts_with_proxy(
+                    &client,
+                    Method::Get,
+                    &parsed,
+                    &headers,
+                    &[],
+                    Some(proxy),
+                )
+                .await?;
+                assert_eq!(status, 200);
+                Response {
+                    status,
+                    headers,
+                    stream,
+                    timeout_info: None,
+                }
+                .bytes_limited(1024)
+                .await
+            })
+            .await
+            .map_err(|_| Error::api("SOCKS fixture request timed out"))?
+        })
+    }
+
+    #[test]
+    fn socks5h_loopback_proxy_preserves_chunked_origin_bytes_and_remote_dns() {
+        let (address, server) = socks_fixture(|mut socket| {
+            fixture_greeting(&mut socket, false);
+            fixture_domain_connect(&mut socket, 80);
+            // Coalesce the SOCKS reply and origin response deliberately: the
+            // negotiation must not consume the HTTP head's first bytes.
+            let mut response = vec![5, 0, 0, 1, 127, 0, 0, 1, 0, 80];
+            response.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\nD\r\ndata: ready\n\n\r\n0\r\n\r\n");
+            fixture_write(&mut socket, &response);
+            let head = fixture_http_head(&mut socket);
+            assert!(head.starts_with("GET /v1?stream=true HTTP/1.1\r\n"));
+            assert!(head.contains("Host: unresolvable.invalid\r\n"));
+            assert!(head.contains("Authorization: Bearer origin-token\r\n"));
+            assert!(!head.to_ascii_lowercase().contains("proxy-authorization"));
+        });
+        let proxy = test_proxy(&format!("socks5h://{address}"));
+        let result = socks_request("http://unresolvable.invalid/v1?stream=true", &proxy);
+        server.join().unwrap();
+        assert_eq!(result.unwrap(), b"data: ready\n\n");
+    }
+
+    #[test]
+    fn authenticated_socks_proxy_preserves_octets_and_binary_ipv6_destination() {
+        let (address, server) = socks_fixture(|mut socket| {
+            fixture_greeting(&mut socket, true);
+            let connect = fixture_read(&mut socket, 22);
+            assert_eq!(&connect[..4], &[5, 1, 0, 4]);
+            assert_eq!(&connect[4..20], &std::net::Ipv6Addr::LOCALHOST.octets());
+            assert_eq!(&connect[20..], &9000_u16.to_be_bytes());
+            fixture_write(&mut socket, &[5, 0, 0, 1, 127, 0, 0, 1, 0, 80]);
+            let head = fixture_http_head(&mut socket);
+            assert!(head.starts_with("GET /api HTTP/1.1\r\n"));
+            assert!(head.contains("Host: [::1]:9000\r\n"));
+            assert!(!head.contains("DO-NOT-FORWARD"));
+            assert!(!head.to_ascii_lowercase().contains("proxy-authorization"));
+            fixture_write(
+                &mut socket,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            );
+        });
+        let proxy = test_proxy(&format!("socks5://u%3Ax:p%FF%00@{address}"));
+        let result = socks_request("http://[::1]:9000/api", &proxy);
+        server.join().unwrap();
+        assert_eq!(result.unwrap(), b"ok");
+    }
+
+    #[test]
+    fn refused_socks_destination_never_falls_back_to_direct_origin() {
+        let origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        origin.set_nonblocking(true).unwrap();
+        let destination = origin.local_addr().unwrap();
+        let (address, server) = socks_fixture(move |mut socket| {
+            fixture_greeting(&mut socket, false);
+            let connect = fixture_read(&mut socket, 10);
+            assert_eq!(&connect[..8], &[5, 1, 0, 1, 127, 0, 0, 1]);
+            assert_eq!(&connect[8..], &destination.port().to_be_bytes());
+            fixture_write(&mut socket, &[5, 5, 0, 1]);
+            let mut byte = [0];
+            assert_eq!(std::io::Read::read(&mut socket, &mut byte).unwrap(), 0);
+        });
+        let proxy = test_proxy(&format!("socks5h://{address}"));
+        let result = socks_request(&format!("http://{destination}/must-not-run"), &proxy);
+        server.join().unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("SOCKS5 destination refused")
+        );
+        assert_eq!(
+            origin.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn socks_auth_downgrade_closes_socket_before_credentials_or_http_are_sent() {
+        let (address, server) = socks_fixture(|mut socket| {
+            assert_eq!(fixture_read(&mut socket, 3), [5, 1, 2]);
+            fixture_write(&mut socket, &[5, 0]);
+            let mut byte = [0];
+            assert_eq!(std::io::Read::read(&mut socket, &mut byte).unwrap(), 0);
+        });
+        let proxy = test_proxy(&format!("socks5h://u%3Ax:p%FF%00@{address}"));
+        let result = socks_request("http://unresolvable.invalid/v1", &proxy);
+        server.join().unwrap();
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("authentication method"));
+        assert!(!error.contains("u:x"));
+    }
+
+    #[test]
+    fn https_over_socks_starts_origin_tls_instead_of_plaintext_http() {
+        let (address, server) = socks_fixture(|mut socket| {
+            fixture_greeting(&mut socket, false);
+            fixture_domain_connect(&mut socket, 443);
+            fixture_write(&mut socket, &[5, 0, 0, 1, 127, 0, 0, 1, 1, 187]);
+            let record = fixture_read(&mut socket, 5);
+            assert_eq!(record[0], 22, "TLS handshake record, never GET or CONNECT");
+            assert_eq!(record[1], 3);
+            // This fixture is not a TLS endpoint. Drop it after observing the
+            // ClientHello; the client must report TLS failure, not send HTTP.
+        });
+        let proxy = test_proxy(&format!("socks5h://{address}"));
+        let result = socks_request("https://unresolvable.invalid/v1", &proxy);
+        server.join().unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TLS connect failed")
+        );
     }
 }

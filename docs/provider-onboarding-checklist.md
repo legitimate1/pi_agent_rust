@@ -381,10 +381,10 @@ cargo test openai
 cargo test gemini
 
 # Contract tests
-cargo test provider_native_contract
+cargo test --test provider_native_contract
 
 # Streaming conformance
-cargo test provider_streaming
+cargo test --test provider_streaming
 ```
 
 ---

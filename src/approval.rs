@@ -31,6 +31,10 @@ use crate::extensions::DangerousCommandClass;
 use crate::plan::PlanState;
 use crate::tools::ToolEffects;
 
+mod scope;
+pub(crate) use scope::append_files_declaration;
+use scope::plan_covers_target;
+
 /// Top-level tool approval mode (bd-cv653.3.19).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -197,6 +201,9 @@ pub struct ApprovalState {
     plan_yolo: Arc<AtomicBool>,
     dual_confirm_classes: Arc<RwLock<Vec<DangerousCommandClass>>>,
     confirmed_tokens: Arc<Mutex<HashSet<String>>>,
+    /// Set when a tool call needed approval and the session had no surface
+    /// that could ever grant it (gh #224).
+    surface_unavailable: Arc<AtomicBool>,
 }
 
 impl Default for ApprovalState {
@@ -218,7 +225,27 @@ impl ApprovalState {
             plan_yolo: Arc::new(AtomicBool::new(plan_yolo)),
             dual_confirm_classes: Arc::new(RwLock::new(dual_confirm_classes)),
             confirmed_tokens: Arc::new(Mutex::new(HashSet::new())),
+            surface_unavailable: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Record that a tool call required approval while this session had no
+    /// surface capable of granting it (gh #224).
+    ///
+    /// A denial for that reason is not a decision anyone made: it means the
+    /// run could never have used tools at all. Non-interactive hosts read this
+    /// back at the end of the run so they can fail loudly instead of exiting
+    /// zero on a turn that silently did nothing.
+    pub fn mark_surface_unavailable(&self) {
+        self.surface_unavailable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether any approval was denied purely because no surface existed.
+    #[must_use]
+    pub fn surface_was_unavailable(&self) -> bool {
+        self.surface_unavailable
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Get current active approval mode.
@@ -383,11 +410,14 @@ impl ApprovalState {
         // write to ~/.ssh/authorized_keys or .git/hooks.
         if self.plan_yolo()
             && let Some(plan) = plan_state
-            && plan.mode() == crate::plan::PlanMode::Approved
+            // Only built-ins whose mutation target is exactly `path` may
+            // inherit this grant. An arbitrary tool can have other targets.
+            && matches!(tool_name, "write" | "edit" | "hashline_edit")
             && (effects.writes() || effects.appends())
             && !effects.processes()
             && !effects.networks()
-            && plan_covers_target(plan.plan().as_deref(), tool_args)
+            && let Some(text) = plan.approved_plan()
+            && plan_covers_target(Some(&text), tool_args)
         {
             return ApprovalEvaluation::AutoApproved {
                 mode,
@@ -472,75 +502,6 @@ impl ApprovalState {
             }),
         }
     }
-}
-
-/// Does the approved plan's `Files:` scope cover this mutation target?
-///
-/// Fail closed: a plan with no parsable `Files:` line, or a tool call with
-/// no `path` argument, is NOT auto-approved — it falls through to the
-/// graduated approval mode (i.e. the user is asked).
-fn plan_covers_target(plan_text: Option<&str>, tool_args: &serde_json::Value) -> bool {
-    let Some(text) = plan_text else { return false };
-    let entries = parse_plan_files(text);
-    if entries.is_empty() {
-        return false;
-    }
-    let Some(path) = tool_args.get("path").and_then(serde_json::Value::as_str) else {
-        return false;
-    };
-    let normalized = path.trim_start_matches("./");
-    entries
-        .iter()
-        .any(|entry| plan_entry_matches(entry, normalized))
-}
-
-/// Extract the file scope from a plan's `Files:` line(s): comma or
-/// whitespace separated entries, case-insensitive key match.
-fn parse_plan_files(plan_text: &str) -> Vec<String> {
-    let mut entries = Vec::new();
-    for line in plan_text.lines() {
-        let trimmed = line.trim();
-        let Some(rest) = trimmed
-            .strip_prefix("Files:")
-            .or_else(|| trimmed.strip_prefix("files:"))
-        else {
-            continue;
-        };
-        for token in rest.split([',', ' ', '\t']) {
-            let token = token.trim().trim_start_matches("./");
-            if !token.is_empty() {
-                entries.push(token.to_string());
-            }
-        }
-    }
-    entries
-}
-
-/// Match one plan entry against a target path: exact, directory prefix, or
-/// a simple `*` glob (segments must appear in order; anchored at both ends).
-fn plan_entry_matches(entry: &str, path: &str) -> bool {
-    if entry.contains('*') {
-        let segments: Vec<&str> = entry.split('*').collect();
-        let (Some(first), Some(last)) = (segments.first(), segments.last()) else {
-            return false;
-        };
-        if !path.starts_with(first) || !path.ends_with(last) {
-            return false;
-        }
-        let mut cursor = 0usize;
-        for segment in &segments {
-            if segment.is_empty() {
-                continue;
-            }
-            match path[cursor..].find(segment) {
-                Some(found) => cursor += found + segment.len(),
-                None => return false,
-            }
-        }
-        return true;
-    }
-    let dir_prefix = entry.trim_end_matches('/');
-    path == entry || path.starts_with(&format!("{dir_prefix}/"))
 }
 
 #[cfg(test)]
@@ -774,7 +735,7 @@ mod tests {
     fn plan_files_scope_matching() {
         let plan =
             "Goal: refactor\nFiles: src/main.rs, src/tools/, tests/*.rs\nVerification: cargo test";
-        let files = super::parse_plan_files(plan);
+        let files = super::scope::parse_plan_files(plan);
         assert_eq!(files, vec!["src/main.rs", "src/tools/", "tests/*.rs"]);
         let covers = |path: &str| super::plan_covers_target(Some(plan), &json!({ "path": path }));
         assert!(covers("src/main.rs"));

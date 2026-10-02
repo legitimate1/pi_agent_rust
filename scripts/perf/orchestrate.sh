@@ -1118,9 +1118,15 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
       bench_name="${CRITERION_BENCHES[$bench]}"
       bench_build_args=(bench --bench "$bench_name" --no-run --profile "$CARGO_PROFILE")
       if [[ "$bench" == "criterion_pijs" ]]; then
+        # Exactly CANONICAL_PIJS_PERF_FEATURES (src/perf_build.rs:44). The gate
+        # compares compiled_features by EXACT slice equality
+        # (matches_canonical_pijs_perf_features), so one extra feature makes
+        # every record it emits inadmissible. `tui` used to be in this list and
+        # is not in the constant; see the header comment on the second copy of
+        # these flags below.
         bench_build_args+=(
           --no-default-features
-          --features clipboard,image,image-resize,sqlite-sessions,tui,wasm-host
+          --features clipboard,image,image-resize,sqlite-sessions,wasm-host
         )
       fi
       if "${PHASE2_RUNNER_ARGS[@]}" "${bench_build_args[@]}" 2>>"$OUTPUT_DIR/logs/build_benches.log"; then
@@ -2265,8 +2271,20 @@ run_test_suite() {
         || exit_code=$?
     fi
 
-    if [[ "$exit_code" -eq 0 ]] \
-      && ! verify_current_clean_source_identity "RCH extension benchmark postcondition"; then
+    # Re-verify source identity whether or not the benchmark succeeded.
+    #
+    # This used to be gated on `exit_code -eq 0`, which skipped the check in
+    # exactly the case it exists to catch: drift DURING the invocation makes
+    # the invocation itself fail, because rch rejects the now-stale
+    # `--base` pin (the fake toolchain models this with exit 67, "strict RCH
+    # execution used an invalid clean committed-source pin"). The orchestrator
+    # then read that as an ordinary suite failure, carried on through artifact
+    # collection and Phases 5 through 5g, and finalized seven artifacts
+    # derived from a tree whose HEAD had already moved. Only the much later
+    # `RCH checksum precondition` noticed, long after the evidence was
+    # written. A source-identity violation outranks whatever the benchmark
+    # reported, so it overrides the exit code unconditionally (bd-b3yao).
+    if ! verify_current_clean_source_identity "RCH extension benchmark postcondition"; then
       exit_code=91
     fi
 
@@ -2730,9 +2748,21 @@ run_criterion_bench() {
     criterion_runner_args=("${PERF_BENCH_RUNNER_ARGS[@]}")
   fi
   if [[ "$suite_name" == "criterion_pijs" ]]; then
+    # These features must equal CANONICAL_PIJS_PERF_FEATURES
+    # (src/perf_build.rs:44) exactly: clipboard, image, image-resize,
+    # sqlite-sessions, wasm-host. `matches_canonical_pijs_perf_features`
+    # compares the compiled set by slice equality, so ONE extra feature sets
+    # eligible_for_regression_gate=false and confidence="medium", and
+    # validate_pijs_gate_classification then rejects the record --
+    # which is what `tui` was doing here since 950827f74 (2026-08-25), twenty
+    # days after the constant was introduced without it. The measurement
+    # boundary is `production_extension_manager`; a terminal UI is not part of
+    # it. Verified empirically: this exact set yields
+    # eligible_for_regression_gate=true, confidence="high", and both
+    # tool_call budgets PASS.
     criterion_cargo_args+=(
       --no-default-features
-      --features clipboard,image,image-resize,sqlite-sessions,tui,wasm-host
+      --features clipboard,image,image-resize,sqlite-sessions,wasm-host
       --
       --regression-gate-pair
     )
@@ -4583,6 +4613,21 @@ else
 fi
 
 # ─── Phase 5f: Phase-1 matrix validation ────────────────────────────────────
+#
+# CONTRACT (bd-b3yao.2): the phase-1 matrix artifact is DIAGNOSTIC, and is
+# written before the lineage and malformed-source-row rejections that follow.
+# A run rejected for foreign lineage or a bad source row still leaves
+# results/phase1_matrix_validation.json behind, so the rejection can be
+# explained from the artifacts rather than only from the console. This is why
+# orchestrate_rejects_foreign_source_lineage_before_finalization and
+# orchestrate_rejects_malformed_source_row_before_finalization both assert the
+# artifact EXISTS on a rejected run; a rejection that left no artifacts would
+# be the opposite contract and would fail them.
+#
+# Being diagnostic is exactly why it is not evidence: writing it says nothing
+# about whether the run was admitted. The post-generation gate in Phase 5g is
+# what decides admission, and the source-identity fences are what decide
+# whether the tree can be vouched for at all.
 
 log_phase "Phase 5f: Phase-1 Matrix Validation"
 

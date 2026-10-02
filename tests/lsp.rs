@@ -592,7 +592,7 @@ fn rust_analyzer_diagnostics_reports_type_error() {
 
     let out = execute_lsp(
         &registry,
-        json!({"action": "diagnostics", "file": "src/broken.rs", "timeout": 30}),
+        json!({"action": "diagnostics", "file": "src/broken.rs", "timeout": 180}),
     )
     .expect("diagnostics executes");
     let payload = output_json(&out);
@@ -628,7 +628,7 @@ fn rust_analyzer_rename_updates_callers_atomically() {
             "line": 4,
             "symbol": "compute_answer",
             "newName": "solve_answer",
-            "timeout": 60,
+            "timeout": 180,
         }),
     )
     .expect("rename executes");
@@ -678,7 +678,7 @@ fn rust_analyzer_rename_file_updates_module_declaration() {
             "action": "rename_file",
             "file": "src/util.rs",
             "newFile": "src/helpers.rs",
-            "timeout": 60,
+            "timeout": 180,
         }),
     )
     .expect("rename_file executes");

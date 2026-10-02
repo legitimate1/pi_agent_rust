@@ -54,11 +54,33 @@ The root object contains a `providers` map.
 | `api` | string | Protocol adapter (e.g. `openai-completions`, `openai-responses`, `anthropic-messages`, `google-generative-ai`, `google-vertex`) |
 | `apiKey` | string | Fallback API key, env var name, or shell command after normal runtime credential resolution (see Secret Resolution) |
 | `models` | object[] | List of models. If omitted, provider settings override built-in config for that provider. |
+| `modelOverrides` | object | Per-model patches keyed by model id (any Model Config field except `id`, plus `compat`). Never replaces the catalog: a known id is patched, an unknown id under a bundled provider is added from that provider's defaults. |
 | `headers` | object | Custom HTTP headers |
 | `authHeader` | boolean | If true, sends key in `Authorization: Bearer <key>` |
 | `compat` | object | Compatibility flags |
 
 If `models` is provided, built-in models for that provider are replaced with the list in `models.json`.
+
+`modelOverrides` is the way to tune one model of a bundled provider without redefining the provider. The common case is pinning OpenRouter routing for an account with an upstream-provider allow-list (same spelling as upstream pi, so a shared `models.json` works for both):
+
+```json
+{
+  "providers": {
+    "openrouter": {
+      "modelOverrides": {
+        "deepseek/deepseek-v4-pro": {
+          "maxTokens": 65536,
+          "compat": {
+            "openRouterRouting": { "provider": { "only": ["deepseek"], "allow_fallbacks": false } }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Every key of `compat.openRouterRouting` is copied verbatim onto the top level of the OpenRouter request body (`provider`, `models`, `route`, …). `pi --model openrouter/deepseek/deepseek-v4-pro` then resolves to the patched entry.
 
 ### Model Config
 
@@ -69,7 +91,7 @@ If `models` is provided, built-in models for that provider are replaced with the
 | `contextWindow` | number | Context window size in tokens |
 | `maxTokens` | number | Max output tokens |
 | `reasoning` | boolean | True if model supports extended thinking |
-| `input` | string[] | `["text", "image"]` |
+| `input` | string[] | Any of `"text"`, `"image"`, `"video"`, `"audio"`. Unknown labels are dropped with a warning. `video`/`audio` are honored only by the Gemini-family transports (`google-generative-ai`, `google-gemini-cli`, `google-vertex`), which get them added automatically for bundled Gemini models; other transports degrade media blocks to a text placeholder |
 | `cost` | object | Cost per million tokens |
 
 ### Compatibility Flags (`compat`)
@@ -81,8 +103,32 @@ If `models` is provided, built-in models for that provider are replaced with the
 | `supportsReasoningEffort` | Send `reasoning_effort` param (OpenAI) |
 | `supportsUsageInStreaming` | Expect usage fields in streaming responses |
 | `maxTokensField` | Override param name (e.g., `max_completion_tokens`) |
-| `openRouterRouting` | OpenRouter routing metadata (JSON object) |
+| `systemRoleName` | Role used for the system prompt message (e.g. `developer`) |
+| `customHeaders` | Extra HTTP headers for every request to this model/provider |
+| `openRouterRouting` | OpenRouter routing metadata (JSON object), merged verbatim into the request body top level (e.g. `{"provider": {"only": ["deepseek"], "allow_fallbacks": false}}`). Merged after everything else, so a `reasoning` or `store` key here overrides what pi would send |
 | `vercelGatewayRouting` | Vercel gateway routing metadata (JSON object) |
+| `thinkingFormat` | Request-side reasoning dialect on the `openai-completions` transport. `"deepseek"` sends DeepSeek's `thinking: {type}` + `reasoning_effort`; `"openrouter"` sends OpenRouter's normalized `reasoning: {effort}` object (the default for reasoning models on the `openrouter` provider or any `openrouter.ai` base URL); any other value (`"openai"`, `"zai"`, `"qwen"`) sends no reasoning controls. Vendor dialects are never sent through the OpenRouter gateway |
+| `thinkingLevelMap` | Per-level override of the value a transport emits for pi's `off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`, e.g. `{"xhigh": "max"}`. Declaring `xhigh`/`max` also unclamps them for that model. On OpenRouter a positive integer becomes `reasoning.max_tokens` (for models that take a budget), any other string is sent as `reasoning.effort`, and mapping `off` (e.g. `{"off": "none"}`) forces thinking off on a model that reasons by default |
+
+#### OpenRouter reasoning
+
+Reasoning models on the `openrouter` provider forward pi's thinking level as OpenRouter's normalized `reasoning` object — `--thinking high` sends `"reasoning": {"effort": "high"}`; `off` sends nothing unless mapped. To hand a token budget to a model that takes one instead:
+
+```json
+{
+  "providers": {
+    "openrouter": {
+      "modelOverrides": {
+        "anthropic/claude-sonnet-4.6": {
+          "thinkingLevelMap": { "low": "2048", "medium": "8192", "high": "16000", "off": "none" }
+        }
+      }
+    }
+  }
+}
+```
+
+A custom OpenAI-compatible proxy that speaks the same shape can opt in with `"compat": {"thinkingFormat": "openrouter"}`.
 
 ## Bundled Provider Registry
 

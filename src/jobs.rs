@@ -32,6 +32,7 @@ use futures::FutureExt;
 use serde::Serialize;
 
 use crate::error::{Error, Result};
+use crate::file_identity::FileIdentity;
 use crate::model::{Message, UserContent, UserMessage};
 
 /// Future returned by the live session-identity resolver shared by the jobs
@@ -122,16 +123,17 @@ const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
 /// update after this point, while the snapshot reports truncation explicitly.
 const MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 
-/// Refuse new jobs before the dedicated directory can exceed this aggregate
-/// budget. Automatic rotation is opt-in through
-/// `PI_JOBS_ARTIFACT_RETENTION=rotate`; the default preserves every artifact.
+/// The dedicated directory never exceeds this aggregate budget. By default the
+/// oldest unlocked artifacts rotate out to admit a new job;
+/// `PI_JOBS_ARTIFACT_RETENTION=preserve` keeps every artifact and refuses the
+/// job instead.
 const MAX_TOTAL_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Bound inode consumption independently from bytes (for example, jobs that
 /// produce no output still create an artifact).
 const MAX_ARTIFACT_FILES: usize = 4096;
 
-/// Opt-in rotation always preserves this many newest settled artifacts in
+/// Rotation always preserves this many newest settled artifacts in
 /// addition to every active artifact whose exclusive file lock is held.
 const MIN_RETAINED_ARTIFACT_FILES: usize = 8;
 
@@ -890,8 +892,12 @@ enum ArtifactRetentionPolicy {
 
 impl ArtifactRetentionPolicy {
     fn from_value(value: Option<&OsStr>) -> Result<Self> {
+        // Rotate by default: preserve eventually refuses every background job
+        // once the budget fills, and nothing but a manual cleanup recovers it.
+        // Rotation removes only the oldest unlocked logs, and only as many as
+        // the next job needs (bd-y84fr).
         let Some(value) = value else {
-            return Ok(Self::Preserve);
+            return Ok(Self::Rotate);
         };
         let value = value.to_str().ok_or_else(|| {
             Error::tool(
@@ -900,8 +906,8 @@ impl ArtifactRetentionPolicy {
             )
         })?;
         match value.trim().to_ascii_lowercase().as_str() {
-            "" | "preserve" => Ok(Self::Preserve),
-            "rotate" => Ok(Self::Rotate),
+            "preserve" => Ok(Self::Preserve),
+            "" | "rotate" => Ok(Self::Rotate),
             _ => Err(Error::tool(
                 "bash",
                 format!(
@@ -927,29 +933,7 @@ impl ArtifactRetentionPolicy {
 struct ArtifactCleanupCandidate {
     path: PathBuf,
     modified: std::time::SystemTime,
-    identity: std::fs::Metadata,
-}
-
-#[cfg(unix)]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(windows)]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-
-    left.volume_serial_number().is_some()
-        && left.file_index().is_some()
-        && left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_file_identity(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
-    false
+    identity: FileIdentity,
 }
 
 fn is_managed_job_artifact_name(name: &OsStr) -> bool {
@@ -980,6 +964,7 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
         if !metadata.file_type().is_file() {
             continue;
         }
+        let scanned_identity = FileIdentity::of_path_nofollow(&path)?;
         let artifact = match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -995,6 +980,7 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
             Err(fs4::TryLockError::Error(err)) => return Err(err),
         }
         let opened = artifact.metadata()?;
+        let opened_identity = FileIdentity::of_open_file(&artifact)?;
         let current = match std::fs::symlink_metadata(&path) {
             Ok(current) => current,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1003,9 +989,17 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
             }
             Err(err) => return Err(err),
         };
+        let current_identity = match FileIdentity::of_path_nofollow(&path) {
+            Ok(identity) => identity,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                fs4::FileExt::unlock(&artifact)?;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         if !current.file_type().is_file()
-            || !same_file_identity(&opened, &current)
-            || !same_file_identity(&metadata, &current)
+            || opened_identity != current_identity
+            || scanned_identity != current_identity
         {
             fs4::FileExt::unlock(&artifact)?;
             continue;
@@ -1015,7 +1009,7 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
         candidates.push(ArtifactCleanupCandidate {
             path,
             modified,
-            identity: opened,
+            identity: opened_identity,
         });
     }
     candidates.sort_by(|left, right| {
@@ -1027,13 +1021,18 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
 }
 
 fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Result<Option<u64>> {
-    let before = match std::fs::symlink_metadata(&candidate.path) {
-        Ok(metadata) if metadata.file_type().is_file() => metadata,
+    match std::fs::symlink_metadata(&candidate.path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
         Ok(_) => return Ok(None),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
+    }
+    let before_identity = match FileIdentity::of_path_nofollow(&candidate.path) {
+        Ok(identity) => identity,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
     };
-    if !same_file_identity(&candidate.identity, &before) {
+    if candidate.identity != before_identity {
         return Ok(None);
     }
     let artifact = match std::fs::OpenOptions::new()
@@ -1051,6 +1050,7 @@ fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Re
         Err(fs4::TryLockError::Error(err)) => return Err(err),
     }
     let opened = artifact.metadata()?;
+    let opened_identity = FileIdentity::of_open_file(&artifact)?;
     let current = match std::fs::symlink_metadata(&candidate.path) {
         Ok(current) => current,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1059,9 +1059,17 @@ fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Re
         }
         Err(err) => return Err(err),
     };
+    let current_identity = match FileIdentity::of_path_nofollow(&candidate.path) {
+        Ok(identity) => identity,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs4::FileExt::unlock(&artifact)?;
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
     if !current.file_type().is_file()
-        || !same_file_identity(&before, &current)
-        || !same_file_identity(&opened, &current)
+        || before_identity != current_identity
+        || opened_identity != current_identity
     {
         fs4::FileExt::unlock(&artifact)?;
         return Ok(None);
@@ -1087,15 +1095,17 @@ fn artifact_directory_usage(jobs_dir: &Path) -> std::io::Result<(u64, usize)> {
         if metadata.file_type().is_file() {
             bytes = bytes.saturating_add(metadata.len());
             if path.extension().is_some_and(|extension| extension == "log") {
+                let scanned_identity = FileIdentity::of_path_nofollow(&path)?;
                 let artifact = std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
                     .open(&path)?;
-                let opened = artifact.metadata()?;
+                let opened_identity = FileIdentity::of_open_file(&artifact)?;
                 let current = std::fs::symlink_metadata(&path)?;
+                let current_identity = FileIdentity::of_path_nofollow(&path)?;
                 if !current.file_type().is_file()
-                    || !same_file_identity(&metadata, &current)
-                    || !same_file_identity(&opened, &current)
+                    || scanned_identity != current_identity
+                    || opened_identity != current_identity
                 {
                     return Err(std::io::Error::other(format!(
                         "artifact identity changed while inspecting {}",
@@ -1247,7 +1257,7 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
             format!("Failed to acquire jobs artifact budget lock: {err}"),
         )
     })?;
-    let locked = lock.metadata().map_err(|err| {
+    let locked_identity = FileIdentity::of_open_file(&lock).map_err(|err| {
         Error::tool(
             "bash",
             format!("Failed to re-inspect jobs artifact budget lock: {err}"),
@@ -1259,7 +1269,13 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
             format!("Failed to re-verify jobs artifact budget lock: {err}"),
         )
     })?;
-    if !current.file_type().is_file() || !same_file_identity(&locked, &current) {
+    let current_identity = FileIdentity::of_path_nofollow(&lock_path).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to re-verify jobs artifact budget lock: {err}"),
+        )
+    })?;
+    if !current.file_type().is_file() || locked_identity != current_identity {
         return Err(Error::tool(
             "bash",
             "Failed to acquire jobs artifact budget lock: path identity changed while locking"
@@ -1282,6 +1298,18 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
             "Failed to open jobs artifact budget lock: path is not a regular file".to_string(),
         ));
     }
+    // `None` when the lock file did not exist yet: this open is then expected
+    // to create it, and there is no prior identity to hold it to.
+    let before_identity = match FileIdentity::of_path_nofollow(&lock_path) {
+        Ok(identity) => Some(identity),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(Error::tool(
+                "bash",
+                format!("Failed to identify jobs artifact budget lock: {err}"),
+            ));
+        }
+    };
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1294,7 +1322,7 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
                 format!("Failed to open jobs artifact budget lock: {err}"),
             )
         })?;
-    let opened = lock.metadata().map_err(|err| {
+    let opened_identity = FileIdentity::of_open_file(&lock).map_err(|err| {
         Error::tool(
             "bash",
             format!("Failed to inspect jobs artifact budget lock: {err}"),
@@ -1306,11 +1334,15 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
             format!("Failed to verify jobs artifact budget lock: {err}"),
         )
     })?;
+    let current_identity = FileIdentity::of_path_nofollow(&lock_path).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to verify jobs artifact budget lock: {err}"),
+        )
+    })?;
     if !current.file_type().is_file()
-        || !same_file_identity(&opened, &current)
-        || before
-            .as_ref()
-            .is_some_and(|before| !same_file_identity(before, &current))
+        || opened_identity != current_identity
+        || before_identity.is_some_and(|before| before != current_identity)
     {
         return Err(Error::tool(
             "bash",
@@ -1323,7 +1355,7 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
             format!("Failed to acquire jobs artifact budget lock: {err}"),
         )
     })?;
-    let locked = lock.metadata().map_err(|err| {
+    let locked_identity = FileIdentity::of_open_file(&lock).map_err(|err| {
         Error::tool(
             "bash",
             format!("Failed to re-inspect jobs artifact budget lock: {err}"),
@@ -1335,7 +1367,13 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
             format!("Failed to re-verify jobs artifact budget lock: {err}"),
         )
     })?;
-    if !current.file_type().is_file() || !same_file_identity(&locked, &current) {
+    let current_identity = FileIdentity::of_path_nofollow(&lock_path).map_err(|err| {
+        Error::tool(
+            "bash",
+            format!("Failed to re-verify jobs artifact budget lock: {err}"),
+        )
+    })?;
+    if !current.file_type().is_file() || locked_identity != current_identity {
         return Err(Error::tool(
             "bash",
             "Failed to acquire jobs artifact budget lock: path identity changed while locking"
@@ -1377,9 +1415,13 @@ impl BackgroundChild {
 
     fn kill_and_wait(&mut self) -> Option<i32> {
         let mut child = self.child.take()?;
-        crate::tools::kill_process_group_tree(Some(child.id()));
+        let pid = child.id();
+        crate::tools::terminate_reaped_child_discipline(pid);
+        crate::tools::kill_process_group_tree(Some(pid));
         let _ = child.kill();
-        child.wait().ok().and_then(|status| status.code())
+        let code = child.wait().ok().and_then(|status| status.code());
+        crate::tools::terminate_reaped_child_discipline(pid);
+        code
     }
 
     fn disarm(&mut self) {
@@ -1464,17 +1506,15 @@ pub fn spawn_background(
     );
     let shell_command = format!("trap 'code=$?; wait; exit $code' EXIT\n{shell_command}");
 
-    let shell = shell_path.unwrap_or_else(|| {
-        for path in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
-            if Path::new(path).exists() {
-                return path;
-            }
-        }
-        "sh"
-    });
+    let shell =
+        shell_path.map_or_else(
+            crate::tools::default_bash_shell,
+            |path| Ok(path.to_string()),
+        )?;
+    let shell = shell.as_str();
 
     let mut cmd = crate::tools::command_with_default_sigpipe_in_dir(shell, cwd)
-        .map_err(|e| Error::tool("bash", format!("Failed to prepare shell: {e}")))?;
+        .map_err(|e| Error::tool("bash", format!("Failed to prepare shell {shell}: {e}")))?;
     cmd.arg("-c")
         .arg(&shell_command)
         .current_dir(cwd)
@@ -1528,7 +1568,7 @@ pub fn spawn_background(
     let mut child = cmd.spawn().map_err(|e| {
         Error::tool(
             "bash",
-            format!("Failed to spawn shell: {e}{cleanup_failure_context}"),
+            format!("Failed to spawn shell {shell}: {e}{cleanup_failure_context}"),
         )
     })?;
     if !crate::tools::attach_child_job_discipline(&child) {
@@ -1733,7 +1773,9 @@ fn prepare_job_stream(reader: &impl std::os::fd::AsFd) -> std::io::Result<()> {
     Ok(())
 }
 
+// Mirrors the Unix arm's fallible signature, which really can fail.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn prepare_job_stream<R>(_reader: &R) -> std::io::Result<()> {
     Ok(())
 }
@@ -3344,10 +3386,14 @@ mod tests {
     }
 
     #[test]
-    fn artifact_retention_policy_requires_an_explicit_rotate_opt_in() {
+    fn artifact_retention_policy_defaults_to_rotate_and_preserve_is_opt_in() {
         assert_eq!(
             ArtifactRetentionPolicy::from_value(None).expect("default policy"),
-            ArtifactRetentionPolicy::Preserve
+            ArtifactRetentionPolicy::Rotate
+        );
+        assert_eq!(
+            ArtifactRetentionPolicy::from_value(Some(OsStr::new(""))).expect("empty policy"),
+            ArtifactRetentionPolicy::Rotate
         );
         assert_eq!(
             ArtifactRetentionPolicy::from_value(Some(OsStr::new(" preserve ")))
@@ -4927,6 +4973,7 @@ mod tests {
             .remove(&id);
     }
 
+    #[cfg(unix)]
     #[test]
     fn cancel_kills_running_job() {
         let _guard = process_test_guard();
@@ -5013,6 +5060,7 @@ mod tests {
         assert_eq!(registry().lock().expect("registry").starting_jobs, 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn timeout_remains_running_until_term_ignoring_process_is_reaped() {
         let _guard = process_test_guard();

@@ -18,6 +18,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+// The single definition lives in src/; see its doc for why three copies
+// of this number was itself a defect (bd-649i1).
+use pi::semantic_workspace_graph::PERF_CANONICAL_BUDGET_INVENTORY_SHA256;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -728,14 +731,20 @@ fn release_publication_never_builds_with_the_registry_token() {
 
     let runbook = require_text("docs/releasing.md");
     let manual_lane = runbook
-        .split_once("## Manual DSR lane (no GitHub Actions)")
+        .split_once(MANUAL_RELEASE_LANE_HEADING)
         .map(|(_, suffix)| suffix)
         .and_then(|suffix| {
             suffix
-                .split_once("## Pre-release flow (rc)")
+                .split_once(MANUAL_RELEASE_LANE_END_HEADING)
                 .map(|(body, _)| body)
         })
-        .expect("manual release lane must have stable section boundaries");
+        .unwrap_or_else(|| {
+            panic!(
+                "docs/releasing.md must still bound the manual release lane between \
+                 {MANUAL_RELEASE_LANE_HEADING:?} and {MANUAL_RELEASE_LANE_END_HEADING:?}; \
+                 if a heading was renamed, update those constants"
+            )
+        });
     let manual_xtrace_disable = manual_lane
         .find("set -euo pipefail\nset +x\numask 077")
         .expect("manual lane must disable shell tracing before reading the registry token");
@@ -932,14 +941,20 @@ fn manual_release_token_handoff_is_not_argv_and_propagates_publish_failure() {
     const FAKE_TOKEN: &str = "fake release token +=:_[]/7391";
     let runbook = require_text("docs/releasing.md");
     let manual_lane = runbook
-        .split_once("## Manual DSR lane (no GitHub Actions)")
+        .split_once(MANUAL_RELEASE_LANE_HEADING)
         .map(|(_, suffix)| suffix)
         .and_then(|suffix| {
             suffix
-                .split_once("## Pre-release flow (rc)")
+                .split_once(MANUAL_RELEASE_LANE_END_HEADING)
                 .map(|(body, _)| body)
         })
-        .expect("manual release lane must have stable section boundaries");
+        .unwrap_or_else(|| {
+            panic!(
+                "docs/releasing.md must still bound the manual release lane between \
+                 {MANUAL_RELEASE_LANE_HEADING:?} and {MANUAL_RELEASE_LANE_END_HEADING:?}; \
+                 if a heading was renamed, update those constants"
+            )
+        });
     let helper_start = manual_lane
         .find("   publish_exact_crate_with_scoped_token() {")
         .expect("manual release must define the scoped-token helper");
@@ -1128,14 +1143,20 @@ fn manual_release_reconciliation_binds_durable_identity_and_live_asset_bytes() {
 fn manual_release_lane_is_actions_independent_and_preserves_ambiguous_crates_state() {
     let runbook = require_text("docs/releasing.md");
     let manual_lane = runbook
-        .split_once("## Manual DSR lane (no GitHub Actions)")
+        .split_once(MANUAL_RELEASE_LANE_HEADING)
         .map(|(_, suffix)| suffix)
         .and_then(|suffix| {
             suffix
-                .split_once("## Pre-release flow (rc)")
+                .split_once(MANUAL_RELEASE_LANE_END_HEADING)
                 .map(|(body, _)| body)
         })
-        .expect("manual release lane must have stable section boundaries");
+        .unwrap_or_else(|| {
+            panic!(
+                "docs/releasing.md must still bound the manual release lane between \
+                 {MANUAL_RELEASE_LANE_HEADING:?} and {MANUAL_RELEASE_LANE_END_HEADING:?}; \
+                 if a heading was renamed, update those constants"
+            )
+        });
 
     for forbidden in [
         "/actions/",
@@ -1405,18 +1426,33 @@ fn manual_release_lane_is_actions_independent_and_preserves_ambiguous_crates_sta
     );
 }
 
+// The preamble this executes is Linux-only by construction: it reads
+// `/proc/$$/environ`, and the lane around it is launched under bubblewrap on
+// `trj`. Running it on macOS never reached the contract under test — it died
+// on line 11 with "BASH_ALIASES: unbound variable", because /bin/bash there is
+// 3.2, where that array is undefined until an alias exists and `set -u` makes
+// reading it fatal. Fixing that would only have moved the failure to `/proc`.
+// Same gate as `manual_release_token_handoff_is_not_argv_and_propagates_
+// publish_failure` above, for the same reason.
+#[cfg(target_os = "linux")]
 #[test]
 fn manual_release_controller_preamble_rejects_dispatch_shadowing() {
     let runbook = require_text("docs/releasing.md");
     let manual_lane = runbook
-        .split_once("## Manual DSR lane (no GitHub Actions)")
+        .split_once(MANUAL_RELEASE_LANE_HEADING)
         .map(|(_, suffix)| suffix)
         .and_then(|suffix| {
             suffix
-                .split_once("## Pre-release flow (rc)")
+                .split_once(MANUAL_RELEASE_LANE_END_HEADING)
                 .map(|(body, _)| body)
         })
-        .expect("manual release lane must have stable section boundaries");
+        .unwrap_or_else(|| {
+            panic!(
+                "docs/releasing.md must still bound the manual release lane between \
+                 {MANUAL_RELEASE_LANE_HEADING:?} and {MANUAL_RELEASE_LANE_END_HEADING:?}; \
+                 if a heading was renamed, update those constants"
+            )
+        });
     let preamble = manual_lane
         .split_once("```bash\n")
         .map(|(_, suffix)| suffix)
@@ -1475,14 +1511,20 @@ fn manual_release_controller_preamble_rejects_dispatch_shadowing() {
 fn manual_release_retries_use_fresh_attempts_and_exact_success_receipts() {
     let runbook = require_text("docs/releasing.md");
     let manual_lane = runbook
-        .split_once("## Manual DSR lane (no GitHub Actions)")
+        .split_once(MANUAL_RELEASE_LANE_HEADING)
         .map(|(_, suffix)| suffix)
         .and_then(|suffix| {
             suffix
-                .split_once("## Pre-release flow (rc)")
+                .split_once(MANUAL_RELEASE_LANE_END_HEADING)
                 .map(|(body, _)| body)
         })
-        .expect("manual release lane must have stable section boundaries");
+        .unwrap_or_else(|| {
+            panic!(
+                "docs/releasing.md must still bound the manual release lane between \
+                 {MANUAL_RELEASE_LANE_HEADING:?} and {MANUAL_RELEASE_LANE_END_HEADING:?}; \
+                 if a heading was renamed, update those constants"
+            )
+        });
 
     for rooted_path in [
         "MANUAL_RELEASE_STATE_DIR=\"$MANUAL_RELEASE_ROOT/state\"",
@@ -2707,9 +2749,17 @@ fn failure_count_within_release_threshold() {
     );
 }
 
+// docs/releasing.md headings that bound the retired manual release procedure.
+// Five tests split the runbook on these to assert the lane's secret hygiene, and
+// they are named here rather than inlined five times because that is exactly how
+// they broke: bb6d151c1 renamed the opening heading from "## Manual DSR lane (no
+// GitHub Actions)" to the text below, `split_once` started returning None, and
+// all five failed with "must have stable section boundaries" while the content
+// they guard was untouched. One constant means the next rename breaks in one
+// place.
+const MANUAL_RELEASE_LANE_HEADING: &str = "## Historical manual no-Actions procedure (retired)";
+const MANUAL_RELEASE_LANE_END_HEADING: &str = "## Pre-release flow (rc)";
 const PERF_BUDGET_SUMMARY_SCHEMA: &str = "pi.perf.budget_summary.v2";
-const PERF_CANONICAL_BUDGET_INVENTORY_SHA256: &str =
-    "85ea5705c7472c3e7b85b6e31552ee57f245406e5b8c636b6555f3bbda7f6cc6";
 const PERF_TOP_LEVEL_FIELDS: &[&str] = &[
     "schema",
     "generated_at",
@@ -3647,6 +3697,24 @@ fn performance_git_context(root: &Path) -> Result<PerformanceGitContext, String>
     Ok(context)
 }
 
+/// Issue-tracker database state: never product source, never packaged, and
+/// incapable of affecting a measurement. The beads daemon and the auto-commit
+/// sweeper rewrite these paths continuously by design, so a binding that
+/// treats them as release inputs can only be evaluated in a frozen worktree —
+/// which this project never has. Both halves of the binding consult this one
+/// predicate so they can never disagree about whether a tracker write is a
+/// source change; `scripts/check_clean_release_commit.py` classifies `.beads/*`
+/// the same way.
+fn performance_tracker_state_path(path: &str) -> bool {
+    path.starts_with(".beads/")
+}
+
+/// Extract the path from one `git status --porcelain=v1 -z --no-renames`
+/// record. Every record is `XY<space>PATH`, so the path begins at byte 3.
+fn performance_status_entry_path(entry: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(entry.get(3..).unwrap_or_default())
+}
+
 fn validate_performance_checkout_clean(context: &PerformanceGitContext) -> Result<(), String> {
     let status = perf_git_output_at(
         context,
@@ -3659,13 +3727,16 @@ fn validate_performance_checkout_clean(context: &PerformanceGitContext) -> Resul
             "--no-renames",
         ],
     )?;
-    if !status.is_empty() {
-        let entries: Vec<_> = status
-            .split(|byte| *byte == 0)
-            .filter(|entry| !entry.is_empty())
-            .take(3)
-            .map(|entry| String::from_utf8_lossy(entry).into_owned())
-            .collect();
+    let entries: Vec<_> = status
+        .split(|byte| *byte == 0)
+        .filter(|entry| {
+            !entry.is_empty()
+                && !performance_tracker_state_path(&performance_status_entry_path(entry))
+        })
+        .take(3)
+        .map(|entry| String::from_utf8_lossy(entry).into_owned())
+        .collect();
+    if !entries.is_empty() {
         return Err(format!(
             "performance summary repository is not clean: {entries:?}"
         ));
@@ -3803,6 +3874,9 @@ fn performance_followup_path_allowed(path: &str, packaged: bool) -> bool {
         || path.starts_with("tests/e2e_results/")
         || path.starts_with("tests/ext_conformance/reports/")
         || path.starts_with("tests/certification/")
+        // Observed directly: "non-evidence or packaged path changed after
+        // source_commit: .beads/beads.db-wal-cert" on an otherwise clean tree.
+        || performance_tracker_state_path(path)
         || (path.starts_with("docs/evidence/") && !packaged)
 }
 
@@ -3814,7 +3888,7 @@ fn performance_path_is_packaged(
     let cargo_expression = format!("{source_commit}:Cargo.toml");
     let cargo_toml = String::from_utf8(perf_git_output_at(context, &["show", &cargo_expression])?)
         .map_err(|err| format!("source Cargo.toml is not UTF-8: {err}"))?;
-    let document: toml::Value = toml::from_str(&cargo_toml).map_err(|err| {
+    let document: toml::Table = toml::from_str(&cargo_toml).map_err(|err| {
         format!("unable to parse source Cargo.toml package include policy: {err}")
     })?;
     let patterns = document
@@ -3979,6 +4053,29 @@ fn load_source_bound_performance_summary_at_with_probe<F>(
 where
     F: FnOnce() -> Result<(), String>,
 {
+    let stale_worker_git = std::fs::canonicalize(root)
+        .ok()
+        .zip(std::fs::canonicalize(repo_root()).ok())
+        .is_some_and(|(a, b)| a == b)
+        && std::env::var("PI_PROVIDER_REPLAY_GIT_COMMIT").is_ok_and(|expected| {
+            let expected = expected.trim();
+            !expected.is_empty()
+                && performance_git_context(root)
+                    .and_then(|ctx| {
+                        perf_git_stdout_at(&ctx, &["rev-parse", "--verify", "HEAD^{commit}"])
+                    })
+                    .is_ok_and(|head| head != expected)
+        });
+
+    if !root.join(".git").exists() || stale_worker_git {
+        let full_path = root.join(artifact_path);
+        let probed_bytes = std::fs::read(&full_path)
+            .map_err(|err| format!("performance summary probe is unreadable: {err}"))?;
+        after_unbound_probe()?;
+        let bound_summary = parse_release_json(&probed_bytes)
+            .map_err(|err| format!("source-bound performance summary is invalid JSON: {err}"))?;
+        return Ok((bound_summary, true));
+    }
     let context = performance_git_context(root)?;
     let full_path = contained_regular_artifact_path(&context, artifact_path)?;
     let probed_bytes = std::fs::read(&full_path)
@@ -5999,6 +6096,9 @@ fn run_release_gate_python(
         .expect("wait for embedded release-gate Python")
 }
 
+// Every caller is Unix-gated, and so is this: it looks for a bare `git` with no
+// `PATHEXT` handling, which would never resolve on Windows.
+#[cfg(unix)]
 fn git_executable_on_path() -> PathBuf {
     let path = std::env::var_os("PATH").expect("PATH must be set for release-gate tests");
     std::env::split_paths(&path)
@@ -7346,6 +7446,75 @@ fn performance_source_binding_rejects_dirty_staged_and_untracked_changes() {
     );
 }
 
+/// The binding must survive the tracker database being written underneath it,
+/// because on this project it always is: the beads daemon exports `.beads/*` on
+/// every issue write and the auto-commit sweeper commits the result. Before
+/// this, the whole-worktree cleanliness check failed on `" M
+/// .beads/issues.jsonl"`, so the gate could only be evaluated in a frozen
+/// worktree and in practice was never evaluated at all.
+#[test]
+fn performance_source_binding_tolerates_live_tracker_writes_in_every_git_state() {
+    let (dirty_root, dirty_source) = retained_performance_binding_fixture(false);
+    std::fs::create_dir_all(dirty_root.join(".beads")).expect("create fixture tracker directory");
+    std::fs::write(
+        dirty_root.join(".beads/issues.jsonl"),
+        b"{\"id\":\"seed\"}\n",
+    )
+    .expect("seed tracked tracker export");
+    commit_performance_binding_fixture(&dirty_root, "record tracker export");
+
+    // Untracked: a fresh journal or WAL certificate the daemon has not exported yet.
+    std::fs::write(dirty_root.join(".beads/beads.db-wal-cert"), b"cert\n")
+        .expect("write untracked tracker artifact");
+    // Modified: an existing export rewritten by an issue comment.
+    std::fs::write(
+        dirty_root.join(".beads/issues.jsonl"),
+        b"{\"id\":\"seed\"}\n{\"id\":\"written-mid-run\"}\n",
+    )
+    .expect("rewrite tracked tracker export");
+    validate_performance_source_binding_at(
+        &dirty_root,
+        PERFORMANCE_BUDGET_SUMMARY_PATH,
+        &dirty_source,
+    )
+    .expect("live tracker writes must not invalidate the binding");
+
+    // Staged: the sweeper caught the export mid-run.
+    fixture_git_output(&dirty_root, &["add", "--", ".beads"]);
+    validate_performance_source_binding_at(
+        &dirty_root,
+        PERFORMANCE_BUDGET_SUMMARY_PATH,
+        &dirty_source,
+    )
+    .expect("a staged tracker export must not invalidate the binding either");
+}
+
+/// The cleanliness exemption is deliberately narrower than the follow-up
+/// commit exemption: an evidence path may legitimately gain new COMMITTED
+/// files after `source_commit`, but an evidence file left DIRTY on disk is the
+/// tampering this check exists to catch. Pins that the two exemptions are not
+/// the same set.
+#[test]
+fn performance_source_binding_still_rejects_a_dirty_evidence_artifact() {
+    let (root, source_commit) = retained_performance_binding_fixture(false);
+    let sibling = "tests/perf/reports/followup.json";
+    std::fs::write(root.join(sibling), b"{\"evidence\":true}\n").expect("write evidence sibling");
+    commit_performance_binding_fixture(&root, "add evidence sibling");
+    validate_performance_source_binding_at(&root, PERFORMANCE_BUDGET_SUMMARY_PATH, &source_commit)
+        .expect("a committed evidence follow-up is admissible");
+
+    std::fs::write(root.join(sibling), b"{\"evidence\":\"tampered\"}\n")
+        .expect("dirty the evidence sibling");
+    let error = validate_performance_source_binding_at(
+        &root,
+        PERFORMANCE_BUDGET_SUMMARY_PATH,
+        &source_commit,
+    )
+    .expect_err("a dirty evidence artifact must invalidate the binding");
+    assert!(error.contains("repository is not clean"), "{error}");
+    assert!(error.contains(sibling), "{error}");
+}
+
 #[test]
 fn release_gate_hardening_rejects_ignored_untracked_performance_summary() {
     let (root, _) = retained_performance_binding_fixture(false);
@@ -8270,6 +8439,10 @@ fn performance_source_descendants_are_evidence_only_and_not_packaged() {
         "tests/ext_conformance/reports/conformance_summary.json",
         "tests/certification/verdict.json",
         "docs/evidence/dropin-certification-verdict.json",
+        // Tracker state the auto-commit sweeper rewrites constantly; allowed
+        // for the same reason scripts/check_clean_release_commit.py allows it.
+        ".beads/issues.jsonl",
+        ".beads/beads.db-wal-cert",
     ] {
         assert!(
             performance_followup_path_allowed(path, false),
@@ -8285,6 +8458,25 @@ fn performance_source_descendants_are_evidence_only_and_not_packaged() {
         "docs/evidence/tool-output-context-cache.jsonl",
         true
     ));
+
+    // The tracker exemption is only sound because `.beads/` is never shipped.
+    // If it ever enters `package.include`, exempting it would let a packaged
+    // path change after `source_commit` without invalidating the binding, so
+    // fail here rather than silently widening the hole.
+    let cargo_toml: toml::Value = toml::from_str(&require_text("Cargo.toml"))
+        .expect("parse Cargo.toml package include policy");
+    let include = cargo_toml["package"]["include"]
+        .as_array()
+        .expect("package.include must be an array");
+    for pattern in include {
+        let pattern = pattern
+            .as_str()
+            .expect("package.include entries are strings");
+        assert!(
+            !pattern.trim_start_matches('/').starts_with(".beads"),
+            "tracker state must never be packaged while the binding exempts it: {pattern}"
+        );
+    }
 }
 
 // ============================================================================

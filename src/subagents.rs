@@ -6,7 +6,6 @@
 //! Rust Pi children even on hosts that also have the TypeScript implementation
 //! installed.
 
-use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
@@ -17,13 +16,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+#[cfg(all(test, unix))]
+use std::process::Command;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
 use std::time::Duration;
+
+mod deadline;
+#[cfg(test)]
+mod deadline_tests;
+mod execution;
+#[cfg(test)]
+mod execution_tests;
+mod protocol;
+
+use deadline::Deadline;
+use execution::ChildRunner;
 
 const MAX_PARALLEL_TASKS: usize = 8;
 const DEFAULT_CONCURRENCY: usize = 4;
@@ -112,6 +120,8 @@ pub struct SubagentTool {
     /// Model spec children run with when their agent definition does not pin
     /// `model:` — the `task` role spec, else `smol` (bd-cv653.3.1).
     role_model_spec: Option<String>,
+    /// Host ceiling for the entire request, not a fresh allowance per child.
+    timeout: Option<Duration>,
 }
 
 impl SubagentTool {
@@ -128,6 +138,7 @@ impl SubagentTool {
             child_binary,
             structured_results: false,
             role_model_spec: None,
+            timeout: None,
         }
     }
 
@@ -136,6 +147,17 @@ impl SubagentTool {
     #[must_use]
     pub fn with_role_model_spec(mut self, spec: Option<String>) -> Self {
         self.role_model_spec = spec.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// Set the host's request-wide execution ceiling (1 ms through 24 hours).
+    /// Without this override, `PI_SUBAGENT_TIMEOUT_SECS` supplies the ceiling,
+    /// defaulting to 900 seconds. A model's `timeoutSeconds` can only shorten it.
+    /// Invalid limits are rejected before launch. Inherited parent deadlines
+    /// remain an upper bound even when this explicit SDK policy is supplied.
+    #[must_use]
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 
@@ -169,6 +191,7 @@ impl SubagentTool {
             return Err(Error::validation("/tan requires non-empty work"));
         }
 
+        let deadline = Deadline::for_request(self.timeout, None)?;
         let definition = tan_agent_definition();
         let agents = BTreeMap::from([(TAN_AGENT_NAME.to_string(), definition)]);
         let request = SubagentTask {
@@ -186,6 +209,7 @@ impl SubagentTool {
             self.child_binary.clone(),
             self.role_model_spec.clone(),
             crate::agent_hub::ChildKind::Tan,
+            deadline,
         )
         .run_one(&agents, request, None, None)
         .await;
@@ -206,6 +230,7 @@ impl SubagentTool {
             child_binary,
             structured_results: false,
             role_model_spec: None,
+            timeout: None,
         }
     }
 
@@ -218,6 +243,9 @@ impl SubagentTool {
         request: SubagentRequest,
         on_update: Option<UpdateCallback>,
     ) -> Result<Vec<SubagentResult>> {
+        // Capture once, before discovery and queueing. Every parallel task,
+        // sequential step and schema-correction retry consumes this budget.
+        let deadline = Deadline::for_request(self.timeout, request.timeout_seconds)?;
         let agents = self.discover(request.scope)?;
         let concurrency = request
             .concurrency
@@ -225,9 +253,9 @@ impl SubagentTool {
             .clamp(1, MAX_PARALLEL_TASKS);
 
         match request.mode()? {
-            RequestMode::Single(task) => {
-                Ok(vec![self.run_one(&agents, task, None, on_update).await])
-            }
+            RequestMode::Single(task) => Ok(vec![
+                self.run_one(&agents, task, None, on_update, deadline).await,
+            ]),
             RequestMode::Parallel(tasks) => {
                 let cwd = self.cwd.clone();
                 let global_dir = self.global_dir.clone();
@@ -249,6 +277,7 @@ impl SubagentTool {
                                 binary,
                                 role_spec,
                                 crate::agent_hub::ChildKind::Subagent,
+                                deadline,
                             );
                             (index, runner.run_one(&agents, task, None, update).await)
                         }
@@ -266,7 +295,7 @@ impl SubagentTool {
                 for (step, task) in tasks.into_iter().enumerate() {
                     let task = task.with_rendered_previous_result(previous.as_ref());
                     let result = self
-                        .run_one(&agents, task, Some(step + 1), on_update.clone())
+                        .run_one(&agents, task, Some(step + 1), on_update.clone(), deadline)
                         .await;
                     let failed = result.is_error;
                     previous = Some(result.clone());
@@ -286,6 +315,7 @@ impl SubagentTool {
         task: SubagentTask,
         step: Option<usize>,
         on_update: Option<UpdateCallback>,
+        deadline: Deadline,
     ) -> SubagentResult {
         ChildRunner::new(
             self.cwd.clone(),
@@ -293,6 +323,7 @@ impl SubagentTool {
             self.child_binary.clone(),
             self.role_model_spec.clone(),
             crate::agent_hub::ChildKind::Subagent,
+            deadline,
         )
         .run_one(agents, task, step, on_update)
         .await
@@ -310,7 +341,7 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. Agent definitions live in $PI_CODING_AGENT_DIR/agents/*.md or .pi/agents/*.md. Workspace isolation: per-task `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; serial application, conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>)."
+        "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Agent definitions live in $PI_CODING_AGENT_DIR/agents/*.md or .pi/agents/*.md. Workspace isolation: per-task `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; serial application, conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>)."
     }
 
     fn parameters(&self) -> Value {
@@ -324,6 +355,7 @@ impl Tool for SubagentTool {
                 "tasks": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Independent tasks to run in parallel."},
                 "chain": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Sequential tasks; {previous} is replaced with the prior child output, and {{previous.data.<field.path>}} addresses the prior task's schema-validated data."},
                 "concurrency": {"type": "integer", "minimum": 1, "maximum": MAX_PARALLEL_TASKS},
+                "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": deadline::MAX_TIMEOUT_SECS, "description": "Budget for this whole delegation request, including queueing, chained steps and corrective retries. May shorten, never extend, the host's limit."},
                 "scope": {"type": "string", "enum": ["both", "user", "project"], "default": "both"}
             },
             "definitions": {
@@ -357,6 +389,17 @@ impl Tool for SubagentTool {
                 format!(
                     "Refusing nested subagent depth above {MAX_SUBAGENT_DEPTH}; child agents are isolated by default and do not receive the subagent tool."
                 ),
+            ));
+        }
+        // An explicit null/string must not silently remove a requested limit
+        // when an SDK caller bypasses schema validation.
+        if input
+            .get("timeoutSeconds")
+            .is_some_and(|value| value.as_u64().is_none())
+        {
+            return Err(Error::tool(
+                "subagent",
+                "PI_SUBAGENT_INVALID_TIMEOUT: timeoutSeconds must be an integer from 1 to 86400",
             ));
         }
         let request: SubagentRequest = serde_json::from_value(input)
@@ -405,6 +448,8 @@ struct SubagentRequest {
     chain: Option<Vec<SubagentTask>>,
     #[serde(default)]
     concurrency: Option<usize>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
     #[serde(default)]
     scope: AgentScope,
 }
@@ -803,429 +848,6 @@ fn parse_frontmatter(raw: &str) -> (BTreeMap<String, String>, String) {
     (fields, body.join("\n"))
 }
 
-struct ChildRunner {
-    cwd: PathBuf,
-    global_dir: PathBuf,
-    child_binary: PathBuf,
-    role_model_spec: Option<String>,
-    hub_kind: crate::agent_hub::ChildKind,
-}
-
-impl ChildRunner {
-    const fn new(
-        cwd: PathBuf,
-        global_dir: PathBuf,
-        child_binary: PathBuf,
-        role_model_spec: Option<String>,
-        hub_kind: crate::agent_hub::ChildKind,
-    ) -> Self {
-        Self {
-            cwd,
-            global_dir,
-            child_binary,
-            role_model_spec,
-            hub_kind,
-        }
-    }
-
-    /// Run one task, applying the typed-output contract (bd-cv653.5.1) when
-    /// an `outputSchema` is in play: the child gets a schema directive
-    /// appended to its system prompt; the parent validates the final output,
-    /// grants exactly one corrective re-run on failure, and then either
-    /// annotates (permissive) or fails (strict) a still-invalid result.
-    ///
-    /// Children are ephemeral (`--no-session`), so the corrective retry is a
-    /// fresh child run carrying the validation errors, not an in-session
-    /// follow-up. Tolerant-dialect repair before validation (bd-cv653.7.8)
-    /// composes here once that layer exists.
-    async fn run_one(
-        &self,
-        agents: &BTreeMap<String, AgentDefinition>,
-        task: SubagentTask,
-        step: Option<usize>,
-        on_update: Option<UpdateCallback>,
-    ) -> SubagentResult {
-        let schema = task.output_schema.clone().or_else(|| {
-            agents
-                .get(&task.agent)
-                .and_then(|agent| agent.output_schema.clone())
-        });
-        let Some(schema) = schema else {
-            return self
-                .run_child_process(agents, task, step, on_update, None)
-                .await;
-        };
-        // Reject an uncompilable schema before spending a child launch.
-        // (Compiled per call rather than held across awaits so the future
-        // stays Send without depending on the validator's auto-traits.)
-        if let Err(error) = compile_output_schema(&schema) {
-            return agents.get(&task.agent).map_or_else(
-                || SubagentResult::unknown(task.clone(), step),
-                |agent| {
-                    SubagentResult::failed(
-                        agent,
-                        task.clone(),
-                        step,
-                        format!("Invalid outputSchema: {error}"),
-                    )
-                },
-            );
-        }
-
-        let schema_mode = task.schema_mode;
-        let mut result = self
-            .run_child_process(agents, task.clone(), step, on_update.clone(), Some(&schema))
-            .await;
-        if result.is_error {
-            return result;
-        }
-
-        let mut retries = 0usize;
-        let mut outcome = validate_child_output(&result.output, &schema);
-        if let Err(errors) = &outcome {
-            // Bounded corrective retry: exactly one fresh run with the errors.
-            retries = 1;
-            let corrective = SubagentTask {
-                task: corrective_retry_task(&task.task, errors),
-                ..task.clone()
-            };
-            let retry_result = self
-                .run_child_process(agents, corrective, step, on_update, Some(&schema))
-                .await;
-            if !retry_result.is_error {
-                result = retry_result;
-                outcome = validate_child_output(&result.output, &schema);
-            }
-        }
-
-        result.schema_retries = Some(retries);
-        match outcome {
-            Ok(data) => {
-                result.data = Some(data);
-                result.schema_valid = Some(true);
-            }
-            Err(errors) => {
-                result.schema_valid = Some(false);
-                result.validation_errors = Some(errors);
-                if schema_mode == SchemaMode::Strict {
-                    result.status = SubagentStatus::Failed;
-                    result.is_error = true;
-                    result.error.get_or_insert_with(|| {
-                        "Child output failed schema validation after the corrective retry (schemaMode: strict)."
-                            .to_string()
-                    });
-                }
-            }
-        }
-        result
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn run_child_process(
-        &self,
-        agents: &BTreeMap<String, AgentDefinition>,
-        task: SubagentTask,
-        step: Option<usize>,
-        on_update: Option<UpdateCallback>,
-        output_schema: Option<&Value>,
-    ) -> SubagentResult {
-        let Some(agent) = agents.get(&task.agent) else {
-            return SubagentResult::unknown(task, step);
-        };
-        let cwd = task.cwd.clone().unwrap_or_else(|| self.cwd.clone());
-        if !cwd.is_dir() {
-            return SubagentResult::failed(
-                agent,
-                task,
-                step,
-                format!("Working directory does not exist: {}", cwd.display()),
-            );
-        }
-
-        // Workspace isolation (bd-cv653.5.2): `worktree` runs the child in
-        // a git worktree carrying the parent's uncommitted state; the patch
-        // is collected and applied per `iso_apply` at completion.
-        let isolation = task
-            .isolation
-            .as_deref()
-            .unwrap_or("none")
-            .to_ascii_lowercase();
-        let iso_handle = if isolation == "worktree" {
-            match crate::worktree_iso::isolate(&cwd, &task.task) {
-                Ok(handle) => Some(handle),
-                Err(err) => {
-                    return SubagentResult::failed(agent, task, step, err.to_string());
-                }
-            }
-        } else {
-            None
-        };
-        let run_cwd = iso_handle
-            .as_ref()
-            .map_or_else(|| cwd.clone(), |handle| handle.path.clone());
-        let iso_apply = task.iso_apply.clone();
-
-        let args = child_args(
-            agent,
-            &task.task,
-            self.role_model_spec.as_deref(),
-            output_schema,
-        );
-        let mut result =
-            SubagentResult::starting(agent, task, step, &self.child_binary, &run_cwd, &args);
-        // Agent-hub registration (bd-cv653.5.3): every spawned child joins the
-        // session roster. Bookkeeping failure must never fail the run.
-        let hub_entry = crate::agent_hub::registry()
-            .lock()
-            .ok()
-            .and_then(|mut reg| {
-                reg.register_kind(&agent.name, &result.task, self.hub_kind)
-                    .ok()
-            });
-        result.hub_id = hub_entry.as_ref().map(|entry| entry.id.clone());
-        let update = on_update.as_ref();
-        emit_progress(update, &result);
-
-        let mut command = Command::new(&self.child_binary);
-        command
-            .args(&args)
-            .current_dir(&run_cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // `Command` inherits the rest of the parent environment, including API/router/auth
-            // variables and `PI_CODING_AGENT_DIR`; set this explicitly for auditability.
-            .env("PI_CODING_AGENT_DIR", &self.global_dir)
-            .env("PI_SUBAGENT_PARENT_PID", std::process::id().to_string())
-            .env("PI_SUBAGENT_DEPTH", child_depth().to_string());
-        // Hub steering channel (bd-cv653.5.3): the child drains this file
-        // between turns via its print-mode steering fetcher.
-        if let Some(entry) = &hub_entry {
-            command
-                .env("PI_SUBAGENT_STEER_FILE", &entry.steer_path)
-                .env("PI_SUBAGENT_RUN_ID", &entry.id);
-        }
-
-        let child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                result.fail(format!(
-                    "Failed to launch {}: {error}",
-                    self.child_binary.display()
-                ));
-                // Settle the roster entry registered above — otherwise the
-                // hub shows this child as Starting forever and steer keeps
-                // queueing messages to it.
-                if let Some(hub_id) = &result.hub_id
-                    && let Ok(mut reg) = crate::agent_hub::registry().lock()
-                {
-                    reg.settle(hub_id, crate::agent_hub::ChildStatus::Failed);
-                }
-                emit_progress(update, &result);
-                return result;
-            }
-        };
-        crate::tools::attach_child_job_discipline(&child);
-        let mut child = ChildProcessGuard::new(child);
-        result.pid = Some(child.id());
-        result.status = SubagentStatus::Running;
-        if let Some(hub_id) = &result.hub_id
-            && let Ok(mut reg) = crate::agent_hub::registry().lock()
-        {
-            reg.mark_running(hub_id, child.id());
-        }
-        emit_progress(update, &result);
-
-        if !child.has_stdout() {
-            result.fail("Child stdout was not piped.".to_string());
-            if let Some(hub_id) = &result.hub_id
-                && let Ok(mut reg) = crate::agent_hub::registry().lock()
-            {
-                reg.settle(hub_id, crate::agent_hub::ChildStatus::Failed);
-            }
-            return result;
-        }
-        let stdout = child.take_stdout().expect("stdout checked above");
-        let stderr = child.take_stderr().expect("stderr is piped");
-        let (tx, rx) = mpsc::sync_channel(256);
-        let stdout_thread = spawn_pipe_reader(stdout, PipeKind::Stdout, tx.clone());
-        let stderr_thread = spawn_pipe_reader(stderr, PipeKind::Stderr, tx);
-        let mut saw_cancellation = false;
-        let cx = AgentCx::for_current_or_request();
-
-        loop {
-            drain_child_frames(&rx, &mut result, update);
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    result.exit_code = status.code();
-                    break;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    result.fail(format!("Failed while waiting for child: {error}"));
-                    child.terminate();
-                    break;
-                }
-            }
-            if cx.checkpoint().is_err() {
-                saw_cancellation = true;
-                result.status = SubagentStatus::Cancelled;
-                result.error = Some("Parent cancellation propagated to child process.".to_string());
-                result.is_error = true;
-                child.terminate();
-                break;
-            }
-            let now = cx
-                .cx()
-                .timer_driver()
-                .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-            asupersync::time::sleep(now, Duration::from_millis(10)).await;
-        }
-
-        drain_until_reader_exit(rx, &mut result, update, stdout_thread, stderr_thread).await;
-        if !saw_cancellation && !matches!(result.status, SubagentStatus::Failed) {
-            if result.exit_code == Some(0) {
-                result.status = SubagentStatus::Completed;
-            } else {
-                result.status = SubagentStatus::Failed;
-                result.is_error = true;
-                result.error.get_or_insert_with(|| {
-                    format!("Child exited with code {}.", result.exit_code.unwrap_or(-1))
-                });
-            }
-        }
-        child.disarm();
-        // Hub settle (bd-cv653.5.3): operator kill (already recorded) beats
-        // exit-code inference; otherwise map the run outcome.
-        if let Some(hub_id) = &result.hub_id
-            && let Ok(mut reg) = crate::agent_hub::registry().lock()
-        {
-            let prior = reg.get(hub_id).map(|entry| entry.status);
-            if prior != Some(crate::agent_hub::ChildStatus::Killed) {
-                let status = match result.status {
-                    SubagentStatus::Completed => Some(crate::agent_hub::ChildStatus::Done),
-                    SubagentStatus::Cancelled => Some(crate::agent_hub::ChildStatus::Cancelled),
-                    SubagentStatus::Failed => Some(crate::agent_hub::ChildStatus::Failed),
-                    SubagentStatus::Starting | SubagentStatus::Running => None,
-                };
-                if let Some(status) = status {
-                    reg.settle(hub_id, status);
-                }
-            }
-        }
-        emit_progress(update, &result);
-
-        // Worktree isolation completion (bd-cv653.5.2): collect the patch
-        // and apply per `iso_apply` (keep/apply/drop). A conflicting apply
-        // reports files and leaves the worktree — never force.
-        if let Some(handle) = iso_handle {
-            let mut mode = crate::worktree_iso::IsoApplyMode::parse(iso_apply.as_deref())
-                .unwrap_or(crate::worktree_iso::IsoApplyMode::Apply);
-            // Never auto-apply the half-finished edits of a failed or
-            // cancelled child into the parent tree — that is exactly the
-            // state isolation exists to contain. Keep the worktree so the
-            // patch stays inspectable.
-            if mode == crate::worktree_iso::IsoApplyMode::Apply
-                && !matches!(result.status, SubagentStatus::Completed)
-            {
-                mode = crate::worktree_iso::IsoApplyMode::Keep;
-            }
-            let mut outcome = crate::worktree_iso::IsoOutcome {
-                schema: crate::worktree_iso::ISO_SCHEMA.to_string(),
-                worktree_path: handle.path.display().to_string(),
-                branch: handle.branch.clone(),
-                diff_stat: String::new(),
-                patch: String::new(),
-                conflicted_files: Vec::new(),
-                apply_mode: mode.as_str().to_string(),
-                applied: false,
-            };
-            match crate::worktree_iso::collect_diff(&handle) {
-                Ok((patch, diff_stat)) => {
-                    outcome.diff_stat = diff_stat;
-                    outcome.patch.clone_from(&patch);
-                    if mode == crate::worktree_iso::IsoApplyMode::Apply {
-                        match crate::worktree_iso::apply_to_parent(&handle, &patch) {
-                            Ok(()) => {
-                                outcome.applied = true;
-                                let _ = crate::worktree_iso::drop_worktree(&handle);
-                            }
-                            Err(err) => {
-                                outcome.conflicted_files =
-                                    err.to_string().lines().map(str::to_string).collect();
-                                result.error = Some(err.to_string());
-                                result.is_error = true;
-                            }
-                        }
-                    } else if mode == crate::worktree_iso::IsoApplyMode::Drop {
-                        let _ = crate::worktree_iso::drop_worktree(&handle);
-                    }
-                }
-                Err(err) => {
-                    result.error = Some(format!("failed to collect isolated diff: {err}"));
-                    result.is_error = true;
-                }
-            }
-            result.iso = Some(outcome);
-        }
-        result
-    }
-}
-
-/// Owns a spawned child until it has been reaped.  The parent agent's abort
-/// path drops tool futures, so this guard is the final cancellation boundary:
-/// a dropped subagent future cannot leave a Rust Pi child running.
-struct ChildProcessGuard {
-    child: Option<std::process::Child>,
-}
-
-impl ChildProcessGuard {
-    const fn new(child: std::process::Child) -> Self {
-        Self { child: Some(child) }
-    }
-
-    fn id(&self) -> u32 {
-        self.child.as_ref().map_or(0, std::process::Child::id)
-    }
-
-    fn has_stdout(&self) -> bool {
-        self.child
-            .as_ref()
-            .is_some_and(|child| child.stdout.is_some())
-    }
-
-    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
-        self.child.as_mut().and_then(|child| child.stdout.take())
-    }
-
-    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
-        self.child.as_mut().and_then(|child| child.stderr.take())
-    }
-
-    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        self.child
-            .as_mut()
-            .map_or(Ok(None), std::process::Child::try_wait)
-    }
-
-    fn terminate(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-
-    fn disarm(&mut self) {
-        let _ = self.child.take();
-    }
-}
-
-impl Drop for ChildProcessGuard {
-    fn drop(&mut self) {
-        self.terminate();
-    }
-}
-
 fn child_args(
     agent: &AgentDefinition,
     task: &str,
@@ -1437,6 +1059,10 @@ struct SubagentResult {
     /// Worktree-isolation outcome (bd-cv653.5.2) when the task ran isolated.
     #[serde(skip_serializing_if = "Option::is_none")]
     iso: Option<crate::worktree_iso::IsoOutcome>,
+    /// Rejected attempts retained before a corrective retry. Their locations
+    /// and patches remain inspectable even when the final attempt succeeds.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    preserved_worktrees: Vec<crate::worktree_iso::IsoOutcome>,
     session_isolation: &'static str,
     /// Agent-hub run id (bd-cv653.5.3) when the registry tracked this run.
     #[serde(skip)]
@@ -1480,6 +1106,7 @@ impl SubagentResult {
             validation_errors: None,
             schema_retries: None,
             iso: None,
+            preserved_worktrees: Vec::new(),
             session_isolation: "ephemeral_no_session",
             hub_id: None,
             is_error: false,
@@ -1510,6 +1137,7 @@ impl SubagentResult {
             validation_errors: None,
             schema_retries: None,
             iso: None,
+            preserved_worktrees: Vec::new(),
             session_isolation: "ephemeral_no_session",
             hub_id: None,
             is_error: true,
@@ -1547,7 +1175,16 @@ fn render_results(results: &[SubagentResult]) -> String {
             } else {
                 result.output.trim()
             };
-            format!("## {heading}\n{body}")
+            if result.is_error && !result.output.trim().is_empty() {
+                format!(
+                    "## {heading}\nFailed: {}\n\nPartial output (not an accepted result):\n{body}",
+                    result.error.as_deref().unwrap_or("child execution failed")
+                )
+            } else if result.schema_valid == Some(false) {
+                format!("## {heading}\nWarning: output failed schema validation; isolated edits were not applied.\n\n{body}")
+            } else {
+                format!("## {heading}\n{body}")
+            }
         })
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -1629,129 +1266,6 @@ fn emit_progress(update: Option<&UpdateCallback>, result: &SubagentResult) {
             "result": result,
         })),
     });
-}
-
-#[derive(Debug, Clone, Copy)]
-enum PipeKind {
-    Stdout,
-    Stderr,
-}
-
-struct PipeFrame {
-    kind: PipeKind,
-    line: String,
-}
-
-fn spawn_pipe_reader<R: Read + Send + 'static>(
-    pipe: R,
-    kind: PipeKind,
-    tx: mpsc::SyncSender<PipeFrame>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let reader = BufReader::new(pipe);
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
-            if tx.send(PipeFrame { kind, line }).is_err() {
-                break;
-            }
-        }
-    })
-}
-
-fn drain_child_frames(
-    rx: &Receiver<PipeFrame>,
-    result: &mut SubagentResult,
-    update: Option<&UpdateCallback>,
-) {
-    while let Ok(frame) = rx.try_recv() {
-        // Hub transcript persistence (bd-cv653.5.3): raw stdout frames land
-        // in the child's session-scoped transcript file for roster paging.
-        if matches!(frame.kind, PipeKind::Stdout)
-            && let (Some(hub_id), Ok(mut reg)) =
-                (result.hub_id.as_ref(), crate::agent_hub::registry().lock())
-        {
-            reg.append_transcript(hub_id, &frame.line);
-        }
-        match frame.kind {
-            PipeKind::Stderr => append_bounded_line(&mut result.stderr, &frame.line),
-            PipeKind::Stdout => ingest_child_event(&frame.line, result, update),
-        }
-    }
-}
-
-async fn drain_until_reader_exit(
-    rx: Receiver<PipeFrame>,
-    result: &mut SubagentResult,
-    update: Option<&UpdateCallback>,
-    stdout: thread::JoinHandle<()>,
-    stderr: thread::JoinHandle<()>,
-) {
-    for _ in 0..500 {
-        drain_child_frames(&rx, result, update);
-        if stdout.is_finished() && stderr.is_finished() {
-            break;
-        }
-        let now = asupersync::time::wall_now();
-        asupersync::time::sleep(now, Duration::from_millis(10)).await;
-    }
-    drain_child_frames(&rx, result, update);
-}
-
-fn ingest_child_event(line: &str, result: &mut SubagentResult, update: Option<&UpdateCallback>) {
-    let Ok(event) = serde_json::from_str::<Value>(line) else {
-        append_bounded_line(&mut result.stderr, line);
-        return;
-    };
-    match event.get("type").and_then(Value::as_str) {
-        Some("message_update") => {
-            if let Some(delta) = event
-                .pointer("/assistantMessageEvent/delta")
-                .and_then(Value::as_str)
-            {
-                append_bounded(&mut result.output, delta);
-                emit_progress(update, result);
-            }
-        }
-        Some("message_end") => {
-            if let Some(text) = assistant_text(event.get("message")) {
-                if result.output.is_empty() {
-                    append_bounded(&mut result.output, &text);
-                }
-                emit_progress(update, result);
-            }
-        }
-        Some("agent_end") => {
-            if result.output.is_empty()
-                && let Some(messages) = event.get("messages").and_then(Value::as_array)
-            {
-                for message in messages.iter().rev() {
-                    if let Some(text) = assistant_text(Some(message)) {
-                        append_bounded(&mut result.output, &text);
-                        break;
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn assistant_text(message: Option<&Value>) -> Option<String> {
-    let message = message?;
-    if message.get("role").and_then(Value::as_str) != Some("assistant") {
-        return None;
-    }
-    let content = message.get("content")?.as_array()?;
-    content.iter().find_map(|block| {
-        (block.get("type").and_then(Value::as_str) == Some("text"))
-            .then(|| {
-                block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-            .flatten()
-    })
 }
 
 fn append_bounded(target: &mut String, value: &str) {
@@ -2271,9 +1785,9 @@ mod tests {
         std::fs::write(
             &child,
             r#"#!/bin/sh
-printf '{"type":"message_update","assistantMessageEvent":{"delta":"streamed:"}}\n'
-printf '{"type":"message_update","assistantMessageEvent":{"delta":"%s"}}\n' "$PI_CODING_AGENT_DIR"
-printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"final child result"}]}]}\n'
+printf '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"streamed:"}}\n'
+printf '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"%s"}}\n' "$PI_CODING_AGENT_DIR"
+printf '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"final child result"}]}]}\n'
 "#,
         )
         .expect("write child fixture");
@@ -2288,19 +1802,31 @@ printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
+        let updates = Arc::new(std::sync::Mutex::new(String::new()));
+        let captured = Arc::clone(&updates);
         let output = runtime
             .block_on(tool.execute(
                 "subagent-fixture",
                 json!({"agent": "scout", "task": "verify child protocol"}),
-                None,
+                Some(Box::new(move |update| {
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push_str(&serde_json::to_string(&update).unwrap());
+                })),
             ))
             .expect("child execution succeeds");
 
         let ContentBlock::Text(text) = &output.content[0] else {
             panic!("expected text output");
         };
-        assert!(text.text.contains("streamed:"));
-        assert!(text.text.contains(global_dir.to_string_lossy().as_ref()));
+        assert_eq!(text.text, "## scout\nfinal child result");
+        let updates = updates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(updates.contains("streamed:"));
+        assert!(updates.contains(global_dir.to_string_lossy().as_ref()));
         assert!(
             output.details.as_ref().is_some_and(|details| {
                 details["results"][0]["binary"] == Value::String(child.display().to_string())
@@ -2321,7 +1847,7 @@ printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"
             &child,
             r#"#!/bin/sh
 sleep 1
-printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"tan fixture completed"}]}]}\n'
+printf '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"tan fixture completed"}]}]}\n'
 "#,
         )
         .expect("write tan child fixture");
@@ -2344,7 +1870,7 @@ printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"
                 .expect("tan child execution succeeds")
         });
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let running_entry = loop {
             let candidate = crate::agent_hub::registry()
                 .lock()
@@ -2352,7 +1878,12 @@ printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"
                 .roster()
                 .into_iter()
                 .find(|entry| {
-                    entry.task == task && entry.status == crate::agent_hub::ChildStatus::Running
+                    entry.task == task
+                        && matches!(
+                            entry.status,
+                            crate::agent_hub::ChildStatus::Running
+                                | crate::agent_hub::ChildStatus::Done
+                        )
                 });
             if let Some(entry) = candidate {
                 break entry;
@@ -2396,10 +1927,10 @@ printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"
             format!(
                 r#"#!/bin/sh
 if [ -f "{marker}" ]; then
-  printf '%s\n' '{{"type":"agent_end","messages":[{{"role":"assistant","content":[{{"type":"text","text":"{second}"}}]}}]}}'
+  printf '%s\n' '{{"type":"agent_end","messages":[{{"role":"assistant","stopReason":"stop","content":[{{"type":"text","text":"{second}"}}]}}]}}'
 else
   : > "{marker}"
-  printf '%s\n' '{{"type":"agent_end","messages":[{{"role":"assistant","content":[{{"type":"text","text":"{first}"}}]}}]}}'
+  printf '%s\n' '{{"type":"agent_end","messages":[{{"role":"assistant","stopReason":"stop","content":[{{"type":"text","text":"{first}"}}]}}]}}'
 fi
 "#,
                 marker = marker.display(),

@@ -88,6 +88,7 @@
 |------|-------|---------|-------|
 | `--skill <path>` | Y | Y | Load skill (repeatable) |
 | `--no-skills` | Y | Y | Disable skill discovery |
+| `--no-context-files` | Y | Y | Disable AGENTS.md / CLAUDE.md discovery |
 | `--prompt-template <path>` | Y | Y | Load template (repeatable) |
 | `--no-prompt-templates` | Y | Y | Disable template discovery |
 
@@ -162,13 +163,13 @@
 |-------|-------|---------|-------|
 | DEFAULT_MAX_LINES | 2000 | 2000 | Match |
 | DEFAULT_MAX_BYTES | 1,000,000 | 1,000,000 | Match |
-| GREP_MAX_LINE_LENGTH | ? | 500 | Needs TS verification |
-| DEFAULT_GREP_LIMIT | ? | 100 | Needs TS verification |
-| DEFAULT_FIND_LIMIT | ? | 1000 | Needs TS verification |
-| DEFAULT_LS_LIMIT | ? | 500 | Needs TS verification |
-| DEFAULT_BASH_TIMEOUT_SECS | ? | 120 | Needs TS verification |
-| IMAGE_MAX_BYTES | ? | 4.5MB | Needs TS verification |
-| READ_TOOL_MAX_BYTES | ? | 100MB | Needs TS verification |
+| GREP_MAX_LINE_LENGTH | 500 | 500 | Match; `GREP_MAX_LINE_LENGTH = 500` in the bundled TS pi |
+| DEFAULT_GREP_LIMIT | ? | 100 | No same-named constant in the bundled TS pi, and no numeric default in its grep tool schema — the cap may be Rust-only |
+| DEFAULT_FIND_LIMIT | ? | 1000 | No same-named constant in the bundled TS pi |
+| DEFAULT_LS_LIMIT | ? | 500 | No same-named constant in the bundled TS pi |
+| DEFAULT_BASH_TIMEOUT_SECS | ? | 120 | No same-named constant in the bundled TS pi |
+| IMAGE_MAX_BYTES | 4.5MB | 4.5MB | Match; `4.5 * 1024 * 1024` in the bundled TS pi |
+| READ_TOOL_MAX_BYTES | ? | 100MB | No same-named constant in the bundled TS pi |
 
 ---
 
@@ -176,24 +177,24 @@
 
 | Command | TS Pi | Rust Pi | Notes |
 |---------|-------|---------|-------|
-| `/settings` | Y | ? | TS settings menu |
+| `/settings` | Y | P | TS settings menu. Classic only; FTUI answers "Unknown command" |
 | `/model` | Y | Y | Model selector |
-| `/scoped-models` | Y | ? | Enable/disable models for cycling |
+| `/scoped-models` | Y | P | Enable/disable models for cycling. Classic only |
 | `/export` | Y | Y | Export session to HTML |
-| `/share` | Y | ? | Share as GitHub gist |
-| `/copy` | Y | ? | Copy last message to clipboard |
-| `/name` | Y | ? | Set session name |
-| `/session` | Y | ? | Session info/stats |
-| `/changelog` | Y | ? | Show changelog |
-| `/hotkeys` | Y | ? | Show keybindings |
-| `/fork` | Y | ? | Fork from previous message |
+| `/share` | Y | Y | Share as GitHub gist; both stacks |
+| `/copy` | Y | P | Copy last message to clipboard. Classic only |
+| `/name` | Y | Y | Set session name; both stacks |
+| `/session` | Y | Y | Session info/stats; both stacks |
+| `/changelog` | Y | P | Show changelog. Classic only; FTUI has no changelog surface |
+| `/hotkeys` | Y | Y | Show keybindings; FTUI gained it in b29a15e2c |
+| `/fork` | Y | P | Fork from previous message. Classic only |
 | `/tree` | Y | Y | Navigate session tree |
-| `/login` | Y | ? | OAuth login |
-| `/logout` | Y | ? | OAuth logout |
-| `/new` | Y | ? | Start new session |
+| `/login` | Y | P | OAuth login. Classic only |
+| `/logout` | Y | P | OAuth logout. Classic only |
+| `/new` | Y | Y | Start new session; both stacks |
 | `/compact` | Y | Y | Manual compaction |
-| `/resume` | Y | ? | Resume different session |
-| `/reload` | Y | ? | Reload extensions/skills/prompts/themes |
+| `/resume` | Y | Y | Resume different session; both stacks |
+| `/reload` | Y | P | Reload extensions/skills/prompts/themes. Classic only |
 | `/help` | Y | Y | Show help |
 | `/clear` | Y | Y | Clear message |
 | `/exit` | Y | Y | Exit application |
@@ -334,19 +335,19 @@
 | Variable | TS Pi | Rust Pi | Notes |
 |----------|-------|---------|-------|
 | `ANTHROPIC_API_KEY` | Y | Y | |
-| `ANTHROPIC_OAUTH_TOKEN` | Y | ? | Needs verification in Rust |
+| `ANTHROPIC_OAUTH_TOKEN` | Y | N | Not read by pi's auth. `anthropic` resolves `ANTHROPIC_API_KEY` or a stored OAuth credential from `/login`; the name appears only in the JS bridge map in extensions_js.rs |
 | `OPENAI_API_KEY` | Y | Y | |
 | `GOOGLE_API_KEY` / `GEMINI_API_KEY` | Y | Y | TS uses GEMINI_, Rust uses GOOGLE_ |
 | `AZURE_OPENAI_API_KEY` | Y | Y | |
-| `AZURE_OPENAI_BASE_URL` | Y | ? | Needs verification |
-| `AZURE_OPENAI_RESOURCE_NAME` | Y | ? | Needs verification |
-| `AZURE_OPENAI_API_VERSION` | Y | ? | Needs verification |
-| `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` | Y | ? | Needs verification |
+| `AZURE_OPENAI_BASE_URL` | Y | N | No base-URL override; pi builds the endpoint from resource + deployment |
+| `AZURE_OPENAI_RESOURCE_NAME` | Y | N | Name near-miss: pi reads `AZURE_OPENAI_RESOURCE` (providers/mod.rs), so the TS spelling is ignored |
+| `AZURE_OPENAI_API_VERSION` | Y | Y | Read in providers/mod.rs; `PI_AZURE_API_VERSION` also works |
+| `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` | Y | N | pi reads a single `AZURE_OPENAI_DEPLOYMENT`; no per-model deployment map |
 | `AWS_ACCESS_KEY_ID` | Y | Y | Bedrock |
 | `AWS_SECRET_ACCESS_KEY` | Y | Y | Bedrock |
-| `AWS_BEARER_TOKEN_BEDROCK` | Y | ? | Needs verification |
-| `AWS_REGION` | Y | ? | Needs verification |
-| `AWS_PROFILE` | Y | ? | Needs verification |
+| `AWS_BEARER_TOKEN_BEDROCK` | Y | Y | Bedrock; in the provider's AWS credential chain |
+| `AWS_REGION` | Y | Y | Resolved in auth.rs |
+| `AWS_PROFILE` | Y | Y | Resolved in auth.rs |
 | `GROQ_API_KEY` | Y | Y | |
 | `CEREBRAS_API_KEY` | Y | Y | |
 | `XAI_API_KEY` | Y | Y | |
@@ -356,10 +357,10 @@
 | `DEEPSEEK_API_KEY` | Y | Y | |
 | `PERPLEXITY_API_KEY` | Y | Y | |
 | `COHERE_API_KEY` | N | Y | Rust-only provider |
-| `AI_GATEWAY_API_KEY` | Y | ? | Vercel AI Gateway |
-| `ZAI_API_KEY` | Y | ? | ZAI provider |
-| `MINIMAX_API_KEY` | Y | ? | MiniMax provider |
-| `KIMI_API_KEY` | Y | ? | Kimi provider |
+| `AI_GATEWAY_API_KEY` | Y | Y | Vercel AI Gateway; `provider_metadata` auth key |
+| `ZAI_API_KEY` | Y | N | The `zai` provider exists but resolves auth from `ZHIPU_API_KEY`; this spelling appears only in the JS bridge map (`extensions_js.rs`). Accepting it as an alias is a one-line call nobody has made |
+| `MINIMAX_API_KEY` | Y | Y | MiniMax provider; `provider_metadata` auth key |
+| `KIMI_API_KEY` | Y | Y | Kimi provider; `provider_metadata` auth key (alongside `MOONSHOT_API_KEY`) |
 | `MOONSHOT_API_KEY` | N | Y | Rust-only |
 | `DASHSCOPE_API_KEY` | N | Y | Rust-only (Qwen) |
 | `FIREWORKS_API_KEY` | N | Y | Rust-only |
@@ -374,17 +375,17 @@
 | `PI_PACKAGE_DIR` | Y | Y | Package directory |
 | `PI_SESSIONS_DIR` | N | Y | Rust-only |
 | `PI_CONFIG_PATH` | N | Y | Rust-only |
-| `PI_SHARE_VIEWER_URL` | Y | ? | Share viewer base URL |
+| `PI_SHARE_VIEWER_URL` | Y | Y | Share viewer base URL; read in `session.rs` |
 
 ### Development / Testing
 
 | Variable | TS Pi | Rust Pi | Notes |
 |----------|-------|---------|-------|
 | `PI_TEST_MODE` | Y | Y | Deterministic rendering |
-| `PI_TIMING` | Y | ? | Timing output |
-| `PI_SKIP_VERSION_CHECK` | Y | ? | Skip version check |
-| `PI_HARDWARE_CURSOR` | Y | ? | Hardware cursor |
-| `PI_CLEAR_ON_SHRINK` | Y | ? | Clear on shrink |
+| `PI_TIMING` | Y | N | TS gates `core/timings.js` on `PI_TIMING === "1"`. Nothing in Rust reads it; there is no equivalent instrumentation module |
+| `PI_SKIP_VERSION_CHECK` | Y | Y | Skips the startup GitHub-releases check; beats `checkForUpdates`, and an empty value does not skip (matching JS truthiness) |
+| `PI_HARDWARE_CURSOR` | Y | Y | Hardware cursor; read in `interactive.rs` |
+| `PI_CLEAR_ON_SHRINK` | Y | Y | Clear on shrink; read in `config.rs`, settings take precedence |
 | `VCR_MODE` | N | Y | Rust-only VCR testing |
 | `VCR_CASSETTE_DIR` | N | Y | Rust-only VCR testing |
 | `PI_VCR_TEST_NAME` | N | Y | Rust-only VCR testing |
@@ -417,10 +418,10 @@
 | GitLab Duo | N | Y | Rust-only |
 | GitHub Copilot | Y | Y | |
 | Ollama | N | Y | Rust-only (local) |
-| Vercel AI Gateway | Y | ? | Needs verification |
-| ZAI | Y | ? | Needs verification |
-| MiniMax | Y | ? | Needs verification |
-| Kimi | Y | ? | Needs verification |
+| Vercel AI Gateway | Y | Y | `vercel` in provider_metadata; auth via `AI_GATEWAY_API_KEY` |
+| ZAI | Y | Y | `zai` and `zai-coding-plan`; auth via `ZHIPU_API_KEY` |
+| MiniMax | Y | Y | `minimax`, `minimax-cn`, and both coding-plan variants |
+| Kimi | Y | Y | `kimi-for-coding` and `kimi-coding`; auth via `KIMI_API_KEY` |
 | Moonshot | N | Y | Rust-only |
 | DashScope/Qwen | N | Y | Rust-only |
 | Fireworks | N | Y | Rust-only |
@@ -462,28 +463,28 @@
 | Event | TS Pi | Rust Pi | Notes |
 |-------|-------|---------|-------|
 | `session_start` | Y | Y | Initial session load |
-| `session_before_switch` | Y | ? | Cancellable |
-| `session_switch` | Y | ? | After switching |
-| `session_before_fork` | Y | ? | Cancellable |
-| `session_fork` | Y | ? | After forking |
-| `session_before_compact` | Y | ? | Cancellable, customizable |
-| `session_compact` | Y | ? | After compaction |
-| `session_before_tree` | Y | ? | Cancellable |
-| `session_tree` | Y | ? | After tree navigation |
+| `session_before_switch` | Y | Y | Cancellable; `dispatch_cancellable_event` from interactive.rs |
+| `session_switch` | Y | Y | After switching |
+| `session_before_fork` | Y | Y | Cancellable |
+| `session_fork` | Y | Y | After forking |
+| `session_before_compact` | Y | Y | Cancellable, customizable |
+| `session_compact` | Y | Y | After compaction |
+| `session_before_tree` | Y | Y | Cancellable |
+| `session_tree` | Y | Y | After tree navigation; emitted from interactive/tree_ui.rs |
 | `session_shutdown` | Y | Y | On exit |
-| `resources_discover` | Y | ? | Resource discovery |
+| `resources_discover` | Y | Y | Resource discovery; emitted from extension_manager_impl.rs |
 
 ### Agent Events
 
 | Event | TS Pi | Rust Pi | Notes |
 |-------|-------|---------|-------|
 | `context` | Y | Y | Before LLM call (can modify) |
-| `before_agent_start` | Y | ? | Cancellable |
+| `before_agent_start` | Y | Y | Cancellable; emitted from agent.rs |
 | `agent_start` | Y | Y | Loop start |
 | `agent_end` | Y | Y | Loop end |
 | `turn_start` | Y | Y | Turn start |
 | `turn_end` | Y | Y | Turn end |
-| `model_select` | Y | ? | Model selection |
+| `model_select` | Y | Y | Model selection; dispatched from interactive/commands.rs |
 
 ### Tool Events
 
@@ -496,8 +497,8 @@
 
 | Event | TS Pi | Rust Pi | Notes |
 |-------|-------|---------|-------|
-| `user_bash` | Y | ? | User shell with ! prefix |
-| `input` | Y | ? | User input (can transform) |
+| `user_bash` | Y | Y | User shell with ! prefix; dispatched from interactive/commands.rs |
+| `input` | Y | Y | User input (can transform); dispatched from agent.rs |
 
 ---
 
@@ -505,34 +506,34 @@
 
 | Command | TS Pi | Rust Pi | Notes |
 |---------|-------|---------|-------|
-| `prompt` | Y | ? | Initial prompt |
+| `prompt` | Y | Y | Initial prompt |
 | `steer` | Y | Y | Steer with user message |
 | `follow_up` / `queue-follow-up` | Y | Y | Queue follow-up |
 | `abort` | Y | Y | Abort current operation |
-| `new_session` | Y | ? | Start new session |
+| `new_session` | Y | Y | Start new session |
 | `get_state` / `get-state` | Y | Y | Get session state |
 | `set_model` / `set-model` | Y | Y | Set active model |
-| `cycle_model` | Y | ? | Cycle to next model |
-| `get_available_models` | Y | ? | List models |
-| `set_thinking_level` | Y | ? | Set thinking level |
-| `cycle_thinking_level` | Y | ? | Cycle thinking level |
-| `set_steering_mode` | Y | ? | Set steering mode |
-| `set_follow_up_mode` | Y | ? | Set follow-up mode |
+| `cycle_model` | Y | Y | Cycle to next model; covered by the g05 RPC differential fixture |
+| `get_available_models` | Y | Y | List models |
+| `set_thinking_level` | Y | Y | Set thinking level |
+| `cycle_thinking_level` | Y | Y | Cycle thinking level; covered by the g05 RPC differential fixture |
+| `set_steering_mode` | Y | Y | Set steering mode |
+| `set_follow_up_mode` | Y | Y | Set follow-up mode |
 | `compact` | Y | Y | Compact session |
 | `set_auto_compaction` / `set-auto-compaction` | Y | Y | Enable/disable compaction |
 | `set_auto_retry` / `set-auto-retry` | Y | Y | Enable/disable retry |
-| `abort_retry` | Y | ? | Abort retry |
-| `bash` | Y | ? | Execute bash |
-| `abort_bash` | Y | ? | Abort bash |
-| `get_session_stats` | Y | ? | Session statistics |
-| `export_html` | Y | ? | Export to HTML |
-| `switch_session` | Y | ? | Switch session |
-| `fork` | Y | ? | Fork from entry |
-| `get_fork_messages` | Y | ? | Get fork messages |
-| `get_last_assistant_text` | Y | ? | Last assistant text |
-| `set_session_name` | Y | ? | Set name |
-| `get_messages` | Y | ? | Get all messages |
-| `get_commands` | Y | ? | List commands |
+| `abort_retry` | Y | Y | Abort retry |
+| `bash` | Y | Y | Execute bash |
+| `abort_bash` | Y | Y | Abort bash |
+| `get_session_stats` | Y | Y | Session statistics |
+| `export_html` | Y | Y | Export to HTML |
+| `switch_session` | Y | Y | Switch session |
+| `fork` | Y | Y | Fork from entry |
+| `get_fork_messages` | Y | Y | Get fork messages; covered by the g05 RPC differential fixture |
+| `get_last_assistant_text` | Y | Y | Last assistant text |
+| `set_session_name` | Y | Y | Set name |
+| `get_messages` | Y | Y | Get all messages |
+| `get_commands` | Y | Y | List commands |
 | `query-completion` | N | Y | Rust-only: completion query |
 
 ### RPC Events (responses)
@@ -595,20 +596,20 @@
 | Clear | Y | Y | Ctrl+C | |
 | Exit | Y | Y | Ctrl+D | When empty |
 | Suspend | Y | Y | Ctrl+Z | |
-| Cycle thinking | Y | Y | Shift+Tab | |
-| Cycle model forward | Y | Y | Ctrl+P | |
-| Cycle model backward | Y | Y | Shift+Ctrl+P | |
-| Select model | Y | Y | Ctrl+L | |
-| Expand tools | Y | ? | Ctrl+O | Needs verification |
-| Toggle thinking | Y | ? | Ctrl+T | Needs verification |
-| Toggle session named filter | Y | ? | Ctrl+N | Needs verification |
-| External editor | Y | ? | Ctrl+G | Needs verification |
-| Follow up | Y | Y | Alt+Enter | |
-| Dequeue | Y | ? | Alt+Up | Needs verification |
-| Paste image | Y | ? | Ctrl+V | Needs verification |
-| New session | Y | ? | (none) | Needs verification |
-| Tree | Y | ? | (none) | Needs verification |
-| Fork | Y | ? | (none) | Needs verification |
+| Cycle thinking | Y | P | Shift+Tab | Classic only; inert on the default ftui stack |
+| Cycle model forward | Y | P | Ctrl+P | Classic only; inert on ftui |
+| Cycle model backward | Y | P | Shift+Ctrl+P | Classic only; inert on ftui |
+| Select model | Y | Y | Ctrl+L | ftui gained it in d5bcc2eb6 |
+| Expand tools | Y | P | Ctrl+O | Classic only; ftui renders no expandable tool output |
+| Toggle thinking | Y | P | Ctrl+T | Classic only; ftui renders no thinking content to toggle |
+| Toggle session named filter | Y | P | Ctrl+N | Classic only; inert on ftui |
+| External editor | Y | P | Ctrl+G | Classic only; inert on ftui |
+| Follow up | Y | P | Alt+Enter | Classic only. On ftui the chord reaches the editor and inserts a newline |
+| Dequeue | Y | P | Alt+Up | Classic only; inert on ftui |
+| Paste image | Y | P | Ctrl+V | Classic only; inert on ftui |
+| New session | Y | X | (none) | No default key in pi's catalog on either side; the action is reachable as `/new` |
+| Tree | Y | X | (none) | No default key in pi's catalog; reachable as `/tree` |
+| Fork | Y | X | (none) | No default key in pi's catalog; reachable as `/fork` (classic) |
 
 ### Customization
 
@@ -656,19 +657,19 @@
 | `ui.input()` | Y | Y | Input dialog |
 | `ui.notify()` | Y | Y | Notification |
 | `ui.setStatus()` | Y | Y | Status bar |
-| `ui.setWorkingMessage()` | Y | ? | Working message |
+| `ui.setWorkingMessage()` | Y | Y | Bridges to `setStatus`; applied on both stacks |
 | `ui.setWidget()` | Y | Y | Custom widget |
-| `ui.setFooter()` | Y | ? | Custom footer |
-| `ui.setHeader()` | Y | ? | Custom header |
+| `ui.setFooter()` | Y | Y | Bridges to `setStatus`/`setTitle`; applied on both stacks |
+| `ui.setHeader()` | Y | Y | Bridges to `setTitle`/`setStatus`; applied on both stacks |
 | `ui.setTitle()` | Y | Y | Window title |
-| `ui.custom()` | Y | ? | Custom component |
-| `ui.setEditorText()` | Y | ? | Set editor text |
-| `ui.getEditorText()` | Y | ? | Get editor text |
-| `ui.editor()` | Y | ? | Full editor dialog |
+| `ui.custom()` | Y | Y | Custom component; `custom` op in extension_dispatcher.rs |
+| `ui.setEditorText()` | Y | Y | `set_editor_text`; applied on both stacks |
+| `ui.getEditorText()` | Y | Y | Answered on both stacks |
+| `ui.editor()` | Y | Y | Full editor dialog; `input`/`editor` op in rpc.rs |
 | `ui.theme` | Y | Y | Current theme |
-| `ui.getAllThemes()` | Y | ? | Theme list |
-| `ui.getTheme()` | Y | ? | Get theme by name |
-| `ui.setTheme()` | Y | ? | Set active theme |
+| `ui.getAllThemes()` | Y | P | Answered on both stacks, but ftui reports only `dark`/`light`; classic also scans resource themes |
+| `ui.getTheme()` | Y | P | Answered on both stacks; ftui resolves only `dark`/`light` |
+| `ui.setTheme()` | Y | P | Applied on both stacks; ftui accepts only `dark`/`light` and reports false otherwise |
 
 ### Hostcalls
 
@@ -698,17 +699,17 @@
 | Component | TS Pi | Rust Pi | Notes |
 |-----------|-------|---------|-------|
 | Model selector | Y | Y | |
-| Scoped models selector | Y | ? | Needs verification |
+| Scoped models selector | Y | P | `handle_slash_scoped_models`; classic only, like `/scoped-models` |
 | Thinking selector | Y | Y | |
 | Session selector/picker | Y | Y | |
 | Tree selector | Y | Y | |
-| Settings selector | Y | ? | Needs verification |
-| Login dialog | Y | ? | OAuth flow |
-| Config selector | Y | ? | Package resource config |
+| Settings selector | Y | P | `SlashCommand::Settings`; classic only |
+| Login dialog | Y | P | OAuth flow; `handle_slash_login`, classic only |
+| Config selector | Y | Y | Package resource config; `ConfigUiApp` in main.rs, independent of the interactive stack |
 | Tool execution display | Y | Y | |
 | Bash execution display | Y | Y | |
 | Skill invocation display | Y | Y | |
-| Extension editor | Y | ? | Custom UI |
+| Extension editor | Y | Y | Custom UI; `ExtensionUiRequest` is handled on both stacks |
 | Autocomplete | Y | Y | @file and /commands |
 
 ---

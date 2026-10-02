@@ -74,6 +74,10 @@
           "justification": "Validates preflight workflow expectations before end-to-end runtime execution."
         },
         {
+          "path": "tests/e2e_resource_load_failure.rs",
+          "justification": "A configured package that fails to install or resolve exits 4 with a machine-readable resource.load_failed record, exits 1 when an explicit -e path is supplied, and stays silent on a healthy run (gh #223 / bd-fpaso)."
+        },
+        {
           "path": "tests/e2e_swarm_flight_recorder.rs",
           "justification": "Exercises deterministic multi-agent flight-recorder replay with real sessions, tools, extension hooks, and redacted JSONL/report artifacts."
         },
@@ -166,6 +170,10 @@
           "justification": "HTTP client request/response behavior and transport-level diagnostics coverage."
         },
         {
+          "path": "tests/http_proxy.rs",
+          "justification": "Proxy wiring for the HTTP client (gh #210): the client dials the configured proxy, uses absolute-form for http:// targets, and forwards the response, proved against a loopback listener with no external network."
+        },
+        {
           "path": "tests/main_cli_selection.rs",
           "justification": "CLI command/model selection behavior and argument-routing correctness."
         },
@@ -180,6 +188,14 @@
         {
           "path": "tests/provider_streaming.rs",
           "justification": "Streaming provider behavior and event-shape stability across runtimes."
+        },
+        {
+          "path": "tests/provider_bedrock_streaming.rs",
+          "justification": "Bedrock streaming against a loopback fixture: signed reasoning and tool calls surviving stream/session/replay, credential redaction in errors, and truncated or corrupt streams never emitting done."
+        },
+        {
+          "path": "tests/agent_cx_io.rs",
+          "justification": "Scoped-I/O regressions driven through real loopback sockets and providers, with no remote credentials or external network."
         },
         {
           "path": "tests/resource_loader.rs",
@@ -278,6 +294,14 @@
           "justification": "Extension entry scanning and discovery behavior verification."
         },
         {
+          "path": "tests/extension_event_parity.rs",
+          "justification": "Behavioural parity: one fixture extension driven through every agent-driving surface on one scripted turn, with the delivered observation-event streams compared and a per-surface JSONL artifact. Catches a surface whose routing call is present but whose session cannot use it (bd-82331)."
+        },
+        {
+          "path": "tests/extension_event_routing.rs",
+          "justification": "Every agent-driving surface routes observation events to extensions, and the inventory of surfaces is complete. Guards the per-surface obligation that has no compiler support (bd-82331)."
+        },
+        {
           "path": "tests/ext_inclusion_list.rs",
           "justification": "Extension inclusion-list policy and allowlist selection coverage."
         },
@@ -348,6 +372,10 @@
         {
           "path": "tests/extensions_process_shim.rs",
           "justification": "Process shim runtime behavior and compatibility checks for extensions."
+        },
+        {
+          "path": "tests/extensions_provider_numeric.rs",
+          "justification": "Extension provider numeric decoding and QuickJS number tagging coverage."
         },
         {
           "path": "tests/extensions_provider_oauth.rs",
@@ -810,6 +838,10 @@
           "justification": "Classified vcr suite included in the bd-8t27h.3 traceability backfill so CI governance covers all registered tests."
         },
         {
+          "path": "tests/sdk_multimodal.rs",
+          "justification": "SDK image prompts over a loopback provider fixture: retry, failover, abort and durable-save fencing with attachments."
+        },
+        {
           "path": "tests/context_intelligence_closeout_gate_contract.rs",
           "justification": "Classified traceability repair suite included so CI governance covers the context-intelligence closeout contract and evidence guard."
         },
@@ -1206,6 +1238,10 @@
         {
           "path": "tests/extensions_provider_streaming.rs",
           "justification": "Provider-path extension runtime behavior support."
+        },
+        {
+          "path": "tests/extension_stream_terminal.rs",
+          "justification": "Extension provider terminals through QuickJS and the real agent: incomplete or inconsistent streams never execute tools."
         },
         {
           "path": "tests/extension_auto_repair_integration.rs",
@@ -2207,6 +2243,10 @@
           "justification": "FTUI interactive surface exercised under tmux."
         },
         {
+          "path": "tests/ftui_conhost_console.rs",
+          "justification": "FTUI native Windows console-input lease and restoration on a real ConHost (opt-in lane)."
+        },
+        {
           "path": "tests/e2e_lsp.rs",
           "justification": "LSP bridge exercised end-to-end through the real binary."
         },
@@ -2317,6 +2357,14 @@
         {
           "path": "tests/browser.rs",
           "justification": "Browser tool schema/metadata, navigation, and tab lifecycle behaviour."
+        },
+        {
+          "path": "tests/browser_frames.rs",
+          "justification": "Browser frame selection preflight; the live Chromium iframe-input scenario runs in the DSR browser lane."
+        },
+        {
+          "path": "tests/browser_cdp.rs",
+          "justification": "Chromium session ownership over CDP: launch and teardown, DOM interaction, staged file uploads, and native page exports (bd-cv653.2.4)."
         },
         {
           "path": "tests/computer.rs",

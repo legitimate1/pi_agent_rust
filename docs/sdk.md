@@ -19,6 +19,25 @@ futures = "0.3"
 When developing against a local checkout, replace `version = "0.2.0"` with
 `path = "/path/to/pi_agent_rust"` while retaining `package = "pi_agent_rust"`.
 
+### Raise your crate's `recursion_limit`
+
+Add this at the top of the crate that drives a session:
+
+```rust
+#![recursion_limit = "256"]
+```
+
+Pi's runtime nests its future types deeply enough that proving `Send` for a
+session future can exceed rustc's default limit of 128. `recursion_limit` is
+per-crate and is **not** inherited from a dependency, so pi raising it
+internally does nothing for yours. Without it you get an `overflow evaluating
+the requirement ...: std::marker::Send` error, or a
+`recursion_depth_exceeding_limit` warning that `-D warnings` makes fatal — and
+neither names the real cause.
+
+This is not hypothetical: every one of pi's own binaries, examples and
+integration tests needed the attribute, `examples/basic_sdk.rs` included.
+
 ## SemVer Surface
 
 The supported library surface is the crate root aliases `pi::Error`,
@@ -299,3 +318,44 @@ fn main() -> pi::sdk::Result<()> {
 - `tests/sdk_api.rs`
 - `tests/sdk_unit.rs`
 - `tests/sdk_integration.rs`
+
+
+### RPC subprocess streaming
+
+`RpcTransportClient::prompt_with_options_streaming` delivers each raw RPC event
+as it is read instead of buffering the complete turn first. `SessionTransport::prompt`
+uses that path, so its callback has the same live-delivery contract in subprocess
+mode as in-process mode.
+
+A server event that races ahead of the matching prompt acknowledgement is retained
+under explicit count and byte bounds, then delivered in order after a successful
+acknowledgement. A failed acknowledgement does not expose those speculative events.
+Prompt acknowledgements must match both request id and command. Individual
+line-delimited JSON frames are capped at 8 MiB; oversized or truncated frames fail
+the transport rather than allocating without bound. Public generic RPC requests
+cannot override the SDK-generated `type` or `id` fields.
+
+The returned `RpcEvents` vector still contains the delivered events for callers
+that need the completed transcript. Live callbacks are therefore additive, not a
+change to the completion payload.
+
+
+### Mid-turn RPC control
+
+Call `RpcTransportClient::control_handle()` before starting a subprocess prompt
+when another thread, event loop, or the prompt's live callback may need to steer
+or abort it. The cloned `RpcControlHandle` shares only the serialized stdin
+writer and request-id allocator. The prompt remains the **only stdout reader**,
+so concurrent control never races a second parser over the RPC event stream.
+
+`RpcControlHandle::steer`, `follow_up`, and `abort` synchronously write and
+flush a command and return its SDK-owned request id. A successful return means
+the command was dispatched to the subprocess pipe; it does not claim the RPC
+server accepted or completed the operation. Its acknowledgement is consumed by
+the prompt's single reader. Use the ordinary `RpcTransportClient` methods when
+you need an acknowledgement and no prompt currently owns the read lane.
+
+The control lane and ordinary requests use one atomic id sequence and one mutexed
+writer, preventing duplicate IDs or interleaved JSON lines. Holding a control
+handle does not keep the child process alive after the owning client shuts down;
+subsequent writes then fail.

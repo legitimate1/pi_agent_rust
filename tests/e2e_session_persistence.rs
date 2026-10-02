@@ -734,6 +734,28 @@ fn required_chaos_env(name: &str) -> String {
 #[cfg(feature = "internal-persistence-fault-injection")]
 const PERSISTENCE_FAILPOINT_HARD_EXIT_CODE: i32 = 86;
 
+/// A wedged failpoint child must fail the test, not hang the lane.
+#[cfg(feature = "internal-persistence-fault-injection")]
+const PERSISTENCE_FAILPOINT_CHILD_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(120);
+
+/// Reopen after a crash window without the recovery-tolerant loader's
+/// forgiveness: a crash that left a malformed or orphaned row must fail
+/// here, not be silently skipped (bd-yn7ud).
+#[cfg(feature = "internal-persistence-fault-injection")]
+async fn reopen_strict(path: &Path, window: &str) -> Session {
+    let (session, diagnostics) = Session::open_with_diagnostics(path.to_string_lossy().as_ref())
+        .await
+        .unwrap_or_else(|err| panic!("reopen after {window}: {err}"));
+    assert!(
+        diagnostics.skipped_entries.is_empty() && diagnostics.orphaned_parent_links.is_empty(),
+        "{window} left rows the strict reopen had to skip: skipped={:?} orphaned={:?}",
+        diagnostics.skipped_entries,
+        diagnostics.orphaned_parent_links
+    );
+    session
+}
+
 #[cfg(feature = "internal-persistence-fault-injection")]
 fn run_persistence_failpoint_child(
     session_path: &Path,
@@ -741,8 +763,14 @@ fn run_persistence_failpoint_child(
     backend: &str,
     failpoint: &str,
     message: &str,
+    save_mode: Option<&str>,
 ) -> std::process::Output {
-    Command::new(std::env::current_exe().expect("current persistence test binary"))
+    // Output goes to files so the parent can poll with a deadline without
+    // a pipe filling up; a child past the deadline is killed and reaped.
+    let logs = tempfile::tempdir().expect("failpoint child log dir");
+    let stdout_path = logs.path().join("stdout");
+    let stderr_path = logs.path().join("stderr");
+    let mut child = Command::new(std::env::current_exe().expect("current persistence test binary"))
         .arg("--exact")
         .arg("persistence_failpoint_worker_process_entrypoint")
         .arg("--nocapture")
@@ -754,9 +782,36 @@ fn run_persistence_failpoint_child(
         .env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT_ACTION", "hard_exit")
         .env("PI_SESSION_PERSISTENCE_TEST_MARKER_PATH", marker_path)
         .env("PI_SESSION_PERSISTENCE_TEST_MESSAGE", message)
+        .env(
+            "PI_SESSION_PERSISTENCE_TEST_SAVE_MODE",
+            save_mode.unwrap_or("default"),
+        )
         .stdin(Stdio::null())
-        .output()
-        .expect("run persistence failpoint child")
+        .stdout(std::fs::File::create(&stdout_path).expect("child stdout file"))
+        .stderr(std::fs::File::create(&stderr_path).expect("child stderr file"))
+        .spawn()
+        .expect("spawn persistence failpoint child");
+    let deadline = std::time::Instant::now() + PERSISTENCE_FAILPOINT_CHILD_DEADLINE;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll failpoint child") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "persistence failpoint child {failpoint} exceeded {:?} and was killed\nstderr:\n{}",
+                PERSISTENCE_FAILPOINT_CHILD_DEADLINE,
+                std::fs::read_to_string(&stderr_path).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    std::process::Output {
+        status,
+        stdout: std::fs::read(&stdout_path).unwrap_or_default(),
+        stderr: std::fs::read(&stderr_path).unwrap_or_default(),
+    }
 }
 
 #[cfg(feature = "internal-persistence-fault-injection")]
@@ -767,7 +822,9 @@ fn persistence_failpoint_worker_process_entrypoint() {
     }
     let session_path = PathBuf::from(required_chaos_env("PI_SESSION_PERSISTENCE_TEST_PATH"));
     let backend = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_BACKEND");
-    let failpoint = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT");
+    // Read only to fail fast when the parent omitted it; the backend consumes
+    // the variable itself at the checkpoint.
+    let _failpoint = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT");
     let message = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_MESSAGE");
 
     run_async_test(async {
@@ -778,8 +835,16 @@ fn persistence_failpoint_worker_process_entrypoint() {
             content: UserContent::Text(message),
             timestamp: Some(0),
         });
-        if backend == "jsonl" {
-            session.set_model_header(Some("failpoint-jsonl".to_string()), None, None);
+        // A dirty header forces the full-rewrite path; leaving it clean takes
+        // the incremental append path. Defaults: JSONL rewrites, SQLite
+        // appends; the save-mode variable selects the other path.
+        let rewrite = match std::env::var("PI_SESSION_PERSISTENCE_TEST_SAVE_MODE").as_deref() {
+            Ok("rewrite") => true,
+            Ok("append") => false,
+            _ => backend == "jsonl",
+        };
+        if rewrite {
+            session.set_model_header(Some(format!("failpoint-{backend}")), None, None);
         }
         let result = session.save().await;
         panic!("hard-exit persistence failpoint returned unexpectedly: {result:?}");
@@ -1840,14 +1905,15 @@ fn multi_turn_persistence() {
 
 #[cfg(feature = "internal-persistence-fault-injection")]
 #[test]
+#[allow(clippy::too_many_lines)] // three sequential crash windows over one session
 fn jsonl_fault_injection_flush_windows_preserve_integrity() {
     let test_name = "e2e_jsonl_fault_injection_flush_windows";
     let harness = TestHarness::new(test_name);
-    let correlation_id = match harness.log().ci_correlation_id() {
-        Some(value) => value,
-        None => harness.log().trace_id(),
-    }
-    .to_string();
+    let correlation_id = harness
+        .log()
+        .ci_correlation_id()
+        .unwrap_or_else(|| harness.log().trace_id())
+        .to_string();
     harness.section("jsonl_fault_injection");
 
     run_async_test(async {
@@ -1868,9 +1934,7 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
         });
         drop(session);
 
-        let reopened_pre = Session::open(stable_path.to_string_lossy().as_ref())
-            .await
-            .expect("reopen after pre-flush crash simulation");
+        let reopened_pre = reopen_strict(&stable_path, "pre-flush crash simulation").await;
         let pre_texts = user_texts_in_order(&reopened_pre.to_messages_for_current_path());
         assert_eq!(pre_texts, vec!["jsonl-base".to_string()]);
         assert_no_duplicate_user_texts(&pre_texts, "jsonl pre-flush window");
@@ -1887,6 +1951,7 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
             "jsonl",
             failpoint,
             "jsonl-midflush-pending",
+            None,
         );
         assert_eq!(
             child.status.code(),
@@ -1897,8 +1962,8 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
         );
         assert_eq!(
             std::fs::read_to_string(&marker_path).expect("read JSONL checkpoint marker"),
-            format!("{failpoint}\n"),
-            "JSONL hard exit must occur only after the exact backend checkpoint"
+            format!("{failpoint}\njsonl_parent_syncs=0\n"),
+            "JSONL hard exit must occur at the exact backend checkpoint, before the parent sync"
         );
         harness
             .log()
@@ -1907,9 +1972,7 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
             });
 
         // Simulate process crash/restart after failed flush.
-        let reopened_mid = Session::open(stable_path.to_string_lossy().as_ref())
-            .await
-            .expect("reopen after mid-flush crash simulation");
+        let reopened_mid = reopen_strict(&stable_path, "mid-flush crash simulation").await;
         let mid_texts = user_texts_in_order(&reopened_mid.to_messages_for_current_path());
         assert_eq!(
             mid_texts,
@@ -1937,6 +2000,7 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
             "jsonl",
             post_failpoint,
             "jsonl-postflush-persisted",
+            None,
         );
         assert_eq!(
             post_child.status.code(),
@@ -1949,7 +2013,7 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
             std::fs::read_to_string(&post_marker_path)
                 .expect("read JSONL post-flush checkpoint marker"),
             format!(
-                "{post_failpoint}\n{}\n",
+                "{post_failpoint}\n{}\njsonl_parent_syncs=1\n",
                 if cfg!(unix) {
                     "parent_sync_completed=unix_fsync"
                 } else {
@@ -1959,9 +2023,7 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
             "JSONL post-flush hard exit must carry the completed platform sync witness"
         );
 
-        let reopened_post = Session::open(stable_path.to_string_lossy().as_ref())
-            .await
-            .expect("reopen after post-flush crash simulation");
+        let reopened_post = reopen_strict(&stable_path, "post-flush crash simulation").await;
         let post_texts = user_texts_in_order(&reopened_post.to_messages_for_current_path());
         assert_eq!(
             post_texts,
@@ -2000,14 +2062,15 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
     feature = "internal-persistence-fault-injection"
 ))]
 #[test]
+#[allow(clippy::too_many_lines)] // three sequential crash windows over one session
 fn sqlite_fault_injection_flush_windows_preserve_integrity() {
     let test_name = "e2e_sqlite_fault_injection_flush_windows";
     let harness = TestHarness::new(test_name);
-    let correlation_id = match harness.log().ci_correlation_id() {
-        Some(value) => value,
-        None => harness.log().trace_id(),
-    }
-    .to_string();
+    let correlation_id = harness
+        .log()
+        .ci_correlation_id()
+        .unwrap_or_else(|| harness.log().trace_id())
+        .to_string();
     harness.section("sqlite_fault_injection");
 
     run_async_test(async {
@@ -2028,9 +2091,7 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
         });
         drop(session);
 
-        let reopened_pre = Session::open(stable_path.to_string_lossy().as_ref())
-            .await
-            .expect("reopen sqlite after pre-flush crash simulation");
+        let reopened_pre = reopen_strict(&stable_path, "sqlite pre-flush crash simulation").await;
         let pre_texts = user_texts_in_order(&reopened_pre.to_messages_for_current_path());
         assert_eq!(pre_texts, vec!["sqlite-base".to_string()]);
         assert_no_duplicate_user_texts(&pre_texts, "sqlite pre-flush window");
@@ -2047,6 +2108,7 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
             "sqlite",
             failpoint,
             "sqlite-midflush-pending",
+            None,
         );
         assert_eq!(
             child.status.code(),
@@ -2066,9 +2128,7 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
                 ctx.push(("checkpoint".into(), failpoint.to_string()));
             });
 
-        let reopened_mid = Session::open(stable_path.to_string_lossy().as_ref())
-            .await
-            .expect("reopen sqlite after mid-flush crash simulation");
+        let reopened_mid = reopen_strict(&stable_path, "sqlite mid-flush crash simulation").await;
         let mid_texts = user_texts_in_order(&reopened_mid.to_messages_for_current_path());
         assert_eq!(mid_texts, vec!["sqlite-base".to_string()]);
         assert_no_duplicate_user_texts(&mid_texts, "sqlite mid-flush window");
@@ -2091,6 +2151,7 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
             "sqlite",
             post_failpoint,
             "sqlite-postflush-persisted",
+            None,
         );
         assert_eq!(
             post_child.status.code(),
@@ -2106,9 +2167,7 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
             "SQLite post-flush hard exit must carry completed COMMIT evidence"
         );
 
-        let reopened_post = Session::open(stable_path.to_string_lossy().as_ref())
-            .await
-            .expect("reopen sqlite after post-flush crash simulation");
+        let reopened_post = reopen_strict(&stable_path, "sqlite post-flush crash simulation").await;
         let post_texts = user_texts_in_order(&reopened_post.to_messages_for_current_path());
         assert_eq!(
             post_texts,
@@ -2602,4 +2661,392 @@ fn cli_continue_tmux_loads_existing_session() {
         });
 
     write_jsonl_artifacts(&harness, test_name);
+}
+
+#[test]
+fn e2e_print_mode_session_path_persists_and_continues() {
+    let harness = TestHarness::new("print_session_path_persists");
+    let env = isolated_cli_env(&harness);
+    let session_path = harness.temp_path("print_session.jsonl");
+
+    // Process 1: run with --session pointing to a non-existent path
+    let session_str = session_path.to_str().unwrap();
+    let result1 = run_cli(
+        &harness,
+        &env,
+        &[
+            "--print",
+            "--mode",
+            "json",
+            "--session",
+            session_str,
+            "hello first turn",
+        ],
+        None,
+    );
+
+    // Process 1 must have persisted the session file to session_path
+    assert!(
+        session_path.exists(),
+        "session file must exist at explicit --session path; stderr:\n{}",
+        result1.stderr
+    );
+    let content = std::fs::read_to_string(&session_path).expect("read session file");
+    assert!(
+        content.contains("\"type\":\"session\""),
+        "session file must contain session header: {content}"
+    );
+
+    // Extract the session ID from the persisted file
+    let first_line = content.lines().next().expect("first line");
+    let header_val: Value = serde_json::from_str(first_line).expect("parse header json");
+    let session_id = header_val["id"].as_str().expect("session id").to_string();
+
+    // Process 2: run with the same --session path
+    let result2 = run_cli(
+        &harness,
+        &env,
+        &[
+            "--print",
+            "--mode",
+            "json",
+            "--session",
+            session_str,
+            "hello second turn",
+        ],
+        None,
+    );
+
+    // The session header emitted in process 2 stdout must have the same session ID
+    let first_line_out2 = result2
+        .stdout
+        .lines()
+        .next()
+        .expect("first line of stdout in process 2");
+    let header_out2: Value =
+        serde_json::from_str(first_line_out2).expect("parse stdout header json");
+    assert_eq!(
+        header_out2["id"].as_str(),
+        Some(session_id.as_str()),
+        "second process must adopt existing session ID from persisted session"
+    );
+}
+
+/// bd-yn7ud: the incremental JSONL append path has its own crash windows. A
+/// hard exit after the append write but before its fsync must leave a strict,
+/// complete log (the bytes are in the page cache; a torn or duplicated row is
+/// the failure), and a hard exit after the fsync must include the new row.
+#[cfg(feature = "internal-persistence-fault-injection")]
+#[test]
+fn jsonl_append_fault_windows_preserve_integrity() {
+    let harness = TestHarness::new("e2e_jsonl_append_fault_windows");
+    run_async_test(async {
+        let cwd = harness.temp_dir().to_path_buf();
+        let mut session = Session::create_with_dir_and_store(Some(cwd), SessionStoreKind::Jsonl);
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("append-base".to_string()),
+            timestamp: Some(0),
+        });
+        session.save().await.expect("save baseline jsonl session");
+        let stable_path = session.path.clone().expect("jsonl session path");
+        drop(session);
+        let markers = tempfile::tempdir().expect("marker dir");
+
+        let point = "jsonl_append_after_write_before_sync";
+        let marker = markers.path().join("append-before-sync.marker");
+        let child = run_persistence_failpoint_child(
+            &stable_path,
+            &marker,
+            "jsonl",
+            point,
+            "append-written-unsynced",
+            Some("append"),
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(PERSISTENCE_FAILPOINT_HARD_EXIT_CODE),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("read marker"),
+            format!("{point}\njsonl_parent_syncs=0\n"),
+            "the child must stop at the append checkpoint, not in the rewrite path"
+        );
+        let reopened = reopen_strict(&stable_path, "append before fsync").await;
+        let texts = user_texts_in_order(&reopened.to_messages_for_current_path());
+        assert_eq!(texts, vec!["append-base", "append-written-unsynced"]);
+        assert_no_duplicate_user_texts(&texts, "jsonl append before fsync");
+        assert_ne!(
+            reopened.header.provider.as_deref(),
+            Some("failpoint-jsonl"),
+            "an append must not have rewritten the header"
+        );
+        drop(reopened);
+
+        let point = "jsonl_append_after_sync";
+        let marker = markers.path().join("append-after-sync.marker");
+        let child = run_persistence_failpoint_child(
+            &stable_path,
+            &marker,
+            "jsonl",
+            point,
+            "append-synced",
+            Some("append"),
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(PERSISTENCE_FAILPOINT_HARD_EXIT_CODE),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("read marker"),
+            format!("{point}\nappend_sync_completed=true\njsonl_parent_syncs=0\n")
+        );
+        let reopened = reopen_strict(&stable_path, "append after fsync").await;
+        let texts = user_texts_in_order(&reopened.to_messages_for_current_path());
+        assert_eq!(
+            texts,
+            vec!["append-base", "append-written-unsynced", "append-synced"]
+        );
+        assert_no_duplicate_user_texts(&texts, "jsonl append after fsync");
+    });
+}
+
+/// bd-5jfkl child: a thinking-level change whose JSONL rewrite renames into
+/// place and then reports failure, on the first save and the idempotent
+/// retry alike. The durable outcome is unknown to the caller, so the live
+/// runtime must not install the level and provider re-entry must stay
+/// refused. The child asserts that itself; the parent inspects the file.
+#[cfg(feature = "internal-persistence-fault-injection")]
+#[test]
+fn setter_post_rename_worker_process_entrypoint() {
+    if std::env::var_os("PI_SESSION_SETTER_FAILPOINT_WORKER").is_none() {
+        return;
+    }
+    let session_path = PathBuf::from(required_chaos_env("PI_SESSION_PERSISTENCE_TEST_PATH"));
+    run_async_test(async {
+        let session = Session::open(session_path.to_string_lossy().as_ref())
+            .await
+            .expect("open setter worker session");
+        let cwd = session_path.parent().expect("session dir").to_path_buf();
+        let provider = Arc::new(PlannedProvider::new(Vec::new()));
+        let mut agent_session = make_agent_session(
+            &cwd,
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            Arc::new(asupersync::sync::Mutex::new(session)),
+        );
+
+        if std::env::var("PI_SESSION_SETTER_KIND").as_deref() == Ok("model") {
+            let auth_dir = tempfile::tempdir().expect("auth dir");
+            let mut auth =
+                pi::auth::AuthStorage::load(auth_dir.path().join("auth.json")).expect("load auth");
+            auth.set(
+                "openai",
+                pi::auth::AuthCredential::ApiKey {
+                    key: "openai-key".to_string(),
+                },
+            );
+            agent_session.set_model_registry(pi::models::ModelRegistry::load(&auth, None));
+            agent_session.set_auth_storage(auth);
+
+            let err = agent_session
+                .set_provider_model("openai", "gpt-4o")
+                .await
+                .expect_err("both saves fail after their rename");
+            assert!(err.is_session_persistence(), "{err}");
+            assert_eq!(
+                agent_session.agent.provider().name(),
+                "planned-provider",
+                "an indeterminate save must not install the target provider"
+            );
+            assert_eq!(
+                agent_session.agent.stream_options().api_key.as_deref(),
+                Some("test-key"),
+                "an indeterminate save must not install the target credential"
+            );
+        } else {
+            let err = agent_session
+                .set_thinking_level(pi::model::ThinkingLevel::High)
+                .await
+                .expect_err("both saves fail after their rename");
+            assert!(err.is_session_persistence(), "{err}");
+            assert_eq!(
+                agent_session.agent.stream_options().thinking_level,
+                None,
+                "an indeterminate save must not install the level"
+            );
+        }
+
+        let err = agent_session
+            .run_text("after the failed setter".to_string(), |_| {})
+            .await
+            .expect_err("provider re-entry must be quarantined");
+        assert!(err.is_session_persistence(), "{err}");
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 0);
+    });
+}
+
+/// bd-5jfkl: see the worker above. The rename landed, so the reopened file
+/// holds the new level while the child's runtime refused it; the file must
+/// still reopen strictly with the prior transcript intact.
+#[cfg(feature = "internal-persistence-fault-injection")]
+#[test]
+fn thinking_setter_post_rename_failure_quarantines_reentry() {
+    let reopened = run_setter_post_rename_child("thinking");
+    assert!(
+        reopened.header.thinking_level.is_some(),
+        "the rename landed, so the file holds the level the runtime refused"
+    );
+}
+
+/// bd-5jfkl: the model-selection twin. The file names the target model the
+/// child's runtime refused to install.
+#[cfg(feature = "internal-persistence-fault-injection")]
+#[test]
+fn model_setter_post_rename_failure_quarantines_reentry() {
+    let reopened = run_setter_post_rename_child("model");
+    assert_eq!(reopened.header.provider.as_deref(), Some("openai"));
+    assert_eq!(reopened.header.model_id.as_deref(), Some("gpt-4o"));
+}
+
+/// Runs the setter worker against a fresh one-message JSONL session with the
+/// post-rename failpoint armed, requires the child's own assertions to pass,
+/// and returns the strictly reopened session.
+#[cfg(feature = "internal-persistence-fault-injection")]
+fn run_setter_post_rename_child(kind: &str) -> Session {
+    let harness = TestHarness::new(format!("e2e_{kind}_setter_post_rename"));
+    let mut reopened_session = None;
+    run_async_test(async {
+        let cwd = harness.temp_dir().to_path_buf();
+        let mut session = Session::create_with_dir_and_store(Some(cwd), SessionStoreKind::Jsonl);
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("setter-base".to_string()),
+            timestamp: Some(0),
+        });
+        session.save().await.expect("save baseline jsonl session");
+        let stable_path = session.path.clone().expect("jsonl session path");
+        assert_eq!(session.header.thinking_level, None);
+        drop(session);
+
+        let logs = tempfile::tempdir().expect("setter child log dir");
+        let stderr_path = logs.path().join("stderr");
+        let status = Command::new(std::env::current_exe().expect("current test binary"))
+            .arg("--exact")
+            .arg("setter_post_rename_worker_process_entrypoint")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("PI_SESSION_SETTER_FAILPOINT_WORKER", "1")
+            .env("PI_SESSION_SETTER_KIND", kind)
+            .env("PI_SESSION_PERSISTENCE_TEST_PATH", &stable_path)
+            .env(
+                "PI_SESSION_PERSISTENCE_TEST_FAILPOINT",
+                "jsonl_after_rename_before_parent_sync",
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&stderr_path).expect("child stderr file"))
+            .status()
+            .expect("run setter failpoint child");
+        assert!(
+            status.success(),
+            "setter child failed ({status}):\n{}",
+            std::fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+
+        let reopened = reopen_strict(&stable_path, "setter post-rename").await;
+        let texts = user_texts_in_order(&reopened.to_messages_for_current_path());
+        assert_eq!(texts, vec!["setter-base"]);
+        reopened_session = Some(reopened);
+    });
+    reopened_session.expect("setter child scenario ran")
+}
+
+/// bd-yn7ud: the SQLite full-rewrite transaction (DELETE + reinsert). A hard
+/// exit inside the transaction must roll back to the previous snapshot,
+/// header included; a hard exit after COMMIT must keep the whole rewrite.
+#[cfg(all(
+    feature = "sqlite-sessions",
+    feature = "internal-persistence-fault-injection"
+))]
+#[test]
+fn sqlite_rewrite_fault_windows_preserve_integrity() {
+    let harness = TestHarness::new("e2e_sqlite_rewrite_fault_windows");
+    run_async_test(async {
+        let cwd = harness.temp_dir().to_path_buf();
+        let mut session = Session::create_with_dir_and_store(Some(cwd), SessionStoreKind::Sqlite);
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("rewrite-base".to_string()),
+            timestamp: Some(0),
+        });
+        session.save().await.expect("save baseline sqlite session");
+        let stable_path = session.path.clone().expect("sqlite session path");
+        drop(session);
+        let markers = tempfile::tempdir().expect("marker dir");
+
+        let point = "sqlite_rewrite_after_mutation_before_commit";
+        let marker = markers.path().join("rewrite-before-commit.marker");
+        let child = run_persistence_failpoint_child(
+            &stable_path,
+            &marker,
+            "sqlite",
+            point,
+            "rewrite-uncommitted",
+            Some("rewrite"),
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(PERSISTENCE_FAILPOINT_HARD_EXIT_CODE),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let marker_text = std::fs::read_to_string(&marker).expect("read marker");
+        assert!(
+            marker_text.starts_with(&format!("{point}\nentries_after=")),
+            "the child must stop inside the rewrite transaction: {marker_text:?}"
+        );
+        let reopened = reopen_strict(&stable_path, "sqlite rewrite before commit").await;
+        let texts = user_texts_in_order(&reopened.to_messages_for_current_path());
+        assert_eq!(
+            texts,
+            vec!["rewrite-base"],
+            "an uncommitted rewrite must roll back"
+        );
+        assert_ne!(
+            reopened.header.provider.as_deref(),
+            Some("failpoint-sqlite"),
+            "the rolled-back rewrite's header must not survive"
+        );
+        drop(reopened);
+
+        let point = "sqlite_rewrite_after_commit";
+        let marker = markers.path().join("rewrite-after-commit.marker");
+        let child = run_persistence_failpoint_child(
+            &stable_path,
+            &marker,
+            "sqlite",
+            point,
+            "rewrite-committed",
+            Some("rewrite"),
+        );
+        assert_eq!(
+            child.status.code(),
+            Some(PERSISTENCE_FAILPOINT_HARD_EXIT_CODE),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("read marker"),
+            format!("{point}\ncommit_completed=true\n")
+        );
+        let reopened = reopen_strict(&stable_path, "sqlite rewrite after commit").await;
+        let texts = user_texts_in_order(&reopened.to_messages_for_current_path());
+        assert_eq!(texts, vec!["rewrite-base", "rewrite-committed"]);
+        assert_eq!(
+            reopened.header.provider.as_deref(),
+            Some("failpoint-sqlite"),
+            "a committed rewrite keeps its header"
+        );
+    });
 }

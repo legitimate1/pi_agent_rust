@@ -6,8 +6,7 @@
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
-    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ToolCall, Usage,
-    UserContent,
+    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, ToolCall, Usage, UserContent,
 };
 use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
@@ -18,6 +17,10 @@ use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::pin::Pin;
+
+mod files;
+pub(super) mod reasoning;
+mod wire;
 
 // ============================================================================
 // Constants
@@ -75,6 +78,7 @@ pub struct GeminiProvider {
     api: String,
     google_cli_mode: bool,
     compat: Option<CompatConfig>,
+    files: files::FileCache,
 }
 
 impl GeminiProvider {
@@ -88,6 +92,7 @@ impl GeminiProvider {
             api: "google-generative-ai".to_string(),
             google_cli_mode: false,
             compat: None,
+            files: files::FileCache::default(),
         }
     }
 
@@ -123,6 +128,7 @@ impl GeminiProvider {
     #[must_use]
     pub fn with_client(mut self, client: Client) -> Self {
         self.client = client;
+        self.files = files::FileCache::default();
         self
     }
 
@@ -158,7 +164,8 @@ impl GeminiProvider {
         }
     }
 
-    /// Build the request body for the Gemini API.
+    /// Build the base request body. The live request additionally applies
+    /// model-specific thinking controls before the request-rewrite hook.
     #[allow(clippy::unused_self)]
     pub fn build_request(&self, context: &Context<'_>, options: &StreamOptions) -> GeminiRequest {
         let contents = Self::build_contents(context);
@@ -215,7 +222,7 @@ impl GeminiProvider {
 struct CloudCodeAssistRequest {
     project: String,
     model: String,
-    request: GeminiRequest,
+    request: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     request_type: Option<String>,
     user_agent: String,
@@ -225,7 +232,7 @@ struct CloudCodeAssistRequest {
 fn build_google_cli_request(
     model_id: &str,
     project_id: &str,
-    request: GeminiRequest,
+    request: serde_json::Value,
     is_antigravity: bool,
 ) -> std::result::Result<CloudCodeAssistRequest, &'static str> {
     let safe_project = project_id.trim();
@@ -296,6 +303,7 @@ impl Provider for GeminiProvider {
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let request_body = self.build_request(context, options);
+        let request_body = reasoning::prepare_request(&self.model, options, &request_body)?;
         let url = self.streaming_url();
 
         // Build request (Content-Type set by .json() below)
@@ -374,22 +382,14 @@ impl Provider for GeminiProvider {
                 |value| super::validate_streamed_json_rewrite(value, &[], &["contents"], &[]),
             )
             .await;
-            let cli_request =
-                build_google_cli_request(&self.model, &project_id, request_body, is_antigravity)
-                    .map_err(|message| Error::provider(self.name(), message.to_string()))?;
-            let request = match rewritten_inner {
-                Some(inner) => {
-                    let mut wrapper = serde_json::to_value(&cli_request).map_err(|err| {
-                        Error::provider(
-                            self.name(),
-                            format!("Failed to serialize Gemini CLI request: {err}"),
-                        )
-                    })?;
-                    wrapper["request"] = inner;
-                    request.json(&wrapper)?
-                }
-                None => request.json(&cli_request)?,
-            };
+            let cli_request = build_google_cli_request(
+                &self.model,
+                &project_id,
+                rewritten_inner.unwrap_or(request_body),
+                is_antigravity,
+            )
+            .map_err(|message| Error::provider(self.name(), message.to_string()))?;
+            let request = request.json(&cli_request)?;
             let response = Box::pin(request.send()).await?;
             let status = response.status();
             if !(200..300).contains(&status) {
@@ -410,76 +410,8 @@ impl Provider for GeminiProvider {
             let provider = self.name().to_string();
             let cloud_cli_mode = self.google_cli_mode;
 
-            let stream = stream::unfold(
-                StreamState::new(event_source, model, api, provider),
-                move |mut state| async move {
-                    if state.finished {
-                        return None;
-                    }
-                    loop {
-                        // Drain pending events before polling for more SSE data
-                        if let Some(event) = state.pending_events.pop_front() {
-                            return Some((Ok(event), state));
-                        }
-
-                        match state.event_source.next().await {
-                            Some(Ok(msg)) => {
-                                state.transient_error_count = 0;
-                                if msg.event == "ping" {
-                                    continue;
-                                }
-
-                                let processing = if cloud_cli_mode {
-                                    state.process_cloud_code_event(&msg.data)
-                                } else {
-                                    state.process_event(&msg.data)
-                                };
-                                if let Err(e) = processing {
-                                    state.finished = true;
-                                    return Some((Err(e), state));
-                                }
-                            }
-                            Some(Err(e)) => {
-                                // WriteZero, WouldBlock, and TimedOut errors are treated as transient.
-                                // Skip them and keep reading the stream, but cap
-                                // consecutive occurrences to avoid infinite loops.
-                                const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 5;
-                                if e.kind() == std::io::ErrorKind::WriteZero
-                                    || e.kind() == std::io::ErrorKind::WouldBlock
-                                    || e.kind() == std::io::ErrorKind::TimedOut
-                                {
-                                    state.transient_error_count += 1;
-                                    if state.transient_error_count
-                                        <= MAX_CONSECUTIVE_TRANSIENT_ERRORS
-                                    {
-                                        tracing::warn!(
-                                            kind = ?e.kind(),
-                                            count = state.transient_error_count,
-                                            "Transient error in SSE stream, continuing"
-                                        );
-                                        continue;
-                                    }
-                                    tracing::warn!(
-                                        kind = ?e.kind(),
-                                        "Error persisted after {MAX_CONSECUTIVE_TRANSIENT_ERRORS} \
-                                         consecutive attempts, treating as fatal"
-                                    );
-                                }
-                                state.finished = true;
-                                let err = Error::sse(&e);
-                                return Some((Err(err), state));
-                            }
-                            None => {
-                                // Stream ended naturally
-                                state.finished = true;
-                                let reason = state.partial.stop_reason;
-                                let message = std::mem::take(&mut state.partial);
-                                return Some((Ok(StreamEvent::Done { reason, message }), state));
-                            }
-                        }
-                    }
-                },
-            );
+            let stream =
+                StreamState::new(event_source, model, api, provider).into_stream(cloud_cli_mode);
 
             return Ok(Box::pin(stream));
         }
@@ -504,6 +436,8 @@ impl Provider for GeminiProvider {
             )
         };
 
+        let upload_auth =
+            files::UploadAuth::for_request(options, self.compat.as_ref(), auth_value.as_deref());
         if let Some(auth_value) = auth_value {
             request = request.header("x-goog-api-key", &auth_value);
         }
@@ -536,10 +470,17 @@ impl Provider for GeminiProvider {
             |value| super::validate_streamed_json_rewrite(value, &[], &["contents"], &[]),
         )
         .await;
-        let request = match &rewritten_body {
-            Some(body) => request.json(body)?,
-            None => request.json(&request_body)?,
-        };
+        // Moving the fallback also drops its media copy when a rewrite won.
+        let mut body = rewritten_body.unwrap_or(request_body);
+        // Stage the final payload after extension rewrites. Session originals
+        // stay inline and portable; remote file URIs are transport-only state.
+        // Cloud Code Assist returned above; Vertex uses its separate provider.
+        Box::pin(
+            self.files
+                .prepare(&self.client, &self.base_url, &upload_auth, &mut body),
+        )
+        .await?;
+        let request = request.json(&body)?;
 
         let response = Box::pin(request.send()).await?;
         let status = response.status();
@@ -563,66 +504,8 @@ impl Provider for GeminiProvider {
         let provider = self.name().to_string();
         let cloud_cli_mode = self.google_cli_mode;
 
-        let stream = stream::unfold(
-            StreamState::new(event_source, model, api, provider),
-            move |mut state| async move {
-                if state.finished {
-                    return None;
-                }
-                loop {
-                    // Drain pending events before polling for more SSE data
-                    if let Some(event) = state.pending_events.pop_front() {
-                        return Some((Ok(event), state));
-                    }
-
-                    match state.event_source.next().await {
-                        Some(Ok(msg)) => {
-                            state.transient_error_count = 0;
-                            if msg.event == "ping" {
-                                continue;
-                            }
-
-                            let processing = if cloud_cli_mode {
-                                state.process_cloud_code_event(&msg.data)
-                            } else {
-                                state.process_event(&msg.data)
-                            };
-                            if let Err(e) = processing {
-                                state.finished = true;
-                                return Some((Err(e), state));
-                            }
-                        }
-                        Some(Err(e)) => {
-                            const MAX_CONSECUTIVE_WRITE_ZERO: usize = 5;
-                            if e.kind() == std::io::ErrorKind::WriteZero {
-                                state.transient_error_count += 1;
-                                if state.transient_error_count <= MAX_CONSECUTIVE_WRITE_ZERO {
-                                    tracing::warn!(
-                                        count = state.transient_error_count,
-                                        "Transient WriteZero error in SSE stream, continuing"
-                                    );
-                                    continue;
-                                }
-                                tracing::warn!(
-                                    "WriteZero error persisted after {MAX_CONSECUTIVE_WRITE_ZERO} \
-                                     consecutive attempts, treating as fatal"
-                                );
-                            }
-                            state.finished = true;
-                            let err = Error::sse(&e);
-                            return Some((Err(err), state));
-                        }
-                        None => {
-                            // Stream ended naturally
-                            state.finished = true;
-                            let reason = state.partial.stop_reason;
-                            let message = std::mem::take(&mut state.partial);
-                            return Some((Ok(StreamEvent::Done { reason, message }), state));
-                        }
-                    }
-                }
-            },
-        );
+        let stream =
+            StreamState::new(event_source, model, api, provider).into_stream(cloud_cli_mode);
 
         Ok(Box::pin(stream))
     }
@@ -632,24 +515,37 @@ impl Provider for GeminiProvider {
 // Stream State
 // ============================================================================
 
-struct StreamState<S>
+/// Shared by Developer API, Cloud Code Assist and Google-native Vertex.
+/// Keeping one parser also keeps signature boundaries and usage accounting
+/// identical across the three transports.
+pub(super) struct StreamState<S>
 where
     S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
 {
-    event_source: SseStream<S>,
+    pub(super) event_source: SseStream<S>,
     partial: AssistantMessage,
-    pending_events: VecDeque<StreamEvent>,
+    pub(super) pending_events: VecDeque<StreamEvent>,
     started: bool,
-    finished: bool,
-    /// Consecutive WriteZero errors seen without a successful event in between.
-    transient_error_count: usize,
+    pub(super) finished: bool,
+    /// Whether a chunk carried a terminal marker (`finishReason` on the
+    /// candidate, or a `promptFeedback.blockReason`). Gemini's final chunk
+    /// always carries one; a transport close without it is a truncated
+    /// stream, not a complete answer.
+    saw_terminal: bool,
+    content_state: reasoning::ContentState,
+    usage_state: reasoning::UsageState,
 }
 
 impl<S> StreamState<S>
 where
     S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
 {
-    fn new(event_source: SseStream<S>, model: String, api: String, provider: String) -> Self {
+    pub(super) fn new(
+        event_source: SseStream<S>,
+        model: String,
+        api: String,
+        provider: String,
+    ) -> Self {
         Self {
             event_source,
             partial: AssistantMessage {
@@ -666,22 +562,129 @@ where
             pending_events: VecDeque::new(),
             started: false,
             finished: false,
-            transient_error_count: 0,
+            saw_terminal: false,
+            content_state: reasoning::ContentState::default(),
+            usage_state: reasoning::UsageState::default(),
         }
     }
 
-    fn process_event(&mut self, data: &str) -> Result<()> {
-        let response: GeminiStreamResponse = serde_json::from_str(data)
-            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
+    pub(super) fn into_stream(
+        self,
+        cloud_cli_mode: bool,
+    ) -> impl Stream<Item = Result<StreamEvent>> {
+        stream::unfold(self, move |mut state| async move {
+            loop {
+                if let Some(event) = state.pending_events.pop_front() {
+                    return Some((Ok(event), state));
+                }
+                if state.finished {
+                    return None;
+                }
+                match state.event_source.next().await {
+                    Some(Ok(msg)) => {
+                        if msg.event == "ping" {
+                            continue;
+                        }
+                        let result = if cloud_cli_mode {
+                            state.process_cloud_code_event(&msg.data)
+                        } else {
+                            state.process_event(&msg.data)
+                        };
+                        if let Err(error) = result {
+                            state.finished = true;
+                            return Some((Err(error), state));
+                        }
+                    }
+                    Some(Err(error)) => {
+                        // SseStream errors are terminal. Swallowing a timeout
+                        // here would turn its next EOF into a clean success
+                        // when a finish marker had already been observed.
+                        state.finished = true;
+                        return Some((Err(Error::sse(&error)), state));
+                    }
+                    None => {
+                        let outcome = state.finish_at_eof();
+                        return Some((outcome, state));
+                    }
+                }
+            }
+        })
+    }
+
+    /// Terminal outcome once the transport closes. A close without a
+    /// terminal marker means the response was cut off mid-stream (proxy
+    /// reset, idle timeout, dropped connection): surface a retryable error
+    /// instead of committing the partial text as a clean `Stop`.
+    pub(super) fn finish_at_eof(&mut self) -> Result<StreamEvent> {
+        self.finished = true;
+        if !self.saw_terminal {
+            return Err(Error::api(format!(
+                "{} stream ended before finishReason (unexpected EOF)",
+                self.service_label()
+            )));
+        }
+        // Gemini commonly sends STOP in a separate final chunk after the
+        // function calls. It completes the model step, not the agent's turn.
+        if self.partial.stop_reason == StopReason::Stop
+            && self
+                .partial
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+        {
+            self.partial.stop_reason = StopReason::ToolUse;
+        }
+        let reason = self.partial.stop_reason;
+        let message = std::mem::take(&mut self.partial);
+        Ok(StreamEvent::Done { reason, message })
+    }
+
+    fn service_label(&self) -> &'static str {
+        if self.partial.api == "google-vertex" {
+            "Vertex AI"
+        } else {
+            "Gemini"
+        }
+    }
+
+    pub(super) fn process_event(&mut self, data: &str) -> Result<()> {
+        let response: GeminiStreamResponse =
+            serde_json::from_str(data).map_err(wire::response_parse_error)?;
         self.process_response(response)
     }
 
     fn process_response(&mut self, response: GeminiStreamResponse) -> Result<()> {
-        // Handle usage metadata
+        // Usage chunks are cumulative and can omit individual counters.
         if let Some(metadata) = response.usage_metadata {
-            self.partial.usage.input = metadata.prompt_token_count.unwrap_or(0);
-            self.partial.usage.output = metadata.candidates_token_count.unwrap_or(0);
-            self.partial.usage.total_tokens = metadata.total_token_count.unwrap_or(0);
+            self.usage_state.update(
+                &mut self.partial.usage,
+                metadata.prompt_token_count,
+                metadata.candidates_token_count,
+                metadata.thoughts_token_count,
+                metadata.cached_content_token_count,
+                metadata.total_token_count,
+            );
+        }
+
+        // A blocked prompt arrives as `promptFeedback.blockReason` with no
+        // candidates and no finishReason: terminal, and an error rather
+        // than an empty success.
+        if let Some(reason) = response
+            .prompt_feedback
+            .as_ref()
+            .and_then(|feedback| feedback.block_reason.as_deref())
+        {
+            self.saw_terminal = true;
+            self.partial.stop_reason = StopReason::Error;
+            self.partial.error_message = Some(format!(
+                "{} blocked the prompt: {reason}",
+                self.service_label()
+            ));
+            self.content_state
+                .close(&self.partial, &mut self.pending_events);
+            // A refused prompt must not dispatch content/tool calls even if
+            // a malformed response also supplies candidates.
+            return Ok(());
         }
 
         // Process candidates
@@ -695,20 +698,22 @@ where
     }
 
     fn process_cloud_code_event(&mut self, data: &str) -> Result<()> {
-        let wrapped: CloudCodeAssistResponseChunk = serde_json::from_str(data)
-            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
+        let wrapped: CloudCodeAssistResponseChunk =
+            serde_json::from_str(data).map_err(wire::response_parse_error)?;
         let Some(response) = wrapped.response else {
             return Ok(());
         };
         self.process_response(GeminiStreamResponse {
             candidates: response.candidates,
             usage_metadata: response.usage_metadata,
+            prompt_feedback: response.prompt_feedback,
         })
     }
 
     #[allow(clippy::unnecessary_wraps)]
     fn process_candidate(&mut self, candidate: GeminiCandidate) -> Result<()> {
         let has_finish_reason = candidate.finish_reason.is_some();
+        self.saw_terminal |= has_finish_reason;
 
         // Handle finish reason
         if let Some(reason) = candidate.finish_reason.as_deref() {
@@ -726,39 +731,49 @@ where
             for part in content.parts {
                 match part {
                     GeminiPart::Text { text } => {
-                        // Accumulate text into partial
-                        let last_is_text =
-                            matches!(self.partial.content.last(), Some(ContentBlock::Text(_)));
-
-                        // Ensure Start is emitted before any TextStart/TextDelta events
-                        // so downstream consumers see the correct event order:
-                        // Start → TextStart → TextDelta
-                        self.ensure_started();
-
-                        let content_index = if last_is_text {
-                            self.partial.content.len() - 1
-                        } else {
-                            let idx = self.partial.content.len();
-                            self.partial
-                                .content
-                                .push(ContentBlock::Text(TextContent::new("")));
-                            self.pending_events
-                                .push_back(StreamEvent::TextStart { content_index: idx });
-                            idx
-                        };
-
-                        if let Some(ContentBlock::Text(t)) =
-                            self.partial.content.get_mut(content_index)
-                        {
-                            t.text.push_str(&text);
-                        }
-
-                        self.pending_events.push_back(StreamEvent::TextDelta {
-                            content_index,
-                            delta: text,
-                        });
+                        self.content_state.append(
+                            &mut self.partial,
+                            &mut self.pending_events,
+                            &mut self.started,
+                            text,
+                            false,
+                            None,
+                        );
                     }
-                    GeminiPart::FunctionCall { function_call } => {
+                    GeminiPart::SignedText {
+                        text,
+                        thought_signature,
+                    } => {
+                        self.content_state.append(
+                            &mut self.partial,
+                            &mut self.pending_events,
+                            &mut self.started,
+                            text,
+                            false,
+                            Some(thought_signature),
+                        );
+                    }
+                    GeminiPart::Thought {
+                        text,
+                        thought_signature,
+                        ..
+                    } => {
+                        self.content_state.append(
+                            &mut self.partial,
+                            &mut self.pending_events,
+                            &mut self.started,
+                            text,
+                            true,
+                            thought_signature,
+                        );
+                    }
+                    GeminiPart::FunctionCall {
+                        function_call,
+                        thought_signature,
+                    } => {
+                        self.content_state
+                            .close(&self.partial, &mut self.pending_events);
+                        self.ensure_started();
                         // Generate a unique ID for this tool call
                         let id = format!("call_{}", uuid::Uuid::new_v4().simple());
 
@@ -771,7 +786,7 @@ where
                             id,
                             name,
                             arguments: args,
-                            thought_signature: None,
+                            thought_signature,
                         };
 
                         self.partial
@@ -779,10 +794,11 @@ where
                             .push(ContentBlock::ToolCall(tool_call.clone()));
                         let content_index = self.partial.content.len() - 1;
 
-                        // Update stop reason for tool use
-                        self.partial.stop_reason = StopReason::ToolUse;
-
-                        self.ensure_started();
+                        // Preserve explicit failure/length outcomes, even when
+                        // the terminal candidate also contains function calls.
+                        if self.partial.stop_reason == StopReason::Stop {
+                            self.partial.stop_reason = StopReason::ToolUse;
+                        }
 
                         // Emit full ToolCallStart → ToolCallDelta → ToolCallEnd sequence
                         self.pending_events.push_back(StreamEvent::ToolCallStart {
@@ -810,22 +826,11 @@ where
             }
         }
 
-        // Emit TextEnd/ThinkingEnd for all open text/thinking blocks (not just the last
-        // one, since text/thinking may precede tool calls).
-        if has_finish_reason {
-            for (content_index, block) in self.partial.content.iter().enumerate() {
-                if let ContentBlock::Text(t) = block {
-                    self.pending_events.push_back(StreamEvent::TextEnd {
-                        content_index,
-                        content: t.text.clone(),
-                    });
-                } else if let ContentBlock::Thinking(t) = block {
-                    self.pending_events.push_back(StreamEvent::ThinkingEnd {
-                        content_index,
-                        content: t.thinking.clone(),
-                    });
-                }
-            }
+        // Seal each block exactly once, including a late signature-bearing
+        // empty text part after the terminal candidate but before EOF.
+        if self.saw_terminal {
+            self.content_state
+                .close(&self.partial, &mut self.pending_events);
         }
 
         Ok(())
@@ -867,9 +872,20 @@ pub(crate) struct GeminiContent {
     pub(crate) parts: Vec<GeminiPart>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub(crate) enum GeminiPart {
+    Thought {
+        text: String,
+        thought: bool,
+        #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
+    },
+    SignedText {
+        text: String,
+        #[serde(rename = "thoughtSignature")]
+        thought_signature: String,
+    },
     Text {
         text: String,
     },
@@ -879,6 +895,15 @@ pub(crate) enum GeminiPart {
     FunctionCall {
         #[serde(rename = "functionCall")]
         function_call: GeminiFunctionCall,
+        /// Opaque model state attached to this exact call, not its arguments.
+        /// Gemini 3 requires it on replay; unsigned parallel calls stay unsigned.
+        #[serde(
+            default,
+            rename = "thoughtSignature",
+            alias = "thought_signature",
+            skip_serializing_if = "Option::is_none"
+        )]
+        thought_signature: Option<String>,
     },
     FunctionResponse {
         #[serde(rename = "functionResponse")]
@@ -900,7 +925,12 @@ pub(crate) struct GeminiBlob {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct GeminiFunctionCall {
     pub(crate) name: String,
+    #[serde(default = "empty_function_arguments")]
     pub(crate) args: serde_json::Value,
+}
+
+fn empty_function_arguments() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -955,6 +985,17 @@ pub(crate) struct GeminiStreamResponse {
     pub(crate) candidates: Option<Vec<GeminiCandidate>>,
     #[serde(default)]
     pub(crate) usage_metadata: Option<GeminiUsageMetadata>,
+    #[serde(default)]
+    pub(crate) prompt_feedback: Option<GeminiPromptFeedback>,
+}
+
+/// `promptFeedback` on a chunk: present with `blockReason` when the prompt
+/// itself was refused (no candidates follow).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GeminiPromptFeedback {
+    #[serde(default)]
+    pub(crate) block_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -971,6 +1012,8 @@ struct CloudCodeAssistResponse {
     candidates: Option<Vec<GeminiCandidate>>,
     #[serde(default)]
     usage_metadata: Option<GeminiUsageMetadata>,
+    #[serde(default)]
+    prompt_feedback: Option<GeminiPromptFeedback>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -991,6 +1034,10 @@ pub(crate) struct GeminiUsageMetadata {
     #[serde(default)]
     pub(crate) candidates_token_count: Option<u64>,
     #[serde(default)]
+    pub(crate) thoughts_token_count: Option<u64>,
+    #[serde(default)]
+    pub(crate) cached_content_token_count: Option<u64>,
+    #[serde(default)]
     pub(crate) total_token_count: Option<u64>,
 }
 
@@ -998,6 +1045,7 @@ pub(crate) struct GeminiUsageMetadata {
 // Conversion Functions
 // ============================================================================
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent> {
     match message {
         Message::User(user) => vec![GeminiContent {
@@ -1012,12 +1060,29 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
         }],
         Message::Assistant(assistant) => {
             let mut parts = Vec::new();
+            let google_history = reasoning::is_google_message(assistant);
 
             for block in &assistant.content {
                 match block {
                     ContentBlock::Text(t) => {
-                        parts.push(GeminiPart::Text {
-                            text: t.text.clone(),
+                        if let Some(signature) =
+                            t.text_signature.as_ref().filter(|_| google_history)
+                        {
+                            parts.push(GeminiPart::SignedText {
+                                text: t.text.clone(),
+                                thought_signature: signature.clone(),
+                            });
+                        } else {
+                            parts.push(GeminiPart::Text {
+                                text: t.text.clone(),
+                            });
+                        }
+                    }
+                    ContentBlock::Thinking(t) if google_history => {
+                        parts.push(GeminiPart::Thought {
+                            text: t.thinking.clone(),
+                            thought: true,
+                            thought_signature: t.thinking_signature.clone(),
                         });
                     }
                     ContentBlock::ToolCall(tc) => {
@@ -1026,13 +1091,19 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
                                 name: tc.name.clone(),
                                 args: tc.arguments.clone(),
                             },
+                            thought_signature: tc
+                                .thought_signature
+                                .clone()
+                                .filter(|_| google_history),
                         });
                     }
                     ContentBlock::Thinking(_)
                     | ContentBlock::Image(_)
+                    | ContentBlock::Media(_)
                     | ContentBlock::RedactedThinking(_) => {
-                        // Anthropic-shaped thinking blocks (including redacted
-                        // markers) and image blocks have no Gemini equivalent.
+                        // Foreign-provider reasoning/signatures are not Google
+                        // state. Redacted markers and model-side media are not
+                        // replayed as reasoning text.
                     }
                 }
             }
@@ -1048,17 +1119,19 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
         }
         Message::ToolResult(result) => {
             // Gemini expects function responses as user role with functionResponse part
-            let content_text = result
+            let inline_parts = tool_result_inline_parts(result);
+            let mut content_text = result
                 .content
                 .iter()
-                .map(|b| match b {
-                    ContentBlock::Text(t) => t.text.clone(),
-                    ContentBlock::Image(img) => format!("[Image ({}) omitted]", img.mime_type),
-                    _ => String::new(),
+                .filter_map(|b| match b {
+                    ContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None,
                 })
-                .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n");
+            if content_text.is_empty() && !inline_parts.is_empty() {
+                content_text = "(see attached media)".to_string();
+            }
 
             let response_value = if result.is_error {
                 serde_json::json!({ "error": content_text })
@@ -1066,7 +1139,7 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
                 serde_json::json!({ "result": content_text })
             };
 
-            vec![GeminiContent {
+            let mut contents = vec![GeminiContent {
                 role: Some("user".into()),
                 parts: vec![GeminiPart::FunctionResponse {
                     function_response: GeminiFunctionResponse {
@@ -1074,7 +1147,18 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
                         response: response_value,
                     },
                 }],
-            }]
+            }];
+            if !inline_parts.is_empty() {
+                let mut parts = vec![GeminiPart::Text {
+                    text: "Tool result media:".to_string(),
+                }];
+                parts.extend(inline_parts);
+                contents.push(GeminiContent {
+                    role: Some("user".into()),
+                    parts,
+                });
+            }
+            contents
         }
     }
 }
@@ -1094,10 +1178,46 @@ pub(crate) fn convert_user_content_to_parts(content: &UserContent) -> Vec<Gemini
                         data: img.data.clone(),
                     },
                 }),
+                // Video/audio go out as the same `inline_data` blob shape the
+                // Gemini API documents for all inline media (gh #212).
+                ContentBlock::Media(media) => Some(GeminiPart::InlineData {
+                    inline_data: GeminiBlob {
+                        mime_type: media.mime_type.clone(),
+                        data: media.data.clone(),
+                    },
+                }),
                 _ => None,
             })
             .collect(),
     }
+}
+
+/// Inline blobs (images, video, audio) carried by a tool result.
+///
+/// Gemini's `functionResponse.response` is a JSON object, so binary tool
+/// output cannot ride inside it on every model generation. Mirroring the
+/// Node reference's cross-model fallback, the blobs are attached as a
+/// separate trailing `user` turn so the model still receives them.
+fn tool_result_inline_parts(result: &crate::model::ToolResultMessage) -> Vec<GeminiPart> {
+    result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image(img) => Some(GeminiPart::InlineData {
+                inline_data: GeminiBlob {
+                    mime_type: img.mime_type.clone(),
+                    data: img.data.clone(),
+                },
+            }),
+            ContentBlock::Media(media) => Some(GeminiPart::InlineData {
+                inline_data: GeminiBlob {
+                    mime_type: media.mime_type.clone(),
+                    data: media.data.clone(),
+                },
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(crate) fn convert_tool_to_gemini(tool: &ToolDef) -> GeminiFunctionDeclaration {
@@ -1114,7 +1234,10 @@ pub(crate) fn convert_tool_to_gemini(tool: &ToolDef) -> GeminiFunctionDeclaratio
 
 #[cfg(test)]
 mod tests {
+    mod integration_reasoning;
+
     use super::*;
+    use crate::model::TextContent;
     use asupersync::runtime::RuntimeBuilder;
     use futures::{StreamExt, stream};
     use serde::{Deserialize, Serialize};
@@ -1205,6 +1328,128 @@ mod tests {
             let summaries: Vec<EventSummary> = events.iter().map(summarize_event).collect();
             assert_eq!(summaries, case.expected, "case {}", case.name);
         }
+    }
+
+    /// Drive the real `Provider::stream` against a canned SSE body and
+    /// collect every item, including the terminal error.
+    fn collect_stream_items_from_body(body: &str) -> Vec<Result<StreamEvent>> {
+        let (base_url, _rx) = spawn_test_server(200, "text/event-stream", body);
+        let provider = GeminiProvider::new("gemini-2.0-flash").with_base_url(base_url);
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer test".to_string());
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider
+                .stream(
+                    &context,
+                    &StreamOptions {
+                        headers,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("stream");
+            let mut out = Vec::new();
+            while let Some(item) = stream.next().await {
+                out.push(item);
+            }
+            out
+        })
+    }
+
+    /// gh #213 (truncated streams): a transport close before the chunk that
+    /// carries `finishReason` is a cut-off response — it must surface as a
+    /// retryable error, never as a clean `Done`/`Stop` that commits the
+    /// partial text to the session.
+    #[test]
+    fn test_stream_rejects_transport_eof_before_finish_reason() {
+        let body = [
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}"#,
+            "",
+            "",
+        ]
+        .join("\n");
+        let out = collect_stream_items_from_body(&body);
+        assert!(
+            out.iter().any(|item| matches!(
+                item,
+                Ok(StreamEvent::TextDelta { delta, .. }) if delta == "partial"
+            )),
+            "partial content is still streamed before the terminal error: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|item| matches!(item, Ok(StreamEvent::Done { .. }))),
+            "premature EOF must never be reported as Done: {out:?}"
+        );
+        let error = out
+            .last()
+            .expect("terminal stream item")
+            .as_ref()
+            .expect_err("premature EOF must be a stream error")
+            .to_string();
+        assert!(error.contains("finishReason"), "{error}");
+        assert!(error.contains("unexpected EOF"), "{error}");
+        assert!(
+            crate::error::is_retryable_error(&error, None, None),
+            "a cut-off stream must be retryable: {error}"
+        );
+    }
+
+    /// The happy path through the same driver: `finishReason` seen, then the
+    /// transport closes → exactly one `Done` and no error.
+    #[test]
+    fn test_stream_eof_after_finish_reason_is_done() {
+        let out = collect_stream_items_from_body(&success_sse_body());
+        assert!(out.iter().all(Result::is_ok), "{out:?}");
+        let done = out
+            .iter()
+            .filter(|item| matches!(item, Ok(StreamEvent::Done { .. })))
+            .count();
+        assert_eq!(done, 1, "{out:?}");
+        assert!(
+            matches!(
+                out.last(),
+                Some(Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    ..
+                }))
+            ),
+            "{out:?}"
+        );
+    }
+
+    /// A refused prompt (`promptFeedback.blockReason`, no candidates) is
+    /// terminal and an error — not an empty successful turn, and not a
+    /// truncated-stream retry.
+    #[test]
+    fn test_blocked_prompt_is_terminal_error_not_empty_success() {
+        let body = [
+            r#"data: {"promptFeedback":{"blockReason":"SAFETY","safetyRatings":[]}}"#,
+            "",
+            "",
+        ]
+        .join("\n");
+        let out = collect_stream_items_from_body(&body);
+        let Some(Ok(StreamEvent::Done { reason, message })) = out.last() else {
+            panic!("expected Done: {out:?}");
+        };
+        assert_eq!(*reason, StopReason::Error);
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("Gemini blocked the prompt: SAFETY")
+        );
+        assert!(message.content.is_empty());
     }
 
     #[derive(Debug)]
@@ -1386,11 +1631,7 @@ mod tests {
             loop {
                 let Some(item) = state.event_source.next().await else {
                     if !state.finished {
-                        state.finished = true;
-                        out.push(StreamEvent::Done {
-                            reason: state.partial.stop_reason,
-                            message: std::mem::take(&mut state.partial),
-                        });
+                        out.push(state.finish_at_eof().expect("terminal chunk seen"));
                     }
                     break;
                 };
@@ -1430,9 +1671,14 @@ mod tests {
 
         std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().expect("accept");
+            // 250ms is the POLLING interval; the deadline below is the budget.
+            // Treating a timed-out read as end-of-request truncated the buffer
+            // and the header scan then failed as a malformed request rather
+            // than a slow one (bd-eg6ng).
             socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_millis(250)))
                 .expect("set read timeout");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
 
             let mut bytes = Vec::new();
             let mut chunk = [0_u8; 4096];
@@ -1449,7 +1695,10 @@ mod tests {
                         if err.kind() == std::io::ErrorKind::WouldBlock
                             || err.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        break;
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fixture timed out waiting for the request"
+                        );
                     }
                     Err(err) => panic!("{err}"),
                 }
@@ -1475,7 +1724,10 @@ mod tests {
                         if err.kind() == std::io::ErrorKind::WouldBlock
                             || err.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        break;
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fixture timed out waiting for the request"
+                        );
                     }
                     Err(err) => panic!("{err}"),
                 }
@@ -1779,6 +2031,113 @@ mod tests {
         }
     }
 
+    /// gh #212: video/audio blocks serialize as the same `inline_data` blob
+    /// shape as images, with the MIME type passed through verbatim.
+    #[test]
+    fn test_convert_user_blocks_with_media_to_gemini_inline_data() {
+        let content = UserContent::Blocks(vec![
+            ContentBlock::Text(TextContent::new("what happens in this clip?")),
+            ContentBlock::Media(crate::model::MediaContent {
+                data: "AAAA".to_string(),
+                mime_type: "video/mp4".to_string(),
+                name: Some("clip.mp4".to_string()),
+            }),
+            ContentBlock::Media(crate::model::MediaContent {
+                data: "BBBB".to_string(),
+                mime_type: "audio/wav".to_string(),
+                name: None,
+            }),
+        ]);
+
+        let parts = convert_user_content_to_parts(&content);
+        assert_eq!(parts.len(), 3);
+        let wire = serde_json::to_value(&parts).expect("serialize parts");
+        assert_eq!(
+            wire,
+            serde_json::json!([
+                { "text": "what happens in this clip?" },
+                { "inline_data": { "mimeType": "video/mp4", "data": "AAAA" } },
+                { "inline_data": { "mimeType": "audio/wav", "data": "BBBB" } },
+            ])
+        );
+    }
+
+    /// gh #212: a tool result carrying media (the `read_media` shape) keeps
+    /// its text inside `functionResponse` and attaches the blobs on a
+    /// trailing user turn, so the model actually receives them.
+    #[test]
+    fn test_convert_tool_result_with_media_attaches_inline_turn() {
+        let message = Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: "call_media".to_string(),
+            tool_name: "read_media".to_string(),
+            content: vec![
+                ContentBlock::Text(TextContent::new("Read media file clip.mp4")),
+                ContentBlock::Media(crate::model::MediaContent {
+                    data: "AAAA".to_string(),
+                    mime_type: "video/mp4".to_string(),
+                    name: Some("clip.mp4".to_string()),
+                }),
+            ],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        });
+
+        let converted = convert_message_to_gemini(&message);
+        assert_eq!(converted.len(), 2, "functionResponse turn + media turn");
+        match &converted[0].parts[0] {
+            GeminiPart::FunctionResponse { function_response } => {
+                assert_eq!(function_response.name, "read_media");
+                assert_eq!(
+                    function_response.response["result"],
+                    "Read media file clip.mp4"
+                );
+            }
+            _ => panic!("expected functionResponse part"),
+        }
+        assert_eq!(converted[1].role, Some("user".to_string()));
+        let wire = serde_json::to_value(&converted[1].parts).expect("serialize parts");
+        assert_eq!(
+            wire,
+            serde_json::json!([
+                { "text": "Tool result media:" },
+                { "inline_data": { "mimeType": "video/mp4", "data": "AAAA" } },
+            ])
+        );
+
+        // A media-only result gets a stand-in text so the JSON response is
+        // never empty; a text-only result stays a single turn.
+        let media_only = Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: "call_media".to_string(),
+            tool_name: "read_media".to_string(),
+            content: vec![ContentBlock::Media(crate::model::MediaContent {
+                data: "AAAA".to_string(),
+                mime_type: "audio/mpeg".to_string(),
+                name: None,
+            })],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        });
+        let converted = convert_message_to_gemini(&media_only);
+        assert_eq!(converted.len(), 2);
+        match &converted[0].parts[0] {
+            GeminiPart::FunctionResponse { function_response } => {
+                assert_eq!(function_response.response["result"], "(see attached media)");
+            }
+            _ => panic!("expected functionResponse part"),
+        }
+        let text_only = Message::tool_result(crate::model::ToolResultMessage {
+            tool_call_id: "call_text".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("plain"))],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        });
+        assert_eq!(convert_message_to_gemini(&text_only).len(), 1);
+    }
+
     #[test]
     fn test_convert_assistant_message_with_tool_call() {
         let message = Message::assistant(AssistantMessage {
@@ -1811,7 +2170,7 @@ mod tests {
             _ => panic!(),
         }
         match &converted[0].parts[1] {
-            GeminiPart::FunctionCall { function_call } => {
+            GeminiPart::FunctionCall { function_call, .. } => {
                 assert_eq!(function_call.name, "read");
                 assert_eq!(function_call.args["path"], "/tmp/test.txt");
             }
@@ -2039,6 +2398,173 @@ mod tests {
             contents[2]["parts"][0]["functionResponse"]["response"]["result"],
             "file contents"
         );
+    }
+
+    #[test]
+    fn signed_parallel_calls_survive_stream_session_and_replay() {
+        const SIGNATURE: &str = "c2lnbmVkLXRvb2w=";
+        let body = [
+            r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"read","args":{"path":"a.txt"}},"thoughtSignature":"c2lnbmVkLXRvb2w="},{"functionCall":{"name":"read","args":{"path":"b.txt"}}}]}}]}"#,
+            "",
+            r#"data: {"candidates":[{"finishReason":"STOP"}]}"#,
+            "",
+            "",
+        ]
+        .join("\n");
+        let events = collect_stream_items_from_body(&body);
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let signatures: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(StreamEvent::ToolCallEnd { tool_call, .. }) => {
+                    Some(tool_call.thought_signature.as_deref())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(signatures, vec![Some(SIGNATURE), None]);
+        let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
+            panic!("expected completed tool step: {events:?}");
+        };
+        assert_eq!(*reason, StopReason::ToolUse);
+        assert_eq!(message.stop_reason, StopReason::ToolUse);
+
+        let stored = serde_json::to_string(&Message::assistant(message.clone())).unwrap();
+        let replay: Message = serde_json::from_str(&stored).expect("session replay");
+        let mut messages = vec![
+            Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Read a.txt and b.txt".to_string()),
+                timestamp: 0,
+            }),
+            replay,
+        ];
+        for block in &message.content {
+            if let ContentBlock::ToolCall(call) = block {
+                messages.push(Message::tool_result(crate::model::ToolResultMessage {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    content: vec![ContentBlock::Text(TextContent::new("contents"))],
+                    details: None,
+                    is_error: false,
+                    timestamp: 1,
+                }));
+            }
+        }
+        let context = Context::owned(None, messages, Vec::new());
+        let provider = GeminiProvider::new("gemini-3-pro");
+        let wire =
+            serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                .unwrap();
+        let parts = wire["contents"][1]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["thoughtSignature"], SIGNATURE);
+        assert!(parts[1].get("thoughtSignature").is_none());
+        assert_eq!(
+            parts[0]["functionCall"]["args"],
+            serde_json::json!({"path": "a.txt"})
+        );
+        assert_eq!(
+            parts[1]["functionCall"]["args"],
+            serde_json::json!({"path": "b.txt"})
+        );
+        assert_eq!(
+            wire["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "read"
+        );
+        assert_eq!(
+            wire["contents"][3]["parts"][0]["functionResponse"]["name"],
+            "read"
+        );
+    }
+
+    #[test]
+    fn function_call_signature_accepts_both_spellings_without_fabrication() {
+        for key in ["thoughtSignature", "thought_signature"] {
+            let mut wire = serde_json::json!({
+                "functionCall": {"name": "read", "args": {"path": "a.txt"}}
+            });
+            wire[key] = serde_json::json!("c2lnbmF0dXJl");
+            let part: GeminiPart = serde_json::from_value(wire).unwrap();
+            let replay = serde_json::to_value(part).unwrap();
+            assert_eq!(replay["thoughtSignature"], "c2lnbmF0dXJl");
+            assert!(replay.get("thought_signature").is_none());
+            assert_eq!(
+                replay["functionCall"]["args"],
+                serde_json::json!({"path": "a.txt"})
+            );
+        }
+        let unsigned = serde_json::json!({"functionCall": {"name": "read", "args": {}}});
+        let part: GeminiPart = serde_json::from_value(unsigned.clone()).unwrap();
+        assert_eq!(serde_json::to_value(part).unwrap(), unsigned);
+    }
+
+    #[test]
+    fn cloud_code_assist_preserves_tool_call_signatures() {
+        let source = stream::empty::<std::io::Result<Vec<u8>>>();
+        let mut state = StreamState::new(
+            SseStream::new(source),
+            "gemini-test".to_string(),
+            "google-gemini-cli".to_string(),
+            "google-gemini-cli".to_string(),
+        );
+        state
+            .process_cloud_code_event(
+                r#"{"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"read","args":{}},"thoughtSignature":"Y2xvdWQ="}]}}]}}"#,
+            )
+            .unwrap();
+        state
+            .process_cloud_code_event(r#"{"response":{"candidates":[{"finishReason":"STOP"}]}}"#)
+            .unwrap();
+        let StreamEvent::Done { reason, message } = state.finish_at_eof().unwrap() else {
+            panic!("expected Done");
+        };
+        assert_eq!(reason, StopReason::ToolUse);
+        let ContentBlock::ToolCall(call) = &message.content[0] else {
+            panic!("expected tool call");
+        };
+        assert_eq!(call.thought_signature.as_deref(), Some("Y2xvdWQ="));
+    }
+
+    #[test]
+    fn terminal_failure_or_length_is_not_overwritten_by_function_calls() {
+        for (finish, expected) in [
+            ("SAFETY", StopReason::Error),
+            ("MAX_TOKENS", StopReason::Length),
+        ] {
+            for separate_terminal_chunk in [false, true] {
+                let source = stream::empty::<std::io::Result<Vec<u8>>>();
+                let mut state = StreamState::new(
+                    SseStream::new(source),
+                    "gemini-test".to_string(),
+                    "google".to_string(),
+                    "google".to_string(),
+                );
+                let mut candidate = serde_json::json!({
+                    "content": {"parts": [{"functionCall": {"name": "read", "args": {}}}]}
+                });
+                if !separate_terminal_chunk {
+                    candidate["finishReason"] = serde_json::json!(finish);
+                }
+                state
+                    .process_event(&serde_json::json!({"candidates": [candidate]}).to_string())
+                    .unwrap();
+                if separate_terminal_chunk {
+                    state
+                        .process_event(
+                            &serde_json::json!({
+                                "candidates": [{"finishReason": finish}]
+                            })
+                            .to_string(),
+                        )
+                        .unwrap();
+                }
+                let StreamEvent::Done { reason, message } = state.finish_at_eof().unwrap() else {
+                    panic!("expected Done");
+                };
+                assert_eq!(reason, expected);
+                assert_eq!(message.stop_reason, expected);
+            }
+        }
     }
 
     // ========================================================================

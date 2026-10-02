@@ -1,30 +1,26 @@
-//! Integration tests for the memory bank (bd-cv653.4.1).
+//! Integration tests for the project memory bank.
 //!
-//! Acceptance coverage:
-//! 1. Retain through the tool surface redacts secrets (acceptance #3).
-//! 2. `memory.backend: local` exposes the four tools; off → absent (#5).
-//! 3. `reflect` answers with the stub provider and cites memory ids (#4).
-//! 4. Cross-instance persistence through the store (#1, tool-level).
-//! 5. forget hard-deletes; invalidate tombstones excluded from recall (#2).
-//!
-//! Logging: structured JSONL per tests/common/logging.rs, v2-validated,
-//! recorded as artifacts.
+//! Exercises real SQLite/FTS operations and the public reflection tool through
+//! a Gemini provider and loopback HTTP/SSE, including terminal failures.
+
+#![recursion_limit = "256"]
 
 mod common;
 
 use clap::Parser;
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
-use pi::model::StreamEvent;
-use pi::provider::{Context, StreamOptions};
+use pi::provider::StreamOptions;
 use pi::tools::{Tool, ToolOutput, ToolRegistry};
-use serde_json::json;
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::io::{Read as _, Write as _};
+use std::net::TcpListener;
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-/// Memory tests share the per-project store dir under the harness temp
-/// root; each test uses a unique project dir, so no global lock is needed.
 fn first_text(output: &ToolOutput) -> &str {
     output
         .content
@@ -72,59 +68,147 @@ fn memory_config(backend: &str) -> pi::config::Config {
     }
 }
 
-/// Canned provider: answers with a fixed text citing the ids it saw in the
-/// prompt (acceptance #4 needs citation ids in the answer).
-struct StubProvider;
+struct CapturedRequest {
+    headers: HashMap<String, String>,
+    body: Value,
+}
 
-#[async_trait::async_trait]
-#[allow(clippy::unnecessary_literal_bound)]
-impl pi::provider::Provider for StubProvider {
-    fn name(&self) -> &str {
-        "stub"
+struct ReflectionServer {
+    base_url: String,
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<Option<CapturedRequest>>>,
+}
+
+impl ReflectionServer {
+    fn start(status: u16, body: String) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind reflection server");
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let join = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut socket = loop {
+                if stopped.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                    return None;
+                }
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("reflection accept: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let header_end = loop {
+                if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break index + 4;
+                }
+                assert!(bytes.len() < 64 * 1024, "bounded headers");
+                let read = socket.read(&mut chunk).expect("read reflection headers");
+                assert!(read > 0, "request closed before headers");
+                bytes.extend_from_slice(&chunk[..read]);
+            };
+            let headers: HashMap<String, String> = String::from_utf8_lossy(&bytes[..header_end])
+                .lines()
+                .skip(1)
+                .filter_map(|line| line.split_once(':'))
+                .map(|(key, value)| (key.to_ascii_lowercase(), value.trim().to_string()))
+                .collect();
+            let length: usize = headers["content-length"].parse().unwrap();
+            assert!(length <= 1024 * 1024, "bounded fixture body");
+            while bytes.len() - header_end < length {
+                let read = socket.read(&mut chunk).expect("read reflection body");
+                assert!(read > 0, "request closed before body");
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            let request = CapturedRequest {
+                headers,
+                body: serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap(),
+            };
+            let response = format!(
+                "HTTP/1.1 {status} Fixture\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .expect("write reflection response");
+            Some(request)
+        });
+        Self {
+            base_url,
+            stop,
+            join: Some(join),
+        }
     }
 
-    fn api(&self) -> &str {
-        "stub-api"
+    fn finish(mut self) -> CapturedRequest {
+        self.stop.store(true, Ordering::Relaxed);
+        self.join
+            .take()
+            .unwrap()
+            .join()
+            .expect("server thread")
+            .expect("captured request")
     }
+}
 
-    fn model_id(&self) -> &str {
-        "stub-model"
+impl Drop for ReflectionServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
     }
+}
 
-    async fn stream(
-        &self,
-        context: &Context<'_>,
-        _options: &StreamOptions,
-    ) -> pi::error::Result<
-        Pin<Box<dyn futures::Stream<Item = pi::error::Result<StreamEvent>> + Send>>,
-    > {
-        // Cite the memory ids that appeared in the prompt (Debug rendering
-        // escapes newlines, so extract with a regex over the raw text).
-        let prompt = context
-            .messages
-            .first()
-            .map(|message| format!("{message:?}")) // ubs:ignore stub provider
-            .unwrap_or_default();
-        let corpus_re = regex::Regex::new(r"- \[(\d+)\]").expect("corpus regex"); // ubs:ignore static test regex
-        let mut corpus_ids: Vec<String> = corpus_re
-            .captures_iter(&prompt)
-            .map(|capture| capture[1].to_string()) // ubs:ignore regex capture group 1 always present
-            .collect();
-        corpus_ids.sort();
-        corpus_ids.dedup();
-        let ids = corpus_ids
-            .iter()
-            .map(|id| format!("[{id}]")) // ubs:ignore stub formatting
-            .collect::<Vec<_>>()
-            .join(" ");
-        let answer = format!("The answer, grounded in memories: {ids} — cargo check first."); // ubs:ignore stub
-        Ok(Box::pin(futures::stream::iter(vec![Ok(
-            StreamEvent::TextDelta {
-                content_index: 0,
-                delta: answer,
-            },
-        )])))
+fn gemini_body(answer: &str, finish: Option<&str>) -> String {
+    let mut body = format!(
+        "data: {}\n\n",
+        json!({
+            "candidates": [{"content": {"parts": [{"text": answer}]}}]
+        })
+    );
+    if let Some(finish) = finish {
+        use std::fmt::Write as _;
+        let _ = write!(
+            body,
+            "data: {}\n\n",
+            json!({
+                "candidates": [{"finishReason": finish}]
+            })
+        );
     }
+    body
+}
+
+fn reflection_tool(
+    store: Arc<pi::memory::MemoryStore>,
+    server: &ReflectionServer,
+) -> pi::memory::ReflectTool {
+    let provider = pi::providers::gemini::GeminiProvider::new("reflection-test")
+        .with_base_url(&server.base_url);
+    pi::memory::ReflectTool::with_provider_and_options(
+        store,
+        Arc::new(provider),
+        StreamOptions {
+            api_key: Some("reflection-fixture-key".to_string()),
+            headers: HashMap::from([(
+                "x-session-binding".to_string(),
+                "fixture-session".to_string(),
+            )]),
+            max_tokens: Some(2048),
+            ..StreamOptions::default()
+        },
+    )
 }
 
 #[test]
@@ -132,7 +216,6 @@ fn retain_tool_redacts_secrets() {
     let case = "retain_tool_redacts_secrets";
     let harness = TestHarness::new(case);
     let root = project_dir(&harness, "proj");
-
     let store = Arc::new(pi::memory::MemoryStore::open(&root).expect("open"));
     let tool = pi::memory::RetainTool::new(store);
     let out = block_on_local(tool.execute(
@@ -148,7 +231,7 @@ fn retain_tool_redacts_secrets() {
     assert!(text.contains("secret redacted"), "{text}");
     assert!(!text.contains("sk-abcdef"), "{text}");
     let details = out.details.as_ref().expect("details");
-    let stored = details["content"].as_str().expect("stored content"); // ubs:ignore test fixture
+    let stored = details["content"].as_str().expect("stored content");
     assert!(stored.contains("[REDACTED_OPENAI_KEY]"), "{stored}");
     assert!(!stored.contains("sk-abcdef"), "{stored}");
     finish_case(&harness, case);
@@ -159,7 +242,6 @@ fn backend_gate_controls_tool_presence() {
     let case = "backend_gate_controls_tool_presence";
     let harness = TestHarness::new(case);
     let root = project_dir(&harness, "proj");
-
     let local = ToolRegistry::new(&["read"], &root, Some(&memory_config("local")));
     let local_names: Vec<&str> = local.tools().iter().map(|tool| tool.name()).collect();
     harness
@@ -171,20 +253,14 @@ fn backend_gate_controls_tool_presence() {
             "backend=local must expose {expected}: {local_names:?}"
         );
     }
-
     let off = ToolRegistry::new(&["read"], &root, Some(&memory_config("off")));
     let off_names: Vec<&str> = off.tools().iter().map(|tool| tool.name()).collect();
-    harness
-        .log()
-        .info("verify", format!("off tools: {off_names:?}"));
     for absent in ["retain", "recall", "reflect", "memory_edit"] {
         assert!(
             !off_names.contains(&absent),
             "backend=off must hide {absent}: {off_names:?}"
         );
     }
-
-    // Default config (no memory section) is off too.
     let default = ToolRegistry::new(&["read"], &root, None::<&pi::config::Config>);
     let default_names: Vec<&str> = default.tools().iter().map(|tool| tool.name()).collect();
     assert!(
@@ -195,11 +271,10 @@ fn backend_gate_controls_tool_presence() {
 }
 
 #[test]
-fn reflect_cites_memory_ids_with_stub_provider() {
-    let case = "reflect_cites_memory_ids_with_stub_provider";
+fn reflect_cites_memory_ids_through_provider_http() {
+    let case = "reflect_cites_memory_ids_through_provider_http";
     let harness = TestHarness::new(case);
     let root = project_dir(&harness, "proj");
-
     let store = Arc::new(pi::memory::MemoryStore::open(&root).expect("open"));
     let memory = store
         .retain(
@@ -209,33 +284,118 @@ fn reflect_cites_memory_ids_with_stub_provider() {
             None,
         )
         .expect("retain");
-
-    let tool = pi::memory::ReflectTool::with_provider(store, Arc::new(StubProvider));
+    let other = store
+        .retain(
+            pi::memory::MemoryKind::Lesson,
+            "run tests before committing",
+            &[],
+            None,
+        )
+        .expect("retain another source");
+    let server = ReflectionServer::start(
+        200,
+        gemini_body(
+            &format!("Run cargo check first [{}].", memory.id),
+            Some("STOP"),
+        ),
+    );
+    let tool = reflection_tool(store, &server);
     let out = block_on_local(tool.execute(
         "call-1",
         json!({"question": "what should run before committing?"}),
         None,
     ))
     .expect("execute");
-    let text = first_text(&out);
-    harness
-        .log()
-        .info("verify", format!("reflect answer: {text}"));
-    assert!(!out.is_error, "{text}");
-    let id_marker = format!("[{}]", memory.id);
-    assert!(
-        text.contains(&id_marker),
-        "answer must cite the memory id {id_marker}: {text}"
-    );
-    let citations = out.details.as_ref().expect("details")["citations"] // ubs:ignore test fixture
-        .as_array()
-        .expect("citations");
-    assert!(
-        citations.iter().any(|id| id.as_i64() == Some(memory.id)),
-        "citations must include {}: {citations:?}",
-        memory.id
-    );
+    assert!(!out.is_error);
+    assert!(first_text(&out).contains(&format!("[{}]", memory.id)));
+    let details = out.details.as_ref().expect("details");
+    assert_eq!(details["citations"], json!([memory.id]));
+    let sources = details["sourceMemoryIds"].as_array().unwrap();
+    assert!(sources.contains(&json!(memory.id)));
+    assert!(sources.contains(&json!(other.id)));
+    assert_eq!(details["provider"], "google");
+    let request = server.finish();
+    assert_eq!(request.headers["x-goog-api-key"], "reflection-fixture-key");
+    assert_eq!(request.headers["x-session-binding"], "fixture-session");
+    assert_eq!(request.body["generationConfig"]["maxOutputTokens"], 2048);
+    let prompt = request.body["contents"][0]["parts"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(prompt.contains(&format!("- [{}]", memory.id)));
+    assert!(prompt.contains(&format!("- [{}]", other.id)));
+    assert!(request.body.get("tools").is_none());
     finish_case(&harness, case);
+}
+
+#[test]
+fn reflect_rejects_truncated_failed_and_invented_citation_responses() {
+    let harness = TestHarness::new("reflect_terminal_errors");
+    let root = project_dir(&harness, "proj");
+    let store = Arc::new(pi::memory::MemoryStore::open(&root).unwrap());
+    let memory = store
+        .retain(
+            pi::memory::MemoryKind::Fact,
+            "parser is incremental",
+            &[],
+            None,
+        )
+        .unwrap();
+    for (body, expected) in [
+        (gemini_body("partial", None), "unexpected EOF"),
+        (gemini_body("blocked", Some("SAFETY")), "successfully"),
+        (gemini_body("truncated", Some("MAX_TOKENS")), "successfully"),
+        (
+            gemini_body(&format!("invented [{}]", memory.id + 1), Some("STOP")),
+            "not supplied",
+        ),
+    ] {
+        let server = ReflectionServer::start(200, body);
+        let tool = reflection_tool(Arc::clone(&store), &server);
+        let error = block_on_local(tool.execute("call-1", json!({"question": "parser?"}), None))
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+        server.finish();
+    }
+}
+
+#[test]
+fn reflect_redacts_credentials_in_http_failures() {
+    let harness = TestHarness::new("reflect_redacted_http_error");
+    let root = project_dir(&harness, "proj");
+    let store = Arc::new(pi::memory::MemoryStore::open(&root).unwrap());
+    store
+        .retain(
+            pi::memory::MemoryKind::Fact,
+            "parser is incremental",
+            &[],
+            None,
+        )
+        .unwrap();
+    let server = ReflectionServer::start(500, "upstream echoed reflection-fixture-key".to_string());
+    let tool = reflection_tool(store, &server);
+    let error =
+        block_on_local(tool.execute("call-1", json!({"question": "parser?"}), None)).unwrap_err();
+    assert!(!error.to_string().contains("reflection-fixture-key"));
+    assert!(error.to_string().contains("REDACTED"));
+    server.finish();
+}
+
+#[test]
+fn reflect_validates_input_and_skips_provider_resolution_without_sources() {
+    let harness = TestHarness::new("reflect_empty_bank");
+    let root = project_dir(&harness, "proj");
+    let store = Arc::new(pi::memory::MemoryStore::open(&root).unwrap());
+    let tool = pi::memory::ReflectTool::new(store);
+    assert!(block_on_local(tool.execute("call-1", json!({"question": "   "}), None)).is_err());
+    assert!(
+        block_on_local(tool.execute("call-1", json!({"question": "x".repeat(8193)}), None))
+            .is_err()
+    );
+    let output =
+        block_on_local(tool.execute("call-1", json!({"question": "unknown parser"}), None))
+            .unwrap();
+    assert!(!output.is_error);
+    assert_eq!(output.details.unwrap()["citations"], json!([]));
 }
 
 #[test]
@@ -243,8 +403,6 @@ fn cross_instance_persistence_and_tombstones() {
     let case = "cross_instance_persistence_and_tombstones";
     let harness = TestHarness::new(case);
     let root = project_dir(&harness, "proj");
-
-    // Session A: retain two facts, invalidate one, forget nothing.
     let (kept_id, tomb_id) = {
         let store = pi::memory::MemoryStore::open(&root).expect("open A");
         let kept = store
@@ -268,13 +426,8 @@ fn cross_instance_persistence_and_tombstones() {
             .expect("invalidate");
         (kept.id, tomb.id)
     };
-
-    // Session B (fresh store instance): kept fact recalls, tombstone does not.
     let store_b = pi::memory::MemoryStore::open(&root).expect("open B");
     let hits = store_b.recall("agent loop", None).expect("recall");
-    harness
-        .log()
-        .info("verify", format!("session B recall: {hits:?}"));
     assert!(
         hits.iter().any(|hit| hit.id == kept_id),
         "session B must recall session A's fact: {hits:?}"
@@ -284,8 +437,6 @@ fn cross_instance_persistence_and_tombstones() {
         tomb_hits.iter().all(|hit| hit.id != tomb_id),
         "tombstone must be excluded: {tomb_hits:?}"
     );
-
-    // Forget hard-deletes the tombstone row entirely.
     store_b
         .edit(tomb_id, pi::memory::MemoryEditOp::Forget, None)
         .expect("forget");
@@ -302,7 +453,6 @@ fn startup_injection_includes_mental_model_when_local() {
     let case = "startup_injection_includes_mental_model_when_local";
     let harness = TestHarness::new(case);
     let root = project_dir(&harness, "proj");
-
     let store = pi::memory::MemoryStore::open(&root).expect("open");
     store
         .retain(
@@ -312,7 +462,6 @@ fn startup_injection_includes_mental_model_when_local() {
             None,
         )
         .expect("retain");
-
     let prompt = build_prompt_for_test(&root, &memory_config("local"));
     harness.log().info(
         "verify",
@@ -323,14 +472,12 @@ fn startup_injection_includes_mental_model_when_local() {
     );
     assert!(
         prompt.contains("Project Memory"),
-        "backend=local must inject the mental model: {}...",
-        &prompt[..prompt.len().min(400)]
+        "backend=local must inject the mental model"
     );
     assert!(
         prompt.contains("fsqlite over rusqlite"),
         "mental model must carry the retained decision"
     );
-
     let off_prompt = build_prompt_for_test(&root, &memory_config("off"));
     assert!(
         !off_prompt.contains("Project Memory"),
@@ -348,7 +495,7 @@ fn build_prompt_for_test(cwd: &Path, config: &pi::config::Config) -> String {
         None,
         &pi::config::Config::global_dir(),
         cwd,
-        false, // memory injection is gated off under test_mode
+        false,
         true,
         None,
         config,

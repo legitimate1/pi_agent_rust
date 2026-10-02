@@ -1,3 +1,10 @@
+// Integration tests are separate crates, so the crate-level `recursion_limit`
+// raised in src/lib.rs does not reach here. Proving `Send` for the replay
+// future now exceeds the default 128 — asupersync 0.5.0 nests its runtime
+// future types more deeply than 0.4.4 did — which the compiler reports as an
+// overflow error rather than a warning in this target.
+#![recursion_limit = "256"]
+
 //! Snapcompact vision-model replay tests (bd-cv653.7.6, AC 2 + AC 4).
 //!
 mod common;

@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; asupersync 0.5.0 nests its runtime future types deeply
+// enough that proving `Send` exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! Non-mock coverage tests for agent/tools orchestration paths (bd-1f42.8.4.1).
 //!
 //! Targets uncovered code paths in src/agent.rs and src/tools.rs:

@@ -84,6 +84,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "explain-extension-policy"
         | "explain-repair-policy"
         | "no-skills"
+        | "no-context-files"
         // bd-cv653.3.12 / bd-cv653.7.12 / bd-cv653.7.12.1: the pre-parser
         // must pass these through to clap — any top-level long missing from
         // this match gets silently diverted to extension-flag extraction.
@@ -436,8 +437,13 @@ pub struct Cli {
     pub no_session: bool,
 
     /// Launch the FrankenTUI interactive stack (default when built with `ftui`).
+    ///
+    /// Conflicts with `--classic`: the two select opposite stacks, and until
+    /// this conflict was declared, nothing read this flag at all — `--ftui`
+    /// appeared to work only because it names the default, and
+    /// `pi --classic --ftui` silently gave you classic.
     #[cfg(feature = "ftui")]
-    #[arg(long)]
+    #[arg(long, conflicts_with = "classic")]
     pub ftui: bool,
 
     /// Force the classic charmed_rust TUI stack instead of the default ftui stack.
@@ -564,6 +570,15 @@ pub struct Cli {
     #[arg(long)]
     pub no_skills: bool,
 
+    // === Context files ===
+    /// Disable AGENTS.md / CLAUDE.md discovery and loading (the global
+    /// agent-dir file, the cwd, and every ancestor directory), plus the
+    /// foreign-format workspace rules import. Use it when a host composes the
+    /// whole system prompt itself (`--system-prompt`) and must not pick up
+    /// ambient project instructions. Separate from `--no-skills` (gh #216).
+    #[arg(long, env = "PI_NO_CONTEXT_FILES")]
+    pub no_context_files: bool,
+
     // === Prompt Templates ===
     /// Load prompt template file/directory (can use multiple times)
     #[arg(long, action = clap::ArgAction::Append)]
@@ -683,7 +698,7 @@ pub struct Cli {
 mod tests {
     use super::{
         Cli, Commands, ExtensionCliFlag, ROOT_SUBCOMMANDS, known_long_option,
-        parse_with_extension_flags,
+        parse_with_extension_flags, preprocess_extension_flags,
     };
     use clap::{CommandFactory, Parser, error::ErrorKind};
     use std::path::PathBuf;
@@ -752,6 +767,76 @@ mod tests {
     fn parse_session_dir() {
         let cli = Cli::parse_from(["pi", "--session-dir", "/tmp/sessions"]);
         assert_eq!(cli.session_dir.as_deref(), Some("/tmp/sessions"));
+    }
+
+    /// bd-print-session-path-persists-nothing: the exact print-mode argv, since
+    /// `parse_session_path` above proves only the two-token form.
+    ///
+    /// `args` is `trailing_var_arg`, so everything from the first positional on
+    /// is a message — including things that look like flags. This pins that
+    /// `--session` placed BEFORE the message still binds, and that the message
+    /// does not end up in `session`.
+    /// `--ftui` and `--classic` pick opposite stacks, so asking for both is a
+    /// mistake worth reporting rather than resolving silently. Before this,
+    /// `pi --classic --ftui` ran classic and said nothing.
+    #[cfg(feature = "ftui")]
+    #[test]
+    fn ftui_and_classic_cannot_both_be_requested() {
+        let cli = Cli::parse_from(["pi", "--ftui"]);
+        assert!(cli.ftui);
+        assert!(!cli.classic);
+
+        let cli = Cli::parse_from(["pi", "--classic"]);
+        assert!(!cli.ftui);
+        assert!(cli.classic);
+
+        assert!(
+            Cli::try_parse_from(["pi", "--classic", "--ftui"]).is_err(),
+            "two stack selectors at once must be refused, not silently ordered"
+        );
+        assert!(
+            Cli::try_parse_from(["pi", "--ftui", "--classic"]).is_err(),
+            "and in the other order too"
+        );
+        // The documented aliases for --classic conflict as well.
+        assert!(Cli::try_parse_from(["pi", "--ftui", "--classic-tui"]).is_err());
+    }
+
+    #[test]
+    fn parse_session_path_in_a_full_print_mode_argv() {
+        let cli = Cli::parse_from([
+            "pi",
+            "--print",
+            "--mode",
+            "json",
+            "--session",
+            "/tmp/session.jsonl",
+            "--provider",
+            "e2eprimary",
+            "--model",
+            "primary-model",
+            "hello",
+        ]);
+        assert_eq!(cli.session.as_deref(), Some("/tmp/session.jsonl"));
+        assert!(cli.print);
+        assert_eq!(cli.mode.as_deref(), Some("json"));
+        assert_eq!(cli.message_args(), vec!["hello".to_string()]);
+    }
+
+    /// The same argv without the trailing message, which is the shape that
+    /// showed `--session` having no effect at runtime.
+    #[test]
+    fn parse_session_path_without_a_message() {
+        let cli = Cli::parse_from([
+            "pi",
+            "--print",
+            "--mode",
+            "json",
+            "--session",
+            "/tmp/s.jsonl",
+        ]);
+        assert_eq!(cli.session.as_deref(), Some("/tmp/s.jsonl"));
+        assert!(cli.message_args().is_empty());
     }
 
     #[test]
@@ -1682,6 +1767,23 @@ mod tests {
     fn no_skills_flag() {
         let cli = Cli::parse_from(["pi", "--no-skills"]);
         assert!(cli.no_skills);
+        // gh #216: skills and context files are independent switches.
+        assert!(!cli.no_context_files);
+    }
+
+    #[test]
+    fn no_context_files_flag() {
+        let cli = Cli::parse_from(["pi", "--no-context-files"]);
+        assert!(cli.no_context_files);
+        assert!(!cli.no_skills);
+    }
+
+    #[test]
+    fn no_context_files_flag_is_not_diverted_to_extension_flags() {
+        let args: Vec<String> = vec!["pi".to_string(), "--no-context-files".to_string()];
+        let (kept, extracted) = preprocess_extension_flags(&args);
+        assert!(extracted.is_empty());
+        assert_eq!(kept, args);
     }
 
     #[test]
@@ -1705,6 +1807,7 @@ mod tests {
         assert!(!cli.no_tools);
         assert!(!cli.no_extensions);
         assert!(!cli.no_skills);
+        assert!(!cli.no_context_files);
         assert!(!cli.no_prompt_templates);
         assert!(!cli.no_themes);
         assert!(cli.provider.is_none());
@@ -2066,7 +2169,8 @@ mod tests {
             fn preprocess_known_flags_never_extracted(
                 flag in prop::sample::select(vec![
                     "--version", "--verbose", "--print", "--no-tools",
-                    "--no-extensions", "--no-skills", "--no-prompt-templates",
+                    "--no-extensions", "--no-skills", "--no-context-files",
+                    "--no-prompt-templates",
                     "--no-mouse-capture", "--rpc", "--list-providers",
                 ]),
             ) {
