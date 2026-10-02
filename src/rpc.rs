@@ -36,7 +36,9 @@ use crate::provider::InputType;
 use crate::provider_metadata::provider_ids_match;
 use crate::providers;
 use crate::resources::ResourceLoader;
-use crate::session::{AutosaveFlushTrigger, Session, SessionEntry, SessionMessage};
+use crate::session::{
+    AutosaveFlushTrigger, Session, SessionEntry, SessionMessage, user_content_to_text,
+};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::{JoinHandle, RuntimeHandle};
@@ -106,6 +108,34 @@ impl Drop for ExtensionUiCloseGuard {
 pub struct RpcScopedModel {
     pub model: ModelEntry,
     pub thinking_level: Option<crate::model::ThinkingLevel>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcErrorCode {
+    InvalidRequest,
+    StaleSession,
+    StaleLeaf,
+    UnknownTarget,
+    TransitionBlocked,
+    PersistenceFailed,
+    SessionUnavailable,
+    Quarantined,
+}
+
+impl RpcErrorCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::StaleSession => "stale_session",
+            Self::StaleLeaf => "stale_leaf",
+            Self::UnknownTarget => "unknown_target",
+            Self::TransitionBlocked => "transition_blocked",
+            Self::PersistenceFailed => "persistence_failed",
+            Self::SessionUnavailable => "session_unavailable",
+            Self::Quarantined => "quarantined",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +219,130 @@ where
         let _guard = asupersync::Cx::set_current(Some(current_cx.clone()));
         future.as_mut().poll(poll_cx)
     })
+}
+
+const RPC_SESSION_TREE_PREVIEW_MAX_CHARS: usize = 120;
+
+fn tree_preview_for_kind(kind: &str, text: &str) -> String {
+    let text = text.trim();
+    let mut preview = String::with_capacity(text.len().min(RPC_SESSION_TREE_PREVIEW_MAX_CHARS));
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if preview.chars().count() + 1 >= RPC_SESSION_TREE_PREVIEW_MAX_CHARS {
+            preview.push('…');
+            break;
+        }
+        preview.push(character);
+    }
+    if preview.is_empty() {
+        return kind.to_string();
+    }
+    preview
+}
+
+fn tree_entry_kind_and_text(entry: &SessionEntry) -> (&'static str, String, Option<String>) {
+    match entry {
+        SessionEntry::Message(message_entry) => match &message_entry.message {
+            SessionMessage::User { content, .. } => {
+                let text = user_content_to_text(content);
+                ("user", text.clone(), Some(text))
+            }
+            SessionMessage::Assistant { message } => {
+                let text = message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ("assistant", text, None)
+            }
+            SessionMessage::ToolResult {
+                tool_name, content, ..
+            } => ("tool_result", tool_name.clone(), None),
+            SessionMessage::BashExecution { command, .. } => ("bash", command.clone(), None),
+            SessionMessage::Custom {
+                custom_type,
+                content,
+                ..
+            } => (
+                "custom",
+                format!("{custom_type}: {content}"),
+                Some(content.clone()),
+            ),
+            SessionMessage::BranchSummary { summary, .. } => {
+                ("branch_summary", summary.clone(), None)
+            }
+            SessionMessage::CompactionSummary { summary, .. } => {
+                ("compaction", summary.clone(), None)
+            }
+        },
+        SessionEntry::Compaction(entry) => ("compaction", entry.summary.clone(), None),
+        SessionEntry::BranchSummary(entry) => ("branch_summary", entry.summary.clone(), None),
+        SessionEntry::ModelChange(entry) => (
+            "model",
+            format!("{}/{}", entry.provider, entry.model_id),
+            None,
+        ),
+        SessionEntry::ThinkingLevelChange(entry) => {
+            ("thinking_level", entry.thinking_level.clone(), None)
+        }
+        SessionEntry::Label(entry) => (
+            "label",
+            format!(
+                "{}: {}",
+                entry.target_id,
+                entry.label.as_deref().unwrap_or("")
+            ),
+            None,
+        ),
+        SessionEntry::SessionInfo(entry) => {
+            ("session_info", entry.name.clone().unwrap_or_default(), None)
+        }
+        SessionEntry::Custom(entry) => ("custom", entry.custom_type.clone(), None),
+    }
+}
+
+fn tree_entry_value(entry: &SessionEntry) -> Value {
+    let (kind, text, resubmit_text) = tree_entry_kind_and_text(entry);
+    let mut value = json!({
+        "id": entry.base().id,
+        "parentId": entry.base().parent_id,
+        "kind": kind,
+        "preview": tree_preview_for_kind(kind, &text),
+    });
+    if matches!(kind, "user" | "custom") {
+        if let Some(text) = resubmit_text {
+            value["resubmitText"] = Value::String(text);
+        }
+    }
+    value
+}
+
+fn tree_snapshot_value(session: &Session) -> Result<Value> {
+    match session.validate_tree_query_integrity() {
+        Ok(()) => {}
+        Err(crate::session::SessionTreeQueryIntegrity::Unavailable) => {
+            return Err(Error::session("session tree is unavailable"));
+        }
+        Err(crate::session::SessionTreeQueryIntegrity::Quarantined) => {
+            return Err(Error::session_persistence(
+                "session tree is quarantined after a source integrity failure",
+            ));
+        }
+    }
+    Ok(json!({
+        "sessionId": session.header.id,
+        "activeLeafId": session.leaf_id(),
+        "entries": session.entries.iter().map(tree_entry_value).collect::<Vec<_>>(),
+    }))
 }
 
 fn normalize_command_type(command_type: &str) -> &str {
@@ -2592,6 +2746,36 @@ pub async fn run(
                     session_stats(&inner_session, guard.save_enabled())
                 };
                 let _ = out_tx.send(response_ok(id, "get_session_stats", Some(data)));
+            }
+
+            "get_session_tree" => {
+                let data = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
+                    Ok(guard) => match guard.session.lock(&cx).await {
+                        Ok(inner_session) => tree_snapshot_value(&inner_session),
+                        Err(err) => {
+                            Err(Error::session(format!("inner session lock failed: {err}")))
+                        }
+                    },
+                    Err(err) => Err(Error::session(format!("session lock failed: {err}"))),
+                };
+                match data {
+                    Ok(data) => {
+                        let _ = out_tx.send(response_ok(id, "get_session_tree", Some(data)));
+                    }
+                    Err(err) => {
+                        let code = if err.is_session_persistence() {
+                            RpcErrorCode::Quarantined
+                        } else {
+                            RpcErrorCode::SessionUnavailable
+                        };
+                        let _ = out_tx.send(response_error_with_hints_and_code(
+                            id,
+                            "get_session_tree",
+                            code,
+                            &err,
+                        ));
+                    }
+                }
             }
 
             "get_messages" => {
@@ -6356,6 +6540,44 @@ fn response_error_with_hints(id: Option<String>, command: &str, error: &Error) -
     resp.to_string()
 }
 
+fn response_error_with_code(
+    id: Option<String>,
+    command: &str,
+    code: RpcErrorCode,
+    error: impl Into<String>,
+) -> String {
+    let mut resp = json!({
+        "type": "response",
+        "command": command,
+        "success": false,
+        "code": code.as_str(),
+        "error": error.into(),
+    });
+    if let Some(id) = id {
+        resp["id"] = Value::String(id);
+    }
+    resp.to_string()
+}
+
+fn response_error_with_hints_and_code(
+    id: Option<String>,
+    command: &str,
+    code: RpcErrorCode,
+    error: &Error,
+) -> String {
+    let mut resp = json!({
+        "type": "response",
+        "command": command,
+        "success": false,
+        "code": code.as_str(),
+        "error": error.to_string(),
+        "errorHints": error_hints_value(error),
+    });
+    if let Some(id) = id {
+        resp["id"] = Value::String(id);
+    }
+    resp.to_string()
+}
 fn event(value: &Value) -> String {
     value.to_string()
 }
@@ -15503,9 +15725,117 @@ export default function init(pi) {
         assert!(parse_optional_u32_field(&payload, "reserveTokens").is_err());
     }
 
-    // -----------------------------------------------------------------------
-    // normalize_command_type
-    // -----------------------------------------------------------------------
+    #[test]
+    fn rpc_error_code_wire_values_are_stable() {
+        assert_eq!(RpcErrorCode::InvalidRequest.as_str(), "invalid_request");
+        assert_eq!(RpcErrorCode::StaleSession.as_str(), "stale_session");
+        assert_eq!(RpcErrorCode::StaleLeaf.as_str(), "stale_leaf");
+        assert_eq!(RpcErrorCode::UnknownTarget.as_str(), "unknown_target");
+        assert_eq!(
+            RpcErrorCode::TransitionBlocked.as_str(),
+            "transition_blocked"
+        );
+        assert_eq!(
+            RpcErrorCode::PersistenceFailed.as_str(),
+            "persistence_failed"
+        );
+        assert_eq!(
+            RpcErrorCode::SessionUnavailable.as_str(),
+            "session_unavailable"
+        );
+        assert_eq!(RpcErrorCode::Quarantined.as_str(), "quarantined");
+    }
+
+    #[test]
+    fn session_tree_preview_is_single_line_and_bounded() {
+        let input = "first line\r\nsecond line\t".to_string() + &"x".repeat(400);
+        let preview = tree_preview_for_kind("other", &input);
+
+        assert!(!preview.contains(['\n', '\r', '\t']));
+        assert!(preview.chars().count() <= RPC_SESSION_TREE_PREVIEW_MAX_CHARS);
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn session_tree_preview_does_not_expose_unbounded_unknown_content() {
+        let preview = tree_preview_for_kind("future_kind", &"sensitive\n".repeat(400));
+
+        assert!(!preview.contains('\n'));
+        assert!(preview.chars().count() <= RPC_SESSION_TREE_PREVIEW_MAX_CHARS);
+    }
+
+    #[test]
+    fn response_error_with_code_uses_optional_top_level_code() {
+        let response = serde_json::from_str::<Value>(&response_error_with_code(
+            Some("tree-1".to_string()),
+            "get_session_tree",
+            RpcErrorCode::InvalidRequest,
+            "invalid tree request",
+        ))
+        .expect("response JSON");
+
+        assert_eq!(response["code"], "invalid_request");
+        assert_eq!(response["error"], "invalid tree request");
+        assert_eq!(response["id"], "tree-1");
+    }
+
+    #[test]
+    fn session_tree_snapshot_preserves_order_links_and_resubmit_text() {
+        let mut session = Session::in_memory();
+        let root_id = session.append_message(SessionMessage::User {
+            content: UserContent::Text("full user text ".to_string() + &"x".repeat(200)),
+            timestamp: Some(0),
+        });
+        let branch_id = session.append_message(SessionMessage::Custom {
+            custom_type: "client-note".to_string(),
+            content: "custom content".to_string(),
+            display: false,
+            details: None,
+            timestamp: Some(1),
+        });
+        session._test_set_leaf_id(Some(root_id.clone()));
+        let inactive_branch_id = session.append_message(SessionMessage::User {
+            content: UserContent::Text("inactive branch".to_string()),
+            timestamp: Some(2),
+        });
+
+        let snapshot = tree_snapshot_value(&session).expect("tree snapshot");
+        let entries = snapshot["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["id"], root_id);
+        assert_eq!(entries[1]["parentId"], entries[0]["id"]);
+        assert_eq!(entries[1]["id"], branch_id);
+        assert_eq!(entries[2]["parentId"], entries[0]["id"]);
+        assert_eq!(entries[2]["id"], inactive_branch_id);
+        assert_eq!(entries[0]["resubmitText"].as_str().unwrap().len(), 215);
+        assert!(
+            entries[0]["preview"].as_str().unwrap().chars().count()
+                <= RPC_SESSION_TREE_PREVIEW_MAX_CHARS
+        );
+        assert_eq!(snapshot["activeLeafId"], inactive_branch_id);
+    }
+
+    #[test]
+    fn session_tree_snapshot_rejects_missing_ids_without_mutating_entries() {
+        let mut session = Session::in_memory();
+        session
+            .entries
+            .push(SessionEntry::Message(crate::session::MessageEntry {
+                base: crate::session::EntryBase {
+                    id: None,
+                    parent_id: None,
+                    timestamp: "now".to_string(),
+                },
+                message: SessionMessage::User {
+                    content: UserContent::Text("legacy".to_string()),
+                    timestamp: Some(0),
+                },
+            }));
+
+        let result = tree_snapshot_value(&session);
+        assert!(result.is_err());
+        assert!(session.entries[0].base_id().is_none());
+    }
 
     #[test]
     fn normalize_command_type_passthrough() {

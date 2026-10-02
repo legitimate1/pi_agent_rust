@@ -2727,6 +2727,12 @@ impl AutosaveQueue {
 // Session
 // ============================================================================
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionTreeQueryIntegrity {
+    Unavailable,
+    Quarantined,
+}
+
 /// A session manages conversation state and persistence.
 #[derive(Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -5628,6 +5634,29 @@ impl Session {
         self.leaf_id.as_deref()
     }
 
+    /// Validate that the in-memory session can provide a complete, pure tree snapshot.
+    ///
+    /// This deliberately does not finalize IDs or rebuild caches. Query callers must
+    /// reject incomplete session state rather than making a read appear to repair it.
+    pub(crate) fn validate_tree_query_integrity(
+        &self,
+    ) -> std::result::Result<(), SessionTreeQueryIntegrity> {
+        if self.source_integrity_failed {
+            return Err(SessionTreeQueryIntegrity::Quarantined);
+        }
+        if self.v2_partial_hydration {
+            return Err(SessionTreeQueryIntegrity::Unavailable);
+        }
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.base_id().map_or(true, |id| id.is_empty()))
+        {
+            return Err(SessionTreeQueryIntegrity::Unavailable);
+        }
+        Ok(())
+    }
+
     /// Initialize the session entries and leaf from a `ForkPlan`.
     ///
     /// This safely applies the new entries and leaf, and rebuilds
@@ -7421,7 +7450,7 @@ fn escape_html(input: &str) -> String {
     escaped
 }
 
-fn user_content_to_text(content: &UserContent) -> String {
+pub(crate) fn user_content_to_text(content: &UserContent) -> String {
     match content {
         UserContent::Text(text) => text.clone(),
         UserContent::Blocks(blocks) => content_blocks_to_text(blocks),

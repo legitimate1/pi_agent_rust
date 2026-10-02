@@ -2654,6 +2654,84 @@ fn rpc_get_messages_with_user_messages() {
 }
 
 #[test]
+fn rpc_get_session_tree_returns_complete_canonical_snapshot() {
+    let harness = TestHarness::new("rpc_get_session_tree_returns_complete_canonical_snapshot");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let mut session = Session::in_memory();
+        let now = 1_700_000_000_000i64;
+        let root_id = session.append_message(SessionMessage::User {
+            content: UserContent::Text("root prompt".to_string()),
+            timestamp: Some(now),
+        });
+        let assistant_id = session.append_message(SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(
+                    "inactive assistant branch",
+                ))],
+                api: "test".to_string(),
+                provider: "test".to_string(),
+                model: "test-model".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: now + 1,
+            },
+        });
+        session._test_set_leaf_id(Some(root_id.clone()));
+        let custom_id = session.append_message(SessionMessage::Custom {
+            custom_type: "client-note".to_string(),
+            content: "full custom text".to_string(),
+            display: false,
+            details: None,
+            timestamp: Some(now + 2),
+        });
+
+        let session_id = session.header.id.clone();
+        let agent_session = build_agent_session(session, &cassette_dir);
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = rpc_output_channel();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
+
+        let response = send_recv(
+            &in_tx,
+            &out_rx,
+            r#"{"id":"tree-1","type":"get_session_tree"}"#,
+            "get_session_tree",
+        )
+        .await;
+        assert_ok(&response, "get_session_tree");
+        assert_eq!(response["data"]["sessionId"], session_id);
+        assert_eq!(response["data"]["activeLeafId"], custom_id);
+
+        let entries = response["data"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["kind"], "user");
+        assert_eq!(entries[0]["id"], root_id);
+        assert_eq!(entries[1]["kind"], "assistant");
+        assert_eq!(entries[1]["id"], assistant_id);
+        assert_eq!(entries[1]["parentId"], entries[0]["id"]);
+        assert_eq!(entries[2]["kind"], "custom");
+        assert_eq!(entries[2]["parentId"], entries[0]["id"]);
+        assert_eq!(entries[2]["resubmitText"], "full custom text");
+        assert!(!entries[1]["preview"].as_str().unwrap().contains('\n'));
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+#[test]
 fn rpc_get_last_assistant_text_empty() {
     let harness = TestHarness::new("rpc_get_last_assistant_text_empty");
     let cassette_dir = cassette_root();

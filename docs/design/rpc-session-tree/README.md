@@ -1,50 +1,40 @@
 # Pi Agent Rust — RPC Session Tree Surface
 
-> **Status:** Draft design for review; no implementation is included.
+> **Status:** Confirmed v1 contract; no implementation is included.
 >
-> **Scope:** Minimal RPC surface for an external client such as Pidian to
-> reproduce the classic TUI session-tree behavior.
+> **Scope:** Minimal RPC surface for the external Pidian client to reproduce the classic TUI session-tree behavior.
 >
 > **Decision:** [decision.md](decision.md), decision key
 > rpc-session-tree-v1.
 
 ## Goal
 
-Expose the minimum session-tree capability needed by an external client:
+Expose the minimum session-tree capability needed by Pidian:
 
-- query the complete current session graph;
+- query one atomic snapshot of the complete current session graph;
 - display historical user, assistant, tool, compaction, and other entries;
-- move the active context to a selected historical entry;
-- let the client re-submit a user/custom entry by navigating to its parent and
-  putting its text back in the editor;
+- move the active context cursor to a selected historical entry;
+- let the client re-submit a user/custom entry by navigating to its parent and putting its full text back in the editor;
 - preserve abandoned branches in the same session file.
 
-The RPC server owns session and Agent state. The client owns presentation and
-selection behavior. The client must not import terminal-specific TUI state or
-write the session JSONL directly.
+Pidian is the RPC client. The RPC server owns session and Agent state. The client owns presentation and selection state. The client must not import terminal-specific TUI state or write the session JSONL directly.
 
 ## Boundary
 
-The classic TUI already provides the relevant session operations through
-src/interactive/tree.rs and src/interactive/tree_ui.rs. The RPC surface only
-extracts the session facts and mutation needed by an external client.
+The classic TUI already provides the relevant session operations through `src/interactive/tree.rs` and `src/interactive/tree_ui.rs`. The RPC surface only extracts the session facts and mutation needed by Pidian.
 
-The existing RPC transition authority remains the single authority for tree
-mutations. The implementation must reuse the same admission, persistence, and
-Agent-context rules as other session transitions.
+The existing RPC transition authority remains the single authority for tree mutations. The implementation must reuse the same admission, persistence, Agent-context, and lifecycle rules as other session transitions.
 
-## Minimal RPC surface
+## Frozen v1 contract
 
 The first version has two commands:
 
 ~~~text
-get_session_tree  -> query the complete graph
-tree_navigate     -> move the active leaf within the current session
+get_session_tree  -> query one atomic complete graph snapshot
+tree_navigate     -> move the active context cursor within the current session
 ~~~
 
-There is deliberately no separate tree_resubmit command. Pidian can derive
-the resubmit target from the selected node's parentId and use the same
-navigation command.
+There is deliberately no separate `tree_resubmit` command. Pidian derives the resubmit target from the selected node's `parentId` and uses the same navigation command.
 
 ### get_session_tree
 
@@ -87,32 +77,46 @@ Response:
 }
 ~~~
 
-entries must contain every graph entry, including entries outside the active
-path. The server must define a stable ordering for the array; clients may use
-that order when ordering sibling nodes. Each entry contains:
+The response is one atomic snapshot: `sessionId`, `activeLeafId`, and `entries` must be read from the same session state. `entries` contains every currently stored navigable entry, including entries outside the active path. `sessionId` is an opaque session identity; it is not a session-file path and not a UI tab ID.
+
+The server returns `entries` in the session store's canonical/persistent entry order, normally JSONL persistence order. Clients may rely on order stability within one snapshot, for example to preserve sibling order, but must not treat array position as tree structure or assume a depth-first traversal. `parentId` defines the graph relationship.
+
+Each entry contains:
 
 ~~~text
 id             persisted session entry ID
 parentId       nullable persisted parent ID
-kind           user | assistant | tool_result | bash | compaction |
-               branch_summary | custom | other
-preview        bounded display text; never unrestricted tool output
-resubmitText   full editable text for user/custom entries only
+kind           open wire string; known values include user, assistant,
+               tool_result, bash, compaction, branch_summary, custom,
+               and other; future values are allowed
+preview        server-generated, single-line, bounded display text;
+               unrestricted tool output is never returned
+resubmitText   full persisted editable text for user/custom entries only;
+               it is not preview text and is not silently truncated by RPC
 ~~~
 
-activeLeafId may be null when the session is at root. resubmitText is needed
-because a user entry on an inactive branch is not available through the
-existing current-path get_messages command.
+`activeLeafId` may be `null` when the session is at root. `resubmitText` is needed because a user entry on an inactive branch is not available through the existing current-path `get_messages` command. The server must omit `resubmitText` for kinds other than `user` and `custom`; Pidian must not automatically use it for unknown kinds.
 
-The server does not need to return role, isLeaf, isOnActivePath,
-childrenCount, canResubmit, or leaves. Pidian can derive those values from
-entries, parentId, kind, and activeLeafId. User-only and show-all filters are
-also client-side presentation state, not session state.
+The server does not need to return role, `isLeaf`, `isOnActivePath`, `childrenCount`, `canResubmit`, or `leaves`. Pidian derives those values from `entries`, `parentId`, `kind`, and `activeLeafId`. User-only and show-all filters are client-side presentation state.
+
+### Preview and resubmission text
+
+`preview` and `resubmitText` have separate contracts:
+
+- `preview` is generated by one server-side safe helper;
+- preview output is bounded, single-line, and newline-folded;
+- tool/bash output is summarized or limited to a safe first-line/summary representation;
+- unknown kinds use the same safe preview helper;
+- the exact preview limit must be a named implementation constant and covered by contract tests;
+- `resubmitText` preserves the full editable source text for `user` and `custom` entries;
+- RPC must not apply preview truncation to `resubmitText`; existing prompt/session size limits remain authoritative;
+- if the current store cannot provide full editable text without changing a persistence or security boundary, implementation must stop and return to design rather than silently truncating it.
 
 ### tree_navigate
 
-Moves the active leaf to an existing entry, or to root when targetLeafId is
-null.
+Moves the active context cursor to an existing entry, or to root when `targetLeafId` is `null`.
+
+`targetLeafId` is retained as an established Pi term, but it does **not** mean a terminal leaf in the tree data structure. It means the entry ID that becomes the active leaf/context cursor after navigation. It may identify an assistant, tool, compaction, or other entry. `null` means root.
 
 Request:
 
@@ -126,12 +130,29 @@ Request:
 }
 ~~~
 
-expectedSessionId and expectedLeafId protect against a stale client
-selection. They should be required for external clients. A missing or changed
-expected value must reject the request without installing the candidate.
+The optimistic-concurrency fields are mandatory for external clients:
 
-For a non-null targetLeafId, the server validates that the entry belongs to
-the current live session. For a null targetLeafId, it resets the leaf to root.
+- `expectedSessionId` must be present and be a string;
+- `expectedLeafId` must be present and be either a string or `null`;
+- when the current cursor is an entry, `expectedLeafId` must equal that entry ID;
+- when the current cursor is root, `expectedLeafId` must be `null`;
+- missing, malformed, or mismatched values reject the request before candidate installation or Agent-context replacement.
+
+For a root request, the canonical form is:
+
+~~~json
+{
+  "id": "tree-root-1",
+  "type": "tree_navigate",
+  "targetLeafId": null,
+  "expectedSessionId": "session-abc",
+  "expectedLeafId": null
+}
+~~~
+
+`targetLeafId: null` while already at root is an idempotent success. It does not start an Agent turn, create a session, or require a new persistence mutation.
+
+For a non-null `targetLeafId`, the server validates that the entry belongs to the current live session snapshot and is navigable under the current transition policy. For a null target, it resets the cursor to root.
 
 Success response:
 
@@ -149,9 +170,38 @@ Success response:
 }
 ~~~
 
-The command does not start an Agent turn and does not create a new session.
-The existing get_messages command can be called after success to refresh the
-client's current-path display.
+The command does not start an Agent turn and does not create a new session. The existing `get_messages` command can be called after success to refresh Pidian's current-path display.
+
+### Error contract
+
+Failures use the existing common RPC error envelope, not a tree-specific response shape. The envelope gains an optional top-level machine-readable `code`; `error` remains human-readable and `errorHints` remains supplementary. Existing RPC commands may omit `code` for compatibility, but new tree commands should provide a stable code for every expected failure. Pidian must handle a missing code on legacy commands and must not parse `error` text as a protocol contract.
+
+The v1 tree codes are:
+
+~~~text
+invalid_request
+stale_session
+stale_leaf
+unknown_target
+transition_blocked
+persistence_failed
+session_unavailable
+quarantined
+~~~
+
+The code is an RPC-layer `RpcErrorCode` mapping. It must not reuse `Error::category_code()`, whose `session`, `validation`, and `io` values are coarse error categories rather than request semantics.
+
+`unknown_target` has a deliberately live-session-relative definition:
+
+> A non-null `targetLeafId` cannot be resolved as a navigable entry in the current live session.
+
+This v1 code does not claim to distinguish a typo, an entry from another session, an old snapshot, or an entry not loaded into the live session. `target_not_in_session` is not part of the v1 contract and may be introduced only with an explicit cross-session target protocol.
+
+### Stable entry ID boundary
+
+`get_session_tree` is a pure read operation with respect to entry identities. The handler must not call `ensure_entry_ids()`, generate temporary query IDs, mutate entries, persist JSONL, or return a partial tree. Session loading/creation or an explicit migration boundary must establish stable IDs before the query. If a live session still contains an entry without a stable ID, the server returns `session_unavailable` or `quarantined` according to the existing session-integrity state.
+
+The existing `Session::ensure_entry_ids()` is not a query helper: it rebuilds caches and may fill missing IDs in memory. `Session::save()` also invokes ID finalization before persistence. Tree navigation must use the stable IDs already present in the live session, so the query and subsequent mutation address the same entries.
 
 ## Client selection semantics
 
@@ -166,9 +216,7 @@ user/custom entry:
     after success, put selected.resubmitText in the editor
 ~~~
 
-This reproduces the classic TUI behavior without making the RPC server aware
-of mouse, cursor, modal, or editor state. Selecting a user/custom entry does
-not automatically submit it.
+This reproduces the classic TUI behavior without making the RPC server aware of mouse, cursor, modal, or editor state. Selecting a user/custom entry does not automatically submit it. Unknown kinds are rendered using Pidian's `other` fallback and do not become resubmittable merely because a field is present.
 
 The minimal Pidian flow is:
 
@@ -182,97 +230,146 @@ get_session_tree
 
 ## Server transition behavior
 
-Every tree_navigate mutation follows the existing RPC session-transition
-authority:
+Every `tree_navigate` mutation follows the existing RPC session-transition authority:
 
-1. Validate the command and target leaf.
-2. Reject streaming, compaction, pending acknowledged input, pending
-   extension actions, or active background bash according to the existing RPC
-   transition policy.
-3. Verify expectedSessionId and expectedLeafId.
-4. Clone the live Session into a candidate.
-5. Call Session::navigate_to for an entry target or Session::reset_leaf for a
-   root target.
-6. Persist the candidate using the existing save and error-reconciliation
-   rules.
-7. Replace the live Session only after the transition is accepted.
-8. Replace Agent messages with candidate.to_messages_for_current_path().
-9. Return the new leaf IDs.
-10. Reuse the existing session-switch lifecycle event with a tree-navigation
-    reason.
+1. Read and validate the command, including mandatory expected fields.
+2. Reject streaming, compaction, pending acknowledged input, pending extension actions, or active background bash according to the existing RPC transition policy.
+3. Verify `expectedSessionId` and `expectedLeafId` against the same live session state used for the transition.
+4. Validate the target against the current live session snapshot.
+5. For a non-idempotent transition, clone the live `Session` into a candidate.
+6. Call `Session::navigate_to` for an entry target or `Session::reset_leaf` for a root target.
+7. Persist the candidate using the existing save and error-reconciliation rules.
+8. Replace the live `Session` only after the transition is accepted.
+9. Replace Agent messages with `candidate.to_messages_for_current_path()`.
+10. Reuse the existing session-switch lifecycle event with a tree-navigation reason.
+11. Return the new leaf IDs.
 
-A failed or unconfirmed persistence transition must not install the candidate
-into the live Agent session. Existing provider-admission quarantine behavior
-remains authoritative when persistence becomes indeterminate.
+A failed or unconfirmed persistence transition must not install the candidate into the live Agent session unless existing reconciliation proves the exact transition. Existing provider-admission quarantine behavior remains authoritative when persistence becomes indeterminate. A non-null target that cannot be resolved in the current live session returns `unknown_target`; v1 does not distinguish whether that ID came from another session or an old snapshot.
 
 ## Scope
 
 ### Included in v1
 
-- complete current-session graph query;
+- complete current-session graph query as one atomic snapshot;
+- opaque session identity;
 - stable entry and parent IDs;
-- bounded previews and user/custom resubmit text;
-- same-session leaf navigation, including root;
-- stale-session/stale-leaf rejection;
+- canonical session-store ordering;
+- bounded single-line previews and full user/custom resubmit text;
+- open entry kind strings with client fallback to `other`;
+- same-session leaf/context-cursor navigation, including root;
+- strict stale-session/stale-leaf rejection;
+- idempotent root navigation;
 - abandoned-branch preservation;
 - persistence and Agent-context replacement under existing RPC rules;
-- no automatic prompt submission.
+- no automatic prompt submission;
+- common error envelope with optional top-level `code` and stable v1 tree error codes;
+- pure tree query that never generates, mutates, or persists missing entry IDs;
 
 ### Deferred
 
 - branch-summary generation and custom summary prompts;
-- a separate tree_resubmit RPC;
-- a dedicated tree-change subscription event;
+- a separate `tree_resubmit` RPC;
+- a dedicated tree-change subscription event or revision protocol;
 - unbounded tool-output retrieval through the tree endpoint;
 - server-side user-only/show-all filtering;
 - copying classic TUI rendering or keyboard handling into RPC.
 
-Branch summaries may later be added as an optional field on tree_navigate
-without changing the tree query or client-side tree model. The safe v1
-behavior is no summary.
+Branch summaries may later be added as an optional field on `tree_navigate` without changing the tree query or client-side tree model. The safe v1 behavior is no summary.
 
 ## Invariants
 
+- `sessionId` is an opaque identity, not a path or UI tab ID.
+- `entries`, `activeLeafId`, and `sessionId` in a tree response come from one session snapshot.
+- Entries include all currently stored navigable branches, not only the active path.
 - Entry IDs and parent IDs remain the persisted session identities.
+- Array order is canonical session-store order; `parentId` is the only tree-structure relation.
 - A mutation only targets the current live RPC session.
-- A stale client selection never silently overwrites a newer leaf.
+- A stale client selection never silently overwrites a newer cursor.
+- Missing or malformed expected fields are rejected.
+- `targetLeafId: null` is a valid root transition and is idempotent when already at root.
 - Abandoned branches remain addressable after navigation.
 - The live Agent projection equals the selected candidate session path.
-- Tree mutations are rejected while the existing transition blocker rejects
-  session changes.
-- Persistence failure is not reported as success.
-- Tree previews are bounded and do not expose unrestricted sensitive tool
-  payloads.
-- Selecting a user/custom entry never starts a model turn automatically.
+- Tree mutations are rejected while the existing transition blocker rejects session changes.
+- Persistence failure is not reported as success, and indeterminate persistence follows reconciliation/quarantine rules.
+- Tree previews are bounded and do not expose unrestricted sensitive tool payloads.
+- `resubmitText` is not preview-truncated.
+- Only user/custom entries are resubmittable; unknown kinds are not implicitly resubmittable.
+- `get_session_tree` is pure with respect to entry IDs and never fills missing IDs at query time.
+- A session with a missing stable entry ID returns `session_unavailable` or `quarantined`, not a partial tree.
+- `unknown_target` means only that a non-null target cannot be resolved in the current live session; v1 does not infer cross-session ownership.
 
 ## Verification
 
-An implementation should prove at minimum:
+Before entering implementation planning, executable contract tests must be mapped to at least these behaviors:
 
-1. A linear session query returns stable IDs, parent links, and the active
-   leaf.
-2. A branched session query returns every branch, not only the active path.
-3. Navigating to an assistant entry updates the active leaf, persists, and
-   replaces Agent context.
-4. Navigating to a tool or compaction entry follows the same non-user path.
-5. Navigating to null resets to root and preserves the old branch.
-6. A client can resubmit a user entry by navigating to its parent and using
-   resubmitText without starting a turn.
-7. A stale session or leaf is rejected without mutation.
-8. Existing streaming/compaction/pending-input blockers reject the mutation.
-9. Save failure leaves the live session and Agent projection unchanged unless
-   existing reconciliation proves the exact transition.
-10. Existing get_messages, fork, rewind, retry, and switch_session behavior
-    does not regress.
+1. A linear session query returns opaque session identity, stable IDs, parent links, canonical order, and the active leaf.
+2. A branched session query returns every navigable branch, not only the active path.
+3. The tree response is atomic and cannot combine entries from one snapshot with `activeLeafId` from another.
+4. Previews are single-line and bounded, including tool/bash and unknown kinds.
+5. User/custom `resubmitText` preserves full editable source text and is not preview-truncated.
+6. Navigating to an assistant entry updates the active cursor, persists, and replaces Agent context.
+7. Navigating to a tool or compaction entry follows the same non-user path.
+8. Navigating to `null` resets to root and preserves the old branch.
+9. Navigating to `null` while already at root is idempotent.
+10. A client can resubmit a user entry by navigating to its parent and using `resubmitText` without starting a turn.
+11. A stale session or leaf is rejected without mutation, with distinct stable error codes.
+12. Missing or malformed expected fields are rejected without mutation.
+13. A non-null target that cannot be resolved in the current live session returns `unknown_target`; v1 does not claim to distinguish targets from another session or old snapshots.
+14. Existing streaming/compaction/pending-input blockers reject the mutation.
+15. Save failure leaves the live session and Agent projection unchanged unless existing reconciliation proves the exact transition.
+16. Quarantine or indeterminate persistence follows the existing policy.
+17. Existing `get_messages`, `fork`, `rewind`, `retry`, and `switch_session` behavior does not regress.
 
 ## Notes
 
-The current Pidian client already has a local get_tree compatibility path.
-That client-side name may remain inside its adapter, but it must not preserve
-the old semantics of calling fork and changing sessionPath. The new server
-contract is same-session navigation through get_session_tree and
-tree_navigate.
+The current Pidian client already has a local `get_tree` compatibility path. That client-side name may remain inside its adapter, but it must not preserve the old semantics of calling `fork` and changing `sessionPath`. The new server contract is same-session navigation through `get_session_tree` and `tree_navigate`.
 
 The protocol is intentionally small. If a future client needs summary
-generation or a long-lived tree subscription, those should be added as
-explicit extensions rather than making them required for basic navigation.
+ generation or a long-lived tree subscription, those should be added as
+ explicit extensions rather than making them required for basic navigation.
+
+## 实现计划总览
+
+> **计划类型：** multi-step
+> **当前计划入口：** [plan1.md](plan1.md)
+> **来源决策：** [decision.md](decision.md), `rpc-session-tree-v1`
+
+### 整体目标
+
+在不复制 TUI 状态、不让 Pidian 写入 session JSONL 的前提下，增加最小 RPC session-tree surface：先建立稳定的只读 tree snapshot 和通用 error `code` 基础，再接入同 session navigation mutation，最后完成 persistence/reconciliation 和既有 RPC 回归验证。
+
+### 步骤总览
+
+- **Step 1：RPC contract foundation and pure tree query** — 进行中 — [plan1.md](plan1.md)
+  - 新增 RPC 层稳定错误码承载；实现 `get_session_tree` 的原子、纯读 snapshot；覆盖查询契约测试。
+- **Step 2：Same-session tree navigation** — 待开始 — 具体计划待生成
+  - 实现 `tree_navigate`、严格 expected session/leaf 校验、root 幂等和现有 transition authority 接入。
+- **Step 3：Persistence, reconciliation, and regression closure** — 待开始 — 具体计划待生成
+  - 覆盖保存失败、quarantine、Agent projection、transition blockers 以及既有 RPC 命令回归，并核对 Pidian-facing envelope 行为。
+
+### 步骤依赖
+
+```text
+Step 1 → Step 2 → Step 3
+```
+
+Step 2 依赖 Step 1 提供的 tree entry read model、稳定 preview/resubmit 映射和 RPC error-code 基础。Step 3 依赖 Step 2 的 mutation path 和既有 transition/reconciliation 证据。
+
+### 全局边界与不变量
+
+- `targetLeafId` 保留 Pi 术语，但表示 active context cursor entry ID，不限定为结构叶子。
+- `sessionId`、`activeLeafId` 和 `entries` 必须来自同一 session snapshot。
+- `entries` 使用 session store canonical/persistent order；`parentId` 才定义树关系。
+- `get_session_tree` 不得生成、修改或持久化缺失 entry ID，也不得返回部分树。
+- `preview` 有界、单行化且安全；`resubmitText` 对 user/custom 保留完整可编辑文本。
+- `kind` 使用开放字符串；未知值由 Pidian fallback 到 `other`。
+- tree error 使用通用 envelope 的可选顶层 `code`，不让客户端依赖错误字符串。
+- v1 不区分跨 session target；当前 live session 无法解析的非空 target 统一为 `unknown_target`。
+- 不新增 `tree_resubmit`、tree subscription、summary generation 或服务端 UI 状态。
+
+### 当前状态
+
+- **设计：** 已确认；公共 RPC 语义已冻结。
+- **Step 1：** 计划待用户确认，未开始实现。
+- **Step 2/3：** 依赖 Step 1，尚未生成具体计划。
+- **工作区：** 当前设计和计划文档的未提交改动必须保留；实现执行前不得清理或覆盖。
