@@ -500,6 +500,8 @@ function Save-State {
 
     Assert-StateShape -State $State
     $json = $State | ConvertTo-Json -Depth 20
+    $json = $json.TrimEnd("`r", "`n")
+    $json = $json -replace "`r`n", "`n"
     [void]($json | ConvertFrom-Json)
     $temporaryPath = "$($script:StatePath).tmp.$([guid]::NewGuid().ToString('N'))"
 
