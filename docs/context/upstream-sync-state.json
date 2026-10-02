@@ -1,0 +1,32 @@
+{
+  "$schema": "./upstream-sync-state.schema.json",
+  "schema_version": 1,
+  "kind": "fork-upstream-sync-state",
+  "upstream": {
+    "repository": "https://github.com/Dicklesworthstone/pi_agent_rust.git",
+    "remote": "upstream",
+    "ref": "main"
+  },
+  "fork": {
+    "upstream_mirror_branch": "main",
+    "development_branch": "custom-next"
+  },
+  "last_completed_sync": null,
+  "customization_reviews": {},
+  "pending_review": {
+    "status": "bootstrap",
+    "candidate_upstream_baseline_sha": "1e4548aa745ecfbc40b66bdbae04baa2d09717f9",
+    "prepared_at": "2026-10-02T15:08:44.2052311Z",
+    "prepared_from_upstream_sha": "",
+    "prepared_from_custom_next_commit": "745cec0b8d451e2b08da650d745c496d6aa6f9da",
+    "main_integration_commit": null,
+    "custom_next_sync_commit": null,
+    "custom_next_sync_kind": null,
+    "reviews": {},
+    "validation": {
+      "status": "not-run",
+      "note": null,
+      "validated_at": null
+    }
+  }
+}
