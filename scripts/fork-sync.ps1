@@ -873,8 +873,14 @@ function Invoke-Review {
         throw 'custom-next does not contain main. Complete branch synchronization before review.'
     }
 
-    $syncCommit = Get-SyncPosition -MainSha $mainSha -CustomNextSha $customNextSha
-    $syncKind = Get-SyncKind -MainSha $mainSha -CustomNextSha $customNextSha
+    if ((Get-PropertyValue -Object $pending -Name 'status' -Default '') -eq 'bootstrap') {
+        $syncCommit = $mainSha
+        $syncKind = 'base'
+    }
+    else {
+        $syncCommit = Get-SyncPosition -MainSha $mainSha -CustomNextSha $customNextSha
+        $syncKind = Get-SyncKind -MainSha $mainSha -CustomNextSha $customNextSha
+    }
     if ($syncKind -eq 'unknown') {
         Stop-Blocked -Message 'Unable to determine custom-next synchronization kind without guessing.'
     }
