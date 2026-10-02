@@ -16,7 +16,8 @@
 4. 读取 `customization-map.md`，了解当前 Fork 差异和基线。
 5. 如果要比较或改造上游 Agent 工作流，读取 `agent-workflow-adoption.md`。
 6. 如果要设计或修改 Fork 的长期维护机制，读取 `decisions/` 下相关 ADR；当前同步状态机制见 `decisions/ADR-001-fork-sync-state-and-tooling.md`。
-7. 根据具体任务，按需读取源码、测试和上游文档。
+7. 如果要实现或修改 Fork 上游同步工具，读取 `fork-sync-tool-design.md`。
+8. 根据具体任务，按需读取源码、测试和上游文档。
 
 ## 文档说明
 
