@@ -1,11 +1,13 @@
 # Fork 同步工具设计
 
-> 状态：设计已确认，尚未实现
+> 状态：设计已确认，已实现
 > 适用分支：`custom-next` 及其后续二开分支
 > 上游决策：[`ADR-001`](decisions/ADR-001-fork-sync-state-and-tooling.md)
+> 实现：`scripts/fork-sync.ps1`
+> 状态文件：`upstream-sync-state.json`
 > 最近审阅：2026-10-02
 
-本文定义本 Fork 上游同步工具的行为、命令边界、状态生命周期和验证规则。本文是实现设计，不代表脚本或状态文件已经存在。
+本文定义并记录本 Fork 上游同步工具的行为、命令边界、状态生命周期和验证规则。脚本已经实现；本文是实现契约和使用说明，不是待实现计划。
 
 ## 1. 目标与背景
 
@@ -19,15 +21,15 @@
 
 工具的目标是让机器负责客观 Git 状态，让 Agent 或用户负责二开差异的语义判断。
 
-## 2. 设计对象
+## 2. 已实现对象
 
-计划创建：
+当前实现文件：
 
 ```text
 scripts/fork-sync.ps1
 ```
 
-计划维护：
+当前状态文件：
 
 ```text
 docs/context/upstream-sync-state.json
@@ -588,7 +590,8 @@ record 仍有未复核差异    → 20
 ## 10. 关联文档
 
 - `AGENTS.md`：本 Fork 的活动 Agent 规则；
+- `docs/context/README.md`：同步工具的 Agent 使用入口；
 - `docs/context/upstream-sync-and-customization-charter.md`：维护宪章；
 - `docs/context/customization-map.md`：二开差异语义和生命周期；
-- `docs/context/upstream-sync-state.json`：待实现的机器状态文件；
+- `docs/context/upstream-sync-state.json`：机器维护的当前同步状态；
 - `docs/context/decisions/ADR-001-fork-sync-state-and-tooling.md`：为什么采用当前机制。

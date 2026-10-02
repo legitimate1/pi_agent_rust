@@ -11,22 +11,33 @@
     "upstream_mirror_branch": "main",
     "development_branch": "custom-next"
   },
-  "last_completed_sync": null,
-  "customization_reviews": {},
-  "pending_review": {
-    "status": "bootstrap",
-    "candidate_upstream_baseline_sha": "1e4548aa745ecfbc40b66bdbae04baa2d09717f9",
-    "prepared_at": "2026-10-02T15:08:44.2052311Z",
-    "prepared_from_upstream_sha": "",
-    "prepared_from_custom_next_commit": "745cec0b8d451e2b08da650d745c496d6aa6f9da",
-    "main_integration_commit": null,
-    "custom_next_sync_commit": null,
-    "custom_next_sync_kind": null,
-    "reviews": {},
-    "validation": {
-      "status": "not-run",
-      "note": null,
-      "validated_at": null
+  "last_completed_sync": {
+    "status": "complete",
+    "upstream_baseline_sha": "1e4548aa745ecfbc40b66bdbae04baa2d09717f9",
+    "main_integration_commit": "aef52107134a6e8e1b197bbb935265aa485932b1",
+    "custom_next_sync_commit": "aef52107134a6e8e1b197bbb935265aa485932b1",
+    "custom_next_sync_kind": "base",
+    "validation_status": "passed",
+    "validation_note": "初始 Fork 基线已核对；bootstrap、review、record 生命周期通过；PowerShell 解析、git diff --check 和 status -Json 通过",
+    "recorded_at": "2026-10-02T15:13:36.9642725Z"
+  },
+  "customization_reviews": {
+    "FORK-GOV-001": {
+      "status": "reviewed",
+      "impact": "unaffected",
+      "note": "已核对 Dependabot 隔离策略；当前上游基线未改变该 Fork 治理差异",
+      "last_reviewed_upstream_sha": "1e4548aa745ecfbc40b66bdbae04baa2d09717f9",
+      "last_reviewed_custom_next_commit": "aef52107134a6e8e1b197bbb935265aa485932b1",
+      "reviewed_at": "2026-10-02T15:13:18.6688385Z"
+    },
+    "FORK-GOV-002": {
+      "status": "reviewed",
+      "impact": "unaffected",
+      "note": "已核对本地 Codegraph 和 Cargo Sweep 忽略规则；当前上游基线未改变其目的",
+      "last_reviewed_upstream_sha": "1e4548aa745ecfbc40b66bdbae04baa2d09717f9",
+      "last_reviewed_custom_next_commit": "aef52107134a6e8e1b197bbb935265aa485932b1",
+      "reviewed_at": "2026-10-02T15:13:19.9052216Z"
     }
-  }
+  },
+  "pending_review": null
 }

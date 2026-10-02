@@ -265,5 +265,5 @@ last_completed_sync
 - `docs/context/README.md`：治理层文档入口；
 - `docs/context/upstream-sync-and-customization-charter.md`：上游同步和二开维护规则；
 - `docs/context/customization-map.md`：当前二开差异和复核状态；
-- `docs/context/upstream-sync-state.json`：待实现的机器同步状态文件；
-- `scripts/fork-sync.ps1`：待实现的同步工具。
+- `docs/context/upstream-sync-state.json`：机器维护的当前同步状态；
+- `scripts/fork-sync.ps1`：已实现的同步工具。

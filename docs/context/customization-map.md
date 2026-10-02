@@ -7,23 +7,29 @@
 
 ## 基线和同步状态
 
-本 Fork 必须把“上游比较基线”和“本地同步位置”分开记录：
+本 Fork 必须把“上游比较基线”和“本地同步位置”分开记录。动态 SHA、同步位置、复核状态和时间以机器状态文件为权威来源：
+
+```text
+docs/context/upstream-sync-state.json
+```
 
 | 字段 | 值 |
 |---|---|
 | 上游仓库 | `https://github.com/Dicklesworthstone/pi_agent_rust.git` |
 | 上游引用 | `main` |
-| 上游比较基线 SHA | `1e4548aa745ecfbc40b66bdbae04baa2d09717f9` |
-| `main` 整合提交 | `aef52107134a6e8e1b197bbb935265aa485932b1` |
+| 状态文件 | `docs/context/upstream-sync-state.json` |
 | Fork 基线分支 | `custom-next` |
-| `custom-next` 基线提交 | `aef52107134a6e8e1b197bbb935265aa485932b1` |
-| `custom-next` 当前 tip | `80a4050f8b3b7447d05b18b76b332b3313744291` |
-| 最近同步时间 | `2026-10-02` |
-| 引导阶段同步说明 | `custom-next` 直接从更新后的本地 `main` 创建，尚无单独的 `custom-next` 合并提交 |
-| 首个 `custom-next` 治理提交 | `80a4050f8` |
 | 旧分支 | `custom` —— 仅作历史参考，尚未迁移 |
 
+使用以下命令查看实时 SHA 和同步状态：
+
+```powershell
+pwsh -NoProfile -File scripts/fork-sync.ps1 status -Json
+```
+
 精确的上游 SHA 是代码基线的事实来源。像 `upstream/main` 这样的可移动分支名，单独不能作为基线证据。
+
+> 动态 SHA、同步位置、复核状态和时间以 `upstream-sync-state.json` 为机器权威来源。本文只保留二开差异的语义说明和生命周期信息；不要手工把新的动态 SHA 回填到本文。
 
 - **上游比较基线（`upstream baseline SHA`）**：用于比较二开差异的上游精确提交；二开条目的语义基线只能使用它。
 - **`main` 整合提交（`main integration commit`）**：上游提交在本地 `main` 中的整合位置，可能包含 Fork 治理例外。
@@ -60,9 +66,7 @@ current_custom_next_tip
 - **目的：** 防止上游 Dependabot 自动创建噪声更新任务，或把本 Fork 当成上游项目运行。
 - **与上游不同的原因：** 本 Fork 有自己的维护和同步策略。依赖更新机器人不能静默地制造 Fork 工作。
 - **验证：** 检查实际生效的 `.github/dependabot.yml`，确认上游更新条目仍然处于禁用状态。
-- **最近复核上游 SHA：** `1e4548aa745ecfbc40b66bdbae04baa2d09717f9`
-- **最近复核的 `custom-next` 提交：** `80a4050f8b3b7447d05b18b76b332b3313744291`
-- **最近一次同步影响：** `unaffected`（该差异属于本 Fork 的治理策略，本次基线变化未改变其目的）
+- **复核说明：** 当前动态复核 SHA、复核时间和影响值见 `upstream-sync-state.json` 的 `customization_reviews.FORK-GOV-001`。
 - **冲突规则：** 上游同步时保留此例外，除非用户明确改变 Fork 政策。
 - **移除条件：** 只有在本 Fork 明确建立替代性的依赖自动化策略，并且用户授权重新启用时，才允许移除。
 - **相关提交：** `6ce84030b`、`aef521071`
@@ -76,9 +80,7 @@ current_custom_next_tip
 - **忽略路径：** `/.codegraph/`、`/sweep.timestamp`，以及项目原有的其他本地生成物规则。
 - **与干净工作树不同的原因：** Codegraph 是 Agent 使用的本地搜索索引，`cargo-sweep` 会留下本地时间戳标记。两者都不是源码、项目配置或可复现的项目产物。
 - **验证：** `git check-ignore -v .codegraph sweep.timestamp`
-- **最近复核上游 SHA：** `1e4548aa745ecfbc40b66bdbae04baa2d09717f9`
-- **最近复核的 `custom-next` 提交：** `80a4050f8b3b7447d05b18b76b332b3313744291`
-- **最近一次同步影响：** `unaffected`（这些路径属于本地工具生成物，与上游业务代码无关）
+- **复核说明：** 当前动态复核 SHA、复核时间和影响值见 `upstream-sync-state.json` 的 `customization_reviews.FORK-GOV-002`。
 - **移除条件：** 只有当工具不再生成这些路径，或本 Fork 有意开始版本化对应的可复现产物时，才允许移除。
 - **相关提交：** `80a4050f8`
 
