@@ -1,994 +1,150 @@
-# AGENTS.md — pi_agent_rust (Pi CLI Coding Agent)
+# pi_agent_rust Fork — Agent 执行契约
 
-> Guidelines for AI coding agents working in this Rust codebase.
+> 这是本 Fork 根目录唯一生效的 Agent 指令文件。
+> 上游的 `AGENTS.md` 只作为参考资料，不在本项目中生效。
 
----
+## 1. 权限与安全
 
-## RULE 0 - THE FUNDAMENTAL OVERRIDE PREROGATIVE
+- 用户的明确指令优先于本文档。
+- 未经明确许可，不得删除任何文件或目录，包括当前任务中由 Agent 新创建的文件。
+- 未经用户明确授权，不得运行 `git reset --hard`、`git clean -fd`、`rm -rf`、强制推送或其他会删除、覆盖或重写历史的危险操作。授权必须明确包含具体操作及其后果。
+- 保留已有的未提交工作。不能因为不清楚修改者是谁，就 stash、回退、重置、覆盖或清理这些改动。
+- 优先使用仓库现有工具和小范围、可检查的编辑。不要使用脚本对源代码进行盲目批量重写。
+- 如果请求会改变公共契约、持久化格式、安全边界或发布策略，先说明影响和待决定事项，再修改。
 
-If I tell you to do something, even if it goes against what follows below, YOU MUST LISTEN TO ME. I AM IN CHARGE, NOT YOU.
+## 2. Fork 分支模型
 
----
+本仓库按照“上游基线 + 独立二开”的方式维护：
 
-## RULE 0.5 - SUITE-WIDE RULES LIVE IN /data/projects/AGENTS.md
-
-The suite-wide rules in **`/data/projects/AGENTS.md`** bind you here too. Read it. Two sections
-are load-bearing for perf work and are NOT duplicated below, so they cannot drift out of sync:
-
-- **`## Named Reward-Hacking Patterns (ALL FORBIDDEN)`** — 12 named patterns, several already
-  observed in this suite: gate self-weakening (and the exact price of a legitimate gate fix),
-  proof-class inflation, golden regeneration reflex, commit-stream pumping, tautological tests,
-  easy-lever cherry-picking, close-pump abuse, scope-splitting, spec-editing as progress,
-  conformance metastasis, dependency smuggling, bench-path hardcoding.
-- **`### Work-Graph Discipline`** — JSONL is truth and `beads.db` is disposable, `br sync
-  --import-only` after every pull, single-writer on graph structure, closure on cited evidence
-  with blocker beads gated on their named probe, `br dep cycles` stays empty.
-
-The three that most often decide whether a number here is real: a **self-speedup is
-MAINTENANCE, not a win** — a win needs the incumbent live in the SAME invocation; **never
-weaken a gate to land a change**, and if a gate is genuinely defective, meet the evidence
-standard and publish the win/lose split of what the fix admits; and **reporting a loss is a
-success** — one line, revert, next lever, no retraction narrative.
-
----
-
-## RULE NUMBER 1: NO FILE DELETION
-
-**YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION.** Even a new file that you yourself created, such as a test code file. You have a horrible track record of deleting critically important files or otherwise throwing away tons of expensive work. As a result, you have permanently lost any and all rights to determine that a file or folder should be deleted.
-
-**YOU MUST ALWAYS ASK AND RECEIVE CLEAR, WRITTEN PERMISSION BEFORE EVER DELETING A FILE OR FOLDER OF ANY KIND.**
-
----
-
-## Irreversible Git & Filesystem Actions — DO NOT EVER BREAK GLASS
-
-1. **Absolutely forbidden commands:** `git reset --hard`, `git clean -fd`, `rm -rf`, or any command that can delete or overwrite code/data must never be run unless the user explicitly provides the exact command and states, in the same message, that they understand and want the irreversible consequences.
-2. **No guessing:** If there is any uncertainty about what a command might delete or overwrite, stop immediately and ask the user for specific approval. "I think it's safe" is never acceptable.
-3. **Safer alternatives first:** When cleanup or rollbacks are needed, request permission to use non-destructive options (`git status`, `git diff`, `git stash`, copying to backups) before ever considering a destructive command.
-4. **Mandatory explicit plan:** Even after explicit user authorization, restate the command verbatim, list exactly what will be affected, and wait for a confirmation that your understanding is correct. Only then may you execute it—if anything remains ambiguous, refuse and escalate.
-5. **Document the confirmation:** When running any approved destructive command, record (in the session notes / final response) the exact user text that authorized it, the command actually run, and the execution time. If that record is absent, the operation did not happen.
-
----
-
-## Git Branch: ONLY Use `main`, NEVER `master`
-
-**The default branch is `main`. The `master` branch exists only for legacy URL compatibility.**
-
-- **All work happens on `main`** — commits, PRs, feature branches all merge to `main`
-- **Never reference `master` in code or docs** — if you see `master` anywhere, it's a bug that needs fixing
-- **The `master` branch must stay synchronized with `main`** — after pushing to `main`, also push to `master`:
-  ```bash
-  git push origin main:master
-  ```
-
----
-
-## Toolchain: Rust & Cargo
-
-We only use **Cargo** in this project, NEVER any other package manager.
-
-- **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
-- **Dependency versions:** Explicit versions for stability
-- **Configuration:** Cargo.toml only
-- **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
-
-### Key Dependencies
-
-| Crate | Purpose |
-|-------|---------|
-| `asupersync` | Structured concurrency async runtime |
-| `rich_rust` | Terminal UI rendering with markup syntax |
-| `serde` + `serde_json` | JSON serialization for API/session formats |
-| `clap` | CLI argument parsing with derive macros |
-| `crossterm` | Low-level terminal control |
-| `thiserror` | Error type definitions |
-
-### Release Profile
-
-The default release build optimizes for shipping size while retaining LTO:
-
-```toml
-[profile.release]
-opt-level = "z"     # Optimize generated code for size
-lto = true          # Link-time optimization
-codegen-units = 1   # Single codegen unit for better optimization
-panic = "abort"     # Smaller binary, no unwinding overhead
-strip = true        # Remove debug symbols
+```text
+upstream/main
+     │
+     ▼
+main                 上游基线 + 已批准的 Fork 治理例外
+     │
+     ▼
+custom-next          当前 Fork 二开主线
+     │
+     └── custom/*     短期功能或修复分支
 ```
 
-jemalloc is opt-in via `--features jemalloc` for allocation-heavy benchmark variants.
+- `main` 跟踪 `upstream/main`。不得在这里加入产品功能或普通二开修改。只有为了防止上游自动化在本 Fork 中错误运行，才允许保留经过明确记录的 Fork 基础设施例外。
+- `custom-next` 是当前 Fork 的二开主线。所有新的 Fork 行为都应在此分支，或从此分支创建的功能分支上开发。
+- 从 `custom-next` 创建主题明确的功能分支，验证完成后合回 `custom-next`。
+- 旧的 `custom` 分支在当前阶段只作为历史参考。在用户明确改变决定前，不要把它当作已迁移的新主线，也不要默认它的代码或文档已经存在于 `custom-next`。
+- 不得把 `custom-next` 合回 `main`。
+- 上游同步和 Fork 功能开发必须是分开的变更。
 
----
+在涉及分支的工作开始前，先确认当前分支和工作区状态。如果当前分支不正确，应先切换分支再编辑；不要默默在 `main` 上开发。
 
-## Code Editing Discipline
+## 3. 维护工作必须读取的上下文
 
-### No Script-Based Changes
+在修改分支策略、上游同步行为、Fork 代码或 Agent 文档前，必须通过 `docs/context/README.md` 了解文档边界，并读取：
 
-**NEVER** run a script that processes/changes code files in this repo. Brittle regex-based transformations create far more problems than they solve.
+- `docs/context/README.md`
+- `docs/context/upstream-sync-and-customization-charter.md`
+- `docs/context/customization-map.md`
 
-- **Always make code changes manually**, even when there are many instances
-- For many simple changes: use parallel subagents
-- For subtle/complex changes: do them methodically yourself
+如果任务涉及是否采用上游 Agent 工作流，还必须读取：
 
-### No File Proliferation
+- `docs/context/agent-workflow-adoption.md`
 
-If you want to change something or add a feature, **revise existing code files in place**.
+这些文件描述 Fork 的治理规则，但不能替代涉及运行时行为时对源码和测试的检查。
 
-**NEVER** create variations like:
-- `mainV2.rs`
-- `main_improved.rs`
-- `main_enhanced.rs`
+## 4. Fork 修改规则
 
-New files are reserved for **genuinely new functionality** that makes zero sense to include in any existing file. The bar for creating new files is **incredibly high**.
+每个 Fork 专属修改都必须：
 
----
+- 归类为 `new`、`override`、`adaptation`、`backport`、`temporary` 或 `governance`；
+- 使用一个聚焦提交，或一组主题一致的提交来表示；
+- 改变可执行行为时，配套适当的测试；如果没有测试，必须说明豁免理由；
+- 改变行为、集成、自动化或已登记的 Fork 策略时，记录到 `docs/context/customization-map.md`；
+- 在最窄的稳定边界实现，优先使用新模块、注册表、trait、适配器和配置，而不是把二开逻辑散落到上游内部；
+- 不混入无关格式化、重命名、顺手重构或生成物变更。
 
-## Backwards Compatibility
+使用清晰的提交前缀，例如：
 
-We do not care about backwards compatibility—we're in early development with no users. We want to do things the **RIGHT** way with **NO TECH DEBT**.
-
-- Never create "compatibility shims"
-- Never create wrapper functions for deprecated APIs
-- Just fix the code directly
-
----
-
-## Product Direction: OMP-Inspired, Not a Legacy Pi Drop-In
-
-Pi Rust is **not** pursuing strict drop-in compatibility with legacy TypeScript
-Pi. Legacy Pi changes too quickly, and reproducing its internal implementation
-details would pull this project away from the product we want to build.
-
-- Treat legacy Pi as historical context and a source of selectively useful
-  behavior, never as a compatibility authority or release gate.
-- Use OMP as the closer product reference for feature selection, workflows,
-  look and feel, and UI/UX, while still making Rust-native design decisions.
-- Do not create or prioritize work merely to satisfy historical drop-in,
-  parity, differential, or certification artifacts.
-- Files under `docs/contracts/` and `docs/evidence/` that describe strict
-  drop-in certification are retained historical records. They do not authorize
-  claims, block releases, define completeness, or override current product
-  decisions.
-- User-facing copy must not call Pi Rust a drop-in replacement. Describe the
-  actual supported behavior and independently valuable product surface.
-
-## Build, Quality, and Release Authority: DSR Only
-
-**NEVER use GitHub Actions for this repository, for any reason.** Do not enable,
-dispatch, rerun, cancel, or cite a GitHub Actions workflow as evidence. Workflow
-files may remain in the tree as historical reference, but they are permanently
-non-authoritative and must stay disabled.
-
-- Doodlestein Self-Releaser (`dsr`) is the exclusive quality, cross-platform
-  build, packaging, signing, and release authority.
-- Use `dsr quality --tool pi_agent_rust`, `dsr build pi_agent_rust`, and
-  `dsr release pi_agent_rust <version>` (or the corresponding fail-closed DSR
-  operation) instead of any Actions workflow or ad hoc release upload.
-- RCH is an implementation detail that DSR may use to offload compilation.
-  Agents must not invoke Cargo or RCH directly as an alternate quality path.
-- A tag, local binary, RCH result, or source build is not a release. A release
-  exists only after DSR publishes the expected artifacts and DSR verification
-  succeeds against the public release.
-
----
-
-## Compiler and Test Checks (CRITICAL)
-
-**After any substantive code changes, use the one authoritative quality entry
-point:**
-
-```bash
-dsr quality --tool pi_agent_rust
+```text
+custom: <Fork 功能或行为>
+custom-fix: <Fork 专属修复>
+custom-docs: <Fork 治理或上下文>
+upstream-sync: <上游同步>
 ```
 
-The registered DSR recipe owns formatting, compiler checks, Clippy, unit,
-conformance, integration, and required feature lanes. Do not run the underlying
-Cargo commands directly, and do not use a direct RCH invocation as a substitute.
-DSR owns target/temp placement and any RCH delegation needed to avoid local
-contention.
+一次提交不得同时包含上游同步和新的 Fork 功能。
 
-If the repository's load-admission rule blocks DSR, record the exact hold and
-leave the relevant Bead open. Static review is useful but does not become a
-compile, test, or quality claim.
+## 5. 上游同步
 
-If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
+正常同步方向是：
 
-### Enumerate whole-tree breakage in one pass, not one error at a time
-
-Clippy stops at the first error per run, so a change that breaks many targets
-looks like one problem and then another and then another. Getting the whole
-list at once is worth the extra run:
-
-```bash
-cargo clippy --locked --all-targets --keep-going 2>&1 | grep -E 'overflow|error\[' -A2
-cargo check  --locked --all-targets --keep-going --message-format short
+```text
+git fetch upstream main
+main ← upstream/main
+custom-next ← main
 ```
 
-`--keep-going` builds every remaining target instead of stopping. On
-2026-09-13 an `asupersync` minor bump raised the nesting of its future types
-past rustc's default `recursion_limit` of 128, breaking nineteen targets:
-without `--keep-going` that took nine sequential clippy runs to enumerate.
+详细流程和同步时限见维护宪章。特别注意：
 
-Two things make this class hard to recognise. `recursion_limit` is **per
-crate** and is not inherited, so `src/lib.rs` raising it does nothing for the
-binary, the examples, or any integration test — each is its own crate. And
-`cargo check` reports most of these as `future_incompatible` **warnings**
-while clippy makes them **errors**, so a green `cargo check` proves nothing
-about the gate. SDK embedders hit the same thing in their own crates; see the
-Install section of `docs/sdk.md`.
+- 记录本次基线对应的精确上游提交 SHA；这个 SHA 是二开差异的语义比较基线；
+- 同时记录本地 `main` 的整合提交，以及同步进入 `custom-next` 的集成提交或基线提交；它们是本地 provenance，不是上游比较基线；
+- 先更新 `main`，只保留有文档记录的 Fork 治理例外；
+- 再把更新后的 `main` 合并到 `custom-next`，并作为独立同步变更；
+- 检查每一个冲突，并对照二开差异清单处理；
+- 不得静默地选择本地代码或上游代码；
+- 重新判断上游变化是否已经使某项二开失去必要；
+- 只有实际复核过的差异条目，才能更新其“最近复核上游 SHA”；
+- 更新差异清单并完成相关验证后，才能声明同步完成。
 
----
+## 6. 工具链与验证
 
-## Testing
+- Rust 项目的依赖、构建、测试和 lint 使用 Cargo。不要为 Rust 项目引入其他包管理器。
+- 使用 `rust-toolchain.toml` 中固定的 Rust nightly。
+- 禁止使用不安全 Rust，除非项目策略被明确修改。
+- 在 Windows 上通过 PowerShell 执行 Cargo 命令，以确保 MSVC 环境可用。
+- 普通代码修改先运行针对性测试和任务所需的轻量检查。通常的轻量静态检查是：
 
-The DSR quality recipe runs the project's required test lanes. Individual
-test names below describe coverage domains; they are not permission to bypass
-DSR with direct Cargo commands.
-
-### Test Categories
-
-| Area | Coverage | Purpose |
-|------|----------|---------|
-| `model` | Serialization + conversion tests | Message/content type correctness |
-| `provider_streaming` | Multi-provider fixtures | Streaming + tool-call parity across providers |
-| `tools` | Built-in + conformance fixtures | File/shell/search behavior and truncation/process safety |
-| `session` | JSONL/tree/index/sqlite tests | Persistence, branching, and replay correctness |
-| `extensions` | Runtime/policy/shim/conformance suites | QuickJS extension compatibility and capability controls |
-| `e2e` | End-to-end scenario tests | CLI/agent/rpc workflows and regression coverage |
-
----
-
-## Pi Agent — This Project
-
-**This is the project you're working on.** Pi is a high-performance AI coding agent CLI, a Rust port of the Pi Agent TypeScript CLI. It provides an interactive terminal interface for AI-assisted coding with streaming responses, tool execution, and session persistence.
-
-### Architecture
-
-```
-CLI (clap) → main/app/config/resources → Agent Session
-                         ↓
-Provider Layer (11 native provider implementation modules + extension providers)
-                         ↓
-Tool Registry (built-ins + extension tools) ↔ Extension Runtime (QuickJS + capability policy)
-                         ↓
-Surfaces: Interactive TUI + RPC/stdin modes
-                         ↓
-Session persistence + index (JSONL, default-enabled SQLite backend support)
+```text
+cargo clippy --lib -- -D warnings
+cargo fmt --check
 ```
 
-### Key Files
+- 只有在明确的收尾质量门禁中，才运行全量测试和 `cargo clippy --all-targets -- -D warnings`；不要把它们作为每个小修改的默认循环。
+- 未经用户明确请求，不得构建、打包、部署或发布。
+- 不确定第三方库 API 的用法时，查阅当前权威文档，不要猜测。
 
-| File | Purpose |
-|------|---------|
-| `src/main.rs` | CLI entry point and subcommands |
-| `src/agent.rs` | Agent loop with tool iteration |
-| `src/provider.rs` | Provider trait definition |
-| `src/providers/anthropic.rs` | Anthropic API implementation |
-| `src/providers/openai.rs` | OpenAI API implementation |
-| `src/providers/openai_responses.rs` | OpenAI Responses API implementation |
-| `src/providers/gemini.rs` | Gemini API implementation |
-| `src/providers/cohere.rs` | Cohere API implementation |
-| `src/providers/azure.rs` | Azure OpenAI API implementation |
-| `src/providers/mod.rs` | Provider factory and extension stream-simple bridge |
-| `src/tools.rs` | Tool trait, registry, and the core file/shell/search tools; other built-ins live in their own modules (36 total, tiered in `src/xdev.rs`; `subagent` is opt-in) |
-| `src/interactive_ftui.rs` | Default FrankenTUI interactive stack (feature `ftui`, on by default) |
-| `src/interactive.rs` | Classic charmed_rust TUI application state and event loop (`--classic`) |
-| `src/rpc.rs` | RPC/stdin server mode |
-| `src/extensions.rs` | Stable extension facade, public contracts, manager state, and shared entry points |
-| `src/extensions/` | Focused manager, protocol, policy, connector, runtime, and behavior-domain test modules |
-| `src/extensions_js.rs` | QuickJS runtime bridge and hostcalls |
-| `src/resources.rs` | Skills/prompt/theme/extension resource loading |
-| `src/models.rs` | Built-in and `models.json` registry resolution |
-| `src/model.rs` | Message/content types |
-| `src/session.rs` | JSONL session persistence |
-| `src/session_index.rs` | Session indexing and metadata cache |
-| `src/sse.rs` | SSE parser for streaming |
-| `src/tui.rs` | Terminal UI rendering helpers |
-| `src/config.rs` | Configuration loading |
-| `src/error.rs` | Error types |
+当前 `custom-next` 不自动继承上游项目的 DSR-only 发布权威。除非本 Fork 明确采用，否则不要把上游的 DSR、RCH 或上游 CI 指令当作本 Fork 的活动规则。
 
-### Core Components
+## 7. Agent 执行协议
 
-**Provider Layer:**
-- Abstract `Provider` trait for LLM backends
-- Anthropic implementation with streaming + extended thinking
-- OpenAI Chat Completions + OpenAI Responses implementations
-- Gemini implementation with streaming + tool use
-- Cohere implementation with streaming + tool use
-- Azure OpenAI implementation (requires resource/deployment config)
-- Extension-provided providers via stream-simple bridge
-- Tool definitions with JSON Schema
+### 编辑前
 
-**Built-in Tools** (36 total; the tier table is `ESSENTIAL_DEFAULTS` / `OPT_IN_ONLY` in `src/xdev.rs`, the default `--tools` list is in `src/cli.rs`, and README "36 Built-in Tools" is the user-facing inventory — keep all three in sync):
-- Essential, always in the schema: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `hashline_edit`, `ask`, `todo`, `web_search`, `submit_plan`, `current_time`, `xdev`
-- Discoverable behind `xdev`: `ast_grep`, `ast_edit`, `lsp`, `debug`, `manage_skill`, plus the memory bank (`retain`, `recall`, `reflect`, `memory_edit`, `learn`) when `memory.backend` is `local`
-- Default-enabled: `jobs`, `hub`
-- `--tools` opt-in: `eval`, `github`, `security_scan`
-- Settings-gated: `browser`, `computer`, `inspect_image`, `generate_image`, `tts`, `read_media`
-- `subagent` - Native isolated Rust Pi child-agent delegation (opt-in only via `--tools ...subagent`)
+1. 确认当前分支和工作区状态。
+2. 通过 `docs/context/README.md` 读取相关治理文档。
+3. 给请求的修改分类。
+4. 定位当前源码和测试；不能把旧上下文文档当作当前行为的证据。
+5. 说明修改范围、验证目标和预期变更文件。
 
-**Session Management:**
-- JSONL format (version 3)
-- Tree structure for branching
-- Entry types: Message, ModelChange, ThinkingLevel, Compaction, etc.
-- Per-project session directories + session index metadata
-- SQLite session backend support is enabled by default via `sqlite-sessions`; opt out with `--no-default-features` and re-enable only the features you need
+### 编辑中
 
-### Migration Strategy
+1. 除非只是非常小的文档修正，否则在主题明确的分支上工作。
+2. 除非差异清单记录了有意的行为差别，否则保留上游行为。
+3. 使用小范围、便于审查的编辑。
+4. 不要把本地生成的索引、缓存、导出文件和构建残留加入提交。
+5. 不得删除或静默替换无关工作。
 
-This port uses two key libraries from sibling projects:
+### 报告完成前
 
-1. **asupersync** (`../asupersync`) - Structured concurrency runtime
-   - Async runtime (structured concurrency)
-   - Provides HTTP client, TLS, SQLite
-   - Enables deterministic testing with LabRuntime
-   - Explicit capability context (Cx)
+1. 运行针对性验证，并将实际结果标记为 `PASS`、`FAIL`、`NOT RUN` 或 `BLOCKED`。
+2. 检查变更文件集合，确认没有无关改动。
+3. 如果 Fork 表面发生变化，更新二开差异清单。
+4. 用户要求提交时，使用主题明确的提交信息。
+5. 留下简短交接，说明基线、改动、验证结果和未解决事项。
 
-2. **rich_rust** (`../rich_rust`) - Terminal UI library
-   - Console with markup syntax `[bold red]text[/]`
-   - Tables, Panels, Progress bars
-   - Markdown rendering
-   - Theme support
+## 8. 文档边界
 
-**Current Status:**
-- asupersync powers runtime + HTTP/TLS + cancellation + optional SQLite integration
-- rich_rust/charmed_rust stack powers the interactive terminal UI
-- Provider layer has 11 native provider implementation modules in `src/providers/`: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini, Cohere, Azure OpenAI, Bedrock, Vertex AI, GitHub Copilot, GitLab Duo, and Cursor
-- Extension runtime, capability policy, and conformance harness are integrated
+- `docs/` 包含上游项目文档及其他项目文档。不要默认把上游用户文档复制到 `docs/context/`。
+- `docs/context/` 是本 Fork 的 Agent 上下文和治理层。当前引导阶段只包含治理内容；架构和功能地图将在单独任务中基于新上游基线重新建立。
+- `docs/context/customization-map.md` 是当前 Fork 专属差异的事实来源。
+- 上游 `AGENTS.md` 可以作为学习材料，但不是本 Fork 的活动规则。采用哪些上游工作流，记录在 `docs/context/agent-workflow-adoption.md`。
 
-### Performance Targets
-
-| Metric | Target | Notes |
-|--------|--------|-------|
-| Startup time | <100ms | No heavy initialization |
-| Binary size (release) | <48 MiB | DSR release-size budget with LTO + strip enabled (raised from 26 MiB for the v0.3.0 capability wave: BPE tables, LSP/DAP, MCP, eval kernels) |
-| TUI framerate | 60fps | Differential rendering |
-| Memory (idle) | <50MB | No leaks on long sessions |
-
----
-
-## Conformance Testing
-
-The port uses fixture-based conformance tests to validate behavior matches expectations.
-
-### Fixture Structure
-
-```json
-{
-  "version": "1.0",
-  "tool": "tool_name",
-  "cases": [
-    {
-      "name": "test_name",
-      "setup": [{"type": "create_file", "path": "...", "content": "..."}],
-      "input": {"param": "value"},
-      "expected": {
-        "content_contains": ["..."],
-        "content_regex": "...",
-        "details_exact": {"key": "value"}
-      }
-    }
-  ]
-}
-```
-
-### Running Conformance Tests
-
-```bash
-dsr quality --tool pi_agent_rust
-```
-
-Conformance is part of that fail-closed recipe. Do not substitute a hand-picked
-subset for the authoritative result.
-
----
-
-## Third-Party Library Usage
-
-If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to find the latest documentation and current best practices.
-
----
-
-## MCP Agent Mail — Multi-Agent Coordination
-
-A mail-like layer that lets coding agents coordinate asynchronously via MCP tools and resources. Provides identities, inbox/outbox, searchable threads, and advisory file reservations with human-auditable artifacts in Git.
-
-### Why It's Useful
-
-- **Prevents conflicts:** Explicit file reservations (leases) for files/globs
-- **Token-efficient:** Messages stored in per-project archive, not in context
-- **Quick reads:** `resource://inbox/...`, `resource://thread/...`
-
-### Same Repository Workflow
-
-1. **Register identity:**
-   ```
-   ensure_project(project_key=<abs-path>)
-   register_agent(project_key, program, model)
-   ```
-
-2. **Reserve files before editing:**
-   ```
-   file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)
-   ```
-
-3. **Communicate with threads:**
-   ```
-   send_message(..., thread_id="FEAT-123")
-   fetch_inbox(project_key, agent_name)
-   acknowledge_message(project_key, agent_name, message_id)
-   ```
-
-4. **Quick reads:**
-   ```
-   resource://inbox/{Agent}?project=<abs-path>&limit=20
-   resource://thread/{id}?project=<abs-path>&include_bodies=true
-   ```
-
-### Macros vs Granular Tools
-
-- **Prefer macros for speed:** `macro_start_session`, `macro_prepare_thread`, `macro_file_reservation_cycle`, `macro_contact_handshake`
-- **Use granular tools for control:** `register_agent`, `file_reservation_paths`, `send_message`, `fetch_inbox`, `acknowledge_message`
-
-### Common Pitfalls
-
-- `"from_agent not registered"`: Always `register_agent` in the correct `project_key` first
-- `"FILE_RESERVATION_CONFLICT"`: Adjust patterns, wait for expiry, or use non-exclusive reservation
-- **Auth errors:** If JWT+JWKS enabled, include bearer token with matching `kid`
-
-### Pre-Commit Guard (installed 2026-09-02, bd-0x31m)
-
-This checkout runs the agent-mail pre-commit guard: `.git/hooks/pre-commit` is
-the chain-runner and `.git/hooks/hooks.d/pre-commit/50-agent-mail.py` checks
-every commit against the active **exclusive** file reservations. It exists
-because an unattended sweeper committed another agent's unverified in-flight
-work five times in one day (last: `5d3eb35a`).
-
-- **Identify yourself, on push as well as commit:** the guard reads
-  `AGENT_NAME` (falling back to the registered pane identity) and is installed
-  on both hooks. Use
-  `AGENT_NAME=<your registered agent name> git commit …` **and**
-  `AGENT_NAME=<your registered agent name> git push …`; an unidentified commit
-  or push is refused when it touches files under an active exclusive
-  reservation — including your own, because without `AGENT_NAME` the guard
-  cannot tell the lease is yours. The push refusal surfaces as a bare
-  `50-agent-mail.py exited with status 2`, which reads like a tool failure
-  rather than a refusal — it is the guard.
-- **Reserve EXCLUSIVELY, or the guard ignores you.** The MCP examples above
-  pass `exclusive=true`; the CLI does not default to it.
-  `am file_reservations reserve <project> <agent> <paths>` creates a SHARED
-  lease unless you pass `--exclusive`, and `50-agent-mail.py` skips every
-  reservation whose `exclusive` is not exactly true. A shared reservation
-  announces intent and blocks nothing. Verified by running the hook both ways
-  against a live reservation: exclusive refuses and names the holder, shared
-  exits 0 silently (bd-0x31m).
-- **Give the lease longer than a gate run.** The 3600s default is shorter than
-  the work it protects: `clippy --all-targets` alone ran 4–22 minutes across
-  this session depending on cache warmth, a three-check cycle 25–45, and a
-  change usually needs two or three cycles before it is committable.
-  A lease taken when you start routinely expires before you commit. Use
-  `--ttl 14400` for a session that will run dsr, or renew while you wait. On
-  2026-09-11 a lease on three files expired at 02:47:01Z and the sweeper
-  committed those exact three files at 02:47:18Z.
-- **Never commit into someone else's reservation.** If the guard names a
-  holder, coordinate in the bead thread or wait for the lease to expire; do
-  not bypass it to land your slice.
-- **Release when you land:** `release_file_reservations` as soon as your
-  change is committed, so the guard stops blocking other agents.
-- **Human bypass only:** `AGENT_MAIL_GUARD_MODE=warn` (allow with a warning)
-  and `AGENT_MAIL_BYPASS=1` (skip) are for the operator, not for agents.
-- The hook files live under `.git/` and are not versioned; reinstall with the
-  agent-mail `install_precommit_guard` tool if a fresh clone lacks them.
-- **The guard fails OPEN, and its failure looks like success.** If your commit
-  prints
-
-      WARNING: mcp-agent-mail: no agent-mail archive matches project
-      '/Users/jemanuel/projects/pi_agent_rust'; nothing to guard, allowing
-
-  that does not mean the project is unregistered. It may mean the mailbox
-  database is unreadable, and the guard allows the commit either way. Nothing
-  else signals it, so from the outside an inert guard is indistinguishable
-  from a working one. On 2026-09-21 it had been inert for six days
-  (bd-n0lnc). Diagnose it rather than reading past the line:
-
-      cat ~/.mcp_agent_mail_git_mailbox_repo/.mailbox.activity.lock   # pid, acquired_at
-      ps -p <pid>                                                     # still alive?
-      cat ~/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3.am-recovery-breaker.json
-      ls  ~/.mcp_agent_mail_git_mailbox_repo/*.corrupt-*
-
-  If a live `am` process holds the exclusive storage-root lock, **do not kill
-  it** — a half-finished recovery is how the corrupt snapshots in that
-  directory got there. Escalate to the operator, and until it clears treat
-  reservations as unavailable: announce intent in the bead thread instead, and
-  do not rely on the guard to stop you landing in someone else's file.
-
----
-
-## Beads (br) — Dependency-Aware Issue Tracking
-
-Beads provides a lightweight, dependency-aware issue database and CLI (`br` - beads_rust) for selecting "ready work," setting priorities, and tracking status. It complements MCP Agent Mail's messaging and file reservations.
-
-**Important:** `br` is non-invasive—it NEVER runs git commands automatically. You must manually commit changes after `br sync --flush-only`.
-
-### Conventions
-
-- **Single source of truth:** Beads for task status/priority/dependencies; Agent Mail for conversation and audit
-- **Shared identifiers:** Use Beads issue ID (e.g., `br-123`) as Mail `thread_id` and prefix subjects with `[br-123]`
-- **Reservations:** When starting a task, call `file_reservation_paths()` with the issue ID in `reason`
-- **Outcome beads close on the outcome, not on the tooling:** a bead whose title names a run, a measurement, a published artifact, or a gate result closes only with that artifact's path and source SHA in the close reason. A shipped script, a dry run, a "blocked on RCH/DSR" note, or a static review closes nothing; leave the bead open with the exact hold recorded (this rule exists because three evidence beads were closed that way on 2026-08-28 and reopened on 2026-09-01)
-
-### Typical Agent Flow
-
-1. **Pick ready work (Beads):**
-   ```bash
-   br ready --json  # Choose highest priority, no blockers
-   ```
-
-2. **Reserve edit surface (Mail):**
-   ```
-   file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true, reason="br-123")
-   ```
-
-3. **Announce start (Mail):**
-   ```
-   send_message(..., thread_id="br-123", subject="[br-123] Start: <title>", ack_required=true)
-   ```
-
-4. **Work and update:** Reply in-thread with progress
-
-5. **Complete and release:**
-   ```bash
-   br close 123 --reason "Completed"
-   br sync --flush-only  # Export to JSONL (no git operations)
-   ```
-   ```
-   release_file_reservations(project_key, agent_name, paths=["src/**"])
-   ```
-   Final Mail reply: `[br-123] Completed` with summary
-
-### Mapping Cheat Sheet
-
-| Concept | Value |
-|---------|-------|
-| Mail `thread_id` | `br-###` |
-| Mail subject | `[br-###] ...` |
-| File reservation `reason` | `br-###` |
-| Commit messages | Include `br-###` for traceability |
-
----
-
-## bv — Graph-Aware Triage Engine
-
-bv is a graph-aware triage engine for Beads projects (`.beads/beads.jsonl`). It computes PageRank, betweenness, critical path, cycles, HITS, eigenvector, and k-core metrics deterministically.
-
-**Scope boundary:** bv handles *what to work on* (triage, priority, planning). For agent-to-agent coordination (messaging, work claiming, file reservations), use MCP Agent Mail.
-
-**CRITICAL: Use non-interactive flags (`--robot-*`, `--recipe`, `--as-of`, `--diff-since`, `--export-md`) only. Bare `bv` launches an interactive TUI that blocks your session.**
-
-### The Workflow: Start With Triage
-
-Use this order of operations:
-
-```bash
-bv --robot-plan          # Primary triage surface (tracks + highest-impact summary)
-bv --robot-priority      # Priority sanity check and suggested re-ranking
-bv --robot-insights      # Deep graph metrics when needed
-br ready --json          # Ground-truth actionable issues from Beads
-```
-
-If your local `bv` build supports `--robot-triage`, you can still use it. If not, `--robot-plan` + `br ready --json` is the required fallback.
-
-**CRITICAL Tombstone Guard:** `bv` output can include `status = tombstone` items in some versions. Tombstones are deleted/merged issues and are **never actionable**.
-
-Before claiming work from `bv`, always verify status with `br`:
-
-```bash
-br show <issue-id> --json | jq -r '.[0].status'
-# Only proceed if status is open/in_progress and the issue is not deleted/tombstoned.
-```
-
-If `br ready --json` is empty and `bv` only surfaces tombstones, do not claim tombstoned items. Create or refine a real bead and proceed.
-
-### Command Reference
-
-**Planning:**
-| Command | Returns |
-|---------|---------|
-| `--robot-plan` | Parallel execution tracks with `unblocks` lists |
-| `--robot-priority` | Priority misalignment detection with confidence |
-| `--robot-recipes` | Available recipe filters for scoped triage |
-
-**Graph Analysis:**
-| Command | Returns |
-|---------|---------|
-| `--robot-insights` | Full metrics: PageRank, betweenness, HITS, eigenvector, critical path, cycles, k-core, articulation points, slack |
-
-**History & Change Tracking:**
-| Command | Returns |
-|---------|---------|
-| `--robot-diff --diff-since <ref>` | Changes since ref: new/closed/modified issues, cycles |
-
-**Other:**
-| Command | Returns |
-|---------|---------|
-| `--recipe <name>` | Apply recipe filters (for example `actionable`, `high-impact`) |
-| `--export-md <file.md>` | Markdown status/export report |
-
-### Scoping & Filtering
-
-```bash
-bv --robot-plan --as-of HEAD~30              # Historical point-in-time
-bv --recipe actionable --robot-plan          # Pre-filter: ready to work
-bv --recipe high-impact --robot-plan         # Pre-filter: top-impact set
-bv --robot-priority                          # Cross-check priority drift
-bv --robot-recipes                           # Discover installed recipe names
-```
-
-### Understanding Robot Output
-
-**All robot JSON includes:**
-- `data_hash` — Fingerprint of source beads.jsonl
-- `status` — Per-metric state: `computed|approx|timeout|skipped` + elapsed ms
-- `as_of` / `as_of_commit` — Present when using `--as-of`
-
-**Two-phase analysis:**
-- **Phase 1 (instant):** degree, topo sort, density
-- **Phase 2 (async, 500ms timeout):** PageRank, betweenness, HITS, eigenvector, cycles
-
-### jq Quick Reference
-
-```bash
-bv --robot-plan | jq '.plan.summary.highest_impact'        # Best unblock target
-bv --robot-plan | jq '.plan.tracks[0].items[0]'            # First candidate in first track
-bv --robot-priority | jq '.recommendations[0]'             # Top priority recommendation
-bv --robot-insights | jq '.status'                         # Check metric readiness
-bv --robot-insights | jq '.Cycles'                         # Circular deps (must fix!)
-```
-
----
-
-## UBS — Ultimate Bug Scanner
-
-**Golden Rule:** `ubs --staged --only=rust .` before every commit. Exit 0 = safe. Exit >0 = fix & re-run.
-
-### Commands
-
-```bash
-ubs --staged --only=rust .              # Staged Rust changes — USE THIS
-python3 scripts/check_ubs_staged_delta.py # Changed-line gate when staged UBS is noisy
-ubs --diff --only=rust .                # Unstaged+staged Rust changes vs HEAD
-ubs --only=rust,toml .                  # Language-filtered project scan
-ubs --ci --fail-on-warning .            # CI mode — before PR
-timeout 60s ubs --staged --only=rust .  # Bounded pre-commit run if UBS stalls
-ubs .                                   # Whole project (ignores target/, Cargo.lock)
-```
-
-### Output Format
-
-```
-⚠️  Category (N errors)
-    file.rs:42:5 – Issue description
-    💡 Suggested fix
-Exit code: 1
-```
-
-Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fail
-
-### Noisy Staged-File Baseline
-
-UBS scans whole staged Rust files, so large modules can report old findings on
-unchanged lines. If raw `ubs --staged --only=rust .` is non-actionable because
-it is dominated by unchanged-file baseline noise, run:
-
-```bash
-python3 scripts/check_ubs_staged_delta.py
-```
-
-That gate still runs UBS on the staged Rust files, then fails only when warning
-or critical findings land on lines added or modified in the staged diff. If it
-passes, treat remaining whole-file findings as baseline inventory and file or
-link owner beads for that inventory instead of blocking the current patch on
-unrelated legacy findings.
-
-### Fix Workflow
-
-1. Read finding → category + fix suggestion
-2. Navigate `file:line:col` → view context
-3. Verify real issue (not false positive)
-4. Fix root cause (not symptom)
-5. Re-stage and re-run `ubs --staged --only=rust .`; if it is noisy from
-   unchanged baseline findings, run `python3 scripts/check_ubs_staged_delta.py`
-   and fix any changed-line failures
-6. Commit
-
-### Bug Severity
-
-- **Critical (always fix):** Memory safety, use-after-free, data races, SQL injection
-- **Important (production):** Unwrap panics, resource leaks, overflow checks
-- **Contextual (judgment):** TODO/FIXME, println! debugging
-
----
-
-## Historical Drop-In Ledger — Retired
-
-`docs/evidence/dropin-parity-gap-ledger.json` and
-`scripts/reconcile_beads_ledger.sh` belong to the retired strict drop-in
-program. They are historical diagnostics, not commit, quality, completeness,
-or release gates.
-
-```bash
-# Optional historical consistency inspection only
-./scripts/reconcile_beads_ledger.sh
-```
-
-Do not create, reopen, or keep product Beads active merely to make this retired
-ledger green. Track current product defects and OMP-inspired improvements
-directly in Beads with concrete user-visible acceptance criteria.
-
----
-
-## Module Reachability — Invariant
-
-**CRITICAL INVARIANT:** Every `pub mod` in `src/lib.rs` must have at least one non-test call site, or an allowlist entry stating why not.
-
-```bash
-python3 scripts/check_module_reachability.py          # exit 0 = safe to commit
-python3 scripts/check_module_reachability.py --json   # machine-readable report
-```
-
-### Why This Exists (bd-4rzpj)
-
-This is the second half of the completion-illusion defense. Ledger reconciliation above catches *untracked* gaps; it cannot catch a bead **closed against code nobody calls**, because that code compiles and its tests pass.
-
-That failure happened at epic scale on 2026-08-24 (bd-33df9): five modules landed with green unit tests, their beads were closed, the parent epics were closed — and nothing in the product ever called them. `reconcile_beads_ledger.sh` exited 0 the entire time. **A module only its own tests reference is not a shipped feature.**
-
-### What Counts as Reachable
-
-- `src/`, `examples/`, and `benches/` are real consumers. In this repo `cargo run --example` is a genuine operational path (the perf and conformance tooling runs that way).
-- `tests/` deliberately does **not** count. "A test pokes it" is exactly the state this gate exists to distinguish from "a user can reach it".
-- References inside a `#[cfg(test)] mod ... { }` block don't count either — the gate brace-tracks those blocks rather than guessing by proximity.
-
-### If It Fails
-
-1. **Land the call site** that makes the module reachable. This is almost always the right answer.
-2. **Or add it to `ALLOWLIST`** in the script *with a real reason*. Test-harness modules (`conformance_shapes`, `flake_classifier`, `swarm_flight_recorder`) are legitimate entries. The reason string is the point: it converts "nobody noticed" into "someone decided".
-
-**Never** silence this gate by deleting a module — Rule 1 forbids file deletion without express written permission, and a failing gate is evidence of missing integration work, not of a surplus file.
-
----
-
-## RCH — DSR-Managed Compilation Transport
-
-RCH can offload compilation to remote workers, but agents do not invoke it
-directly in this repository. DSR decides when and how RCH is used and remains
-the only quality/build authority. An RCH result outside DSR is diagnostic only
-and cannot satisfy a Bead, integration, or release gate.
-
----
-
-## ast-grep vs ripgrep
-
-**Use `ast-grep` when structure matters.** It parses code and matches AST nodes, ignoring comments/strings, and can **safely rewrite** code.
-
-- Refactors/codemods: rename APIs, change import forms
-- Policy checks: enforce patterns across a repo
-- Editor/automation: LSP mode, `--json` output
-
-**Use `ripgrep` when text is enough.** Fastest way to grep literals/regex.
-
-- Recon: find strings, TODOs, log lines, config values
-- Pre-filter: narrow candidate files before ast-grep
-
-### Rule of Thumb
-
-- Need correctness or **applying changes** → `ast-grep`
-- Need raw speed or **hunting text** → `rg`
-- Often combine: `rg` to shortlist files, then `ast-grep` to match/modify
-
-### Rust Examples
-
-```bash
-# Find structured code (ignores comments)
-ast-grep run -l Rust -p 'fn $NAME($$$ARGS) -> $RET { $$$BODY }'
-
-# Find all unwrap() calls
-ast-grep run -l Rust -p '$EXPR.unwrap()'
-
-# Quick textual hunt
-rg -n 'println!' -t rust
-
-# Combine speed + precision
-rg -l -t rust 'unwrap\(' | xargs ast-grep run -l Rust -p '$X.unwrap()' --json
-```
-
----
-
-## Morph Warp Grep — AI-Powered Code Search
-
-**Use `mcp__morph-mcp__warp_grep` for exploratory "how does X work?" questions.** An AI agent expands your query, greps the codebase, reads relevant files, and returns precise line ranges with full context.
-
-**Use `ripgrep` for targeted searches.** When you know exactly what you're looking for.
-
-**Use `ast-grep` for structural patterns.** When you need AST precision for matching/rewriting.
-
-### When to Use What
-
-| Scenario | Tool | Why |
-|----------|------|-----|
-| "How is streaming implemented?" | `warp_grep` | Exploratory; don't know where to start |
-| "Where is the Anthropic provider?" | `warp_grep` | Need to understand architecture |
-| "Find all uses of `serde_json::from_str`" | `ripgrep` | Targeted literal search |
-| "Find files with `println!`" | `ripgrep` | Simple pattern |
-| "Replace all `unwrap()` with `expect()`" | `ast-grep` | Structural refactor |
-
-### warp_grep Usage
-
-```
-mcp__morph-mcp__warp_grep(
-  repoPath: "/path/to/pi_agent_rust",
-  query: "How does the SSE parser handle streaming events?"
-)
-```
-
-Returns structured results with file paths, line ranges, and extracted code snippets.
-
-### Anti-Patterns
-
-- **Don't** use `warp_grep` to find a specific function name → use `ripgrep`
-- **Don't** use `ripgrep` to understand "how does X work" → wastes time with manual reads
-- **Don't** use `ripgrep` for codemods → risks collateral edits
-
----
-
-## Beads Workflow Integration
-
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
-
-**Important:** `br` is non-invasive—it NEVER executes git commands. After `br sync --flush-only`, you must manually run `git add .beads/ && git commit`.
-
-### Essential Commands
-
-```bash
-# View issues (launches TUI - avoid in automated sessions)
-bv
-
-# CLI commands for agents (use these instead)
-br ready              # Show issues ready to work (no blockers)
-br list --status=open # All open issues
-br show <id>          # Full issue details with dependencies
-br create --title="..." --type=task --priority=2
-br update <id> --status=in_progress
-br close <id> --reason "Completed"
-br close <id1> <id2>  # Close multiple issues at once
-br sync --flush-only  # Export to JSONL (NO git operations)
-```
-
-### Workflow Pattern
-
-1. **Start**: Run `br ready` to find actionable work
-2. **Claim**: Use `br update <id> --status=in_progress`
-3. **Work**: Implement the task
-4. **Complete**: Use `br close <id>`
-5. **Sync**: Run `br sync --flush-only` then manually commit
-
-### Key Concepts
-
-- **Dependencies**: Issues can block other issues. `br ready` shows only unblocked work.
-- **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers, not words)
-- **Types**: task, bug, feature, epic, question, docs
-- **Blocking**: `br dep add <issue> <depends-on>` to add dependencies
-
-### Session Protocol
-
-**Before ending any session, run this checklist:**
-
-```bash
-git status              # Check what changed
-git add <files>         # Stage code changes
-br sync --flush-only    # Export beads to JSONL
-git add .beads/         # Stage beads changes
-git commit -m "..."     # Commit everything together
-git push                # Push to remote
-```
-
-### Best Practices
-
-- Check `br ready` at session start to find available work
-- Update status as you work (in_progress → closed)
-- Create new issues with `br create` when you discover tasks
-- Use descriptive titles and set appropriate priority/type
-- Always `br sync --flush-only && git add .beads/` before ending session
-
----
-
-## Landing the Plane (Session Completion)
-
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
-
-**MANDATORY WORKFLOW:**
-
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   br sync --flush-only    # Export beads to JSONL (no git ops)
-   git add .beads/         # Stage beads changes
-   git add <other files>   # Stage code changes
-   git commit -m "..."     # Commit everything
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
-- Stage only the files YOU changed (`git add <files>`, never `git add -A` or
-  `git add .`). Other sessions' uncommitted work must stay uncommitted until
-  they commit it; sweeping it into your commit under your message hides what
-  was tested and by whom (on 2026-09-01 this committed an ineffective fix
-  mid-edit and two implementations of the same tool within an hour)
-
-
----
-
-## cass — Cross-Agent Session Search
-
-`cass` indexes prior agent conversations (Claude Code, Codex, Cursor, Gemini, ChatGPT, etc.) so we can reuse solved problems.
-
-**Rules:** Never run bare `cass` (TUI). Always use `--robot` or `--json`.
-
-### Examples
-
-```bash
-cass health
-cass search "async runtime" --robot --limit 5
-cass view /path/to/session.jsonl -n 42 --json
-cass expand /path/to/session.jsonl -n 42 -C 3 --json
-cass capabilities --json
-cass robot-docs guide
-```
-
-### Tips
-
-- Use `--fields minimal` for lean output
-- Filter by agent with `--agent`
-- Use `--days N` to limit to recent history
-
-stdout is data-only, stderr is diagnostics; exit code 0 means success.
-
-Treat cass as a way to avoid re-solving problems other agents already handled.
-
----
-
-## Note for Codex/GPT-5.2
-
-You constantly bother me and stop working with concerned questions that look similar to this:
-
-```
-Unexpected changes (need guidance)
-
-- Working tree still shows edits I did not make in Cargo.toml, Cargo.lock, src/cli/commands/upgrade.rs, src/storage/sqlite.rs, tests/conformance.rs, tests/storage_deps.rs. Please advise whether to keep/commit/revert these before any further work. I did not touch them.
-
-Next steps (pick one)
-
-1. Decide how to handle the unrelated modified files above so we can resume cleanly.
-2. Triage beads_rust-orko (clippy/cargo warnings) and beads_rust-ydqr (rustfmt failures).
-3. If you want a full suite run later, fix the reported blockers and re-run `dsr quality --tool pi_agent_rust`.
-```
-
-NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into thinking YOU made the changes and simply don't recall it for some reason.
-
----
-
-## Note on Built-in TODO Functionality
-
-Also, if I ask you to explicitly use your built-in TODO functionality, don't complain about this and say you need to use beads. You can use built-in TODOs if I tell you specifically to do so. Always comply with such orders.
-
-For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"
+如果文档与当前源码不一致，应明确报告冲突。涉及当前运行时行为时，源码和测试是证据；上下文文档用于导航和制定维护政策。
